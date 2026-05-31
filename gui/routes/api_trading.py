@@ -1,40 +1,49 @@
 """
-API routes for Paper Trading, Alerts, and Risk Management.
+API routes for Paper Trading, Live Trading, Alerts, and Risk Management.
 """
 from flask import Blueprint, request, jsonify
 import traceback
+import os
 
 from gui.globals import paper_traders, alert_manager, risk_manager
 from brokers.paper_trader import PaperTrader
+from brokers.live_trader import LiveEtradeBroker
 from core.models import Asset, AssetType, OrderType
 
 trading_bp = Blueprint('trading', __name__, url_prefix='/api')
 
-# ==================== PAPER TRADING ====================
+# ==================== TRADING SESSIONS ====================
+active_traders = {}
 
-@trading_bp.route('/paper_trader/create', methods=['POST'])
-def create_paper_trader():
-    """Create a new paper trading session"""
+@trading_bp.route('/trader/create', methods=['POST'])
+def create_trader():
+    """Create a new paper or live trading session"""
     try:
         data = request.json or {}
         trader_id = data.get('trader_id', 'default')
-        initial_capital = float(data.get('initial_capital', 50000))
+        mode = data.get('mode', 'paper')
         
-        paper_traders[trader_id] = PaperTrader(initial_capital)
-        
-        return jsonify({
-            'trader_id': trader_id,
-            'initial_capital': initial_capital,
-            'status': 'created'
-        })
+        if mode == 'live':
+            active_traders[trader_id] = LiveEtradeBroker(
+                consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
+                consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),
+                access_token=os.getenv("ETRADE_ACCESS_TOKEN"),
+                access_secret=os.getenv("ETRADE_ACCESS_SECRET"),
+                account_id_key=os.getenv("ETRADE_ACCOUNT_ID_KEY")
+            )
+        else:
+            initial_capital = float(data.get('initial_capital', 50000))
+            active_traders[trader_id] = PaperTrader(initial_capital)
+            
+        return jsonify({'trader_id': trader_id, 'mode': mode, 'status': 'created'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@trading_bp.route('/paper_trader/<trader_id>/order', methods=['POST'])
+@trading_bp.route('/trader/<trader_id>/order', methods=['POST'])
 def place_order(trader_id):
-    """Place an order in paper trader"""
+    """Place an order using the active trader instance"""
     try:
-        if trader_id not in paper_traders:
+        if trader_id not in active_traders:
             return jsonify({'error': f'Trader {trader_id} not found'}), 404
             
         data = request.json or {}
@@ -43,32 +52,31 @@ def place_order(trader_id):
         quantity = int(data.get('quantity', 0))
         price = float(data.get('price', 0))
         
-        if not symbol or quantity <= 0 or price <= 0:
+        if not symbol or quantity <= 0:
             return jsonify({'error': 'Invalid parameters'}), 400
             
-        trader = paper_traders[trader_id]
+        trader = active_traders[trader_id]
         asset = Asset(symbol, AssetType.STOCK)
         order_type = OrderType.BUY if action == 'BUY' else OrderType.SELL
         
-        order_id = trader.place_order(asset, order_type, quantity, price)
+        order_id = trader.place_order(asset, order_type, quantity, limit_price=price if price > 0 else None)
         
         return jsonify({'order_id': order_id, 'status': 'placed'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@trading_bp.route('/paper_trader/<trader_id>/status', methods=['GET'])
+@trading_bp.route('/trader/<trader_id>/status', methods=['GET'])
 def get_trader_status(trader_id):
-    """Get paper trader status"""
+    """Get status of active trader"""
     try:
-        if trader_id not in paper_traders:
+        if trader_id not in active_traders:
             return jsonify({'error': f'Trader {trader_id} not found'}), 404
             
-        trader = paper_traders[trader_id]
+        trader = active_traders[trader_id]
         status = trader.get_portfolio_status()
         return jsonify(status)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 
 # ==================== ALERTS ====================
 
