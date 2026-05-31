@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-12">
+        <div class="jumbotron bg-light p-5 rounded-lg mb-4">
+            <h1 class="display-4"><i class="bi bi-graph-up-arrow text-success"></i> Trading System</h1>
+            <p class="lead">Quantitative Multi-Asset Trading Platform</p>
+            <hr class="my-4">
+            <p>Backtest strategies, trade with paper money, and analyze markets.</p>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-4 mb-4">
+        <div class="card h-100 shadow-sm">
+            <div class="card-body">
+                <h5 class="card-title"><i class="bi bi-clock-history text-primary"></i> Backtesting</h5>
+                <p class="card-text">Test trading strategies on historical data</p>
+                <a href="/backtest" class="btn btn-primary">Go to Backtest</a>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4 mb-4">
+        <div class="card h-100 shadow-sm">
+            <div class="card-body">
+                <h5 class="card-title"><i class="bi bi-cash-flow text-success"></i> Paper Trading</h5>
+                <p class="card-text">Trade with simulated money in real-time</p>
+                <a href="/paper_trade" class="btn btn-success">Go to Paper Trade</a>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4 mb-4">
+        <div class="card h-100 shadow-sm">
+            <div class="card-body">
+                <h5 class="card-title"><i class="bi bi-bar-chart text-info"></i> Analysis</h5>
+                <p class="card-text">Analyze stocks with technical indicators</p>
+                <a href="/analysis" class="btn btn-info">Go to Analysis</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-5">
+    <div class="col-md-12">
+        <h2>Features</h2>
+        <div class="list-group">
+            <div class="list-group-item">
+                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Multiple Strategies</h6>
+                <p class="mb-0">Momentum, Mean Reversion, Statistical Arbitrage</p>
+            </div>
+            <div class="list-group-item">
+                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Technical Indicators</h6>
+                <p class="mb-0">MACD, RSI, Bollinger Bands, SMA, EMA, ATR and more</p>
+            </div>
+            <div class="list-group-item">
+                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Risk Metrics</h6>
+                <p class="mb-0">Sharpe Ratio, Max Drawdown, Win Rate, P&L Tracking</p>
+            </div>
+            <div class="list-group-item">
+                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Options Support</h6>
+                <p class="mb-0">Black-Scholes pricing for call and put options</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

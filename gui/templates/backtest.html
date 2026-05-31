@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-md-12">
+        <h2><i class="bi bi-clock-history"></i> Backtesting</h2>
+        <p class="text-muted">Test trading strategies on historical data</p>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-4">
+        <div class="card shadow-sm">
+            <div class="card-header bg-primary text-white">
+                <h5 class="mb-0">Parameters</h5>
+            </div>
+            <div class="card-body">
+                <form id="backtestForm">
+                    <div class="mb-3">
+                        <label class="form-label">Symbols (comma-separated)</label>
+                        <input type="text" class="form-control" id="symbols" placeholder="AAPL, MSFT, GOOGL" value="AAPL, MSFT">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Strategy</label>
+                        <select class="form-select" id="strategy">
+                            <option value="momentum">Momentum</option>
+                            <option value="mean_reversion">Mean Reversion</option>
+                            <option value="stat_arb">Statistical Arbitrage</option>
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Start Date</label>
+                        <input type="date" class="form-control" id="startDate" value="2023-01-01">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">End Date</label>
+                        <input type="date" class="form-control" id="endDate" value="2023-12-31">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Initial Capital ($)</label>
+                        <input type="number" class="form-control" id="initialCapital" value="100000">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Position Size (%)</label>
+                        <input type="number" class="form-control" id="positionSize" value="10" step="0.1">
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="bi bi-play-fill"></i> Run Backtest
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-8">
+        <div id="resultsContainer"></div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById('backtestForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const symbols = document.getElementById('symbols').value;
+    const strategy = document.getElementById('strategy').value;
+    const startDate = document.getElementById('startDate').value;
+    const endDate = document.getElementById('endDate').value;
+    const initialCapital = document.getElementById('initialCapital').value;
+    const positionSize = document.getElementById('positionSize').value / 100;
+    
+    const resultsDiv = document.getElementById('resultsContainer');
+    resultsDiv.innerHTML = '<div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div>';
+    
+    try {
+        const response = await fetch('/api/backtest', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                symbols,
+                strategy,
+                start_date: startDate,
+                end_date: endDate,
+                initial_capital: initialCapital,
+                position_size: positionSize
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+            resultsDiv.innerHTML = `<div class="alert alert-danger">${data.error}</div>`;
+            return;
+        }
+        
+        const summary = data.summary;
+        resultsDiv.innerHTML = `
+            <div class="card shadow-sm">
+                <div class="card-header bg-success text-white">
+                    <h5 class="mb-0">Results</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <h6>Portfolio Summary</h6>
+                            <table class="table table-sm">
+                                <tr>
+                                    <td><strong>Initial Capital:</strong></td>
+                                    <td>$${summary.initial_capital?.toFixed(2)}</td>
+                                </tr>
+                                <tr>
+                                    <td><strong>Final Value:</strong></td>
+                                    <td>$${summary.current_value?.toFixed(2)}</td>
+                                </tr>
+                                <tr>
+                                    <td><strong>Total Return:</strong></td>
+                                    <td><span class="badge ${summary.total_return_pct >= 0 ? 'bg-success' : 'bg-danger'}">${summary.total_return_pct?.toFixed(2)}%</span></td>
+                                </tr>
+                            </table>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <h6>Risk Metrics</h6>
+                            <table class="table table-sm">
+                                <tr>
+                                    <td><strong>Sharpe Ratio:</strong></td>
+                                    <td>${summary.sharpe_ratio?.toFixed(2)}</td>
+                                </tr>
+                                <tr>
+                                    <td><strong>Max Drawdown:</strong></td>
+                                    <td>${summary.max_drawdown?.toFixed(2)}%</td>
+                                </tr>
+                                <tr>
+                                    <td><strong>Win Rate:</strong></td>
+                                    <td>${summary.win_rate?.toFixed(2)}%</td>
+                                </tr>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <h6 class="mt-4">Trade Statistics</h6>
+                    <table class="table table-sm">
+                        <tr>
+                            <td><strong>Closed Trades:</strong></td>
+                            <td>${summary.closed_trades}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Realized P&L:</strong></td>
+                            <td>$${summary.realized_pnl?.toFixed(2)}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Unrealized P&L:</strong></td>
+                            <td>$${summary.unrealized_pnl?.toFixed(2)}</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        `;
+    } catch (error) {
+        resultsDiv.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
+    }
+});
+</script>
+{% endblock %}
