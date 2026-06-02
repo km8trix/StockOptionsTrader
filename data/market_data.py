@@ -1,48 +1,132 @@
 """
-Market Data Handler - Fetches and manages price data
+Market Data Handler - Fetches and manages price data using OpenBB ODP
 """
 
 import pandas as pd
 import numpy as np
-import yfinance as yf
+from openbb import obb
 from datetime import date, datetime, timedelta
 from typing import cast, Dict, Optional, Tuple, Any
 from core.models import Asset, AssetType
 
 
 class MarketDataHandler:
-    """Fetches and manages market data for backtesting and live trading"""
+    """Fetches and manages market data using OpenBB Open Data Platform (ODP)"""
     
     def __init__(self):
         self.stock_data: Dict[str, pd.DataFrame] = {}
         self.cache: Dict[str, pd.DataFrame] = {}
+        # OpenBB ODP providers available for equity historical data
+        self.providers = ['fmp', 'intrinio', 'polygon', 'tiingo']
 
     def fetch_stock_data(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """Fetch historical stock data from Yahoo Finance with structural flattening safeguards"""
+        """
+        Fetch historical stock data from OpenBB ODP with structural safeguards
+        
+        Args:
+            symbol: Stock ticker symbol (e.g., 'AAPL')
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            
+        Returns:
+            DataFrame with columns: open, high, low, close, volume
+        """
         try:
             cache_key = f"{symbol}_{start_date}_{end_date}"
             if cache_key in self.cache:
                 return self.cache[cache_key]
+            
+            data = None
+            last_error = None
+            
+            # Try multiple ODP providers
+            for provider in self.providers:
+                try:
+                    result = obb.equity.price.historical(
+                        symbol=symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        provider=provider
+                    )
+                    
+                    if result is None or not hasattr(result, 'results'):
+                        continue
+                    
+                    # Convert OBB results to DataFrame
+                    data_list = []
+                    for item in result.results:
+                        data_list.append({
+                            'date': item.date,
+                            'open': float(item.open) if item.open else None,
+                            'high': float(item.high) if item.high else None,
+                            'low': float(item.low) if item.low else None,
+                            'close': float(item.close) if item.close else None,
+                            'volume': float(item.volume) if item.volume else None,
+                        })
+                    
+                    if data_list:
+                        data = pd.DataFrame(data_list)
+                        print(f"Successfully fetched {symbol} from OpenBB ODP provider: {provider}")
+                        break
+                        
+                except Exception as e:
+                    last_error = e
+                    continue
+            
+            # If ODP failed, use fallback
+            if data is None or data.empty:
+                print(f"ODP fetch failed for {symbol}, attempting fallback")
+                return self._fetch_with_fallback(symbol, start_date, end_date)
+            
+            # Process the data
+            data['date'] = pd.to_datetime(data['date'])
+            data.set_index('date', inplace=True)
+            
+            # Standardize column names to lowercase
+            data.columns = [str(col).lower() for col in data.columns]
+            
+            # Select only expected columns and handle missing ones
+            expected_columns = ['open', 'high', 'low', 'close', 'volume']
+            available_columns = [col for col in expected_columns if col in data.columns]
+            
+            if not available_columns:
+                return pd.DataFrame()
+            
+            data = data[available_columns]
+            
+            self.cache[cache_key] = data
+            return data
+            
+        except Exception as e:
+            print(f"Error fetching data for {symbol}: {e}")
+            return self._fetch_with_fallback(symbol, start_date, end_date)
+    
+    def _fetch_with_fallback(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        Fallback method using yfinance if ODP providers are unavailable
+        Ensures backward compatibility when ODP/APIs are not accessible
+        """
+        try:
+            import yfinance as yf
             
             data = yf.download(symbol, start=start_date, end=end_date, progress=False)
             
             if data.empty:
                 return pd.DataFrame()
             
-            # Defensive check: Flatten multi-index header structures to clear ticker levels
+            # Flatten multi-index if needed
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.droplevel(1)
             
-            # Standardize case formatting to guarantee string matching behaves predictably
             data.columns = [str(col).lower() for col in data.columns]
-            
             expected_columns = ['open', 'high', 'low', 'close', 'volume']
-            data = data[expected_columns]
+            available_columns = [col for col in expected_columns if col in data.columns]
+            data = data[available_columns]
             
-            self.cache[cache_key] = data
+            print(f"Fetched {symbol} using yfinance fallback")
             return data
         except Exception as e:
-            print(f"Error fetching data for {symbol}: {e}")
+            print(f"Fallback fetch also failed for {symbol}: {e}")
             return pd.DataFrame()
     
     def get_current_price(self, symbol: str, date: datetime) -> Optional[float]:
@@ -121,3 +205,5 @@ class MarketDataHandler:
         """Calculate historical volatility"""
         returns = data['close'].pct_change()
         return returns.rolling(window=window).std().iloc[-1] * np.sqrt(252)
+
+
