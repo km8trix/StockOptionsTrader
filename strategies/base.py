@@ -131,7 +131,15 @@ class StatisticalArbitrageStrategy(Strategy):
         sma = data['close'].rolling(window=20).mean()
         std = data['close'].rolling(window=20).std()
         
+        # Avoid division by zero when std is 0 (flat prices)
+        if std.iloc[-1] == 0:
+            return 'HOLD'
+        
         z_score = (current['close'] - sma.iloc[-1]) / std.iloc[-1]
+        
+        # Safely handle NaN z_score
+        if pd.isna(z_score):
+            return 'HOLD'
         
         if z_score < -self.z_score_threshold:
             return 'BUY'
