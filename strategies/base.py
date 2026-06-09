@@ -27,7 +27,7 @@ class Strategy(ABC):
         pass
     
     def analyze(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """Analyze data and generate signals"""
+        """Analyze data and generate a full historical series of signals safely"""
         data = self.market_data.fetch_stock_data(symbol, start_date, end_date)
         if data.empty:
             return data
@@ -35,9 +35,16 @@ class Strategy(ABC):
         data = self.market_data.calculate_indicators(data)
         asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
         
+        # Initialize signal history column
+        data['signal'] = 'HOLD'
+        
         for idx in range(1, len(data)):
             signal = self.generate_signals(data.iloc[:idx+1], asset)
-            self.signals[asset] = signal
+            data.loc[data.index[idx], 'signal'] = signal
+        
+        # Store latest state to prevent breaks in legacy single-lookup indicators
+        if not data.empty:
+            self.signals[asset] = data['signal'].iloc[-1]
         
         return data
 
@@ -45,8 +52,6 @@ class Strategy(ABC):
 class MomentumStrategy(Strategy):
     """
     Momentum-based strategy using technical indicators
-    - BUY: When price crosses above SMA50 with strong RSI
-    - SELL: When RSI > 70 or price crosses below SMA20
     """
     
     def __init__(self):
@@ -61,15 +66,12 @@ class MomentumStrategy(Strategy):
         current = data.iloc[-1]
         prev = data.iloc[-2]
         
-        # Check MACD crossover
         macd_bullish = (current['macd'] > current['signal']) and (prev['macd'] <= prev['signal'])
         macd_bearish = (current['macd'] < current['signal']) and (prev['macd'] >= prev['signal'])
         
-        # Check RSI
         rsi_bullish = current['rsi'] < self.rsi_oversold
         rsi_bearish = current['rsi'] > self.rsi_overbought
         
-        # Check price position relative to moving averages
         price_above_sma20 = current['close'] > current['sma_20']
         price_above_sma50 = current['close'] > current['sma_50']
         
@@ -84,8 +86,6 @@ class MomentumStrategy(Strategy):
 class MeanReversionStrategy(Strategy):
     """
     Mean reversion strategy using Bollinger Bands
-    - BUY: When price touches lower Bollinger Band with oversold RSI
-    - SELL: When price touches upper Bollinger Band with overbought RSI
     """
     
     def __init__(self):
@@ -97,11 +97,9 @@ class MeanReversionStrategy(Strategy):
         
         current = data.iloc[-1]
         
-        # Check Bollinger Band positions
         at_lower_band = current['close'] <= current['bb_lower']
         at_upper_band = current['close'] >= current['bb_upper']
         
-        # Check RSI
         rsi_oversold = current['rsi'] < 30
         rsi_overbought = current['rsi'] > 70
         
@@ -116,7 +114,6 @@ class MeanReversionStrategy(Strategy):
 class StatisticalArbitrageStrategy(Strategy):
     """
     Statistical arbitrage using Z-score and correlation
-    - Identifies mean deviations and potential reversals
     """
     
     def __init__(self, z_score_threshold: float = 2.0):
@@ -131,13 +128,11 @@ class StatisticalArbitrageStrategy(Strategy):
         sma = data['close'].rolling(window=20).mean()
         std = data['close'].rolling(window=20).std()
         
-        # Avoid division by zero when std is 0 (flat prices)
         if std.iloc[-1] == 0:
             return 'HOLD'
         
         z_score = (current['close'] - sma.iloc[-1]) / std.iloc[-1]
         
-        # Safely handle NaN z_score
         if pd.isna(z_score):
             return 'HOLD'
         

@@ -2,7 +2,7 @@
 
 ## Overview
 
-A comprehensive **Quantitative Trading Platform** for multi-asset trading focusing on stocks and options. Built with production-quality Python using NumPy, pandas, scikit-learn, and yfinance.
+A comprehensive **Quantitative Trading Platform** for multi-asset trading focusing on stocks and options. Built with production-quality Python using NumPy, pandas, scikit-learn, and OpenBB.
 
 **Status**: ✅ Complete & Tested
 
@@ -302,7 +302,7 @@ python examples.py
 - **numpy**: Numerical computing
 - **scikit-learn**: Machine learning ready
 - **scipy**: Scientific computing
-- **yfinance**: Market data
+- **OpenBB**: Market data
 - **ta**: Additional indicators
 - **matplotlib/seaborn**: Visualization ready
 

@@ -223,7 +223,7 @@ NEW PACKAGES ADDED:
   • plotly (5.17.0) - Interactive charts
 
 EXISTING PACKAGES:
-  • yfinance - Market data
+  • openbb - Market data
   • pandas - Data manipulation
   • numpy - Numerical computing
   • scipy - Scientific computing

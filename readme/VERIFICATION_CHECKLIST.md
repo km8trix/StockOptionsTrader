@@ -174,7 +174,7 @@
 - [x] plotly (interactive charts)
 
 ### ✅ Existing Dependencies Still Work
-- [x] yfinance
+- [x] openbb
 - [x] pandas
 - [x] numpy
 - [x] scipy

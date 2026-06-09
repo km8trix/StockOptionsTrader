@@ -7,7 +7,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime
-from typing import Tuple
+from typing import Optional, Tuple
 from strategies.base import Strategy
 from core.models import Asset
 
@@ -25,10 +25,10 @@ class MachineLearningStrategy(Strategy):
         self.scaler = StandardScaler()
         self.is_trained = False
     
-    def _create_features(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    def _create_features(self, data: pd.DataFrame) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Create features for ML model"""
         if len(data) < self.lookback + 1:
-            return None, None
+            return None
         
         features_list = []
         labels = []
@@ -59,8 +59,9 @@ class MachineLearningStrategy(Strategy):
         
         # Train model on first use
         if not self.is_trained and len(data) > self.lookback + 50:
-            X, y = self._create_features(data)
-            if X is not None:
+            result = self._create_features(data)
+            if result is not None:
+                X, y = result
                 X_scaled = self.scaler.fit_transform(X)
                 self.model.fit(X_scaled, y)
                 self.is_trained = True
@@ -69,8 +70,11 @@ class MachineLearningStrategy(Strategy):
             return 'HOLD'
         
         # Generate signal for current data
-        X, _ = self._create_features(data.iloc[:-1])
-        if X is None or len(X) == 0:
+        result = self._create_features(data.iloc[:-1])
+        if result is None:
+            return 'HOLD'
+        X, _ = result
+        if len(X) == 0:
             return 'HOLD'
         
         X_scaled = self.scaler.transform(X)
@@ -224,9 +228,13 @@ class AdaptiveStrategy(Strategy):
         volatility = returns.std()
         trend_strength = abs(returns.mean())
         
+        abs_returns = returns.abs()
+        volatility_threshold = abs_returns.quantile(0.75)
+        trend_threshold = abs_returns.quantile(0.50)
+        
         # High volatility + weak trend = mean reversion
         # Low volatility + strong trend = momentum
-        if volatility > returns.std().quantile(0.75) and trend_strength < returns.mean().quantile(0.5):
+        if volatility > volatility_threshold and trend_strength < trend_threshold:
             return self.reversion_strategy.generate_signals(data, asset)
         else:
             return self.momentum_strategy.generate_signals(data, asset)

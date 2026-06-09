@@ -7,8 +7,15 @@ import os
 
 from gui.globals import paper_traders, alert_manager, risk_manager
 from brokers.paper_trader import PaperTrader
-from brokers.live_trader import LiveEtradeBroker
 from core.models import Asset, AssetType, OrderType
+
+try:
+    from brokers.live_trader import LiveEtradeBroker
+except ModuleNotFoundError as e:
+    LiveEtradeBroker = None
+    LIVE_TRADER_IMPORT_ERROR = e
+else:
+    LIVE_TRADER_IMPORT_ERROR = None
 
 trading_bp = Blueprint('trading', __name__, url_prefix='/api')
 
@@ -24,6 +31,13 @@ def create_trader():
         mode = data.get('mode', 'paper')
         
         if mode == 'live':
+            if LiveEtradeBroker is None:
+                return jsonify({
+                    'error': 'Live trading dependencies are not installed',
+                    'details': str(LIVE_TRADER_IMPORT_ERROR),
+                    'install': 'pip install requests-oauthlib'
+                }), 503
+
             active_traders[trader_id] = LiveEtradeBroker(
                 consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
                 consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),

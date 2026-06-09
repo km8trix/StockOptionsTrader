@@ -206,7 +206,7 @@ print(trade.pnl_pct)  # Realized P&L %
 
 ## Data Sources
 
-- **Market Data**: Yahoo Finance (via yfinance)
+- **Market Data**: OpenBB Open Data Platform providers
 - **Options Data**: (Ready for integration)
 
 ## Performance Optimization

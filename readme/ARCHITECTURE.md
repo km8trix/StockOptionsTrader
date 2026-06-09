@@ -251,7 +251,7 @@ class MyStrategy(Strategy):
 
 ```python
 def fetch_stock_data(self, symbol, start_date, end_date):
-    # Replace yfinance with your API
+    # Configure an OpenBB provider or add your own API adapter
     # Return DataFrame with OHLCV data
 ```
 
@@ -406,4 +406,3 @@ PaperTrader
 - Multi-symbol backtests
 - Strategy comparisons
 - Performance metrics validation
-

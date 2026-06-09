@@ -105,7 +105,7 @@ Run with: `python examples_advanced.py`
 ```
 scikit-learn==1.3.0      # ML strategies
 plotly==5.17.0          # Interactive charts
-(Plus existing deps: yfinance, pandas, numpy, scipy, Flask, etc.)
+(Plus existing deps: openbb, pandas, numpy, scipy, Flask, etc.)
 ```
 
 Install: `pip install -r requirements.txt`

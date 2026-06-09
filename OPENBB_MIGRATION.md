@@ -1,7 +1,7 @@
 # OpenBB ODP Migration Guide
 
 ## Overview
-This project has been refactored to use **OpenBB Open Data Platform (ODP)** for market data retrieval, replacing the previous yfinance dependency.
+This project has been refactored to use **OpenBB Open Data Platform (ODP)** for market data retrieval.
 
 ## Why OpenBB ODP?
 
@@ -13,11 +13,12 @@ This project has been refactored to use **OpenBB Open Data Platform (ODP)** for 
 - **Alternative data**: Access to non-traditional financial data sources
 - **Active development**: Regular updates and improvements
 
+OpenBB itself is open source and free to install from the OpenBB-finance repository or PyPI. Individual data providers exposed through OpenBB may still require API keys or have provider-specific limits.
+
 ## Key Changes
 
 ### 1. Dependencies Update
-- **Removed**: `yfinance==0.2.32`
-- **Added**: `openbb==4.1.0`
+- **Added**: `openbb==4.5.0`
 
 Update requirements:
 ```bash
@@ -28,7 +29,7 @@ pip install -r requirements.txt
 
 #### New Features
 - **Multi-provider support**: Automatically tries multiple ODP providers (FMP, Intrinio, Polygon, Tiingo)
-- **Graceful fallback**: Falls back to yfinance if ODP providers unavailable
+- **Graceful failure**: Returns an empty DataFrame if OpenBB providers are unavailable
 - **Better error handling**: Improved logging and error messages
 - **Provider discovery**: Automatically selects working providers
 
@@ -45,22 +46,20 @@ For equity historical price data, the following providers are available:
 
 | Provider | Best For | API Key Required |
 |----------|----------|------------------|
+| CBOE | Market data where supported | No/varies |
+| TMX | Canadian market data where supported | No/varies |
 | FMP | Financial data, detailed metrics | Yes |
 | Intrinio | High-quality data, alternative data | Yes |
 | Polygon | Crypto and equity data, real-time | Yes |
 | Tiingo | End-of-day and intraday data | Yes |
+| Alpha Vantage | Equity and technical data | Yes |
+| Tradier | Brokerage and market data | Yes |
 
 ## Configuration
 
 ### Using Different Providers
 
-The `MarketDataHandler` automatically tries providers in this order:
-1. FMP
-2. Intrinio
-3. Polygon
-4. Tiingo
-
-If all fail, it falls back to yfinance.
+The `MarketDataHandler` automatically tries configured OpenBB providers and returns an empty DataFrame if none can provide data.
 
 ### Setting API Keys
 
@@ -123,13 +122,12 @@ engine = BacktestEngine(MomentumStrategy(), initial_capital=100000)
 results = engine.run(['AAPL', 'MSFT'], '2024-01-01', '2024-06-01')
 ```
 
-## Fallback Behavior
+## Provider Failure Behavior
 
-The system is designed to work offline or with internet issues:
+The system is designed to fail gracefully when data is unavailable:
 
-1. **If ODP providers fail**: Automatically falls back to yfinance
-2. **If yfinance also fails**: Returns empty DataFrame (gracefully handled)
-3. **Cached data**: Previously fetched data is cached in memory
+1. **If OpenBB providers fail**: Returns an empty DataFrame (gracefully handled)
+2. **Cached data**: Previously fetched OpenBB data is cached in memory
 
 ## Advantages of OpenBB ODP
 
@@ -161,7 +159,7 @@ The OpenBB platform is actively developed with regular updates and new features.
 - ✅ Refactored `MarketDataHandler`
 - ✅ Added multi-provider support
 - ✅ Maintained backward compatibility
-- ✅ Added fallback to yfinance
+- ✅ Removed direct yfinance fallback
 - ✅ Updated tests
 - ✅ All system tests pass
 
@@ -169,13 +167,11 @@ The OpenBB platform is actively developed with regular updates and new features.
 
 ### Issue: "No module named 'openbb'"
 ```bash
-pip install openbb==4.1.0
+pip install openbb==4.5.0
 ```
 
 ### Issue: Provider validation errors
-Ensure you're using a valid provider:
-- Valid providers: 'fmp', 'intrinio', 'polygon', 'tiingo'
-- Invalid: 'yfinance' (not available in ODP equity.price.historical)
+Ensure you're using a provider supported by your installed OpenBB version. Newer OpenBB releases support more providers for `obb.equity.price.historical` than older releases.
 
 ### Issue: API rate limits
 If you exceed rate limits, the code will automatically try the next provider. Consider:

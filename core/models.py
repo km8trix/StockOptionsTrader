@@ -42,26 +42,25 @@ class Asset:
     asset_type: AssetType
     strike_price: Optional[float] = None
     expiration_date: Optional[str] = None
-    
-    def __init__(self, symbol: str, asset_type):
-        self.symbol = symbol
-        self.asset_type = asset_type
 
     def __eq__(self, other):
-        """Ensures assets with identical symbols and types evaluate as the same key."""
+        """Ensures assets with identical options parameters evaluate as the same key."""
         if not isinstance(other, Asset):
             return False
-        return self.symbol == other.symbol and self.asset_type == other.asset_type
+        return (self.symbol == other.symbol and 
+                self.asset_type == other.asset_type and 
+                self.strike_price == other.strike_price and 
+                self.expiration_date == other.expiration_date)
 
     def __hash__(self):
-        """Allows Asset objects to be safely hashed and used as dictionary keys."""
-        return hash((self.symbol, self.asset_type))
+        """Allows Asset objects to be safely hashed using all unique properties."""
+        return hash((self.symbol, self.asset_type, self.strike_price, self.expiration_date))
 
     def __str__(self):
         if self.asset_type == AssetType.STOCK:
             return f"{self.symbol}"
         else:
-            return f"{self.symbol} {self.expiration_date} {self.strike_price} {self.asset_type.value}"
+            return f"{self.symbol} {self.expiration_date or 'N/A'} ${self.strike_price or 0.00} {self.asset_type.value}"
 
 
 @dataclass
