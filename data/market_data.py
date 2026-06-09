@@ -4,9 +4,8 @@ Market Data Handler - Fetches and manages price data using OpenBB ODP
 
 import pandas as pd
 import numpy as np
-from openbb import obb
 from datetime import date, datetime, timedelta
-from typing import cast, Dict, Optional, Tuple, Any
+from typing import Dict, Optional
 from core.models import Asset, AssetType
 
 
@@ -16,31 +15,41 @@ class MarketDataHandler:
     def __init__(self):
         self.stock_data: Dict[str, pd.DataFrame] = {}
         self.cache: Dict[str, pd.DataFrame] = {}
-        # OpenBB ODP providers available for equity historical data
-        self.providers = ['fmp', 'intrinio', 'polygon', 'tiingo']
+        # OpenBB providers for equity historical data. Some providers require API keys.
+        self.providers = [
+            'cboe',
+            'tmx',
+            'fmp',
+            'intrinio',
+            'polygon',
+            'tiingo',
+            'alpha_vantage',
+            'tradier',
+        ]
+
+    def _get_openbb(self):
+        """Import OpenBB only when it is needed; initialization can touch user-level files."""
+        try:
+            from openbb import obb
+            return obb
+        except Exception as e:
+            print(f"OpenBB unavailable: {e}")
+            return None
 
     def fetch_stock_data(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         Fetch historical stock data from OpenBB ODP with structural safeguards
-        
-        Args:
-            symbol: Stock ticker symbol (e.g., 'AAPL')
-            start_date: Start date in YYYY-MM-DD format
-            end_date: End date in YYYY-MM-DD format
-            
-        Returns:
-            DataFrame with columns: open, high, low, close, volume
         """
+        cache_key = f"{symbol}_{start_date}_{end_date}"
         try:
-            cache_key = f"{symbol}_{start_date}_{end_date}"
             if cache_key in self.cache:
                 return self.cache[cache_key]
             
             data = None
-            last_error = None
+            obb = self._get_openbb()
             
             # Try multiple ODP providers
-            for provider in self.providers:
+            for provider in self.providers if obb is not None else []:
                 try:
                     result = obb.equity.price.historical(
                         symbol=symbol,
@@ -70,13 +79,11 @@ class MarketDataHandler:
                         break
                         
                 except Exception as e:
-                    last_error = e
                     continue
             
-            # If ODP failed, use fallback
+            # If all OpenBB providers failed, return no data.
             if data is None or data.empty:
-                print(f"ODP fetch failed for {symbol}, attempting fallback")
-                return self._fetch_with_fallback(symbol, start_date, end_date)
+                return self._empty_data(symbol)
             
             # Process the data
             data['date'] = pd.to_datetime(data['date'])
@@ -95,39 +102,17 @@ class MarketDataHandler:
             data = data[available_columns]
             
             self.cache[cache_key] = data
+            self.stock_data[symbol] = data
             return data
             
         except Exception as e:
             print(f"Error fetching data for {symbol}: {e}")
-            return self._fetch_with_fallback(symbol, start_date, end_date)
+            return self._empty_data(symbol)
     
-    def _fetch_with_fallback(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """
-        Fallback method using yfinance if ODP providers are unavailable
-        Ensures backward compatibility when ODP/APIs are not accessible
-        """
-        try:
-            import yfinance as yf
-            
-            data = yf.download(symbol, start=start_date, end=end_date, progress=False)
-            
-            if data.empty:
-                return pd.DataFrame()
-            
-            # Flatten multi-index if needed
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.droplevel(1)
-            
-            data.columns = [str(col).lower() for col in data.columns]
-            expected_columns = ['open', 'high', 'low', 'close', 'volume']
-            available_columns = [col for col in expected_columns if col in data.columns]
-            data = data[available_columns]
-            
-            print(f"Fetched {symbol} using yfinance fallback")
-            return data
-        except Exception as e:
-            print(f"Fallback fetch also failed for {symbol}: {e}")
-            return pd.DataFrame()
+    def _empty_data(self, symbol: str) -> pd.DataFrame:
+        """Return an empty result when OpenBB cannot provide data."""
+        print(f"No OpenBB data available for {symbol}")
+        return pd.DataFrame()
     
     def get_current_price(self, symbol: str, date: datetime) -> Optional[float]:
         """Get price for a specific date"""
@@ -139,38 +124,32 @@ class MarketDataHandler:
 
         if date_str in data.index:
             raw_value = data.at[date_str, 'close']
-            return cast(float, raw_value)
+            return float(raw_value)
         return None
     
     def calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators"""
-        # Simple Moving Averages
         data['sma_20'] = data['close'].rolling(window=20).mean()
         data['sma_50'] = data['close'].rolling(window=50).mean()
         
-        # Exponential Moving Average
         data['ema_12'] = data['close'].ewm(span=12, adjust=False).mean()
         data['ema_26'] = data['close'].ewm(span=26, adjust=False).mean()
         
-        # MACD
         data['macd'] = data['ema_12'] - data['ema_26']
         data['signal'] = data['macd'].ewm(span=9, adjust=False).mean()
         data['macd_hist'] = data['macd'] - data['signal']
         
-        # RSI (Relative Strength Index)
         delta = data['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         data['rsi'] = 100 - (100 / (1 + rs))
         
-        # Bollinger Bands
         data['bb_middle'] = data['close'].rolling(window=20).mean()
         data['bb_std'] = data['close'].rolling(window=20).std()
         data['bb_upper'] = data['bb_middle'] + (data['bb_std'] * 2)
         data['bb_lower'] = data['bb_middle'] - (data['bb_std'] * 2)
         
-        # Average True Range
         data['tr'] = np.maximum(
             data['high'] - data['low'],
             np.maximum(
@@ -179,8 +158,6 @@ class MarketDataHandler:
             )
         )
         data['atr'] = data['tr'].rolling(window=14).mean()
-        
-        # Volume indicators
         data['volume_sma'] = data['volume'].rolling(window=20).mean()
         
         return data
@@ -205,5 +182,3 @@ class MarketDataHandler:
         """Calculate historical volatility"""
         returns = data['close'].pct_change()
         return returns.rolling(window=window).std().iloc[-1] * np.sqrt(252)
-
-
