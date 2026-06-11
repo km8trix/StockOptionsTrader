@@ -6,7 +6,7 @@ import pandas as pd
 import io
 import logging
 
-from gui.globals import db
+from gui.globals import get_db
 from backtesting.backtest_engine import BacktestEngine
 from strategies.base import MomentumStrategy, MeanReversionStrategy, StatisticalArbitrageStrategy
 from strategies.advanced import (
@@ -29,6 +29,24 @@ STRATEGIES = {
     'adaptive': AdaptiveStrategy,
     'machine_learning': MachineLearningStrategy,
 }
+
+
+def _fetch_info(handler, symbol):
+    """Provenance for one symbol, or None.
+
+    Guarded with getattr so this never breaks against an older
+    MarketDataHandler that predates get_last_fetch_info; provenance is
+    auxiliary metadata, so any failure degrades to None instead of a 500.
+    """
+    get_info = getattr(handler, 'get_last_fetch_info', None)
+    if not callable(get_info):
+        return None
+    try:
+        return get_info(symbol)
+    except Exception:
+        logger.warning('get_last_fetch_info failed for %s', symbol, exc_info=True)
+        return None
+
 
 @backtest_bp.route('/backtest', methods=['POST'])
 def run_backtest():
@@ -58,7 +76,13 @@ def run_backtest():
         
         if 'error' in results:
             return jsonify({'error': results['error']}), 400
-            
+
+        # Additive data provenance: which provider served each symbol.
+        results['data_sources'] = {
+            symbol: _fetch_info(backtester.market_data, symbol)
+            for symbol in symbols
+        }
+
         return jsonify(results)
     except Exception:
         logger.error('Backtest failed', exc_info=True)
@@ -80,7 +104,7 @@ def list_strategies():
 def list_backtests():
     """Get list of saved backtests from DB"""
     try:
-        backtests = db.get_backtests(limit=50)
+        backtests = get_db().get_backtests(limit=50)
         return jsonify({'backtests': backtests, 'count': len(backtests)})
     except Exception:
         logger.error('Failed to list backtests', exc_info=True)
@@ -90,10 +114,11 @@ def list_backtests():
 def get_backtest_detail(backtest_id):
     """Get backtest details with trades"""
     try:
+        db = get_db()
         backtest = db.get_backtest(backtest_id)
         if not backtest:
             return jsonify({'error': 'Backtest not found'}), 404
-            
+
         trades = db.get_backtest_trades(backtest_id)
         return jsonify({'backtest': backtest, 'trades': trades, 'trade_count': len(trades)})
     except Exception:
@@ -104,7 +129,7 @@ def get_backtest_detail(backtest_id):
 def delete_backtest(backtest_id):
     """Delete backtest"""
     try:
-        db.delete_backtest(backtest_id)
+        get_db().delete_backtest(backtest_id)
         return jsonify({'message': 'Backtest deleted'})
     except Exception:
         logger.error('Failed to delete backtest', exc_info=True)
@@ -114,10 +139,11 @@ def delete_backtest(backtest_id):
 def export_backtest(backtest_id):
     """Export backtest trades as CSV"""
     try:
+        db = get_db()
         backtest = db.get_backtest(backtest_id)
         if not backtest:
             return jsonify({'error': 'Backtest not found'}), 404
-            
+
         trades = db.get_backtest_trades(backtest_id)
         df = pd.DataFrame(trades)
         
@@ -139,7 +165,7 @@ def export_backtest(backtest_id):
 def export_report(backtest_id):
     """Export backtest as text report"""
     try:
-        backtest = db.get_backtest(backtest_id)
+        backtest = get_db().get_backtest(backtest_id)
         if not backtest:
             return jsonify({'error': 'Backtest not found'}), 404
             

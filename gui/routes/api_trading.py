@@ -7,7 +7,7 @@ from flask import Blueprint, request, jsonify
 import logging
 import os
 
-from gui.globals import paper_traders, alert_manager, risk_manager
+from gui.globals import alert_manager, risk_manager
 from brokers.paper_trader import PaperTrader
 from core.models import Asset, AssetType, OrderType
 

@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, Optional, List
 from core.models import Asset, AssetType, Order, OrderStatus, OrderType, Position
 from portfolio.manager import PortfolioManager
@@ -25,6 +26,8 @@ class PaperTrader(ExecutionBroker):
         self.market_data = MarketDataHandler()
         self.pending_orders: List[Order] = []
         self.order_id_counter = 0
+        # Date of the close that served each symbol's last price quote.
+        self.last_price_dates: Dict[str, date] = {}
 
     def place_order(self, asset: Asset, order_type: OrderType, quantity: int,
                    limit_price: Optional[float]) -> str:
@@ -62,13 +65,44 @@ class PaperTrader(ExecutionBroker):
         return False
 
     def get_current_price(self, symbol: str) -> Optional[float]:
-        """Get current price for a symbol"""
+        """Get the most recent close for a symbol.
+
+        Fetches a window of the last 10 calendar days through today (a
+        same-day-only request returns nothing on weekends/holidays) and
+        uses the latest close. The date that close traded is recorded in
+        self.last_price_dates, and a WARNING is logged when it is more
+        than 3 business days old. Returns None when the window is empty.
+        """
         try:
-            data = self.market_data.fetch_stock_data(symbol,
-                                                     datetime.now().strftime('%Y-%m-%d'),
-                                                     datetime.now().strftime('%Y-%m-%d'))
-            if not data.empty:
-                return data.iloc[-1]['close']
+            end = datetime.now()
+            start = end - timedelta(days=10)
+            data = self.market_data.fetch_stock_data(
+                symbol,
+                start.strftime('%Y-%m-%d'),
+                end.strftime('%Y-%m-%d'),
+            )
+            if data is None or data.empty:
+                logger.warning(
+                    "No price data for %s in the last 10 calendar days", symbol
+                )
+                return None
+
+            price = float(data['close'].iloc[-1])
+            try:
+                price_date = pd.Timestamp(data.index[-1]).date()
+                self.last_price_dates[symbol] = price_date
+                age_bdays = int(np.busday_count(price_date, end.date()))
+                if age_bdays > 3:
+                    logger.warning(
+                        "Stale price for %s: latest close %.2f is from %s "
+                        "(%d business days old)",
+                        symbol, price, price_date.isoformat(), age_bdays,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Could not assess price staleness for %s: %s", symbol, e
+                )
+            return price
         except Exception as e:
             logger.warning("Failed to fetch current price for %s: %s", symbol, e)
         return None

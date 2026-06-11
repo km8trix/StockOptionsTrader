@@ -9,16 +9,24 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import date, datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 from core.models import Asset, AssetType
+from data.cache import OHLCVCache
 
 logger = logging.getLogger(__name__)
 
 
 class MarketDataHandler:
     """Fetches and manages market data using OpenBB Open Data Platform (ODP)"""
-    
-    def __init__(self):
+
+    def __init__(self, cache: Union[OHLCVCache, bool, None] = None):
+        """
+        Args:
+            cache: SQLite-backed OHLCV cache. None (default) constructs an
+                OHLCVCache lazily on the first fetch; pass an OHLCVCache to
+                share/configure one; pass False to disable persistent caching
+                (pre-Phase-2 behavior).
+        """
         self.stock_data: Dict[str, pd.DataFrame] = {}
         self.cache: Dict[str, pd.DataFrame] = {}
         # OpenBB providers for equity historical data. Some providers require API keys.
@@ -32,6 +40,26 @@ class MarketDataHandler:
             'alpha_vantage',
             'tradier',
         ]
+        self._sqlite_cache: Optional[OHLCVCache] = (
+            cache if isinstance(cache, OHLCVCache) else None
+        )
+        self._sqlite_cache_enabled = cache is not False
+        # Per-symbol provenance of the most recent fetch (see
+        # get_last_fetch_info for the contract).
+        self._last_fetch_info: Dict[str, dict] = {}
+
+    def _get_sqlite_cache(self) -> Optional[OHLCVCache]:
+        """Return the persistent cache, constructing the default lazily."""
+        if not self._sqlite_cache_enabled:
+            return None
+        if self._sqlite_cache is None:
+            try:
+                self._sqlite_cache = OHLCVCache()
+            except Exception as e:
+                logger.warning("OHLCV cache unavailable; caching disabled: %s", e)
+                self._sqlite_cache_enabled = False
+                return None
+        return self._sqlite_cache
 
     def _get_openbb(self):
         """Import OpenBB only when it is needed; initialization can touch user-level files."""
@@ -44,16 +72,48 @@ class MarketDataHandler:
 
     def fetch_stock_data(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
-        Fetch historical stock data from OpenBB ODP with structural safeguards
+        Fetch historical stock data with structural safeguards.
+
+        Lookup order: in-memory dict -> persistent OHLCVCache -> OpenBB ODP
+        providers. Provider successes are written back to the persistent
+        cache; provenance is recorded for get_last_fetch_info either way.
         """
         cache_key = f"{symbol}_{start_date}_{end_date}"
+        failures: list = []
+        info = {
+            'provider': None,
+            'from_cache': False,
+            'fetched_at': datetime.now().isoformat(),
+            'failures': failures,
+            'start_date': start_date,
+            'end_date': end_date,
+        }
         try:
             if cache_key in self.cache:
+                info['from_cache'] = True
+                self._last_fetch_info[symbol] = info
                 return self.cache[cache_key]
-            
+
+            sqlite_cache = self._get_sqlite_cache()
+            if sqlite_cache is not None:
+                cached = None
+                try:
+                    cached = sqlite_cache.get(symbol, start_date, end_date)
+                except Exception as e:
+                    logger.warning("OHLCV cache read failed for %s: %s", symbol, e)
+                if cached is not None:
+                    logger.info("Served %s %s..%s from OHLCV cache (%d rows)",
+                                symbol, start_date, end_date, len(cached))
+                    info['from_cache'] = True
+                    self._last_fetch_info[symbol] = info
+                    self.cache[cache_key] = cached
+                    self.stock_data[symbol] = cached
+                    return cached
+
             data = None
+            used_provider = None
             obb = self._get_openbb()
-            
+
             # Try multiple ODP providers
             for provider in self.providers if obb is not None else []:
                 try:
@@ -63,10 +123,12 @@ class MarketDataHandler:
                         end_date=end_date,
                         provider=provider
                     )
-                    
+
                     if result is None or not hasattr(result, 'results'):
+                        failures.append({'provider': provider,
+                                         'error': 'no results returned'})
                         continue
-                    
+
                     # Convert OBB results to DataFrame
                     data_list = []
                     for item in result.results:
@@ -78,48 +140,84 @@ class MarketDataHandler:
                             'close': float(item.close) if item.close else None,
                             'volume': float(item.volume) if item.volume else None,
                         })
-                    
+
                     if data_list:
                         data = pd.DataFrame(data_list)
+                        used_provider = provider
                         logger.info(
                             "Fetched %s from OpenBB ODP provider %s (%d rows)",
                             symbol, provider, len(data_list)
                         )
                         break
+                    failures.append({'provider': provider,
+                                     'error': 'empty result set'})
 
                 except Exception as e:
                     logger.warning(
                         "OpenBB provider %s failed for %s: %s", provider, symbol, e
                     )
+                    failures.append({'provider': provider, 'error': str(e)})
                     continue
-            
+
             # If all OpenBB providers failed, return no data.
             if data is None or data.empty:
+                self._last_fetch_info[symbol] = info
                 return self._empty_data(symbol)
-            
-            # Process the data
+
+            # Process the data. The index unit is canonicalized to 'us' so
+            # provider-served and cache-served frames are indistinguishable
+            # (providers may yield date objects, which infer as 's').
             data['date'] = pd.to_datetime(data['date'])
             data.set_index('date', inplace=True)
-            
+            data.index = data.index.as_unit('us')
+
             # Standardize column names to lowercase
             data.columns = [str(col).lower() for col in data.columns]
-            
+
             # Select only expected columns and handle missing ones
             expected_columns = ['open', 'high', 'low', 'close', 'volume']
             available_columns = [col for col in expected_columns if col in data.columns]
-            
+
             if not available_columns:
+                self._last_fetch_info[symbol] = info
                 return pd.DataFrame()
-            
+
             data = data[available_columns]
-            
+
+            info['provider'] = used_provider
+            self._last_fetch_info[symbol] = info
+
+            if sqlite_cache is not None:
+                try:
+                    sqlite_cache.store(symbol, data, used_provider,
+                                       start_date, end_date)
+                except Exception as e:
+                    logger.warning("OHLCV cache write failed for %s: %s", symbol, e)
+
             self.cache[cache_key] = data
             self.stock_data[symbol] = data
             return data
-            
+
         except Exception as e:
             logger.warning("Error fetching data for %s: %s", symbol, e)
+            self._last_fetch_info[symbol] = info
             return self._empty_data(symbol)
+
+    def get_last_fetch_info(self, symbol: str) -> Optional[dict]:
+        """Provenance for the most recent fetch_stock_data call for symbol.
+
+        Returns a dict with exactly these keys (the shared interface
+        contract consumed by the GUI routes):
+            'provider': str | None — provider that served the data, None if
+                served from cache (or if every provider failed),
+            'from_cache': bool,
+            'fetched_at': str (ISO-8601),
+            'failures': list of {'provider': str, 'error': str},
+            'start_date': str,
+            'end_date': str.
+        Returns None if the symbol was never fetched in this process.
+        """
+        return self._last_fetch_info.get(symbol)
 
     def _empty_data(self, symbol: str) -> pd.DataFrame:
         """Return an empty result when OpenBB cannot provide data."""

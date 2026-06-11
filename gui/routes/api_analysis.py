@@ -12,6 +12,24 @@ logger = logging.getLogger(__name__)
 
 analysis_bp = Blueprint('analysis', __name__, url_prefix='/api')
 
+
+def _fetch_info(handler, symbol):
+    """Provenance for one symbol, or None.
+
+    Guarded with getattr so this never breaks against an older
+    MarketDataHandler that predates get_last_fetch_info; provenance is
+    auxiliary metadata, so any failure degrades to None instead of a 500.
+    """
+    get_info = getattr(handler, 'get_last_fetch_info', None)
+    if not callable(get_info):
+        return None
+    try:
+        return get_info(symbol)
+    except Exception:
+        logger.warning('get_last_fetch_info failed for %s', symbol, exc_info=True)
+        return None
+
+
 @analysis_bp.route('/analyze/<symbol>')
 def analyze_stock(symbol):
     try:
@@ -41,6 +59,8 @@ def analyze_stock(symbol):
             'current_macd': safe_float(data.iloc[-1]['macd']),
             'current_sma_20': safe_float(data.iloc[-1]['sma_20']),
             'current_sma_50': safe_float(data.iloc[-1]['sma_50']),
+            # Additive data provenance: which provider served this symbol.
+            'data_source': _fetch_info(market_data, symbol),
         }
         return jsonify(result)
     except Exception:

@@ -18,7 +18,8 @@ class TradingDatabase:
     DB_PATH = "trading_data.db"
     
     def __init__(self, db_path: str = None):
-        self.db_path = db_path or self.DB_PATH
+        """db_path defaults to env TRADING_DB_PATH, falling back to DB_PATH."""
+        self.db_path = db_path or os.environ.get('TRADING_DB_PATH') or self.DB_PATH
         # Ensure parent directory exists for non-memory databases
         if db_path and db_path != ':memory:':
             os.makedirs(os.path.dirname(db_path) or '.', exist_ok=True)
