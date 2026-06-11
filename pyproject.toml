@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-options-trader"
+version = "0.1.0"
+description = "Personal quant trading platform: backtesting, paper trading, and an E*TRADE live-broker skeleton"
+requires-python = ">=3.10"
+dependencies = [
+    "openbb==4.7.2",
+    "pandas==3.0.3",
+    "numpy==2.4.6",
+    "scipy==1.17.1",
+    "scikit-learn==1.8.0",
+    "Flask==3.1.3",
+    "Flask-CORS==6.0.2",
+    "Werkzeug==3.1.8",
+    "plotly==6.7.0",
+    "requests==2.34.2",
+    "python-dotenv==1.2.2",
+    "requests-oauthlib==2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["core*", "data*", "brokers*", "portfolio*", "backtesting*", "strategies*", "utils*", "gui*"]
+exclude = ["readme*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

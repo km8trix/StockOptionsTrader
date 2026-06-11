@@ -4,9 +4,11 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import traceback
+import logging
 
 from gui.globals import market_data
+
+logger = logging.getLogger(__name__)
 
 analysis_bp = Blueprint('analysis', __name__, url_prefix='/api')
 
@@ -41,8 +43,9 @@ def analyze_stock(symbol):
             'current_sma_50': safe_float(data.iloc[-1]['sma_50']),
         }
         return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    except Exception:
+        logger.error('Stock analysis failed', exc_info=True)
+        return jsonify({'error': 'Analysis failed'}), 500
 
 @analysis_bp.route('/chart/indicators', methods=['POST'])
 def get_indicators_chart():
@@ -76,7 +79,8 @@ def get_indicators_chart():
                 
         fig.update_layout(height=800, template='plotly_dark', title_text=f'Technical Indicators - {symbol}')
         return jsonify({'chart': fig.to_json()})
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    except Exception:
+        logger.error('Indicator chart generation failed', exc_info=True)
+        return jsonify({'error': 'Chart generation failed'}), 500
 
 # You can move the rest of your charting/pricing routes (like /chart/price, /price_option) here!

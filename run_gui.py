@@ -1,24 +1,27 @@
 """
 Launch the web GUI for the Trading System
 """
+from __future__ import annotations
 
-import sys
 import os
+import sys
 
 # 1. Add the project root directory to the Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 2. Explicitly import the app from the gui package
-from gui.app import app
+# 2. Build the app via the application factory
+from gui.app import create_app, get_server_config
 
 if __name__ == '__main__':
-    print("\n" + "="*70)
+    host, port, debug = get_server_config()
+
+    print("\n" + "=" * 70)
     print("Stock Options Trading System - Web GUI")
-    print("="*70)
+    print("=" * 70)
     print("\n🌐 Starting Modular Flask server...\n")
-    print("📱 Open your browser and go to: http://localhost:5001")
+    print(f"📱 Open your browser and go to: http://{host}:{port}")
     print("📱 Press CTRL+C to stop the server\n")
-    print("="*70 + "\n")
-    
+    print("=" * 70 + "\n")
+
     # 3. Run the application
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    create_app().run(host=host, port=port, debug=debug)

@@ -2,25 +2,32 @@
 Paper Trader - Simulated trading for live market data
 """
 
+from __future__ import annotations
+
+import logging
+
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Optional, List
-from core.models import Asset, AssetType, Order, OrderType, Position
+from core.models import Asset, AssetType, Order, OrderStatus, OrderType, Position
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
+from brokers.base import ExecutionBroker
+
+logger = logging.getLogger(__name__)
 
 
-class PaperTrader:
+class PaperTrader(ExecutionBroker):
     """Simulated trading with real market data"""
-    
+
     def __init__(self, initial_capital: float = 100000):
         self.portfolio = PortfolioManager(initial_capital)
         self.market_data = MarketDataHandler()
         self.pending_orders: List[Order] = []
         self.order_id_counter = 0
-    
-    def place_order(self, asset: Asset, order_type: OrderType, quantity: int, 
-                   limit_price: float) -> str:
+
+    def place_order(self, asset: Asset, order_type: OrderType, quantity: int,
+                   limit_price: Optional[float]) -> str:
         """Place a new order"""
         self.order_id_counter += 1
         order_id = f"ORD-{self.order_id_counter:06d}"
@@ -36,17 +43,34 @@ class PaperTrader:
         
         self.pending_orders.append(order)
         return order_id
-    
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending order by its order id.
+
+        Returns True when the order was found and removed from the pending
+        queue (its status is set to CANCELLED), False otherwise.
+        """
+        for order in self.pending_orders:
+            if order.order_id == order_id:
+                order.status = OrderStatus.CANCELLED
+                self.pending_orders.remove(order)
+                logger.info("Cancelled pending order %s (%s %d %s)",
+                            order_id, order.order_type.value, order.quantity,
+                            order.asset.symbol)
+                return True
+        logger.warning("cancel_order: no pending order with id %s", order_id)
+        return False
+
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Get current price for a symbol"""
         try:
-            data = self.market_data.fetch_stock_data(symbol, 
+            data = self.market_data.fetch_stock_data(symbol,
                                                      datetime.now().strftime('%Y-%m-%d'),
                                                      datetime.now().strftime('%Y-%m-%d'))
             if not data.empty:
                 return data.iloc[-1]['close']
-        except:
-            pass
+        except Exception as e:
+            logger.warning("Failed to fetch current price for %s: %s", symbol, e)
         return None
     
     def process_orders(self):
@@ -59,8 +83,12 @@ class PaperTrader:
             
             # Check if order can be filled
             filled = False
-            
-            if order.order_type == OrderType.BUY and current_price <= order.price:
+
+            if order.price is None:
+                # Market order (limit_price=None per ExecutionBroker contract):
+                # immediately marketable for both BUY and SELL at current price.
+                filled = True
+            elif order.order_type == OrderType.BUY and current_price <= order.price:
                 filled = True
             elif order.order_type == OrderType.SELL and current_price >= order.price:
                 filled = True

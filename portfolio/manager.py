@@ -2,6 +2,8 @@
 Portfolio Manager - Tracks positions, cash, and performance metrics
 """
 
+from __future__ import annotations
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -69,10 +71,15 @@ class PortfolioManager:
         return sum(pos.pnl() for pos in self.positions.values())
     
     def get_portfolio_pnl_pct(self) -> float:
-        """Calculate portfolio P&L percentage"""
+        """Calculate portfolio P&L percentage relative to initial capital.
+
+        Returns 0.0 when initial_capital is zero or negative: a percentage
+        return has no meaningful base in that case (the divisor is
+        initial_capital, NOT the current portfolio value).
+        """
+        if self.initial_capital <= 0:
+            return 0.0
         portfolio_value = self.get_portfolio_value()
-        if portfolio_value == 0:
-            return 0
         return ((portfolio_value - self.initial_capital) / self.initial_capital) * 100
     
     def get_realized_pnl(self) -> float:
@@ -97,23 +104,104 @@ class PortfolioManager:
         drawdowns = (np.array(values) - running_max) / running_max
         return float(np.min(drawdowns) * 100)
 
+    def get_daily_returns(self) -> List[float]:
+        """Simple returns between consecutive portfolio_history snapshots.
+
+        Computed from each snapshot's 'portfolio_value'. Returns [] when
+        there are fewer than 2 snapshots. Pairs whose previous value is
+        non-positive are skipped defensively (a simple return is undefined
+        for a zero or negative base).
+        """
+        if len(self.portfolio_history) < 2:
+            return []
+
+        values = [h['portfolio_value'] for h in self.portfolio_history]
+        returns: List[float] = []
+        for prev, curr in zip(values[:-1], values[1:]):
+            if prev > 0:
+                returns.append(curr / prev - 1.0)
+        return returns
+
     def get_sharpe_ratio(self, risk_free_rate: float = 0.02) -> float:
-        """Calculate Sharpe ratio safely avoiding zero standard deviation crashes"""
-        if not self.closed_trades:
-            return 0.0
-        
-        returns = [trade.pnl_pct for trade in self.closed_trades]
+        """Annualized Sharpe ratio computed from DAILY portfolio returns.
+
+        daily excess return = daily return - risk_free_rate / 252
+        sharpe = mean(excess) / std(excess) * sqrt(252)
+
+        Uses the population standard deviation (np.std, ddof=0). Returns 0.0
+        when there are fewer than 2 daily returns or the std is zero.
+        """
+        returns = self.get_daily_returns()
         if len(returns) < 2:
             return 0.0
-        
+
         excess_returns = np.array(returns) - (risk_free_rate / 252)
         std_dev = np.std(excess_returns)
-        
+
         # Prevent division by zero runtime crash
         if std_dev == 0:
             return 0.0
-            
-        return np.mean(excess_returns) / std_dev * np.sqrt(252)
+
+        return float(np.mean(excess_returns) / std_dev * np.sqrt(252))
+
+    def get_sortino_ratio(self, risk_free_rate: float = 0.02) -> float:
+        """Annualized Sortino ratio computed from DAILY portfolio returns.
+
+        Numerator matches the Sharpe numerator (mean daily excess return).
+        Denominator is the target downside deviation (target semideviation)
+        about a zero excess return, computed over ALL N daily returns:
+
+            downside_dev = sqrt(mean(min(excess_returns, 0) ** 2))
+
+        This measures the magnitude of returns below the target — the
+        standard Sortino denominator — not the dispersion of the losing
+        subset about its own mean.
+
+        Convention: returns 0.0 when there are fewer than 2 daily returns or
+        when the downside deviation is zero (no returns below the target;
+        downside risk is treated as undefined rather than infinite).
+        """
+        returns = self.get_daily_returns()
+        if len(returns) < 2:
+            return 0.0
+
+        excess_returns = np.array(returns) - (risk_free_rate / 252)
+        downside_dev = np.sqrt(np.mean(np.minimum(excess_returns, 0.0) ** 2))
+        if downside_dev == 0:
+            return 0.0
+
+        return float(np.mean(excess_returns) / downside_dev * np.sqrt(252))
+
+    def get_calmar_ratio(self) -> float:
+        """Calmar ratio: annualized return / abs(max drawdown as a FRACTION).
+
+        Annualized return = (last_value / first_value) ** (252 / (n_snapshots - 1)) - 1.
+        n_snapshots history entries span only n_snapshots - 1 (daily) return
+        periods — the first snapshot is the base value — so the exponent uses
+        the period count, not the snapshot count.
+
+        NOTE: get_max_drawdown() returns a PERCENTAGE (e.g. -12.5 for -12.5%),
+        so it is divided by 100 here to obtain the fractional drawdown used in
+        the denominator.
+
+        Returns 0.0 when there are fewer than 2 snapshots, when the first or
+        last portfolio value is non-positive, or when the drawdown is zero.
+        """
+        n_snapshots = len(self.portfolio_history)
+        if n_snapshots < 2:
+            return 0.0
+
+        first_value = self.portfolio_history[0]['portfolio_value']
+        last_value = self.portfolio_history[-1]['portfolio_value']
+        if first_value <= 0 or last_value <= 0:
+            return 0.0
+
+        max_dd_fraction = abs(self.get_max_drawdown()) / 100.0
+        if max_dd_fraction == 0:
+            return 0.0
+
+        annualized_return = (last_value / first_value) ** (252.0 / (n_snapshots - 1)) - 1.0
+        return float(annualized_return / max_dd_fraction)
     
     def get_win_rate(self) -> float:
         """Calculate win rate"""
@@ -150,4 +238,6 @@ class PortfolioManager:
             'win_rate': self.get_win_rate(),
             'max_drawdown': self.get_max_drawdown(),
             'sharpe_ratio': self.get_sharpe_ratio(),
+            'sortino_ratio': self.get_sortino_ratio(),
+            'calmar_ratio': self.get_calmar_ratio(),
         }

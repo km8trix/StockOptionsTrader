@@ -2,11 +2,17 @@
 Market Data Handler - Fetches and manages price data using OpenBB ODP
 """
 
+from __future__ import annotations
+
+import logging
+
 import pandas as pd
 import numpy as np
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 from core.models import Asset, AssetType
+
+logger = logging.getLogger(__name__)
 
 
 class MarketDataHandler:
@@ -33,7 +39,7 @@ class MarketDataHandler:
             from openbb import obb
             return obb
         except Exception as e:
-            print(f"OpenBB unavailable: {e}")
+            logger.warning("OpenBB unavailable: %s", e)
             return None
 
     def fetch_stock_data(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -75,10 +81,16 @@ class MarketDataHandler:
                     
                     if data_list:
                         data = pd.DataFrame(data_list)
-                        print(f"Successfully fetched {symbol} from OpenBB ODP provider: {provider}")
+                        logger.info(
+                            "Fetched %s from OpenBB ODP provider %s (%d rows)",
+                            symbol, provider, len(data_list)
+                        )
                         break
-                        
+
                 except Exception as e:
+                    logger.warning(
+                        "OpenBB provider %s failed for %s: %s", provider, symbol, e
+                    )
                     continue
             
             # If all OpenBB providers failed, return no data.
@@ -106,12 +118,12 @@ class MarketDataHandler:
             return data
             
         except Exception as e:
-            print(f"Error fetching data for {symbol}: {e}")
+            logger.warning("Error fetching data for %s: %s", symbol, e)
             return self._empty_data(symbol)
-    
+
     def _empty_data(self, symbol: str) -> pd.DataFrame:
         """Return an empty result when OpenBB cannot provide data."""
-        print(f"No OpenBB data available for {symbol}")
+        logger.warning("No OpenBB data available for %s", symbol)
         return pd.DataFrame()
     
     def get_current_price(self, symbol: str, date: datetime) -> Optional[float]:
@@ -157,6 +169,13 @@ class MarketDataHandler:
                 abs(data['low'] - data['close'].shift())
             )
         )
+        if len(data) > 0:
+            # Wilder convention: there is no prior close on the first bar, so
+            # TR_1 = high_1 - low_1 (np.maximum would propagate the NaN from
+            # close.shift() otherwise). ATR is then valid from bar 14.
+            data.iloc[0, data.columns.get_loc('tr')] = (
+                data['high'].iloc[0] - data['low'].iloc[0]
+            )
         data['atr'] = data['tr'].rolling(window=14).mean()
         data['volume_sma'] = data['volume'].rolling(window=20).mean()
         

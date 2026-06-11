@@ -1,11 +1,14 @@
 # brokers/live_trader.py
+from __future__ import annotations
+
 import requests
 from requests_oauthlib import OAuth1Session # Required for E*TRADE authentication
 from datetime import datetime
 from core.models import Asset, AssetType, Order, OrderType
+from brokers.base import ExecutionBroker
 import json
 
-class LiveEtradeBroker:
+class LiveEtradeBroker(ExecutionBroker):
     """Live execution broker for E*TRADE API"""
     
     def __init__(self, consumer_key, consumer_secret, access_token, access_secret, account_id_key):
@@ -55,6 +58,20 @@ class LiveEtradeBroker:
             return data.get("PlaceOrderResponse", {}).get("OrderIds", [{}])[0].get("orderId", "UNKNOWN")
         else:
             raise Exception(f"Live trade failed: {response.text}")
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a live order. Not yet wired to the E*TRADE API."""
+        raise NotImplementedError(
+            "LiveEtradeBroker.cancel_order will be implemented in Phase 9 "
+            "(E*TRADE live integration)."
+        )
+
+    def get_current_price(self, symbol: str) -> float | None:
+        """Fetch a live quote. Not yet wired to the E*TRADE API."""
+        raise NotImplementedError(
+            "LiveEtradeBroker.get_current_price will be implemented in Phase 9 "
+            "(E*TRADE live integration)."
+        )
 
     def get_portfolio_status(self) -> dict:
         """Fetches real-time portfolio balances and positions from the broker"""

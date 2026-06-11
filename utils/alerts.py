@@ -3,12 +3,15 @@ Alerts and Notifications System
 Generates real-time alerts for trading events
 """
 
+import logging
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from typing import Dict, List, Optional
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class AlertPriority(Enum):
@@ -165,7 +168,7 @@ Details:
                 server.send_message(msg)
         
         except Exception as e:
-            print(f"Failed to send email: {e}")
+            logger.error("Failed to send email: %s", e)
     
     def get_alerts(self, unread_only: bool = False) -> List[Dict]:
         """Get alerts"""

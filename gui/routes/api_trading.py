@@ -1,21 +1,33 @@
 """
 API routes for Paper Trading, Live Trading, Alerts, and Risk Management.
 """
+from __future__ import annotations
+
 from flask import Blueprint, request, jsonify
-import traceback
+import logging
 import os
 
 from gui.globals import paper_traders, alert_manager, risk_manager
 from brokers.paper_trader import PaperTrader
 from core.models import Asset, AssetType, OrderType
 
+logger = logging.getLogger(__name__)
+
+# Any failure to import the live broker must be LOUD: this module previously
+# failed silently on Python 3.9 (``float | None`` syntax raised at import,
+# which a bare ModuleNotFoundError catch never saw). Catch everything, keep
+# the message, and log it at ERROR.
+LIVE_BROKER_IMPORT_ERROR: str | None
 try:
     from brokers.live_trader import LiveEtradeBroker
-except ModuleNotFoundError as e:
+    LIVE_BROKER_IMPORT_ERROR = None
+except Exception as e:  # noqa: BLE001 - import failure of any kind disables live trading
     LiveEtradeBroker = None
-    LIVE_TRADER_IMPORT_ERROR = e
-else:
-    LIVE_TRADER_IMPORT_ERROR = None
+    LIVE_BROKER_IMPORT_ERROR = f'{type(e).__name__}: {e}'
+    logger.error(
+        'Failed to import LiveEtradeBroker — live trading is unavailable: %s',
+        LIVE_BROKER_IMPORT_ERROR,
+    )
 
 trading_bp = Blueprint('trading', __name__, url_prefix='/api')
 
@@ -33,9 +45,8 @@ def create_trader():
         if mode == 'live':
             if LiveEtradeBroker is None:
                 return jsonify({
-                    'error': 'Live trading dependencies are not installed',
-                    'details': str(LIVE_TRADER_IMPORT_ERROR),
-                    'install': 'pip install requests-oauthlib'
+                    'error': 'Live trading unavailable',
+                    'reason': LIVE_BROKER_IMPORT_ERROR,
                 }), 503
 
             active_traders[trader_id] = LiveEtradeBroker(
@@ -50,8 +61,9 @@ def create_trader():
             active_traders[trader_id] = PaperTrader(initial_capital)
             
         return jsonify({'trader_id': trader_id, 'mode': mode, 'status': 'created'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to create trading session', exc_info=True)
+        return jsonify({'error': 'Failed to create trading session'}), 500
 
 @trading_bp.route('/trader/<trader_id>/order', methods=['POST'])
 def place_order(trader_id):
@@ -76,8 +88,9 @@ def place_order(trader_id):
         order_id = trader.place_order(asset, order_type, quantity, limit_price=price if price > 0 else None)
         
         return jsonify({'order_id': order_id, 'status': 'placed'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to place order', exc_info=True)
+        return jsonify({'error': 'Failed to place order'}), 500
 
 @trading_bp.route('/trader/<trader_id>/status', methods=['GET'])
 def get_trader_status(trader_id):
@@ -89,8 +102,9 @@ def get_trader_status(trader_id):
         trader = active_traders[trader_id]
         status = trader.get_portfolio_status()
         return jsonify(status)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to fetch trader status', exc_info=True)
+        return jsonify({'error': 'Failed to retrieve trader status'}), 500
 
 # ==================== ALERTS ====================
 
@@ -106,8 +120,9 @@ def get_alerts():
             'unread_count': unread_count,
             'total_count': len(alerts)
         })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to fetch alerts', exc_info=True)
+        return jsonify({'error': 'Failed to retrieve alerts'}), 500
 
 @trading_bp.route('/alert/<int:alert_id>/read', methods=['POST'])
 def mark_alert_read(alert_id):
@@ -115,8 +130,9 @@ def mark_alert_read(alert_id):
     try:
         alert_manager.mark_read(alert_id)
         return jsonify({'message': 'Alert marked as read'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to mark alert as read', exc_info=True)
+        return jsonify({'error': 'Failed to mark alert as read'}), 500
 
 @trading_bp.route('/price-target', methods=['POST'])
 def add_price_target():
@@ -134,8 +150,9 @@ def add_price_target():
             details={'type': 'price_target'}
         )
         return jsonify(alert)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to add price target alert', exc_info=True)
+        return jsonify({'error': 'Failed to add price target'}), 500
 
 
 # ==================== RISK MANAGEMENT ====================
@@ -146,8 +163,9 @@ def get_risk_report():
     try:
         report = risk_manager.get_report()
         return jsonify(report)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to generate risk report', exc_info=True)
+        return jsonify({'error': 'Failed to retrieve risk report'}), 500
 
 @trading_bp.route('/risk/settings', methods=['GET', 'POST'])
 def manage_risk_settings():
@@ -172,5 +190,6 @@ def manage_risk_settings():
             risk_manager.position_stop_loss = data['position_stop_loss']
             
         return jsonify({'message': 'Settings updated'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to manage risk settings', exc_info=True)
+        return jsonify({'error': 'Failed to update risk settings'}), 500

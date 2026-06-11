@@ -4,7 +4,7 @@ API routes for backtesting execution, history, and exports.
 from flask import Blueprint, request, jsonify, send_file
 import pandas as pd
 import io
-import traceback
+import logging
 
 from gui.globals import db
 from backtesting.backtest_engine import BacktestEngine
@@ -13,6 +13,8 @@ from strategies.advanced import (
     MachineLearningStrategy, EnhancedMeanReversionStrategy,
     VolatilityBreakoutStrategy, CombinedStrategy, AdaptiveStrategy
 )
+
+logger = logging.getLogger(__name__)
 
 backtest_bp = Blueprint('backtest', __name__, url_prefix='/api')
 
@@ -58,8 +60,9 @@ def run_backtest():
             return jsonify({'error': results['error']}), 400
             
         return jsonify(results)
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    except Exception:
+        logger.error('Backtest failed', exc_info=True)
+        return jsonify({'error': 'Backtest failed'}), 500
 
 @backtest_bp.route('/strategies', methods=['GET'])
 def list_strategies():
@@ -79,8 +82,9 @@ def list_backtests():
     try:
         backtests = db.get_backtests(limit=50)
         return jsonify({'backtests': backtests, 'count': len(backtests)})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to list backtests', exc_info=True)
+        return jsonify({'error': 'Failed to retrieve backtests'}), 500
 
 @backtest_bp.route('/backtest/<int:backtest_id>', methods=['GET'])
 def get_backtest_detail(backtest_id):
@@ -92,8 +96,9 @@ def get_backtest_detail(backtest_id):
             
         trades = db.get_backtest_trades(backtest_id)
         return jsonify({'backtest': backtest, 'trades': trades, 'trade_count': len(trades)})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to fetch backtest detail', exc_info=True)
+        return jsonify({'error': 'Failed to retrieve backtest'}), 500
 
 @backtest_bp.route('/backtest/<int:backtest_id>', methods=['DELETE'])
 def delete_backtest(backtest_id):
@@ -101,8 +106,9 @@ def delete_backtest(backtest_id):
     try:
         db.delete_backtest(backtest_id)
         return jsonify({'message': 'Backtest deleted'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to delete backtest', exc_info=True)
+        return jsonify({'error': 'Failed to delete backtest'}), 500
 
 @backtest_bp.route('/export/backtest/<int:backtest_id>', methods=['GET'])
 def export_backtest(backtest_id):
@@ -125,8 +131,9 @@ def export_backtest(backtest_id):
             as_attachment=True,
             download_name=f'backtest_{backtest_id}.csv'
         )
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to export backtest CSV', exc_info=True)
+        return jsonify({'error': 'Failed to export backtest'}), 500
 
 @backtest_bp.route('/export/report/<int:backtest_id>', methods=['GET'])
 def export_report(backtest_id):
@@ -155,5 +162,6 @@ Initial Capital: ${backtest.get('initial_capital', 0):,.2f}
 Final Value: ${backtest.get('initial_capital', 0) * (1 + backtest.get('total_return', 0)):,.2f}
 """
         return report, 200, {'Content-Type': 'text/plain'}
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.error('Failed to export backtest report', exc_info=True)
+        return jsonify({'error': 'Failed to export report'}), 500

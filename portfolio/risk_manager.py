@@ -3,6 +3,8 @@ Risk Management Module
 Enforces trading rules and position limits
 """
 
+from __future__ import annotations
+
 from typing import Dict, List
 from core.models import Asset, Position
 from datetime import datetime
@@ -32,9 +34,31 @@ class RiskManager:
         self.daily_loss = 0.0
         self.trading_allowed = True
         self.violations: List[str] = []
-    
+
+    def _fail_closed_on_invalid_portfolio_value(self, portfolio_value: float,
+                                                check_name: str) -> bool:
+        """Record a violation for a degenerate (zero or negative) portfolio value.
+
+        Every ratio-based check divides by portfolio_value; a non-positive
+        value makes the ratio meaningless. Risk checks must fail CLOSED in
+        that case — record a violation and return False — rather than raise
+        ZeroDivisionError into the order flow.
+        """
+        self.violations.append(
+            f"{check_name}: portfolio value {portfolio_value:.2f} is not positive; "
+            f"failing closed"
+        )
+        return False
+
     def check_position_size(self, portfolio_value: float, position_size: float) -> bool:
-        """Check if position size is acceptable"""
+        """Check if position size is acceptable.
+
+        A zero/negative portfolio value is an automatic violation (fail closed).
+        """
+        if portfolio_value <= 0:
+            return self._fail_closed_on_invalid_portfolio_value(
+                portfolio_value, 'Position size check')
+
         position_pct = position_size / portfolio_value
         
         if position_pct > self.max_position_size:
@@ -47,7 +71,14 @@ class RiskManager:
     
     def check_sector_exposure(self, positions: Dict[str, Position], new_sector: str, new_size: float, 
                              portfolio_value: float) -> bool:
-        """Check sector concentration risk"""
+        """Check sector concentration risk.
+
+        A zero/negative portfolio value is an automatic violation (fail closed).
+        """
+        if portfolio_value <= 0:
+            return self._fail_closed_on_invalid_portfolio_value(
+                portfolio_value, 'Sector exposure check')
+
         sector_exposure = new_size
         
         for pos in positions.values():
@@ -65,7 +96,17 @@ class RiskManager:
         return True
     
     def check_daily_loss_limit(self, daily_pnl: float, portfolio_value: float) -> bool:
-        """Check if daily loss exceeds limit"""
+        """Check if daily loss exceeds limit.
+
+        A zero/negative portfolio value is an automatic violation (fail
+        closed) and halts trading, since this check is the kill switch and
+        the loss percentage cannot be computed.
+        """
+        if portfolio_value <= 0:
+            self.trading_allowed = False
+            return self._fail_closed_on_invalid_portfolio_value(
+                portfolio_value, 'Daily loss check')
+
         daily_loss_pct = abs(daily_pnl) / portfolio_value if daily_pnl < 0 else 0
         
         if daily_loss_pct > self.max_daily_loss:
@@ -78,7 +119,14 @@ class RiskManager:
         return True
     
     def check_leverage(self, total_notional: float, portfolio_value: float) -> bool:
-        """Check leverage ratio"""
+        """Check leverage ratio.
+
+        A zero/negative portfolio value is an automatic violation (fail closed).
+        """
+        if portfolio_value <= 0:
+            return self._fail_closed_on_invalid_portfolio_value(
+                portfolio_value, 'Leverage check')
+
         leverage = total_notional / portfolio_value
         
         if leverage > self.max_leverage:
@@ -94,11 +142,17 @@ class RiskManager:
         return entry_price * (1 - self.position_stop_loss)
     
     def should_close_position(self, position: Position) -> bool:
-        """Check if position should be closed due to stop-loss"""
-        if position.entry_price is None:
+        """Check if position should be closed due to stop-loss.
+
+        Uses Position.avg_entry_price (see core.models.Position). Returns
+        False when the entry price is missing or non-positive, since no
+        meaningful stop level can be computed in that case.
+        """
+        entry_price = getattr(position, 'avg_entry_price', None)
+        if entry_price is None or entry_price <= 0:
             return False
-        
-        stop_price = self.calculate_position_stop_loss(position.entry_price)
+
+        stop_price = self.calculate_position_stop_loss(entry_price)
         return position.current_price <= stop_price
     
     def check_all_constraints(self, positions: Dict[str, Position], 
