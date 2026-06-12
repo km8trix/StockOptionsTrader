@@ -1,58 +1,62 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stock Options Trading System</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css" rel="stylesheet">
+    <title>{% block title %}StockOptionsTrader{% endblock %}</title>
+    <link href="{{ url_for('static', filename='vendor/bootstrap/bootstrap.min.css') }}" rel="stylesheet">
+    <link href="{{ url_for('static', filename='vendor/bootstrap-icons/bootstrap-icons.min.css') }}" rel="stylesheet">
     <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
     {% block extra_css %}{% endblock %}
 </head>
-<body>
-    <!-- Navigation -->
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark sticky-top">
+<body class="d-flex flex-column min-vh-100">
+    <nav class="navbar navbar-expand-lg app-nav sticky-top" aria-label="Main navigation">
         <div class="container-fluid">
             <a class="navbar-brand" href="/">
-                <i class="bi bi-graph-up"></i> Trading System
+                <i class="bi bi-terminal-fill" aria-hidden="true"></i>StockOptionsTrader
             </a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+                    data-bs-target="#navbarNav" aria-controls="navbarNav"
+                    aria-expanded="false" aria-label="Toggle navigation">
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto">
+                    {% set nav_items = [
+                        ('/', 'Dashboard'),
+                        ('/analysis', 'Analysis'),
+                        ('/backtest', 'Backtest'),
+                        ('/paper_trade', 'Paper Trading'),
+                        ('/floor', 'Trading Floor'),
+                    ] %}
+                    {% for href, label in nav_items %}
                     <li class="nav-item">
-                        <a class="nav-link" href="/">Home</a>
+                        <a class="nav-link{% if request.path == href %} active{% endif %}"
+                           {% if request.path == href %}aria-current="page"{% endif %}
+                           href="{{ href }}">{{ label }}</a>
                     </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/backtest">Backtest</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/paper_trade">Paper Trade</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/analysis">Analysis</a>
-                    </li>
+                    {% endfor %}
                 </ul>
             </div>
         </div>
     </nav>
 
-    <!-- Alert Container -->
-    <div id="alertContainer" class="container-fluid mt-3"></div>
+    <!-- Toast container (top-right); utils.js showToast() appends here -->
+    <div id="toastContainer" class="toast-container-app" aria-live="polite" aria-atomic="false"></div>
 
-    <!-- Main Content -->
-    <main class="container-fluid py-4">
+    <main class="container-fluid py-3 flex-grow-1">
         {% block content %}{% endblock %}
     </main>
 
-    <!-- Footer -->
-    <footer class="bg-dark text-white text-center py-3 mt-5">
-        <p>&copy; 2024 Quantitative Trading System. All rights reserved.</p>
+    <footer class="status-bar">
+        <span>v{{ app_version }}</span>
+        <span>
+            <span id="healthDot" class="status-dot" aria-hidden="true"></span>
+            <span id="healthLabel">checking…</span>
+        </span>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="{{ url_for('static', filename='vendor/bootstrap/bootstrap.bundle.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/utils.js') }}"></script>
     {% block extra_js %}{% endblock %}
 </body>

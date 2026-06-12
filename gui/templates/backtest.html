@@ -1,171 +1,196 @@
 {% extends "base.html" %}
 
+{% block title %}Backtest · StockOptionsTrader{% endblock %}
+
 {% block content %}
-<div class="row mb-4">
-    <div class="col-md-12">
-        <h2><i class="bi bi-clock-history"></i> Backtesting</h2>
-        <p class="text-muted">Test trading strategies on historical data</p>
-    </div>
+<div class="d-flex align-items-baseline gap-3 mb-3">
+    <h1 class="page-title">Backtest</h1>
+    <p class="page-subtitle">Next-bar-open fills · SPY benchmark · background jobs</p>
 </div>
 
-<div class="row">
-    <div class="col-md-4">
-        <div class="card shadow-sm">
-            <div class="card-header bg-primary text-white">
-                <h5 class="mb-0">Parameters</h5>
-            </div>
+<div class="row g-2">
+    <!-- Left: parameters + saved history -->
+    <div class="col-lg-3 col-xl-2">
+        <div class="card mb-2">
+            <div class="card-header">Parameters</div>
             <div class="card-body">
-                <form id="backtestForm">
+                <form id="backtestForm" novalidate>
                     <div class="mb-3">
-                        <label class="form-label">Symbols (comma-separated)</label>
-                        <input type="text" class="form-control" id="symbols" placeholder="AAPL, MSFT, GOOGL" value="AAPL, MSFT">
+                        <label class="form-label" for="btStrategy">Strategy</label>
+                        <select class="form-select" id="btStrategy"></select>
                     </div>
-                    
                     <div class="mb-3">
-                        <label class="form-label">Strategy</label>
-                        <select class="form-select" id="strategy">
-                            <option value="momentum">Momentum</option>
-                            <option value="mean_reversion">Mean Reversion</option>
-                            <option value="stat_arb">Statistical Arbitrage</option>
-                        </select>
+                        <label class="form-label" for="btSymbols">Symbols (comma-separated)</label>
+                        <input type="text" class="form-control num" id="btSymbols"
+                               placeholder="AAPL, MSFT" value="AAPL, MSFT"
+                               autocomplete="off" spellcheck="false" required>
+                        <div class="invalid-feedback">Enter one or more valid symbols.</div>
                     </div>
-                    
                     <div class="mb-3">
-                        <label class="form-label">Start Date</label>
-                        <input type="date" class="form-control" id="startDate" value="2023-01-01">
+                        <label class="form-label" for="startDate">Start date</label>
+                        <input type="date" class="form-control num" id="startDate" required>
+                        <div class="invalid-feedback">Start must be before end.</div>
                     </div>
-                    
                     <div class="mb-3">
-                        <label class="form-label">End Date</label>
-                        <input type="date" class="form-control" id="endDate" value="2023-12-31">
+                        <label class="form-label" for="endDate">End date</label>
+                        <input type="date" class="form-control num" id="endDate" required>
+                        <div class="invalid-feedback">End date is required.</div>
                     </div>
-                    
                     <div class="mb-3">
-                        <label class="form-label">Initial Capital ($)</label>
-                        <input type="number" class="form-control" id="initialCapital" value="100000">
+                        <label class="form-label" for="btCapital">Initial capital ($)</label>
+                        <input type="number" class="form-control num" id="btCapital"
+                               value="100000" min="1" step="1000" required>
+                        <div class="invalid-feedback">Capital must be positive.</div>
                     </div>
-                    
                     <div class="mb-3">
-                        <label class="form-label">Position Size (%)</label>
-                        <input type="number" class="form-control" id="positionSize" value="10" step="0.1">
+                        <label class="form-label" for="btPositionSize">Position size (% of portfolio)</label>
+                        <input type="number" class="form-control num" id="btPositionSize"
+                               value="10" min="0.1" max="100" step="0.1" required>
+                        <div class="invalid-feedback">Between 0.1 and 100.</div>
                     </div>
-                    
-                    <button type="submit" class="btn btn-primary w-100">
-                        <i class="bi bi-play-fill"></i> Run Backtest
+                    <button type="submit" class="btn btn-primary w-100" id="runBtn">
+                        <i class="bi bi-play-fill" aria-hidden="true"></i> Run backtest
                     </button>
                 </form>
             </div>
         </div>
+
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span>Saved backtests</span>
+                <button type="button" class="btn btn-outline-secondary btn-sm"
+                        id="reloadSavedBtn" aria-label="Reload saved backtests">
+                    <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <ul class="list-unstyled mb-0" id="savedList"></ul>
+                <div id="savedEmpty" class="d-none"></div>
+                <div class="p-2 border-top" style="border-color: var(--border) !important;">
+                    <button type="button" class="btn btn-outline-secondary btn-sm w-100"
+                            id="compareBtn" disabled>
+                        <i class="bi bi-layout-split" aria-hidden="true"></i>
+                        Compare selected (pick 2)
+                    </button>
+                </div>
+            </div>
+        </div>
     </div>
-    
-    <div class="col-md-8">
-        <div id="resultsContainer"></div>
+
+    <!-- Right: progress / results / compare -->
+    <div class="col-lg-9 col-xl-10">
+        <!-- Progress (hidden until a job is running) -->
+        <div class="card mb-2 d-none" id="progressCard">
+            <div class="card-body">
+                <div class="progress-app" role="progressbar" aria-label="Backtest progress"
+                     aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressBar">
+                    <div class="progress-fill" id="progressFill" style="width: 0%;"></div>
+                </div>
+                <div class="progress-meta">
+                    <span id="progressStatus">submitting…</span>
+                    <span class="num" id="progressPct">0%</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Empty state before any run -->
+        <div id="resultsEmpty"></div>
+
+        <!-- Results -->
+        <div id="resultsSection" class="d-none">
+            <div class="row g-2 mb-2">
+                <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
+                    <div class="metric-label">Total return</div>
+                    <div class="metric-value num" id="mTotalReturn">—</div>
+                </div></div>
+                <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
+                    <div class="metric-label">Sharpe</div>
+                    <div class="metric-value num" id="mSharpe">—</div>
+                </div></div>
+                <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
+                    <div class="metric-label">Sortino</div>
+                    <div class="metric-value num" id="mSortino">—</div>
+                </div></div>
+                <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
+                    <div class="metric-label">Calmar</div>
+                    <div class="metric-value num" id="mCalmar">—</div>
+                </div></div>
+                <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
+                    <div class="metric-label">Max drawdown</div>
+                    <div class="metric-value num" id="mMaxDD">—</div>
+                </div></div>
+                <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
+                    <div class="metric-label">Win rate</div>
+                    <div class="metric-value num" id="mWinRate">—</div>
+                </div></div>
+            </div>
+
+            <div id="pendingSignalsNote" class="mb-2 d-none"></div>
+
+            <div class="card mb-2">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>Equity curve vs benchmark</span>
+                    <span class="provenance-caption" id="equityProvenance"></span>
+                </div>
+                <div class="card-body p-2">
+                    <div id="equityChart" style="min-height: 320px;"></div>
+                </div>
+            </div>
+
+            <div class="card mb-2">
+                <div class="card-header">Drawdown</div>
+                <div class="card-body p-2">
+                    <div id="drawdownChart" style="min-height: 200px;"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    Trades <span class="provenance-caption">(signal date → next-bar-open fill)</span>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table" id="tradesTable" aria-label="Backtest trades">
+                            <thead>
+                                <tr>
+                                    <th class="sortable" data-key="signal_date" data-type="str" scope="col">Signal date<span class="sort-arrow"></span></th>
+                                    <th class="sortable" data-key="date" data-type="str" scope="col">Fill date<span class="sort-arrow"></span></th>
+                                    <th class="sortable" data-key="symbol" data-type="str" scope="col">Symbol<span class="sort-arrow"></span></th>
+                                    <th class="sortable" data-key="action" data-type="str" scope="col">Action<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="quantity" data-type="num" scope="col">Qty<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="price" data-type="num" scope="col">Price<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="value" data-type="num" scope="col">Value<span class="sort-arrow"></span></th>
+                                </tr>
+                            </thead>
+                            <tbody id="tradesBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="tradesEmpty" class="d-none"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Compare -->
+        <div id="compareSection" class="d-none">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <h2 class="page-title" style="font-size: 15px;">Comparison</h2>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="closeCompareBtn">
+                    <i class="bi bi-x" aria-hidden="true"></i> Close comparison
+                </button>
+            </div>
+            <div class="row g-2 mb-2" id="compareCards"></div>
+            <div class="card">
+                <div class="card-header">Equity curves</div>
+                <div class="card-body p-2">
+                    <div id="compareChart" style="min-height: 320px;"></div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
-
 {% endblock %}
 
 {% block extra_js %}
-<script>
-document.getElementById('backtestForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const symbols = document.getElementById('symbols').value;
-    const strategy = document.getElementById('strategy').value;
-    const startDate = document.getElementById('startDate').value;
-    const endDate = document.getElementById('endDate').value;
-    const initialCapital = document.getElementById('initialCapital').value;
-    const positionSize = document.getElementById('positionSize').value / 100;
-    
-    const resultsDiv = document.getElementById('resultsContainer');
-    resultsDiv.innerHTML = '<div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div>';
-    
-    try {
-        const response = await fetch('/api/backtest', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                symbols,
-                strategy,
-                start_date: startDate,
-                end_date: endDate,
-                initial_capital: initialCapital,
-                position_size: positionSize
-            })
-        });
-        
-        const data = await response.json();
-        
-        if (!response.ok) {
-            resultsDiv.innerHTML = `<div class="alert alert-danger">${data.error}</div>`;
-            return;
-        }
-        
-        const summary = data.summary;
-        resultsDiv.innerHTML = `
-            <div class="card shadow-sm">
-                <div class="card-header bg-success text-white">
-                    <h5 class="mb-0">Results</h5>
-                </div>
-                <div class="card-body">
-                    <div class="row">
-                        <div class="col-md-6 mb-3">
-                            <h6>Portfolio Summary</h6>
-                            <table class="table table-sm">
-                                <tr>
-                                    <td><strong>Initial Capital:</strong></td>
-                                    <td>$${summary.initial_capital?.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Final Value:</strong></td>
-                                    <td>$${summary.current_value?.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Total Return:</strong></td>
-                                    <td><span class="badge ${summary.total_return_pct >= 0 ? 'bg-success' : 'bg-danger'}">${summary.total_return_pct?.toFixed(2)}%</span></td>
-                                </tr>
-                            </table>
-                        </div>
-                        <div class="col-md-6 mb-3">
-                            <h6>Risk Metrics</h6>
-                            <table class="table table-sm">
-                                <tr>
-                                    <td><strong>Sharpe Ratio:</strong></td>
-                                    <td>${summary.sharpe_ratio?.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Max Drawdown:</strong></td>
-                                    <td>${summary.max_drawdown?.toFixed(2)}%</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Win Rate:</strong></td>
-                                    <td>${summary.win_rate?.toFixed(2)}%</td>
-                                </tr>
-                            </table>
-                        </div>
-                    </div>
-                    
-                    <h6 class="mt-4">Trade Statistics</h6>
-                    <table class="table table-sm">
-                        <tr>
-                            <td><strong>Closed Trades:</strong></td>
-                            <td>${summary.closed_trades}</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Realized P&L:</strong></td>
-                            <td>$${summary.realized_pnl?.toFixed(2)}</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Unrealized P&L:</strong></td>
-                            <td>$${summary.unrealized_pnl?.toFixed(2)}</td>
-                        </tr>
-                    </table>
-                </div>
-            </div>
-        `;
-    } catch (error) {
-        resultsDiv.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
-    }
-});
-</script>
+<script src="{{ url_for('static', filename='vendor/plotly/plotly.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/backtest.js') }}"></script>
 {% endblock %}

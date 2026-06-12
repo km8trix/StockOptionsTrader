@@ -1,215 +1,189 @@
 {% extends "base.html" %}
 
+{% block title %}Paper Trading · StockOptionsTrader{% endblock %}
+
 {% block content %}
-<div class="row mb-4">
-    <div class="col-md-12">
-        <h2><i class="bi bi-cash-flow"></i> Paper Trading</h2>
-        <p class="text-muted">Trade with simulated money in real-time</p>
+<div class="d-flex align-items-baseline justify-content-between mb-3">
+    <div class="d-flex align-items-baseline gap-3">
+        <h1 class="page-title">Paper Trading</h1>
+        <p class="page-subtitle">Simulated execution on live closes</p>
+    </div>
+    <div class="d-flex align-items-center gap-3" id="refreshControls">
+        <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" role="switch"
+                   id="autoRefreshToggle" checked>
+            <label class="form-check-label" for="autoRefreshToggle"
+                   style="font-size:12px; color: var(--text-muted);">Auto-refresh 15s</label>
+        </div>
+        <button type="button" class="btn btn-outline-secondary btn-sm" id="refreshBtn">
+            <i class="bi bi-arrow-clockwise" aria-hidden="true"></i> Refresh
+        </button>
     </div>
 </div>
 
-<div class="row">
-    <div class="col-md-4">
-        <div class="card shadow-sm mb-4">
-            <div class="card-header bg-success text-white">
-                <h5 class="mb-0">Create Trader</h5>
-            </div>
-            <div class="card-body">
-                <form id="createTraderForm">
-                    <div class="mb-3">
-                        <label class="form-label">Trader ID</label>
-                        <input type="text" class="form-control" id="traderId" placeholder="trader1" value="trader1">
+<!-- No-trader empty state + create flow -->
+<div id="createTraderPanel" class="d-none">
+    <div class="row justify-content-center">
+        <div class="col-md-6 col-xl-4">
+            <div class="card">
+                <div class="card-body p-0">
+                    <div class="empty-state">
+                        <i class="bi bi-wallet2" aria-hidden="true"></i>
+                        <div class="empty-msg">No paper trading session</div>
+                        <div class="empty-hint">Create one to start placing simulated orders.</div>
                     </div>
-                    
-                    <div class="mb-3">
-                        <label class="form-label">Initial Capital ($)</label>
-                        <input type="number" class="form-control" id="traderCapital" value="50000">
-                    </div>
-                    
-                    <button type="submit" class="btn btn-success w-100">
-                        <i class="bi bi-plus-circle"></i> Create Trader
-                    </button>
-                </form>
-            </div>
-        </div>
-        
-        <div class="card shadow-sm">
-            <div class="card-header bg-info text-white">
-                <h5 class="mb-0">Place Order</h5>
-            </div>
-            <div class="card-body">
-                <form id="orderForm">
-                    <div class="mb-3">
-                        <label class="form-label">Symbol</label>
-                        <input type="text" class="form-control" id="orderSymbol" placeholder="AAPL" value="AAPL">
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label class="form-label">Action</label>
-                        <select class="form-select" id="orderAction">
-                            <option value="BUY">BUY</option>
-                            <option value="SELL">SELL</option>
-                        </select>
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label class="form-label">Quantity</label>
-                        <input type="number" class="form-control" id="orderQuantity" value="100">
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label class="form-label">Price ($)</label>
-                        <input type="number" class="form-control" id="orderPrice" step="0.01" value="150.00">
-                    </div>
-                    
-                    <button type="submit" class="btn btn-info w-100">
-                        <i class="bi bi-arrow-repeat"></i> Place Order
-                    </button>
-                </form>
+                </div>
+                <div class="card-body pt-0">
+                    <form id="createTraderForm" novalidate>
+                        <div class="mb-3">
+                            <label class="form-label" for="traderId">Session ID</label>
+                            <input type="text" class="form-control num" id="traderId"
+                                   value="default" autocomplete="off" spellcheck="false" required>
+                            <div class="invalid-feedback">Letters, digits, dashes, underscores.</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="traderCapital">Initial capital ($)</label>
+                            <input type="number" class="form-control num" id="traderCapital"
+                                   value="50000" min="1" step="1000" required>
+                            <div class="invalid-feedback">Capital must be positive.</div>
+                        </div>
+                        <button type="submit" class="btn btn-primary w-100" id="createTraderBtn">
+                            <i class="bi bi-plus-circle" aria-hidden="true"></i> Create paper session
+                        </button>
+                    </form>
+                </div>
             </div>
         </div>
-    </div>
-    
-    <div class="col-md-8">
-        <div id="portfolioContainer"></div>
     </div>
 </div>
 
+<!-- Active trading panel -->
+<div id="tradingPanel" class="d-none">
+    <!-- Account metric cards -->
+    <div class="row g-2 mb-3">
+        <div class="col-6 col-lg-3">
+            <div class="metric-card">
+                <div class="metric-label">Cash</div>
+                <div class="metric-value num" id="acctCash">—</div>
+            </div>
+        </div>
+        <div class="col-6 col-lg-3">
+            <div class="metric-card">
+                <div class="metric-label">Portfolio value</div>
+                <div class="metric-value num" id="acctValue">—</div>
+            </div>
+        </div>
+        <div class="col-6 col-lg-3">
+            <div class="metric-card">
+                <div class="metric-label">Unrealized P&amp;L</div>
+                <div class="metric-value num" id="acctUnrealized">—</div>
+                <div class="metric-delta num" id="acctUnrealizedPct"></div>
+            </div>
+        </div>
+        <div class="col-6 col-lg-3">
+            <div class="metric-card">
+                <div class="metric-label">Open positions</div>
+                <div class="metric-value num" id="acctPositions">—</div>
+                <div class="metric-delta" id="acctUpdated"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-2">
+        <!-- Order entry -->
+        <div class="col-lg-3 col-xl-2">
+            <div class="card">
+                <div class="card-header">Order entry</div>
+                <div class="card-body">
+                    <form id="orderForm" novalidate>
+                        <div class="mb-3">
+                            <label class="form-label" for="orderSymbol">Symbol</label>
+                            <input type="text" class="form-control num" id="orderSymbol"
+                                   placeholder="AAPL" autocomplete="off" spellcheck="false"
+                                   maxlength="10" required>
+                            <div class="invalid-feedback">Enter a valid symbol.</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="orderSide">Side</label>
+                            <select class="form-select" id="orderSide">
+                                <option value="BUY" selected>BUY</option>
+                                <option value="SELL">SELL</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="orderQty">Quantity</label>
+                            <input type="number" class="form-control num" id="orderQty"
+                                   value="10" min="1" step="1" required>
+                            <div class="invalid-feedback">Whole number of shares ≥ 1.</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="orderLimit">Limit price ($ · blank = market)</label>
+                            <input type="number" class="form-control num" id="orderLimit"
+                                   placeholder="market" min="0.01" step="0.01">
+                            <div class="invalid-feedback">Positive price, or blank for market.</div>
+                        </div>
+                        <div class="risk-feedback mb-3" id="riskFeedback" aria-live="polite"></div>
+                        <button type="submit" class="btn btn-primary w-100" id="placeOrderBtn">
+                            <i class="bi bi-send" aria-hidden="true"></i> Place order
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- Positions + pending orders -->
+        <div class="col-lg-9 col-xl-10">
+            <div class="card mb-2">
+                <div class="card-header">Positions</div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table" aria-label="Open positions">
+                            <thead>
+                                <tr>
+                                    <th scope="col">Symbol</th>
+                                    <th class="num" scope="col">Qty</th>
+                                    <th class="num" scope="col">Entry</th>
+                                    <th class="num" scope="col">Current</th>
+                                    <th class="num" scope="col">P&amp;L $</th>
+                                    <th class="num" scope="col">P&amp;L %</th>
+                                </tr>
+                            </thead>
+                            <tbody id="positionsBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="positionsEmpty" class="d-none"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>Pending orders</span>
+                    <span class="provenance-caption">filled against latest close when marketable</span>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table" aria-label="Pending orders">
+                            <thead>
+                                <tr>
+                                    <th scope="col">Order</th>
+                                    <th scope="col">Symbol</th>
+                                    <th scope="col">Side</th>
+                                    <th class="num" scope="col">Qty</th>
+                                    <th class="num" scope="col">Limit</th>
+                                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                                </tr>
+                            </thead>
+                            <tbody id="ordersBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ordersEmpty" class="d-none"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
-<script>
-let currentTraderId = null;
-
-document.getElementById('createTraderForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const traderId = document.getElementById('traderId').value;
-    const capital = document.getElementById('traderCapital').value;
-    
-    try {
-        const response = await fetch('/api/paper_trader/create', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({trader_id: traderId, initial_capital: capital})
-        });
-        
-        const data = await response.json();
-        currentTraderId = traderId;
-        showAlert('Trader created successfully!', 'success');
-        updatePortfolio();
-    } catch (error) {
-        showAlert(`Error: ${error.message}`, 'danger');
-    }
-});
-
-document.getElementById('orderForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    if (!currentTraderId) {
-        showAlert('Please create a trader first', 'warning');
-        return;
-    }
-    
-    const symbol = document.getElementById('orderSymbol').value;
-    const action = document.getElementById('orderAction').value;
-    const quantity = document.getElementById('orderQuantity').value;
-    const price = document.getElementById('orderPrice').value;
-    
-    try {
-        const response = await fetch(`/api/paper_trader/${currentTraderId}/order`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({symbol, action, quantity, price})
-        });
-        
-        const data = await response.json();
-        showAlert(`Order placed: ${data.order_id}`, 'success');
-        updatePortfolio();
-    } catch (error) {
-        showAlert(`Error: ${error.message}`, 'danger');
-    }
-});
-
-async function updatePortfolio() {
-    if (!currentTraderId) return;
-    
-    try {
-        const response = await fetch(`/api/paper_trader/${currentTraderId}/status`);
-        const data = await response.json();
-        
-        const container = document.getElementById('portfolioContainer');
-        container.innerHTML = `
-            <div class="card shadow-sm mb-4">
-                <div class="card-header bg-primary text-white">
-                    <h5 class="mb-0">Portfolio Status</h5>
-                </div>
-                <div class="card-body">
-                    <div class="row">
-                        <div class="col-md-6">
-                            <h6>Summary</h6>
-                            <table class="table table-sm">
-                                <tr>
-                                    <td><strong>Cash:</strong></td>
-                                    <td>$${parseFloat(data.cash).toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Portfolio Value:</strong></td>
-                                    <td>$${parseFloat(data.portfolio_value).toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Unrealized P&L:</strong></td>
-                                    <td><span class="badge ${data.unrealized_pnl >= 0 ? 'bg-success' : 'bg-danger'}">${parseFloat(data.unrealized_pnl).toFixed(2)}</span></td>
-                                </tr>
-                            </table>
-                        </div>
-                        <div class="col-md-6">
-                            <h6>Status</h6>
-                            <p><strong>Positions:</strong> ${data.positions.length}</p>
-                            <p><strong>Pending Orders:</strong> ${data.pending_orders}</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            ${data.positions.length > 0 ? `
-                <div class="card shadow-sm">
-                    <div class="card-header bg-info text-white">
-                        <h5 class="mb-0">Open Positions</h5>
-                    </div>
-                    <div class="card-body">
-                        <table class="table table-hover">
-                            <thead>
-                                <tr>
-                                    <th>Symbol</th>
-                                    <th>Quantity</th>
-                                    <th>Entry Price</th>
-                                    <th>Current Price</th>
-                                    <th>P&L</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.positions.map(pos => `
-                                    <tr>
-                                        <td>${pos.symbol}</td>
-                                        <td>${pos.quantity}</td>
-                                        <td>$${parseFloat(pos.entry_price).toFixed(2)}</td>
-                                        <td>$${parseFloat(pos.current_price).toFixed(2)}</td>
-                                        <td><span class="badge ${pos.pnl >= 0 ? 'bg-success' : 'bg-danger'}">${parseFloat(pos.pnl).toFixed(2)}</span></td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            ` : '<div class="alert alert-info">No open positions</div>'}
-        `;
-    } catch (error) {
-        showAlert(`Error: ${error.message}`, 'danger');
-    }
-}
-
-// Auto-update every 5 seconds
-setInterval(updatePortfolio, 5000);
-</script>
+<script src="{{ url_for('static', filename='js/paper_trade.js') }}"></script>
 {% endblock %}

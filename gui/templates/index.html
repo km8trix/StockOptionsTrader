@@ -1,70 +1,102 @@
 {% extends "base.html" %}
 
+{% block title %}Dashboard · StockOptionsTrader{% endblock %}
+
 {% block content %}
-<div class="row">
-    <div class="col-md-12">
-        <div class="jumbotron bg-light p-5 rounded-lg mb-4">
-            <h1 class="display-4"><i class="bi bi-graph-up-arrow text-success"></i> Trading System</h1>
-            <p class="lead">Quantitative Multi-Asset Trading Platform</p>
-            <hr class="my-4">
-            <p>Backtest strategies, trade with paper money, and analyze markets.</p>
-        </div>
+<div class="d-flex align-items-baseline justify-content-between mb-3">
+    <div class="d-flex align-items-baseline gap-3">
+        <h1 class="page-title">Dashboard</h1>
+        <p class="page-subtitle">Paper portfolio · saved backtests · alerts</p>
+    </div>
+    <div class="d-flex gap-2">
+        <a href="/backtest" class="btn btn-primary btn-sm">
+            <i class="bi bi-clock-history" aria-hidden="true"></i> New backtest
+        </a>
+        <a href="/analysis" class="btn btn-outline-secondary btn-sm">
+            <i class="bi bi-graph-up" aria-hidden="true"></i> Analyze a symbol
+        </a>
     </div>
 </div>
 
-<div class="row">
-    <div class="col-md-4 mb-4">
-        <div class="card h-100 shadow-sm">
-            <div class="card-body">
-                <h5 class="card-title"><i class="bi bi-clock-history text-primary"></i> Backtesting</h5>
-                <p class="card-text">Test trading strategies on historical data</p>
-                <a href="/backtest" class="btn btn-primary">Go to Backtest</a>
-            </div>
+<!-- Portfolio metric cards -->
+<div id="portfolioMetrics" class="row g-2 mb-3">
+    <div class="col-6 col-lg-3">
+        <div class="metric-card">
+            <div class="metric-label">Portfolio value</div>
+            <div class="metric-value num" id="metricPortfolioValue"><span class="skeleton w-50"></span></div>
+            <div class="metric-delta num" id="metricPortfolioDelta"></div>
         </div>
     </div>
-    
-    <div class="col-md-4 mb-4">
-        <div class="card h-100 shadow-sm">
-            <div class="card-body">
-                <h5 class="card-title"><i class="bi bi-cash-flow text-success"></i> Paper Trading</h5>
-                <p class="card-text">Trade with simulated money in real-time</p>
-                <a href="/paper_trade" class="btn btn-success">Go to Paper Trade</a>
-            </div>
+    <div class="col-6 col-lg-3">
+        <div class="metric-card">
+            <div class="metric-label">Cash</div>
+            <div class="metric-value num" id="metricCash"><span class="skeleton w-50"></span></div>
+            <div class="metric-delta" id="metricCashHint"></div>
         </div>
     </div>
-    
-    <div class="col-md-4 mb-4">
-        <div class="card h-100 shadow-sm">
-            <div class="card-body">
-                <h5 class="card-title"><i class="bi bi-bar-chart text-info"></i> Analysis</h5>
-                <p class="card-text">Analyze stocks with technical indicators</p>
-                <a href="/analysis" class="btn btn-info">Go to Analysis</a>
-            </div>
+    <div class="col-6 col-lg-3">
+        <div class="metric-card">
+            <div class="metric-label">Unrealized P&amp;L</div>
+            <div class="metric-value num" id="metricUnrealized"><span class="skeleton w-50"></span></div>
+            <div class="metric-delta num" id="metricUnrealizedPct"></div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="metric-card">
+            <div class="metric-label">Open positions</div>
+            <div class="metric-value num" id="metricPositions"><span class="skeleton w-25"></span></div>
+            <div class="metric-delta" id="metricPendingOrders"></div>
         </div>
     </div>
 </div>
+<div id="portfolioEmpty" class="mb-3 d-none"></div>
 
-<div class="row mt-5">
-    <div class="col-md-12">
-        <h2>Features</h2>
-        <div class="list-group">
-            <div class="list-group-item">
-                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Multiple Strategies</h6>
-                <p class="mb-0">Momentum, Mean Reversion, Statistical Arbitrage</p>
+<div class="row g-2">
+    <!-- Recent backtests -->
+    <div class="col-lg-8">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span>Recent backtests</span>
+                <a href="/backtest" class="text-decoration-none" style="font-size:12px;">View all</a>
             </div>
-            <div class="list-group-item">
-                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Technical Indicators</h6>
-                <p class="mb-0">MACD, RSI, Bollinger Bands, SMA, EMA, ATR and more</p>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table" aria-label="Recent backtests">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Strategy</th>
+                                <th>Period</th>
+                                <th class="num">Return</th>
+                                <th class="num">Sharpe</th>
+                            </tr>
+                        </thead>
+                        <tbody id="backtestRows">
+                            <!-- skeleton rows injected by dashboard.js -->
+                        </tbody>
+                    </table>
+                </div>
+                <div id="backtestEmpty" class="d-none"></div>
             </div>
-            <div class="list-group-item">
-                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Risk Metrics</h6>
-                <p class="mb-0">Sharpe Ratio, Max Drawdown, Win Rate, P&L Tracking</p>
+        </div>
+    </div>
+
+    <!-- Alerts -->
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span>Alerts</span>
+                <span id="alertUnreadBadge" class="badge-unread d-none">0</span>
             </div>
-            <div class="list-group-item">
-                <h6 class="mb-1"><i class="bi bi-check-circle-fill text-success"></i> Options Support</h6>
-                <p class="mb-0">Black-Scholes pricing for call and put options</p>
+            <div class="card-body p-0">
+                <ul class="list-unstyled mb-0" id="alertList"></ul>
+                <div id="alertEmpty" class="d-none"></div>
             </div>
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 {% endblock %}

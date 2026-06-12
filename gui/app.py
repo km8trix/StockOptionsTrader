@@ -57,6 +57,16 @@ def create_app(config: dict | None = None) -> Flask:
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-insecure-change-me')
     CORS(app)
 
+    @app.context_processor
+    def inject_app_version():
+        """Expose the installed package version to templates (status bar)."""
+        try:
+            from importlib.metadata import version
+            app_version = version('stock-options-trader')
+        except Exception:  # pragma: no cover - metadata missing in some envs
+            app_version = '0.1.0'
+        return {'app_version': app_version}
+
     # Import blueprints inside the factory so importing gui.app stays cheap
     # and side-effect free until an app is actually built.
     from gui.routes.views import views_bp
@@ -73,6 +83,13 @@ def create_app(config: dict | None = None) -> Flask:
     def health():
         """Liveness probe (Docker healthcheck target in Phase 4)."""
         return jsonify({'status': 'ok', 'service': 'stock-options-trader'}), 200
+
+    @app.errorhandler(400)
+    def bad_request(error):
+        # Keep API errors JSON even when werkzeug raises BadRequest before a
+        # route runs (e.g. request.json on an empty/malformed body).
+        description = getattr(error, 'description', None)
+        return jsonify({'error': description or 'Bad request'}), 400
 
     @app.errorhandler(404)
     def not_found(error):

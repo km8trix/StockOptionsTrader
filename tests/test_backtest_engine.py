@@ -16,6 +16,7 @@ import pytest
 from backtesting.backtest_engine import BacktestEngine, MAX_PENDING_DAYS
 from core.models import Asset
 from data.market_data import MarketDataHandler
+from portfolio.manager import PortfolioManager
 from strategies.base import Strategy
 
 COMMISSION = 0.001
@@ -233,3 +234,182 @@ class TestPendingIntentExpiry:
         assert MAX_PENDING_DAYS < 10
         assert engine.trades_log == []
         assert report['pending_signals'] == []
+
+
+class TestProgressCallback:
+    def test_progress_monotonic_and_hits_100_exactly_once(
+            self, make_ohlcv, patch_market_data):
+        df = make_ohlcv(n_days=20, seed=37)
+        patch_market_data({'TEST': df})
+
+        strategy = ScriptedStrategy(buy_date=df.index[5])
+        engine = BacktestEngine(strategy, initial_capital=100000.0,
+                                commission=COMMISSION)
+        calls: list = []
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31',
+                            position_size=0.1,
+                            progress_callback=calls.append,
+                            benchmark_symbol=None)
+
+        assert 'error' not in report
+        # One call per simulated trading day.
+        assert len(calls) == len(df.index)
+        # Monotonically nondecreasing, bounded by (0, 100].
+        assert all(later >= earlier
+                   for earlier, later in zip(calls, calls[1:]))
+        assert all(0.0 < value <= 100.0 for value in calls)
+        # 100.0 exactly once, and it is the final call.
+        assert calls[-1] == 100.0
+        assert calls.count(100.0) == 1
+
+    def test_single_day_backtest_reports_100_once(self, make_ohlcv,
+                                                  patch_market_data):
+        df = make_ohlcv(n_days=1, seed=41)
+        patch_market_data({'TEST': df})
+
+        engine = BacktestEngine(ScriptedStrategy(), initial_capital=100000.0,
+                                commission=COMMISSION)
+        calls: list = []
+        engine.run(['TEST'], '2023-01-01', '2023-12-31',
+                   progress_callback=calls.append, benchmark_symbol=None)
+        assert calls == [100.0]
+
+
+class TestBenchmark:
+    def test_benchmark_is_normalized_buy_and_hold_of_initial_capital(
+            self, make_ohlcv, patch_market_data):
+        initial_capital = 100000.0
+        df = make_ohlcv(n_days=20, seed=43)
+        spy = make_ohlcv(n_days=20, seed=99, start_price=400.0)
+        patch_market_data({'TEST': df, 'SPY': spy})
+
+        engine = BacktestEngine(ScriptedStrategy(),
+                                initial_capital=initial_capital,
+                                commission=COMMISSION)
+        # benchmark_symbol defaults to 'SPY'.
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31')
+
+        bench = report['benchmark']
+        assert bench is not None
+        assert bench['symbol'] == 'SPY'
+
+        curve = bench['equity_curve']
+        assert len(curve) == len(spy.index)
+        # Normalized: the first marked value is exactly the initial capital.
+        assert curve[0]['value'] == pytest.approx(initial_capital)
+
+        # Each point is a buy-and-hold mark at that session's close.
+        base_close = float(spy['close'].iloc[0])
+        for point, (ts, close) in zip(curve, spy['close'].items()):
+            assert point['date'] == ts.strftime('%Y-%m-%d')
+            assert point['value'] == pytest.approx(
+                float(close) / base_close * initial_capital)
+
+        # All benchmark dates fall within the requested backtest range.
+        dates = [point['date'] for point in curve]
+        assert min(dates) >= '2023-01-01'
+        assert max(dates) <= '2023-12-31'
+
+    def test_benchmark_fetch_failure_does_not_break_run(
+            self, make_ohlcv, monkeypatch, caplog):
+        df = make_ohlcv(n_days=20, seed=47)
+
+        def fake_fetch(self, symbol, start_date, end_date):
+            if symbol == 'SPY':
+                raise RuntimeError('provider down')
+            return df
+
+        monkeypatch.setattr(MarketDataHandler, 'fetch_stock_data', fake_fetch)
+
+        engine = BacktestEngine(ScriptedStrategy(buy_date=df.index[5]),
+                                initial_capital=100000.0,
+                                commission=COMMISSION)
+        with caplog.at_level('WARNING', logger='backtesting.backtest_engine'):
+            report = engine.run(['TEST'], '2023-01-01', '2023-12-31')
+
+        assert 'error' not in report
+        assert report['benchmark'] is None
+        # The backtest itself still ran to completion.
+        assert len(report['portfolio_history']) == len(df.index)
+        assert len(engine.trades_log) == 1
+        assert any('Benchmark' in record.message for record in caplog.records)
+
+    def test_benchmark_empty_data_yields_none(self, make_ohlcv,
+                                              patch_market_data):
+        df = make_ohlcv(n_days=20, seed=53)
+        # No SPY frame: the patched fetch serves an empty DataFrame for it.
+        patch_market_data({'TEST': df})
+
+        engine = BacktestEngine(ScriptedStrategy(), initial_capital=100000.0,
+                                commission=COMMISSION)
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31')
+        assert 'error' not in report
+        assert report['benchmark'] is None
+
+    def test_benchmark_none_disables_benchmark(self, make_ohlcv,
+                                               patch_market_data):
+        df = make_ohlcv(n_days=20, seed=59)
+        patch_market_data({'TEST': df})
+
+        engine = BacktestEngine(ScriptedStrategy(), initial_capital=100000.0,
+                                commission=COMMISSION)
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31',
+                            benchmark_symbol=None)
+        assert report['benchmark'] is None
+
+
+class TestDrawdownSeries:
+    def test_hand_computed_sequence(self):
+        # Values: 100 -> 110 -> 99 -> 104.5 -> 88.
+        # Running max: 100, 110, 110, 110, 110.
+        # Drawdowns:     0%,   0%, -10%,  -5%, -20%.
+        pm = PortfolioManager(initial_capital=100.0)
+        values = [100.0, 110.0, 99.0, 104.5, 88.0]
+        dates = pd.bdate_range('2023-01-02', periods=len(values))
+        for ts, value in zip(dates, values):
+            pm.portfolio_history.append(
+                {'timestamp': ts, 'portfolio_value': value})
+
+        series = pm.get_drawdown_series()
+        assert [point['date'] for point in series] == [
+            '2023-01-02', '2023-01-03', '2023-01-04',
+            '2023-01-05', '2023-01-06']
+        expected = [0.0, 0.0, -10.0, -5.0, -20.0]
+        assert [point['drawdown_pct'] for point in series] == pytest.approx(
+            expected)
+        # Same math as get_max_drawdown: the series minimum IS the max DD.
+        assert min(point['drawdown_pct'] for point in series) == \
+            pytest.approx(pm.get_max_drawdown())
+
+    def test_empty_history_returns_empty_series(self):
+        assert PortfolioManager(initial_capital=100.0).get_drawdown_series() == []
+
+    def test_report_drawdown_series_matches_history_and_max_drawdown(
+            self, make_ohlcv, patch_market_data):
+        df = make_ohlcv(n_days=30, seed=61)
+        patch_market_data({'TEST': df})
+
+        strategy = ScriptedStrategy(buy_date=df.index[2])
+        engine = BacktestEngine(strategy, initial_capital=100000.0,
+                                commission=COMMISSION)
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31',
+                            position_size=0.5, benchmark_symbol=None)
+
+        series = report['drawdown_series']
+        history = report['portfolio_history']
+        assert len(series) == len(history) == len(df.index)
+
+        # Hand-recompute the running-max drawdown with plain Python.
+        running_max = float('-inf')
+        for point, snapshot in zip(series, history):
+            value = snapshot['portfolio_value']
+            running_max = max(running_max, value)
+            expected_dd = (value - running_max) / running_max * 100.0
+            assert point['date'] == snapshot['timestamp'].strftime('%Y-%m-%d')
+            assert point['drawdown_pct'] == pytest.approx(expected_dd)
+            assert point['drawdown_pct'] <= 0.0
+
+        assert min(point['drawdown_pct'] for point in series) == \
+            pytest.approx(engine.portfolio.get_max_drawdown())
+        assert min(point['drawdown_pct'] for point in series) == \
+            pytest.approx(report['summary']['max_drawdown'])

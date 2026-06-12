@@ -1,99 +1,565 @@
-/* Custom Styles for Trading System GUI */
+/* ==========================================================================
+   StockOptionsTrader — dark trading-terminal design system
+   Base theme: Bootstrap 5.3 dark mode (<html data-bs-theme="dark">) with a
+   restrained palette. One accent hue. Semantic gain/loss everywhere P&L
+   appears. Tabular numerals for every number. Compact density.
+   Spacing scale: multiples of 4px (4 / 8 / 12 / 16 / 24 / 32).
+   ========================================================================== */
 
-:root {
-    --primary-color: #0d6efd;
-    --success-color: #198754;
-    --danger-color: #dc3545;
+:root,
+[data-bs-theme="dark"] {
+    /* Palette */
+    --bg: #0d1117;            /* page background */
+    --surface: #161b22;       /* cards, nav, panels */
+    --surface-2: #1c232d;     /* hover / inset surfaces */
+    --border: #2d333b;        /* muted hairlines */
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #4493f8;        /* single restrained hue */
+    --accent-dim: rgba(68, 147, 248, 0.15);
+    --gain: #3fb950;          /* semantic P&L green */
+    --gain-dim: rgba(63, 185, 80, 0.12);
+    --loss: #f85149;          /* semantic P&L red */
+    --loss-dim: rgba(248, 81, 73, 0.12);
+    --warn: #d29922;
+
+    /* Typography */
+    --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+        "Liberation Mono", monospace;
+
+    /* Spacing scale (4px base) */
+    --sp-1: 4px;
+    --sp-2: 8px;
+    --sp-3: 12px;
+    --sp-4: 16px;
+    --sp-6: 24px;
+    --sp-8: 32px;
+
+    /* Map Bootstrap dark tokens onto the palette */
+    --bs-body-bg: var(--bg);
+    --bs-body-color: var(--text);
+    --bs-secondary-color: var(--text-muted);
+    --bs-border-color: var(--border);
+    --bs-link-color: var(--accent);
+    --bs-link-hover-color: #6cabfa;
+    --bs-primary: var(--accent);
+    --bs-success: var(--gain);
+    --bs-danger: var(--loss);
 }
 
 body {
-    background-color: #f5f5f5;
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 14px;
+    line-height: 1.45;
 }
 
-.navbar-brand {
-    font-weight: bold;
-    font-size: 1.3rem;
+/* --------------------------------------------------------------------------
+   Numbers: monospace + tabular figures, right-aligned in tables
+   -------------------------------------------------------------------------- */
+.num,
+td.num,
+th.num,
+.metric-value,
+.metric-delta {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
 }
 
-.jumbotron {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
+td.num,
+th.num {
+    text-align: right;
 }
 
+/* Semantic P&L colors — the ONLY red/green in the app */
+.pnl-pos { color: var(--gain); }
+.pnl-neg { color: var(--loss); }
+.pnl-flat { color: var(--text-muted); }
+
+/* --------------------------------------------------------------------------
+   Navigation
+   -------------------------------------------------------------------------- */
+.navbar.app-nav {
+    background-color: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding-top: var(--sp-2);
+    padding-bottom: var(--sp-2);
+    min-height: 48px;
+}
+
+.app-nav .navbar-brand {
+    font-weight: 700;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+    color: var(--text);
+}
+
+.app-nav .navbar-brand .bi {
+    color: var(--accent);
+    margin-right: var(--sp-1);
+}
+
+.app-nav .nav-link {
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 500;
+    padding: var(--sp-1) var(--sp-3);
+    border-radius: 4px;
+}
+
+.app-nav .nav-link:hover {
+    color: var(--text);
+}
+
+.app-nav .nav-link.active {
+    color: var(--text);
+    background-color: var(--accent-dim);
+}
+
+/* --------------------------------------------------------------------------
+   Cards / panels
+   -------------------------------------------------------------------------- */
 .card {
-    border: none;
-    border-radius: 0.5rem;
-    transition: all 0.3s ease;
-}
-
-.card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1) !important;
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
 }
 
 .card-header {
-    border-radius: 0.5rem 0.5rem 0 0;
+    background-color: transparent;
+    border-bottom: 1px solid var(--border);
+    padding: var(--sp-3) var(--sp-4);
+    font-size: 12px;
     font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+}
+
+.card-body {
+    padding: var(--sp-4);
+}
+
+/* --------------------------------------------------------------------------
+   Metric cards: label + large value + delta
+   -------------------------------------------------------------------------- */
+.metric-card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: var(--sp-3) var(--sp-4);
+}
+
+.metric-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: var(--sp-1);
+}
+
+.metric-value {
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.2;
+}
+
+.metric-delta {
+    font-size: 12px;
+    margin-top: var(--sp-1);
+}
+
+/* --------------------------------------------------------------------------
+   Tables: compact, hairline rows, numeric right-aligned
+   -------------------------------------------------------------------------- */
+.table {
+    --bs-table-bg: transparent;
+    --bs-table-color: var(--text);
+    --bs-table-border-color: var(--border);
+    margin-bottom: 0;
+    font-size: 13px;
+}
+
+.table > :not(caption) > * > * {
+    padding: var(--sp-2) var(--sp-3);
+    background-color: transparent;
+}
+
+.table thead th {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.table tbody tr:hover {
+    background-color: var(--surface-2);
+}
+
+/* --------------------------------------------------------------------------
+   Forms: compact, restrained focus ring
+   -------------------------------------------------------------------------- */
+.form-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: var(--sp-1);
+}
+
+.form-control,
+.form-select {
+    background-color: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 13px;
+    padding: var(--sp-1) var(--sp-2);
+}
+
+.form-control:focus,
+.form-select:focus {
+    background-color: var(--bg);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-dim);
+    color: var(--text);
+}
+
+.form-control.is-invalid {
+    border-color: var(--loss);
+}
+
+.invalid-feedback {
+    font-size: 12px;
+    color: var(--loss);
 }
 
 .btn {
-    border-radius: 0.375rem;
+    font-size: 13px;
     font-weight: 500;
-    transition: all 0.2s ease;
+    border-radius: 4px;
+    padding: var(--sp-1) var(--sp-3);
 }
 
-.form-control, .form-select {
-    border-radius: 0.375rem;
-    border: 1px solid #dee2e6;
+.btn-primary {
+    --bs-btn-bg: var(--accent);
+    --bs-btn-border-color: var(--accent);
+    --bs-btn-hover-bg: #5ba0f9;
+    --bs-btn-hover-border-color: #5ba0f9;
+    --bs-btn-active-bg: #3b86e8;
+    --bs-btn-active-border-color: #3b86e8;
 }
 
-.form-control:focus, .form-select:focus {
-    border-color: var(--primary-color);
-    box-shadow: 0 0 0 0.2rem rgba(13, 110, 253, 0.25);
+.btn-outline-secondary {
+    --bs-btn-color: var(--text-muted);
+    --bs-btn-border-color: var(--border);
+    --bs-btn-hover-bg: var(--surface-2);
+    --bs-btn-hover-border-color: var(--border);
+    --bs-btn-hover-color: var(--text);
 }
 
-.badge {
-    padding: 0.5rem 0.75rem;
-    border-radius: 0.375rem;
-    font-weight: 500;
+/* --------------------------------------------------------------------------
+   Toasts (top-right)
+   -------------------------------------------------------------------------- */
+.toast-container-app {
+    position: fixed;
+    top: 56px;
+    right: var(--sp-4);
+    z-index: 1080;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    max-width: 360px;
 }
 
-.table {
-    margin-bottom: 0;
+.toast-app {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-2);
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--text-muted);
+    border-radius: 6px;
+    padding: var(--sp-3) var(--sp-4);
+    font-size: 13px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    animation: toast-in 0.18s ease-out;
 }
 
-.table td {
-    vertical-align: middle;
-    padding: 0.75rem;
+.toast-app.toast-success { border-left-color: var(--gain); }
+.toast-app.toast-error   { border-left-color: var(--loss); }
+.toast-app.toast-warning { border-left-color: var(--warn); }
+.toast-app.toast-info    { border-left-color: var(--accent); }
+
+.toast-app .toast-msg { flex: 1 1 auto; word-break: break-word; }
+
+.toast-app .btn-close {
+    flex: 0 0 auto;
+    font-size: 10px;
+    margin-top: 2px;
 }
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateX(8px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+
+/* --------------------------------------------------------------------------
+   Loading: overlay + spinner + skeleton rows
+   -------------------------------------------------------------------------- */
+.loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(13, 17, 23, 0.7);
+    border-radius: inherit;
+    z-index: 10;
+}
+
+.pos-relative { position: relative; }
 
 .spinner-border {
-    color: var(--primary-color);
+    color: var(--accent);
 }
 
-.alert {
-    border-radius: 0.375rem;
-    border: none;
+.skeleton {
+    display: block;
+    height: 14px;
+    border-radius: 3px;
+    background: linear-gradient(
+        90deg,
+        var(--surface-2) 25%,
+        #232a35 50%,
+        var(--surface-2) 75%
+    );
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.2s ease-in-out infinite;
 }
 
-.list-group-item {
-    border: 1px solid #e9ecef;
-    border-radius: 0.375rem;
-    margin-bottom: 0.5rem;
+@keyframes skeleton-shimmer {
+    from { background-position: 200% 0; }
+    to   { background-position: -200% 0; }
 }
 
-@keyframes fadeIn {
-    from {
-        opacity: 0;
-        transform: translateY(10px);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
+/* --------------------------------------------------------------------------
+   Empty state: icon + message + hint
+   -------------------------------------------------------------------------- */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
+    padding: var(--sp-8) var(--sp-4);
+    text-align: center;
+    color: var(--text-muted);
 }
 
-.card {
-    animation: fadeIn 0.3s ease;
+.empty-state .bi {
+    font-size: 28px;
+    opacity: 0.5;
 }
+
+.empty-state .empty-msg {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.empty-state .empty-hint {
+    font-size: 12px;
+}
+
+/* --------------------------------------------------------------------------
+   Status bar (bottom, one line, muted)
+   -------------------------------------------------------------------------- */
+.status-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-1) var(--sp-4);
+    border-top: 1px solid var(--border);
+    background-color: var(--surface);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+.status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: var(--text-muted);
+    vertical-align: middle;
+}
+
+.status-dot.ok    { background-color: var(--gain); }
+.status-dot.error { background-color: var(--loss); }
+
+/* --------------------------------------------------------------------------
+   Misc utilities
+   -------------------------------------------------------------------------- */
+.text-muted { color: var(--text-muted) !important; }
+
+.page-title {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    margin: 0;
+}
+
+.page-subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.badge-unread {
+    background-color: var(--loss);
+    color: #fff;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    border-radius: 8px;
+    padding: 1px 6px;
+}
+
+.provenance-caption {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+}
+
+a { text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Plotly charts inherit the page background; kill default white flash */
+.js-plotly-plot, .plot-container { background: transparent !important; }
+
+/* --------------------------------------------------------------------------
+   Progress bar (async backtests)
+   -------------------------------------------------------------------------- */
+.progress-app {
+    height: 6px;
+    border-radius: 3px;
+    background-color: var(--surface-2);
+    overflow: hidden;
+}
+
+.progress-app .progress-fill {
+    height: 100%;
+    background-color: var(--accent);
+    border-radius: 3px;
+    transition: width 0.4s ease;
+}
+
+.progress-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    margin-top: var(--sp-1);
+}
+
+/* --------------------------------------------------------------------------
+   Sortable table headers (click to sort)
+   -------------------------------------------------------------------------- */
+th.sortable {
+    cursor: pointer;
+    user-select: none;
+}
+
+th.sortable:hover { color: var(--text); }
+
+th.sortable .sort-arrow {
+    display: inline-block;
+    width: 1em;
+    color: var(--accent);
+}
+
+/* --------------------------------------------------------------------------
+   Inline notes (pending signals, benchmark unavailable, risk feedback)
+   -------------------------------------------------------------------------- */
+.note-line {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+    font-size: 12px;
+    color: var(--text-muted);
+    border-left: 2px solid var(--accent);
+    background-color: var(--accent-dim);
+    border-radius: 0 4px 4px 0;
+    padding: var(--sp-2) var(--sp-3);
+}
+
+.note-line.note-warn {
+    border-left-color: var(--warn);
+    background-color: rgba(210, 153, 34, 0.12);
+}
+
+.risk-feedback {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    min-height: 16px;
+}
+
+.risk-feedback.risk-breach { color: var(--warn); }
+
+/* --------------------------------------------------------------------------
+   Trading Floor desks: per-firm accent on an otherwise uniform card
+   -------------------------------------------------------------------------- */
+.desk-card { border-top: 2px solid var(--desk-accent, var(--accent)); }
+
+.desk-card .card-header .bi { color: var(--desk-accent, var(--accent)); }
+
+.desk-rentech    { --desk-accent: #58a6ff; }  /* signal blue */
+.desk-citadel    { --desk-accent: #bc8cff; }  /* pod purple  */
+.desk-janestreet { --desk-accent: #d2a822; }  /* vol gold    */
+
+.desk-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    min-height: 3.6em;
+    margin-bottom: var(--sp-3);
+}
+
+.badge-phase {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+}
+
+.metric-disabled {
+    opacity: 0.55;
+    background-color: var(--bg);
+}
+
+.desk-footnote {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: var(--sp-4) var(--sp-1) 0;
+}
+
+.desk-footnote .bi { color: var(--accent); }

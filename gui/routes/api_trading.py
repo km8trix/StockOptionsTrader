@@ -38,7 +38,7 @@ active_traders = {}
 def create_trader():
     """Create a new paper or live trading session"""
     try:
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         trader_id = data.get('trader_id', 'default')
         mode = data.get('mode', 'paper')
         
@@ -72,7 +72,7 @@ def place_order(trader_id):
         if trader_id not in active_traders:
             return jsonify({'error': f'Trader {trader_id} not found'}), 404
             
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         symbol = data.get('symbol', '').upper()
         action = data.get('action', 'BUY').upper()
         quantity = int(data.get('quantity', 0))
@@ -91,6 +91,54 @@ def place_order(trader_id):
     except Exception:
         logger.error('Failed to place order', exc_info=True)
         return jsonify({'error': 'Failed to place order'}), 500
+
+@trading_bp.route('/trader/<trader_id>/orders', methods=['GET'])
+def list_pending_orders(trader_id):
+    """List the trader's pending (unfilled) orders with their ids.
+
+    The portfolio status endpoint only exposes a pending-order COUNT; the
+    paper-trading UI needs the actual orders to offer per-order cancel.
+    Brokers without a pending_orders queue degrade to an empty list.
+    """
+    try:
+        if trader_id not in active_traders:
+            return jsonify({'error': f'Trader {trader_id} not found'}), 404
+
+        trader = active_traders[trader_id]
+        pending = getattr(trader, 'pending_orders', None) or []
+        orders = [
+            {
+                'order_id': order.order_id,
+                'symbol': order.asset.symbol,
+                'side': order.order_type.value.upper(),
+                'quantity': order.quantity,
+                'limit_price': order.price,  # None == market order
+                'timestamp': order.timestamp.isoformat()
+                if hasattr(order.timestamp, 'isoformat') else str(order.timestamp),
+            }
+            for order in pending
+        ]
+        return jsonify({'orders': orders, 'count': len(orders)})
+    except Exception:
+        logger.error('Failed to list pending orders', exc_info=True)
+        return jsonify({'error': 'Failed to retrieve pending orders'}), 500
+
+
+@trading_bp.route('/trader/<trader_id>/order/<order_id>/cancel', methods=['POST'])
+def cancel_pending_order(trader_id, order_id):
+    """Cancel one pending order by id."""
+    try:
+        if trader_id not in active_traders:
+            return jsonify({'error': f'Trader {trader_id} not found'}), 404
+
+        trader = active_traders[trader_id]
+        if trader.cancel_order(order_id):
+            return jsonify({'message': 'Order cancelled', 'order_id': order_id})
+        return jsonify({'error': f'Order {order_id} not found'}), 404
+    except Exception:
+        logger.error('Failed to cancel order %s', order_id, exc_info=True)
+        return jsonify({'error': 'Failed to cancel order'}), 500
+
 
 @trading_bp.route('/trader/<trader_id>/status', methods=['GET'])
 def get_trader_status(trader_id):
@@ -138,7 +186,7 @@ def mark_alert_read(alert_id):
 def add_price_target():
     """Add price target alert"""
     try:
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         symbol = data.get('symbol')
         target_price = data.get('target_price')
         
@@ -179,7 +227,7 @@ def manage_risk_settings():
                 'position_stop_loss': risk_manager.position_stop_loss,
             })
             
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         if 'max_position_size' in data:
             risk_manager.max_position_size = data['max_position_size']
         if 'max_sector_exposure' in data:

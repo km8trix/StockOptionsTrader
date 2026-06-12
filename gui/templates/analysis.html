@@ -1,218 +1,75 @@
 {% extends "base.html" %}
 
+{% block title %}Analysis · StockOptionsTrader{% endblock %}
+
 {% block content %}
-<div class="row mb-4">
-    <div class="col-md-12">
-        <h2><i class="bi bi-bar-chart"></i> Technical Analysis</h2>
-        <p class="text-muted">Analyze stocks with technical indicators</p>
-    </div>
+<div class="d-flex align-items-baseline gap-3 mb-3">
+    <h1 class="page-title">Analysis</h1>
+    <p class="page-subtitle">Candlesticks · SMA · Bollinger · MACD · RSI · strategy signals</p>
 </div>
 
-<div class="row">
-    <div class="col-md-3">
-        <div class="card shadow-sm mb-4">
-            <div class="card-header bg-info text-white">
-                <h5 class="mb-0">Analyze Stock</h5>
-            </div>
+<div class="row g-2">
+    <div class="col-lg-3 col-xl-2">
+        <div class="card">
+            <div class="card-header">Analyze symbol</div>
             <div class="card-body">
-                <form id="analysisForm">
+                <form id="analysisForm" novalidate>
                     <div class="mb-3">
-                        <label class="form-label">Symbol</label>
-                        <input type="text" class="form-control" id="analysisSymbol" placeholder="AAPL" value="AAPL">
+                        <label class="form-label" for="analysisSymbol">Symbol</label>
+                        <input type="text" class="form-control num" id="analysisSymbol"
+                               placeholder="AAPL" value="AAPL" autocomplete="off"
+                               spellcheck="false" maxlength="10" required>
+                        <div class="invalid-feedback">Enter a symbol (letters, dots, dashes).</div>
                     </div>
-                    
                     <div class="mb-3">
-                        <label class="form-label">Days Back</label>
-                        <input type="number" class="form-control" id="daysBack" value="252">
+                        <label class="form-label" for="startDate">Start date</label>
+                        <input type="date" class="form-control num" id="startDate" required>
+                        <div class="invalid-feedback">Start must be before end.</div>
                     </div>
-                    
-                    <button type="submit" class="btn btn-info w-100">
-                        <i class="bi bi-search"></i> Analyze
-                    </button>
-                </form>
-            </div>
-        </div>
-        
-        <div class="card shadow-sm">
-            <div class="card-header bg-warning text-dark">
-                <h5 class="mb-0">Price Option</h5>
-            </div>
-            <div class="card-body">
-                <form id="optionForm">
                     <div class="mb-3">
-                        <label class="form-label">Stock Price ($)</label>
-                        <input type="number" class="form-control" id="stockPrice" value="150" step="0.01">
+                        <label class="form-label" for="endDate">End date</label>
+                        <input type="date" class="form-control num" id="endDate" required>
+                        <div class="invalid-feedback">End date is required.</div>
                     </div>
-                    
                     <div class="mb-3">
-                        <label class="form-label">Strike ($)</label>
-                        <input type="number" class="form-control" id="strike" value="150" step="0.01">
+                        <label class="form-label" for="strategySelect">Signal overlay</label>
+                        <select class="form-select" id="strategySelect">
+                            <option value="" selected>None</option>
+                        </select>
                     </div>
-                    
-                    <div class="mb-3">
-                        <label class="form-label">Days to Expiry</label>
-                        <input type="number" class="form-control" id="daysExpiry" value="30">
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label class="form-label">Volatility (%)</label>
-                        <input type="number" class="form-control" id="volatility" value="25">
-                    </div>
-                    
-                    <button type="submit" class="btn btn-warning w-100">
-                        <i class="bi bi-calculator"></i> Price Option
+                    <button type="submit" class="btn btn-primary w-100" id="analyzeBtn">
+                        <i class="bi bi-search" aria-hidden="true"></i> Analyze
                     </button>
                 </form>
             </div>
         </div>
     </div>
-    
-    <div class="col-md-9">
-        <div id="analysisContainer"></div>
+
+    <div class="col-lg-9 col-xl-10">
+        <!-- Current indicator snapshot -->
+        <div id="snapshotRow" class="row g-2 mb-2 d-none">
+            <div class="col"><div class="metric-card"><div class="metric-label">Last</div><div class="metric-value num" id="snapPrice">—</div></div></div>
+            <div class="col"><div class="metric-card"><div class="metric-label">RSI 14</div><div class="metric-value num" id="snapRsi">—</div></div></div>
+            <div class="col"><div class="metric-card"><div class="metric-label">MACD</div><div class="metric-value num" id="snapMacd">—</div></div></div>
+            <div class="col"><div class="metric-card"><div class="metric-label">SMA 20</div><div class="metric-value num" id="snapSma20">—</div></div></div>
+            <div class="col"><div class="metric-card"><div class="metric-label">SMA 50</div><div class="metric-value num" id="snapSma50">—</div></div></div>
+        </div>
+
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span id="chartTitle">Chart</span>
+                <span class="provenance-caption" id="provenanceCaption"></span>
+            </div>
+            <div class="card-body p-2 pos-relative" id="chartPanel">
+                <div id="chartEmpty"></div>
+                <div id="analysisChart" class="d-none" style="min-height: 640px;"></div>
+            </div>
+        </div>
     </div>
 </div>
-
 {% endblock %}
 
 {% block extra_js %}
-<script>
-document.getElementById('analysisForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const symbol = document.getElementById('analysisSymbol').value;
-    const days = document.getElementById('daysBack').value;
-    
-    const container = document.getElementById('analysisContainer');
-    container.innerHTML = '<div class="spinner-border" role="status"></div>';
-    
-    try {
-        const response = await fetch(`/api/analyze/${symbol}?days=${days}`);
-        const data = await response.json();
-        
-        if (!response.ok) {
-            container.innerHTML = `<div class="alert alert-danger">${data.error}</div>`;
-            return;
-        }
-        
-        container.innerHTML = `
-            <div class="card shadow-sm mb-4">
-                <div class="card-header bg-primary text-white">
-                    <h5 class="mb-0">${symbol} - Technical Analysis</h5>
-                </div>
-                <div class="card-body">
-                    <div class="row">
-                        <div class="col-md-6">
-                            <h6>Current Indicators</h6>
-                            <table class="table table-sm">
-                                <tr>
-                                    <td><strong>Price:</strong></td>
-                                    <td>$${data.current_price?.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>RSI:</strong></td>
-                                    <td>${data.current_rsi?.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>MACD:</strong></td>
-                                    <td>${data.current_macd?.toFixed(4)}</td>
-                                </tr>
-                            </table>
-                        </div>
-                        <div class="col-md-6">
-                            <h6>Moving Averages</h6>
-                            <table class="table table-sm">
-                                <tr>
-                                    <td><strong>SMA 20:</strong></td>
-                                    <td>$${data.current_sma_20?.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>SMA 50:</strong></td>
-                                    <td>$${data.current_sma_50?.toFixed(2)}</td>
-                                </tr>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        `;
-    } catch (error) {
-        container.innerHTML = `<div class="alert alert-danger">Error: ${error.message}</div>`;
-    }
-});
-
-document.getElementById('optionForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const stockPrice = parseFloat(document.getElementById('stockPrice').value);
-    const strike = parseFloat(document.getElementById('strike').value);
-    const daysExpiry = parseFloat(document.getElementById('daysExpiry').value);
-    const volatility = parseFloat(document.getElementById('volatility').value) / 100;
-    
-    try {
-        const response = await fetch('/api/price_option', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                stock_price: stockPrice,
-                strike: strike,
-                time_to_expiry: daysExpiry,
-                volatility: volatility,
-                option_type: 'call'
-            })
-        });
-        
-        const data = await response.json();
-        
-        if (!response.ok) {
-            alert(`Error: ${data.error}`);
-            return;
-        }
-        
-        const container = document.getElementById('analysisContainer');
-        container.innerHTML = `
-            <div class="card shadow-sm">
-                <div class="card-header bg-warning text-dark">
-                    <h5 class="mb-0">Option Prices (Black-Scholes)</h5>
-                </div>
-                <div class="card-body">
-                    <div class="row">
-                        <div class="col-md-6">
-                            <h6>Parameters</h6>
-                            <table class="table table-sm">
-                                <tr>
-                                    <td><strong>Stock Price:</strong></td>
-                                    <td>$${data.stock_price.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Strike:</strong></td>
-                                    <td>$${data.strike.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Days to Expiry:</strong></td>
-                                    <td>${data.time_to_expiry_days}</td>
-                                </tr>
-                            </table>
-                        </div>
-                        <div class="col-md-6">
-                            <h6>Prices</h6>
-                            <table class="table table-sm">
-                                <tr>
-                                    <td><strong>Call Price:</strong></td>
-                                    <td class="badge bg-success" style="font-size: 1rem;">$${data.call_price.toFixed(2)}</td>
-                                </tr>
-                                <tr>
-                                    <td><strong>Put Price:</strong></td>
-                                    <td class="badge bg-danger" style="font-size: 1rem;">$${data.put_price.toFixed(2)}</td>
-                                </tr>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        `;
-    } catch (error) {
-        alert(`Error: ${error.message}`);
-    }
-});
-</script>
+<script src="{{ url_for('static', filename='vendor/plotly/plotly.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/analysis.js') }}"></script>
 {% endblock %}

@@ -104,6 +104,36 @@ class PortfolioManager:
         drawdowns = (np.array(values) - running_max) / running_max
         return float(np.min(drawdowns) * 100)
 
+    def get_drawdown_series(self) -> List[Dict]:
+        """Per-snapshot drawdown from the running portfolio-value maximum.
+
+        Returns [{'date': 'YYYY-MM-DD', 'drawdown_pct': float <= 0}, ...],
+        one entry per portfolio_history snapshot, using the same math as
+        get_max_drawdown (so min(drawdown_pct) == get_max_drawdown()).
+        Returns [] when there is no history.
+        """
+        if not self.portfolio_history:
+            return []
+
+        values = [h['portfolio_value'] for h in self.portfolio_history]
+        running_max = np.maximum.accumulate(values)
+
+        # Avoid division runtime warnings if running_max somehow encounters 0
+        running_max = np.where(running_max == 0, 1.0, running_max)
+
+        drawdowns = (np.array(values) - running_max) / running_max * 100
+
+        series: List[Dict] = []
+        for snapshot, drawdown_pct in zip(self.portfolio_history, drawdowns):
+            timestamp = snapshot['timestamp']
+            if hasattr(timestamp, 'strftime'):
+                date_str = timestamp.strftime('%Y-%m-%d')
+            else:
+                date_str = str(timestamp)[:10]
+            series.append({'date': date_str,
+                           'drawdown_pct': float(drawdown_pct)})
+        return series
+
     def get_daily_returns(self) -> List[float]:
         """Simple returns between consecutive portfolio_history snapshots.
 

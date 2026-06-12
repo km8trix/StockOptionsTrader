@@ -18,3 +18,12 @@ def paper_trade_page():
 @views_bp.route('/analysis')
 def analysis_page():
     return render_template('analysis.html')
+
+@views_bp.route('/floor')
+def floor_page():
+    return render_template('floor.html')
+
+@views_bp.route('/trading_floor')
+def trading_floor_page():
+    # Back-compat alias for the Stage 1 nav link; same page as /floor.
+    return render_template('floor.html')

@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}Trading Floor · StockOptionsTrader{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-baseline gap-3 mb-3">
+    <h1 class="page-title">Trading Floor</h1>
+    <p class="page-subtitle">Firm-style desks · strategy + risk + capital allocation</p>
+</div>
+
+<div class="row g-2">
+    <!-- Renaissance desk (Phase 6) -->
+    <div class="col-md-6 col-xl-4">
+        <div class="card desk-card desk-rentech h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-diagram-3" aria-hidden="true"></i> Renaissance</span>
+                <span class="badge-phase">Activates in Phase 6</span>
+            </div>
+            <div class="card-body">
+                <p class="desk-desc">Gaussian HMM regime detection, regime-conditioned 1–5d
+                   mean reversion, nonlinear stat-arb, cointegration pairs.</p>
+                <div class="row g-2" aria-disabled="true">
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">Regime</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">P&amp;L</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">Risk</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Citadel desk (Phase 7) -->
+    <div class="col-md-6 col-xl-4">
+        <div class="card desk-card desk-citadel h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-grid-1x2" aria-hidden="true"></i> Citadel</span>
+                <span class="badge-phase">Activates in Phase 7</span>
+            </div>
+            <div class="card-body">
+                <p class="desk-desc">Strategy pods with own capital, central risk book with
+                   vega/gamma limits, performance-weighted capital reallocation.</p>
+                <div class="row g-2" aria-disabled="true">
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">Regime</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">P&amp;L</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">Risk</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Jane Street desk (Phase 8) -->
+    <div class="col-md-6 col-xl-4">
+        <div class="card desk-card desk-janestreet h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-sliders" aria-hidden="true"></i> Jane Street</span>
+                <span class="badge-phase">Activates in Phase 8</span>
+            </div>
+            <div class="card-body">
+                <p class="desk-desc">Fair-value engine, simulated market-making, IV-rank VRP
+                   selling gated by the Renaissance regime model.</p>
+                <div class="row g-2" aria-disabled="true">
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">Regime</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">P&amp;L</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                    <div class="col-4"><div class="metric-card metric-disabled">
+                        <div class="metric-label">Risk</div>
+                        <div class="metric-value num">—</div>
+                    </div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<p class="desk-footnote">
+    <i class="bi bi-link-45deg" aria-hidden="true"></i>
+    Cross-desk synergy: the Renaissance regime model gates Jane Street premium selling;
+    the Citadel central risk book enforces portfolio-wide vega/gamma limits.
+    Until then, backtesting and paper trading are fully operational.
+</p>
+{% endblock %}

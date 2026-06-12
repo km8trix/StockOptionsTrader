@@ -15,7 +15,7 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from core.models import Asset, AssetType, Order, OrderType, OrderStatus, Position
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
@@ -46,7 +46,9 @@ class BacktestEngine:
         self.pending_intents: Dict[Asset, Dict] = {}
 
     def run(self, symbols: List[str], start_date: str, end_date: str,
-            position_size: float = 0.1) -> Dict:
+            position_size: float = 0.1,
+            progress_callback: Optional[Callable[[float], None]] = None,
+            benchmark_symbol: Optional[str] = 'SPY') -> Dict:
         """Run backtest on given symbols.
 
         Each simulated trading day executes, in this order:
@@ -58,6 +60,14 @@ class BacktestEngine:
             3. Compute indicators/signals on data through today (expanding
                window) and queue resulting BUY/SELL intents for the next day.
             4. Record the portfolio snapshot.
+
+        progress_callback, when given, is invoked after each simulated day
+        with the percentage of trading days processed (float 0-100,
+        monotonically nondecreasing, exactly 100.0 once at completion).
+
+        benchmark_symbol, when set, adds a buy-and-hold benchmark equity
+        curve to the report under 'benchmark' (None on any benchmark data
+        failure — the backtest itself never fails because of the benchmark).
         """
         all_data = {}
         for symbol in symbols:
@@ -80,7 +90,8 @@ class BacktestEngine:
         self.pending_intents = {}
 
         # Simulate sequential historical trading day by day
-        for date in sorted_dates:
+        total_days = len(sorted_dates)
+        for day_number, date in enumerate(sorted_dates, start=1):
             # --- PHASE 1: FILL PENDING INTENTS AT TODAY'S OPEN ---
             self._fill_pending_intents(all_data, date, position_size)
 
@@ -119,7 +130,17 @@ class BacktestEngine:
             # --- PHASE 4: RECORD SNAPSHOT ---
             self.portfolio.record_snapshot(date)
 
-        return self._generate_report()
+            if progress_callback is not None:
+                if day_number == total_days:
+                    pct = 100.0
+                else:
+                    # Guard against float rounding ever reporting an early
+                    # 100.0: only the final day may emit exactly 100.0.
+                    pct = min(100.0 * day_number / total_days, 99.99)
+                progress_callback(pct)
+
+        return self._generate_report(benchmark_symbol=benchmark_symbol,
+                                     start_date=start_date, end_date=end_date)
 
     def _fill_pending_intents(self, all_data: Dict[str, pd.DataFrame],
                               date, position_size: float) -> None:
@@ -233,13 +254,62 @@ class BacktestEngine:
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
 
-    def _generate_report(self) -> Dict:
+    def _build_benchmark(self, benchmark_symbol: str, start_date: str,
+                         end_date: str) -> Optional[Dict]:
+        """Buy-and-hold benchmark equity curve over the backtest date range.
+
+        initial_capital is notionally invested at the first available
+        benchmark close in range; the position is marked at each session
+        close, so value[0] == initial_capital by construction. Fetched via
+        self.market_data so the persistent OHLCV cache applies. Returns None
+        (with a WARNING log) on any data failure — the caller must treat the
+        benchmark as strictly optional.
+        """
+        try:
+            data = self.market_data.fetch_stock_data(
+                benchmark_symbol, start_date, end_date)
+            if data is None or data.empty or 'close' not in data.columns:
+                raise ValueError(f"no usable data for {benchmark_symbol}")
+
+            closes = data['close'].dropna()
+            if closes.empty:
+                raise ValueError(f"all closes NaN for {benchmark_symbol}")
+
+            base_close = float(closes.iloc[0])
+            if base_close <= 0:
+                raise ValueError(
+                    f"non-positive base close {base_close} for {benchmark_symbol}")
+
+            initial_capital = self.portfolio.initial_capital
+            equity_curve = [
+                {
+                    'date': ts.strftime('%Y-%m-%d'),
+                    'value': float(close) / base_close * initial_capital,
+                }
+                for ts, close in closes.items()
+            ]
+            return {'symbol': benchmark_symbol, 'equity_curve': equity_curve}
+        except Exception as e:
+            logger.warning("Benchmark %s unavailable (%s..%s): %s",
+                           benchmark_symbol, start_date, end_date, e)
+            return None
+
+    def _generate_report(self, benchmark_symbol: Optional[str] = None,
+                         start_date: Optional[str] = None,
+                         end_date: Optional[str] = None) -> Dict:
         """Generate backtest report"""
         summary = self.portfolio.get_summary()
+
+        benchmark = None
+        if benchmark_symbol:
+            benchmark = self._build_benchmark(benchmark_symbol,
+                                              start_date, end_date)
 
         return {
             'strategy': self.strategy.name,
             'summary': summary,
+            'benchmark': benchmark,
+            'drawdown_series': self.portfolio.get_drawdown_series(),
             'trades': self.trades_log,
             'closed_trades': [
                 {
