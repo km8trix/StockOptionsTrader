@@ -287,6 +287,59 @@ class TestConfigurationGates:
         assert manager.env == "production"
         assert manager.api_base_url == "https://api.etrade.com"
 
+
+class TestEnvScopedConsumerKeys:
+    """Sandbox and production consumer keys are different pairs at
+    E*TRADE; env-scoped names take precedence over the legacy generic
+    names so both pairs can coexist in .env."""
+
+    def test_sandbox_prefers_env_scoped_names(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ETRADE_CONSUMER_KEY", "ck-generic")
+        monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "cs-generic")
+        monkeypatch.setenv("ETRADE_SANDBOX_CONSUMER_KEY", "ck-sb")
+        monkeypatch.setenv("ETRADE_SANDBOX_CONSUMER_SECRET", "cs-sb")
+        monkeypatch.setenv("ETRADE_ENV", "sandbox")
+        manager = EtradeAuthManager(db_path=str(tmp_path / "a.db"),
+                                    session_factory=FakeFactory())
+        assert manager.consumer_key == "ck-sb"
+        assert manager.consumer_secret == "cs-sb"
+
+    def test_production_prefers_prod_scoped_names(self, monkeypatch,
+                                                  tmp_path):
+        monkeypatch.setenv("ETRADE_CONSUMER_KEY", "ck-generic")
+        monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "cs-generic")
+        monkeypatch.setenv("ETRADE_PROD_CONSUMER_KEY", "ck-prod")
+        monkeypatch.setenv("ETRADE_PROD_CONSUMER_SECRET", "cs-prod")
+        monkeypatch.setenv("ETRADE_ENV", "production")
+        monkeypatch.setenv("ETRADE_PRODUCTION_ACK",
+                           "I_UNDERSTAND_LIVE_TRADING")
+        manager = EtradeAuthManager(db_path=str(tmp_path / "a.db"),
+                                    session_factory=FakeFactory())
+        assert manager.consumer_key == "ck-prod"
+        assert manager.consumer_secret == "cs-prod"
+
+    def test_sandbox_ignores_prod_scoped_names(self, monkeypatch,
+                                               tmp_path):
+        monkeypatch.delenv("ETRADE_CONSUMER_KEY", raising=False)
+        monkeypatch.delenv("ETRADE_CONSUMER_SECRET", raising=False)
+        monkeypatch.setenv("ETRADE_PROD_CONSUMER_KEY", "ck-prod")
+        monkeypatch.setenv("ETRADE_PROD_CONSUMER_SECRET", "cs-prod")
+        monkeypatch.setenv("ETRADE_ENV", "sandbox")
+        manager = EtradeAuthManager(db_path=str(tmp_path / "a.db"),
+                                    session_factory=FakeFactory())
+        assert manager.status()["state"] == "unconfigured"
+
+    def test_generic_fallback_still_works(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ETRADE_SANDBOX_CONSUMER_KEY", raising=False)
+        monkeypatch.delenv("ETRADE_SANDBOX_CONSUMER_SECRET", raising=False)
+        monkeypatch.setenv("ETRADE_CONSUMER_KEY", "ck-generic")
+        monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "cs-generic")
+        monkeypatch.setenv("ETRADE_ENV", "sandbox")
+        manager = EtradeAuthManager(db_path=str(tmp_path / "a.db"),
+                                    session_factory=FakeFactory())
+        assert manager.consumer_key == "ck-generic"
+        assert manager.consumer_secret == "cs-generic"
+
     def test_sandbox_api_base(self, sandbox_env, tmp_path):
         manager, _ = make_manager(tmp_path)
         assert manager.api_base_url == "https://apisb.etrade.com"

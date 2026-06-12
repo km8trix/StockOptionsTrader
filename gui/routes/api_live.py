@@ -33,6 +33,9 @@ Response shapes consumed by gui/static/js/live.js:
   POST /api/live/reconcile   -> <C19 result> + {'kill_switch_engaged': bool}
   GET  /api/live/orders (additive)         -> {'orders': [...], 'count': int}
   POST /api/live/orders/<id>/cancel (additive)
+  GET  /api/live/scheduler   -> <LiveScheduler.status()> + interval_minutes
+  POST /api/live/scheduler {action: 'start'|'stop', interval_minutes?}
+        -> same shape as GET (503 until a scheduler is configured)
 """
 from __future__ import annotations
 
@@ -95,6 +98,18 @@ except Exception as e:  # noqa: BLE001
     logger.error(
         'Failed to import reconcile — reconciliation is unavailable: %s',
         RECONCILE_IMPORT_ERROR,
+    )
+
+SCHEDULER_IMPORT_ERROR: str | None
+try:
+    from utils.scheduler import LiveScheduler
+    SCHEDULER_IMPORT_ERROR = None
+except Exception as e:  # noqa: BLE001
+    LiveScheduler = None
+    SCHEDULER_IMPORT_ERROR = f'{type(e).__name__}: {e}'
+    logger.error(
+        'Failed to import LiveScheduler — the scheduler is unavailable: %s',
+        SCHEDULER_IMPORT_ERROR,
     )
 
 live_bp = Blueprint('live', __name__, url_prefix='/api/live')
@@ -183,6 +198,34 @@ def auth_unavailable_reason() -> str:
     """Reason string for 503s when the auth surface is unusable."""
     return (ETRADE_AUTH_IMPORT_ERROR or _auth_construct_error
             or 'EtradeAuthManager construction failed')
+
+
+# The process-wide LiveScheduler. Deliberately NOT auto-constructed: a
+# scheduler needs a LiveTradingSession (desk + broker + portfolio +
+# data_fn), which only the operator's live wiring can provide. Whoever
+# builds that session installs its scheduler here via set_scheduler();
+# until then the /scheduler routes answer 503 'unconfigured' — automation
+# that materializes by itself is exactly what Phase 9 ruled out.
+_scheduler = None
+
+
+def set_scheduler(scheduler) -> None:
+    """Install (or clear, with None) the shared LiveScheduler."""
+    global _scheduler
+    with _singleton_lock:
+        _scheduler = scheduler
+
+
+def get_scheduler():
+    """The installed LiveScheduler, or None while unconfigured."""
+    return _scheduler
+
+
+def scheduler_unavailable_reason() -> str:
+    """Reason string for 503s when the scheduler surface is unusable."""
+    return (SCHEDULER_IMPORT_ERROR
+            or 'No live scheduler is configured — create a live trading '
+               'session (which installs its scheduler) first.')
 
 
 def kill_switch_engaged() -> bool:
@@ -520,3 +563,77 @@ def cancel_working_order(order_id):
         logger.error('Failed to cancel working order %s', order_id,
                      exc_info=True)
         return jsonify({'error': 'Failed to cancel order'}), 500
+
+
+# ==================== MARKET-HOURS SCHEDULER ====================
+
+#: Bounds for the GUI-settable evaluation interval (minutes).
+SCHEDULER_INTERVAL_MIN = 1
+SCHEDULER_INTERVAL_MAX = 240
+
+
+def _scheduler_payload(scheduler) -> dict:
+    """LiveScheduler.status() plus the configured interval (one shape for
+    GET and POST so live.js renders both identically)."""
+    payload = dict(scheduler.status())
+    payload['interval_minutes'] = getattr(scheduler, 'interval_minutes', None)
+    return payload
+
+
+@live_bp.route('/scheduler', methods=['GET'])
+def scheduler_status():
+    """Scheduler state for the Live page card.
+
+    503 until a scheduler is configured (set_scheduler) — the GUI never
+    constructs a trading loop on its own.
+    """
+    scheduler = get_scheduler()
+    if scheduler is None:
+        return _unavailable('Scheduler', scheduler_unavailable_reason())
+    try:
+        return jsonify(_scheduler_payload(scheduler))
+    except Exception:
+        logger.error('Failed to read scheduler status', exc_info=True)
+        return jsonify({'error': 'Failed to read scheduler status'}), 500
+
+
+@live_bp.route('/scheduler', methods=['POST'])
+def scheduler_action():
+    """Start/stop the scheduler ({action: 'start'|'stop'}).
+
+    'start' optionally takes interval_minutes (an int, 1-240) applied
+    before the loop starts. The scheduler itself audits every start/stop/
+    pause; pause states (kill switch, circuit breaker, error storm) can
+    ONLY be cleared by an explicit 'start' — there is no 'resume'.
+    """
+    scheduler = get_scheduler()
+    if scheduler is None:
+        return _unavailable('Scheduler', scheduler_unavailable_reason())
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if action not in ('start', 'stop'):
+        return jsonify(
+            {'error': "'action' must be 'start' or 'stop'"}), 400
+    interval = data.get('interval_minutes')
+    if interval is not None:
+        if action != 'start':
+            return jsonify({'error': "'interval_minutes' only applies to "
+                                     "action 'start'"}), 400
+        if (not isinstance(interval, int) or isinstance(interval, bool)
+                or not SCHEDULER_INTERVAL_MIN <= interval
+                <= SCHEDULER_INTERVAL_MAX):
+            return jsonify(
+                {'error': f"'interval_minutes' must be an integer between "
+                          f'{SCHEDULER_INTERVAL_MIN} and '
+                          f'{SCHEDULER_INTERVAL_MAX}'}), 400
+    try:
+        if action == 'start':
+            if interval is not None:
+                scheduler.interval_minutes = interval
+            scheduler.start()
+        else:
+            scheduler.stop()
+        return jsonify(_scheduler_payload(scheduler))
+    except Exception:
+        logger.error('Scheduler %s failed', action, exc_info=True)
+        return jsonify({'error': f'Scheduler {action} failed'}), 500

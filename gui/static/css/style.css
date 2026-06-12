@@ -1032,6 +1032,29 @@ th.sortable .sort-arrow {
     margin: 0;
 }
 
+/* Scheduler card: compact stat grid (same vocabulary as .token-times)
+   plus a narrow interval input next to the start/stop buttons. */
+.sched-stats {
+    display: grid;
+    grid-template-columns: auto 1fr auto 1fr;
+    gap: var(--sp-1) var(--sp-4);
+    font-size: 12px;
+    margin-bottom: var(--sp-3);
+    max-width: 720px;
+}
+
+.sched-stats dt {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.sched-stats dd { margin: 0; }
+
+.sched-interval-input { width: 140px; }
+
 /* Global kill-switch banner (base.html): unmistakable on every page. */
 .kill-banner {
     display: flex;

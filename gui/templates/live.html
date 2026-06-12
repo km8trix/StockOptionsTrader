@@ -110,6 +110,63 @@
         </div>
     </div>
 
+    <!-- ==================== SCHEDULER ==================== -->
+    <!-- Market-hours automation card. ALL dynamic fields are painted by
+         live.js with textContent (never innerHTML rebuilds), so the poll
+         can never wipe in-progress input elsewhere on the page. Start and
+         stop both require an explicit confirm; a paused scheduler (kill
+         switch / circuit breaker / error storm) stays paused until a
+         human presses Start again. -->
+    <div class="col-12">
+        <div class="card" id="schedulerCard">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-alarm" aria-hidden="true"></i> Scheduler</span>
+                <span class="card-header-hint">market hours only · pauses on any halt</span>
+            </div>
+            <div class="card-body" aria-live="polite">
+                <div class="d-flex flex-wrap align-items-center gap-3 mb-2">
+                    <div id="schedState" class="ks-state ks-unknown">
+                        <i class="bi bi-question-circle" aria-hidden="true"></i>
+                        <span id="schedStateLabel">UNKNOWN</span>
+                    </div>
+                    <p id="schedStateDetail" class="ks-detail mb-0">
+                        Scheduler state has not been read yet.
+                    </p>
+                </div>
+                <dl class="sched-stats">
+                    <dt>Interval</dt><dd class="num" id="schedInterval">—</dd>
+                    <dt>Last run</dt><dd class="num" id="schedLastRun">—</dd>
+                    <dt>Next run</dt><dd class="num" id="schedNextRun">—</dd>
+                    <dt>Runs today</dt><dd class="num" id="schedRunsToday">—</dd>
+                    <dt>Consecutive errors</dt><dd class="num" id="schedErrors">—</dd>
+                </dl>
+                <div class="d-flex flex-wrap align-items-end gap-2">
+                    <div>
+                        <label class="form-label" for="schedIntervalInput">Interval (minutes)</label>
+                        <input type="number" class="form-control sched-interval-input"
+                               id="schedIntervalInput" min="1" max="240" step="1"
+                               inputmode="numeric" placeholder="15">
+                        <div class="invalid-feedback">Enter a whole number of minutes between 1 and 240.</div>
+                    </div>
+                    <button type="button" class="btn btn-primary" id="btnSchedStart" disabled>
+                        <i class="bi bi-play-fill" aria-hidden="true"></i> Start scheduler
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary" id="btnSchedStop" disabled>
+                        <i class="bi bi-stop-fill" aria-hidden="true"></i> Stop
+                    </button>
+                </div>
+                <p class="ks-footnote mt-2">
+                    Runs evaluate_once() on the interval during NYSE hours
+                    (09:30–16:00 ET, holidays/half-days respected) and sleeps
+                    otherwise. The kill switch and daily-loss circuit breaker
+                    are checked inside every evaluation — any halt pauses the
+                    scheduler until it is manually started again. Both actions
+                    require confirmation and are audit-logged.
+                </p>
+            </div>
+        </div>
+    </div>
+
     <!-- ==================== AUDIT LOG ==================== -->
     <div class="col-12">
         <div class="card">

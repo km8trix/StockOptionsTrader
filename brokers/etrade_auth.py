@@ -36,7 +36,13 @@ secrets are stored locally only — they are NEVER logged and NEVER placed
 in audit payloads; audit rows carry event metadata (env, reason) only.
 
 Config (read from os.environ only — never from the .env file directly):
-    ETRADE_CONSUMER_KEY / ETRADE_CONSUMER_SECRET   consumer credentials
+    ETRADE_SANDBOX_CONSUMER_KEY / ETRADE_SANDBOX_CONSUMER_SECRET
+        consumer credentials used when ETRADE_ENV=sandbox (preferred)
+    ETRADE_PROD_CONSUMER_KEY / ETRADE_PROD_CONSUMER_SECRET
+        consumer credentials used when ETRADE_ENV=production (preferred)
+    ETRADE_CONSUMER_KEY / ETRADE_CONSUMER_SECRET
+        legacy generic fallback for either env when the env-scoped
+        names are absent
     ETRADE_ENV                                     'sandbox' (default) |
                                                    'production'
     ETRADE_PRODUCTION_ACK                          must equal
@@ -164,13 +170,20 @@ class EtradeAuthManager:
                  session_factory: Optional[Callable] = None,
                  clock: Optional[Callable[[], datetime]] = None,
                  audit: Optional[AuditLog] = None):
-        self.consumer_key = os.environ.get("ETRADE_CONSUMER_KEY")
-        self.consumer_secret = os.environ.get("ETRADE_CONSUMER_SECRET")
         self.env = os.environ.get("ETRADE_ENV", "sandbox").strip().lower()
         if self.env not in API_BASE_URLS:
             raise EtradeNotConfigured(
                 f"ETRADE_ENV must be 'sandbox' or 'production', "
                 f"got {self.env!r}")
+        # Sandbox and production are DIFFERENT consumer-key pairs at
+        # E*TRADE. Prefer env-scoped names so both pairs can coexist in
+        # .env without swapping; fall back to the legacy generic names.
+        _prefix = ("ETRADE_SANDBOX_" if self.env == "sandbox"
+                   else "ETRADE_PROD_")
+        self.consumer_key = (os.environ.get(_prefix + "CONSUMER_KEY")
+                             or os.environ.get("ETRADE_CONSUMER_KEY"))
+        self.consumer_secret = (os.environ.get(_prefix + "CONSUMER_SECRET")
+                                or os.environ.get("ETRADE_CONSUMER_SECRET"))
         if self.env == "production" and (
                 os.environ.get("ETRADE_PRODUCTION_ACK")
                 != PRODUCTION_ACK_VALUE):
@@ -332,8 +345,14 @@ class EtradeAuthManager:
                                         self.consumer_secret)
         response = session.get(REQUEST_TOKEN_URL)
         if response.status_code != 200:
+            # Surface E*TRADE's oauth_problem reason for diagnosability.
+            # The body carries no secrets, but redact the consumer key
+            # defensively in case the gateway ever echoes request params.
+            body = (response.text or "")[:300].replace(
+                self.consumer_key, "<consumer_key>")
             raise EtradeAuthError(
-                f"request_token failed with HTTP {response.status_code}")
+                f"request_token failed with HTTP {response.status_code}: "
+                f"{body}")
         tokens = _parse_token_body(response.text)
         if "oauth_token" not in tokens or "oauth_token_secret" not in tokens:
             raise EtradeAuthError(

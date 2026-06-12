@@ -58,6 +58,7 @@ def _isolate_live_singletons(monkeypatch, tmp_path):
     monkeypatch.setattr(api_live, '_auth_manager', None)
     monkeypatch.setattr(api_live, '_kill_switch', None)
     monkeypatch.setattr(api_live, '_audit_log', None)
+    monkeypatch.setattr(api_live, '_scheduler', None)
 
 
 @pytest.fixture()
@@ -1850,6 +1851,41 @@ class FakeAuditLog:
         return self.verify_result
 
 
+class FakeScheduler:
+    """LiveScheduler-shaped fake: status() snapshot + recorded actions."""
+
+    def __init__(self, running=False, paused_reason=None):
+        self.running = running
+        self.paused_reason = paused_reason
+        self.interval_minutes = 15
+        self.calls = []
+
+    def status(self):
+        return {
+            'running': self.running,
+            'last_run': ('2026-06-12T10:00:00-04:00'
+                         if self.running else None),
+            'last_result': ({'status': 'ok', 'reports': []}
+                            if self.running else None),
+            'next_run_estimate': ('2026-06-12T10:15:00-04:00'
+                                  if self.running else None),
+            'runs_today': 3 if self.running else 0,
+            'consecutive_errors': 0,
+            'paused_reason': self.paused_reason,
+        }
+
+    def start(self):
+        self.calls.append('start')
+        self.running = True
+        self.paused_reason = None
+        return True
+
+    def stop(self):
+        self.calls.append('stop')
+        self.running = False
+        return True
+
+
 @pytest.fixture()
 def patch_live(monkeypatch):
     """Inject fake C16/C17/C18 surfaces into api_live; reset module state."""
@@ -1865,6 +1901,16 @@ def patch_live(monkeypatch):
     monkeypatch.setattr(api_live, 'get_audit_log', lambda: fakes['audit'])
     monkeypatch.setattr(api_live, '_last_reconciliation', None)
     return fakes
+
+
+@pytest.fixture()
+def patch_scheduler(monkeypatch):
+    """Inject a mocked LiveScheduler into api_live."""
+    import gui.routes.api_live as api_live
+
+    fake = FakeScheduler()
+    monkeypatch.setattr(api_live, 'get_scheduler', lambda: fake)
+    return fake
 
 
 class TestLivePageAndChrome:
@@ -2368,6 +2414,136 @@ class TestLiveWorkingOrders:
         response = client.post('/api/live/orders/PX-1/cancel')
         assert response.status_code == 409
         assert response.get_json()['error'] == 'No live broker session'
+
+
+class TestLiveSchedulerEndpoint:
+    """GET/POST /api/live/scheduler against a mocked LiveScheduler."""
+
+    STATUS_KEYS = {'running', 'last_run', 'last_result',
+                   'next_run_estimate', 'runs_today', 'consecutive_errors',
+                   'paused_reason', 'interval_minutes'}
+
+    def test_get_status_shape_while_stopped(self, client, patch_scheduler):
+        response = client.get('/api/live/scheduler')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert set(body) == self.STATUS_KEYS
+        assert body['running'] is False
+        assert body['paused_reason'] is None
+        assert body['interval_minutes'] == 15
+
+    def test_get_passes_paused_state_through(self, client, patch_scheduler):
+        patch_scheduler.paused_reason = 'kill_switch_engaged'
+
+        body = client.get('/api/live/scheduler').get_json()
+        assert body['running'] is False
+        assert body['paused_reason'] == 'kill_switch_engaged'
+
+    def test_start_calls_start_and_returns_running_status(
+            self, client, patch_scheduler):
+        response = client.post('/api/live/scheduler',
+                               json={'action': 'start'})
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['running'] is True
+        assert set(body) == self.STATUS_KEYS
+        assert patch_scheduler.calls == ['start']
+        # No interval in the request: the configured one is untouched.
+        assert patch_scheduler.interval_minutes == 15
+
+    def test_start_applies_interval_before_starting(
+            self, client, patch_scheduler):
+        response = client.post('/api/live/scheduler', json={
+            'action': 'start', 'interval_minutes': 30})
+
+        assert response.status_code == 200
+        assert response.get_json()['interval_minutes'] == 30
+        assert patch_scheduler.interval_minutes == 30
+        assert patch_scheduler.calls == ['start']
+
+    def test_stop_calls_stop(self, client, patch_scheduler):
+        patch_scheduler.running = True
+        response = client.post('/api/live/scheduler', json={'action': 'stop'})
+
+        assert response.status_code == 200
+        assert response.get_json()['running'] is False
+        assert patch_scheduler.calls == ['stop']
+
+    @pytest.mark.parametrize('action', [None, '', 'pause', 'restart', 1])
+    def test_unknown_action_rejected(self, client, patch_scheduler, action):
+        response = client.post('/api/live/scheduler',
+                               json={'action': action})
+        assert response.status_code == 400
+        assert 'action' in response.get_json()['error']
+        assert patch_scheduler.calls == []
+
+    @pytest.mark.parametrize('interval', [0, 241, -15, 2.5, '15', True])
+    def test_bad_interval_rejected_without_side_effects(
+            self, client, patch_scheduler, interval):
+        response = client.post('/api/live/scheduler', json={
+            'action': 'start', 'interval_minutes': interval})
+
+        assert response.status_code == 400
+        assert 'interval_minutes' in response.get_json()['error']
+        assert patch_scheduler.calls == []
+        assert patch_scheduler.interval_minutes == 15
+
+    def test_interval_with_stop_rejected(self, client, patch_scheduler):
+        response = client.post('/api/live/scheduler', json={
+            'action': 'stop', 'interval_minutes': 30})
+        assert response.status_code == 400
+        assert patch_scheduler.calls == []
+
+    def test_503_while_unconfigured_by_default(self, client):
+        """No mocking at all: the GUI never builds a scheduler itself, so
+        a fresh process answers 503-with-reason until the live wiring
+        installs one via set_scheduler()."""
+        for response in (client.get('/api/live/scheduler'),
+                         client.post('/api/live/scheduler',
+                                     json={'action': 'start'})):
+            assert response.status_code == 503
+            body = response.get_json()
+            assert body['error'] == 'Scheduler unavailable'
+            assert 'configured' in body['reason']
+
+    def test_503_reason_is_import_error_when_import_failed(
+            self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic scheduler import failure'
+        monkeypatch.setattr(api_live, 'get_scheduler', lambda: None)
+        monkeypatch.setattr(api_live, 'SCHEDULER_IMPORT_ERROR', sentinel)
+
+        response = client.get('/api/live/scheduler')
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Scheduler unavailable', 'reason': sentinel}
+
+    def test_set_scheduler_installs_the_singleton(self, client):
+        """The real accessor pair the live wiring uses (not monkeypatched):
+        set_scheduler -> get_scheduler -> routes go live."""
+        import gui.routes.api_live as api_live
+
+        fake = FakeScheduler(running=True)
+        api_live.set_scheduler(fake)
+        try:
+            body = client.get('/api/live/scheduler').get_json()
+            assert body['running'] is True
+        finally:
+            api_live.set_scheduler(None)
+
+    def test_live_page_ships_scheduler_card(self, client):
+        html = client.get('/live').get_data(as_text=True)
+        for marker in (
+            'id="schedulerCard"', 'id="schedState"', 'id="schedStateLabel"',
+            'id="schedStateDetail"', 'id="schedInterval"',
+            'id="schedLastRun"', 'id="schedNextRun"', 'id="schedRunsToday"',
+            'id="schedErrors"', 'id="schedIntervalInput"',
+            'id="btnSchedStart"', 'id="btnSchedStop"',
+        ):
+            assert marker in html, f'/live missing {marker}'
 
 
 class TestLiveTraderConstruction:

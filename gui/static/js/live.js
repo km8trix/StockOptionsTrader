@@ -713,6 +713,183 @@ async function runReconcile() {
 }
 
 /* ==========================================================================
+   Scheduler (market-hours evaluate_once loop via /api/live/scheduler)
+
+   Render rules:
+   * EVERY dynamic field is painted with textContent on pre-existing nodes —
+     no innerHTML rebuilds — so the 10s poll can never wipe an in-progress
+     input or swallow a click (the same failure class the connection
+     panel's render-keying fix guards against; this card avoids it by
+     construction).
+   * The interval <input> belongs to the OPERATOR while they are editing:
+     the poll only fills it while it is untouched and unfocused.
+   ========================================================================== */
+
+let schedIntervalDirty = false;
+
+/** Plain-text timestamp (textContent — no HTML escaping wanted). */
+function fmtTimestampText(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
+}
+
+const SCHED_STATES = {
+    running: ['ks-state ks-off', 'bi bi-play-circle-fill', 'RUNNING'],
+    paused: ['ks-state ks-engaged', 'bi bi-pause-circle-fill', 'PAUSED'],
+    stopped: ['ks-state ks-unknown', 'bi bi-stop-circle', 'STOPPED'],
+    unknown: ['ks-state ks-unknown', 'bi bi-question-circle', 'UNKNOWN'],
+};
+
+function paintSchedulerState(kind, detail) {
+    const state = document.getElementById('schedState');
+    const label = document.getElementById('schedStateLabel');
+    const detailEl = document.getElementById('schedStateDetail');
+    if (!state || !label || !detailEl) return;
+    const [cls, icon, text] = SCHED_STATES[kind] || SCHED_STATES.unknown;
+    state.className = cls;
+    state.firstElementChild.className = icon;
+    label.textContent = text;
+    detailEl.textContent = detail;
+}
+
+function renderScheduler(data) {
+    const running = !!(data && data.running === true);
+    const pausedReason = data ? data.paused_reason : null;
+
+    if (running) {
+        paintSchedulerState('running',
+            'Evaluating automatically during NYSE market hours. ' +
+            'Kill switch and circuit breaker are checked every cycle.');
+    } else if (pausedReason) {
+        paintSchedulerState('paused',
+            `Paused: ${pausedReason}. Resolve the halt, then start ` +
+            'manually — the scheduler never resumes on its own.');
+    } else {
+        paintSchedulerState('stopped',
+            'Not running. Start to evaluate automatically during market ' +
+            'hours.');
+    }
+
+    const fields = {
+        schedInterval: Number.isFinite(Number(data.interval_minutes))
+            ? `${data.interval_minutes} min` : '—',
+        schedLastRun: fmtTimestampText(data.last_run),
+        schedNextRun: running ? fmtTimestampText(data.next_run_estimate) : '—',
+        schedRunsToday: Number.isFinite(Number(data.runs_today))
+            ? String(data.runs_today) : '—',
+        schedErrors: Number.isFinite(Number(data.consecutive_errors))
+            ? String(data.consecutive_errors) : '—',
+    };
+    Object.entries(fields).forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    });
+
+    const btnStart = document.getElementById('btnSchedStart');
+    const btnStop = document.getElementById('btnSchedStop');
+    if (btnStart) btnStart.disabled = running;
+    if (btnStop) btnStop.disabled = !running;
+
+    // The interval input is the operator's while focused/edited; the poll
+    // only keeps the placeholder fresh and fills an untouched field.
+    const input = document.getElementById('schedIntervalInput');
+    if (input && data.interval_minutes != null) {
+        input.placeholder = String(data.interval_minutes);
+        if (!schedIntervalDirty && document.activeElement !== input) {
+            input.value = String(data.interval_minutes);
+        }
+    }
+}
+
+function renderSchedulerUnavailable(reason) {
+    paintSchedulerState('unknown',
+        reason || 'The scheduler backend has not been configured.');
+    const btnStart = document.getElementById('btnSchedStart');
+    const btnStop = document.getElementById('btnSchedStop');
+    if (btnStart) btnStart.disabled = true;
+    if (btnStop) btnStop.disabled = true;
+}
+
+async function refreshScheduler() {
+    try {
+        const data = await fetchJSON('/api/live/scheduler', { silent: true });
+        renderScheduler(data);
+    } catch (err) {
+        renderSchedulerUnavailable(
+            (err.body && (err.body.reason || err.body.error)) || err.message);
+    }
+}
+
+/** The interval to send with 'start': null = omit (server keeps current),
+    undefined = invalid input (caller aborts). */
+function schedIntervalToSend() {
+    const input = document.getElementById('schedIntervalInput');
+    if (!input) return null;
+    const raw = (input.value || '').trim();
+    if (!raw) { input.classList.remove('is-invalid'); return null; }
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > 240) {
+        input.classList.add('is-invalid');
+        return undefined;
+    }
+    input.classList.remove('is-invalid');
+    return n;
+}
+
+async function startScheduler() {
+    const interval = schedIntervalToSend();
+    if (interval === undefined) {
+        showToast('warning', 'Interval must be a whole number of minutes ' +
+            'between 1 and 240.');
+        return;
+    }
+    const label = interval === null ? 'the configured interval'
+        : `every ${interval} minutes`;
+    if (!window.confirm('Start the market-hours scheduler? It will run ' +
+        `evaluate_once() ${label} during NYSE hours until stopped, ` +
+        'and pause itself on any kill-switch or circuit-breaker halt.')) {
+        return;
+    }
+    const body = { action: 'start' };
+    if (interval !== null) body.interval_minutes = interval;
+    const restore = btnLoading(document.getElementById('btnSchedStart'));
+    try {
+        const data = await fetchJSON('/api/live/scheduler', {
+            method: 'POST', body: JSON.stringify(body),
+        });
+        showToast('success', 'Scheduler started.');
+        schedIntervalDirty = false;
+        renderScheduler(data);
+        loadAudit(); // start is audit-logged — show it immediately
+    } catch (_) {
+        // toasted by fetchJSON
+    } finally {
+        restore();
+    }
+}
+
+async function stopScheduler() {
+    if (!window.confirm('Stop the scheduler? Automatic evaluations halt ' +
+        'until it is started again. Working orders are not affected.')) {
+        return;
+    }
+    const restore = btnLoading(document.getElementById('btnSchedStop'));
+    try {
+        const data = await fetchJSON('/api/live/scheduler', {
+            method: 'POST', body: JSON.stringify({ action: 'stop' }),
+        });
+        showToast('info', 'Scheduler stopped.');
+        renderScheduler(data);
+        loadAudit(); // stop is audit-logged — show it immediately
+    } catch (_) {
+        // toasted by fetchJSON
+    } finally {
+        restore();
+    }
+}
+
+/* ==========================================================================
    Status poll — the ONLY live-status poll in the app
    ========================================================================== */
 
@@ -744,14 +921,16 @@ async function refreshStatus() {
    ========================================================================== */
 
 document.addEventListener('DOMContentLoaded', () => {
-    // Initial paint + the page's poll. Status and working orders refresh
-    // every LIVE_POLL_MS; the audit log loads once and after actions (it
-    // is paged and append-only — no need to poll it).
+    // Initial paint + the page's poll. Status, working orders and the
+    // scheduler refresh every LIVE_POLL_MS; the audit log loads once and
+    // after actions (it is paged and append-only — no need to poll it).
     refreshStatus();
     refreshWorkingOrders();
+    refreshScheduler();
     loadAudit();
     setInterval(refreshStatus, LIVE_POLL_MS);
     setInterval(refreshWorkingOrders, LIVE_POLL_MS);
+    setInterval(refreshScheduler, LIVE_POLL_MS);
 
     const ksBtn = document.getElementById('btnKillSwitch');
     if (ksBtn) ksBtn.addEventListener('click', openKillSwitchModal);
@@ -766,6 +945,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const btnReconcile = document.getElementById('btnReconcile');
     if (btnReconcile) btnReconcile.addEventListener('click', runReconcile);
+
+    const btnSchedStart = document.getElementById('btnSchedStart');
+    if (btnSchedStart) btnSchedStart.addEventListener('click', startScheduler);
+    const btnSchedStop = document.getElementById('btnSchedStop');
+    if (btnSchedStop) btnSchedStop.addEventListener('click', stopScheduler);
+    const schedInput = document.getElementById('schedIntervalInput');
+    if (schedInput) {
+        // Any keystroke hands the field to the operator until the next
+        // explicit start (mirrors the verifier-input protection).
+        schedInput.addEventListener('input', () => {
+            schedIntervalDirty = true;
+            schedInput.classList.remove('is-invalid');
+        });
+    }
 
     const auditFilter = document.getElementById('auditEventType');
     if (auditFilter) {
