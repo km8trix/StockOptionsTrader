@@ -679,6 +679,9 @@ class TestEndToEndWithEngine:
         json.dumps(report['walk_forward'])
         json.dumps(report['trader_notes'])
 
+        # Phase 7 regression (C8): pod_history is a citadel-only key.
+        assert 'pod_history' not in report
+
         assert desk.get_status()['regime'] in REGIME_LABELS
 
     def test_book_notes_are_filterable_per_c7(self, report_and_desk):
@@ -748,3 +751,5 @@ class TestEndToEndWithEngine:
                             benchmark_symbol=None)
         # C5: absent or [] are both acceptable; it must never be non-empty.
         assert not report.get('regime_series')
+        # Phase 7 regression (C8): same for pod_history.
+        assert not report.get('pod_history')

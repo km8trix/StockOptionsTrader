@@ -166,6 +166,21 @@
                 </div>
             </div>
 
+            <!-- Citadel pods (Phase 7, contract C8): per-pod status cards +
+                 stacked pod-weight allocation chart with reallocation and
+                 probation/cut markers. Painted by backtest.js only when the
+                 report carries a non-empty pod_history. -->
+            <div class="card mb-2 d-none" id="podCard">
+                <div class="card-header">
+                    Pod capital allocation
+                    <span class="provenance-caption">(weights · reallocations · cuts)</span>
+                </div>
+                <div class="card-body p-2">
+                    <div class="row g-2 mb-2" id="podCards"></div>
+                    <div id="podAllocChart" style="min-height: 260px;"></div>
+                </div>
+            </div>
+
             <div class="card">
                 <div class="card-header">
                     Trades <span class="provenance-caption">(signal date → next-bar-open fill)</span>
@@ -202,6 +217,10 @@
                              notes carry data.book; composes with categories. -->
                         <div class="note-filters d-none" id="noteBookFilters" role="group"
                              aria-label="Filter trader notes by book"></div>
+                        <!-- Phase 7 (contract C9): pod chips appear only when
+                             notes carry data.pod; composes with the rows above. -->
+                        <div class="note-filters d-none" id="notePodFilters" role="group"
+                             aria-label="Filter trader notes by pod"></div>
                     </div>
                 </div>
                 <div class="card-body p-0">

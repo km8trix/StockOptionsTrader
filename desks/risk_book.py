@@ -1,0 +1,258 @@
+"""
+Central risk book — desk-agnostic exposure limits over a batch of intents.
+
+Tracks, from the portfolio plus a pending-intents view, the desk's gross
+exposure (sum of absolute per-symbol position values, including pending
+fills' estimated value), net exposure, per-symbol exposure (aggregated
+ACROSS pods/books — positions are netted per symbol first), and short
+exposure. check() approves or blocks each OPENING intent against the
+limits; CLOSING intents (SELL/COVER) are ALWAYS approved.
+
+CUMULATIVE EVALUATION (the core guarantee): intents are evaluated in the
+order given, and every approved opening intent's estimated value is
+committed to the running exposure state before the next intent is
+checked — so a batch that passes item-wise can never jointly breach the
+book. Callers are responsible for a deterministic order; CitadelDesk
+sorts closes first, then opens by pod weight descending, then symbol.
+
+CONSERVATISM: closing intents do NOT credit exposure relief within the
+same batch. A close might not fill (no bar) while a later open does, so
+the book never counts unfilled exits as freed-up room. Approval is
+therefore conservative by construction.
+
+BOUNDARY SEMANTICS (exact): an intent that brings an exposure EXACTLY to
+its limit passes; any amount over — even epsilon — blocks (strict ``>``
+comparisons against the dollar limits).
+
+Estimated intent value matches the engine's fill sizing exactly:
+portfolio_value * capital_allocation * size_fraction, evaluated at check
+time. ``prices`` (symbol -> latest close) is the preferred mark for
+existing positions, falling back to each position's current_price.
+
+MARGIN IS NOT MODELED: max_gross defaults to 1.0x desk capital (no
+leverage) under the cash-account approximation used desk-wide.
+
+--------------------------------------------------------------------------
+PHASE 8 PLACEHOLDER — GREEKS LIMITS (short_vega / short_gamma)
+--------------------------------------------------------------------------
+The Jane Street desk introduces options positions whose aggregate short
+vega and short gamma must be capped desk-wide through this same book.
+The constructor already accepts ``short_vega_limit`` / ``short_gamma_limit``
+so the configuration surface is stable, but evaluating them requires a
+per-position Greeks feed that does not exist yet: configuring either
+limit makes check() raise NotImplementedError until Phase 8 wires the
+options data in. They must never be silently ignored — a configured risk
+limit that cannot be evaluated is a hard error, not a no-op.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Callable, Dict, List, Optional, Tuple
+
+from desks.base import DeskIntent
+from portfolio.manager import PortfolioManager
+
+logger = logging.getLogger(__name__)
+
+#: Intent actions that close exposure and are therefore always approved.
+_CLOSING_ACTIONS = ('SELL', 'COVER')
+
+
+class CentralRiskBook:
+    """Cumulative gross/net/per-symbol/short exposure limits for a desk.
+
+    Limits are fractions of DESK CAPITAL (portfolio value *
+    capital_allocation, evaluated at check time):
+
+        max_gross   — gross exposure cap (1.0 = no margin).
+        max_symbol  — per-symbol exposure cap, aggregated across pods.
+        max_net     — net exposure band: |net| <= max_net * capital.
+
+    register_limit(name, check_fn) adds custom limits evaluated after the
+    built-ins, in registration order. check_fn(intent, state) returns None
+    to pass or a reason string to block; ``state`` is a dict with the
+    PRE-COMMIT exposure view and the candidate values:
+    {'desk_capital', 'gross', 'net', 'short', 'per_symbol', 'intent_value',
+     'candidate_gross', 'candidate_net', 'candidate_symbol',
+     'candidate_short'}.
+    """
+
+    def __init__(self, capital_allocation: float = 1.0,
+                 max_gross: float = 1.0,
+                 max_symbol: float = 0.10,
+                 max_net: float = 0.60,
+                 short_vega_limit: Optional[float] = None,
+                 short_gamma_limit: Optional[float] = None):
+        if not (0.0 < capital_allocation <= 1.0):
+            raise ValueError(
+                f"capital_allocation {capital_allocation} must be in (0, 1]")
+        for name, value in (('max_gross', max_gross),
+                            ('max_symbol', max_symbol),
+                            ('max_net', max_net)):
+            if value <= 0:
+                raise ValueError(f"{name} must be > 0, got {value}")
+        self.capital_allocation = capital_allocation
+        self.max_gross = max_gross
+        self.max_symbol = max_symbol
+        self.max_net = max_net
+        # Phase 8 placeholder (see module docstring): accepted, not yet
+        # evaluable — check() raises while either is configured.
+        self.short_vega_limit = short_vega_limit
+        self.short_gamma_limit = short_gamma_limit
+        #: name -> check_fn, evaluated in registration order (dicts
+        #: preserve insertion order).
+        self._custom_limits: Dict[str, Callable] = {}
+
+    # ------------------------------------------------------------------
+    # Extension point
+    # ------------------------------------------------------------------
+    def register_limit(self, name: str, check_fn: Callable) -> None:
+        """Register a custom limit (see class docstring for the protocol)."""
+        if not callable(check_fn):
+            raise ValueError(f"check_fn for limit '{name}' must be callable")
+        self._custom_limits[name] = check_fn
+        logger.info("CentralRiskBook: registered custom limit '%s'", name)
+
+    # ------------------------------------------------------------------
+    # Exposure measurement
+    # ------------------------------------------------------------------
+    def compute_exposures(self, portfolio: PortfolioManager,
+                          prices: Optional[Dict[str, float]] = None) -> Dict:
+        """Current exposure snapshot from open positions (no pendings).
+
+        Positions are marked at prices[symbol] when available, else at
+        their own current_price, and NETTED per symbol before gross/net/
+        short are derived:
+
+            per_symbol[s] = sum(quantity * mark) over positions in s
+            gross = sum(|per_symbol|);  net = sum(per_symbol)
+            short = sum(-per_symbol where per_symbol < 0)
+        """
+        prices = prices or {}
+        per_symbol: Dict[str, float] = {}
+        for asset, position in portfolio.positions.items():
+            if position.quantity == 0:
+                continue
+            mark = prices.get(asset.symbol, position.current_price)
+            per_symbol[asset.symbol] = (per_symbol.get(asset.symbol, 0.0)
+                                        + position.quantity * mark)
+        gross = sum(abs(value) for value in per_symbol.values())
+        net = sum(per_symbol.values())
+        short = sum(-value for value in per_symbol.values() if value < 0)
+        return {'gross': gross, 'net': net, 'short': short,
+                'per_symbol': per_symbol}
+
+    # ------------------------------------------------------------------
+    # The check
+    # ------------------------------------------------------------------
+    def check(self, intents: List[DeskIntent], portfolio: PortfolioManager,
+              prices: Optional[Dict[str, float]] = None
+              ) -> Tuple[List[DeskIntent], List[Tuple[DeskIntent, str]]]:
+        """Evaluate a batch of intents cumulatively, in the order given.
+
+        Returns (approved, blocked_with_reasons) where blocked entries
+        are (intent, reason) tuples. Closing intents (SELL/COVER) are
+        always approved; opening intents commit their estimated value to
+        the running exposure state when approved (see module docstring
+        for ordering, conservatism and boundary semantics).
+        """
+        self._raise_if_greeks_configured()
+
+        approved: List[DeskIntent] = []
+        blocked: List[Tuple[DeskIntent, str]] = []
+        if not intents:
+            return approved, blocked
+
+        desk_capital = (portfolio.get_portfolio_value()
+                        * self.capital_allocation)
+        state = self.compute_exposures(portfolio, prices)
+        gross, net, short = state['gross'], state['net'], state['short']
+        per_symbol = state['per_symbol']
+
+        gross_limit = self.max_gross * desk_capital
+        symbol_limit = self.max_symbol * desk_capital
+        net_limit = self.max_net * desk_capital
+
+        for intent in intents:
+            if intent.action in _CLOSING_ACTIONS:
+                approved.append(intent)
+                continue
+
+            if desk_capital <= 0:
+                # Fail closed: no meaningful limit base exists.
+                blocked.append((intent,
+                                f"desk capital {desk_capital:,.2f} is not "
+                                f"positive; failing closed"))
+                continue
+
+            value = desk_capital * intent.size_fraction
+            symbol = intent.asset.symbol
+            delta = value if intent.action == 'BUY' else -value
+
+            candidate_gross = gross + value
+            candidate_net = net + delta
+            candidate_symbol = per_symbol.get(symbol, 0.0) + delta
+            candidate_short = short + (value if intent.action == 'SHORT'
+                                       else 0.0)
+
+            reason = None
+            if candidate_gross > gross_limit:
+                reason = (f"gross exposure {candidate_gross:,.2f} would "
+                          f"exceed the {self.max_gross:.0%} limit "
+                          f"{gross_limit:,.2f}")
+            elif abs(candidate_net) > net_limit:
+                reason = (f"net exposure {candidate_net:,.2f} would leave "
+                          f"the +/-{self.max_net:.0%} band "
+                          f"(limit {net_limit:,.2f})")
+            elif abs(candidate_symbol) > symbol_limit:
+                reason = (f"{symbol} exposure {abs(candidate_symbol):,.2f} "
+                          f"would exceed the per-symbol {self.max_symbol:.0%} "
+                          f"limit {symbol_limit:,.2f}")
+            else:
+                custom_state = {
+                    'desk_capital': desk_capital,
+                    'gross': gross, 'net': net, 'short': short,
+                    'per_symbol': dict(per_symbol),
+                    'intent_value': value,
+                    'candidate_gross': candidate_gross,
+                    'candidate_net': candidate_net,
+                    'candidate_symbol': candidate_symbol,
+                    'candidate_short': candidate_short,
+                }
+                for name, check_fn in self._custom_limits.items():
+                    custom_reason = check_fn(intent, custom_state)
+                    if custom_reason is not None:
+                        reason = f"custom limit '{name}': {custom_reason}"
+                        break
+
+            if reason is not None:
+                blocked.append((intent, reason))
+                logger.debug("CentralRiskBook blocked %s %s: %s",
+                             intent.action, symbol, reason)
+                continue
+
+            # Commit: the approved open is now part of the pending view.
+            gross = candidate_gross
+            net = candidate_net
+            short = candidate_short
+            per_symbol[symbol] = candidate_symbol
+            approved.append(intent)
+
+        return approved, blocked
+
+    # ------------------------------------------------------------------
+    # Phase 8 placeholder: Greeks limits (short_vega / short_gamma)
+    # ------------------------------------------------------------------
+    def _raise_if_greeks_configured(self) -> None:
+        """Greeks limits cannot be evaluated without options data (Phase 8).
+
+        A configured-but-unevaluable risk limit must fail loudly rather
+        than be silently skipped.
+        """
+        if self.short_vega_limit is not None \
+                or self.short_gamma_limit is not None:
+            raise NotImplementedError(
+                "short_vega/short_gamma limits are configured but Greeks "
+                "evaluation requires the Phase 8 options data feed; "
+                "remove the limits or upgrade to Phase 8")

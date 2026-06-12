@@ -738,3 +738,51 @@ th.sortable .sort-arrow {
 .note-book-mean_reversion { color: var(--gain); border-color: var(--gain); }
 .note-book-stat_arb       { color: var(--warn); border-color: var(--warn); }
 .note-book-pairs          { color: #bc8cff;     border-color: #bc8cff; }
+
+/* --------------------------------------------------------------------------
+   Citadel desk (Phase 7): pod status cards + pod note tags (contracts C8/C9)
+   -------------------------------------------------------------------------- */
+/* Per-pod summary card: hue via --pod-color (only POD_PALETTE colors —
+   pod keys themselves never become class suffixes or style values). */
+.pod-card {
+    border-left: 3px solid var(--pod-color, var(--accent));
+}
+
+.pod-name {
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--pod-color, var(--text));
+}
+
+.pod-detail {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: var(--sp-1);
+}
+
+/* Pod lifecycle badge: ACTIVE green / PROBATION yellow / CUT red */
+.pod-status-badge {
+    font-size: 10px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+}
+
+.pod-status-active    { color: var(--gain); border-color: var(--gain); }
+.pod-status-probation { color: var(--warn); border-color: var(--warn); }
+.pod-status-cut       { color: var(--loss); border-color: var(--loss); }
+
+/* Pod tag on note entries + pod filter chips (contract C9) */
+.note-pod-chip {
+    color: var(--pod-color, #bc8cff);
+    border-color: var(--pod-color, #bc8cff);
+}

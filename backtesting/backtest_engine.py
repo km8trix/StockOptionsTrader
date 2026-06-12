@@ -489,5 +489,11 @@ class BacktestEngine:
             regime_series = getattr(self.desk, 'regime_series', None)
             if regime_series:
                 report['regime_series'] = list(regime_series)
+            # Contract C8: desks with pod accounting expose pod_history;
+            # included only when non-empty (Foundation/Renaissance reports
+            # stay byte-identical).
+            pod_history = getattr(self.desk, 'pod_history', None)
+            if pod_history:
+                report['pod_history'] = list(pod_history)
 
         return report

@@ -12,6 +12,7 @@ import logging
 from typing import Dict, List, Optional
 
 from desks.base import Desk
+from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.renaissance import RenaissanceDesk
 
@@ -47,10 +48,11 @@ _DESK_SPECS: Dict[str, Dict] = {
         'description': ('Strategy pods with their own capital, a central '
                         'risk book, and performance-weighted capital '
                         'allocation with drawdown-based pod cuts.'),
-        'status': 'planned',
-        'activates_in_phase': 7,
+        # Contract C10: ready as of Phase 7; accent stays '#bc8cff'.
+        'status': 'ready',
+        'activates_in_phase': None,
         'accent': '#bc8cff',
-        'factory': None,
+        'factory': CitadelDesk,
     },
     'janestreet': {
         'name': 'Jane Street Desk',

@@ -5,7 +5,11 @@
 // Renaissance regime visualization (contract C5: translucent equity-chart
 // bands + a current-regime chip), book filter chips on the trader's notes
 // (contract C7: note.data.book), and per-model walk-forward marker colors
-// (fits MAY carry 'model'). Talks to:
+// (fits MAY carry 'model'). Phase 7 adds the Citadel pod visualization
+// (contract C8: report.pod_history -> stacked pod-weight allocation chart
+// with reallocation/probation/cut event markers + per-pod status cards) and
+// pod filter chips on the trader's notes (contract C9: note.data.pod,
+// composing with the category filter exactly like books). Talks to:
 //   POST /api/backtest/run            -> {job_id} (strategy OR desk payload)
 //   GET  /api/backtest/status/<id>    -> JobManager record
 //   GET  /api/backtests               -> saved history rows
@@ -37,6 +41,24 @@ const NOTE_BOOKS = {
     stat_arb: 'Stat Arb',
     pairs: 'Pairs',
 };
+// Citadel pods (contract C8): pod keys are dynamic backend strings, so
+// unlike NOTE_BOOKS there is no whitelist — each pod is assigned the next
+// hue from this fixed palette in first-seen order (cycling past the end),
+// and pod text only ever reaches the DOM escaped/as textContent.
+const POD_PALETTE = ['#58a6ff', '#3fb950', '#d29922', '#bc8cff',
+                     '#39c5cf', '#ff7b72', '#7ee787', '#f0883e'];
+// Pod lifecycle states (contract C8) -> status-badge label + CSS class.
+const POD_STATUS_META = {
+    active:    { label: 'ACTIVE',    cls: 'pod-status-active' },
+    probation: { label: 'PROBATION', cls: 'pod-status-probation' },
+    cut:       { label: 'CUT',       cls: 'pod-status-cut' },
+};
+// Pod-chart event markers: reallocation step-changes + status downgrades.
+const POD_EVENT_META = {
+    realloc:   { label: 'Reallocation',  color: '#bc8cff' },
+    probation: { label: 'Pod probation', color: '#d29922' },
+    cut:       { label: 'Pod cut',       color: '#f85149' },
+};
 // Regime states (contract C5): equity-chart band tint (low alpha, behind
 // the traces) + solid hue for the legend swatch and current-regime chip.
 const REGIME_META = {
@@ -57,6 +79,8 @@ let desksByKey = {};        // ready desks from /api/floor/desks, keyed by key
 let currentNotes = [];      // trader_notes of the report on screen
 let noteFilter = 'all';     // active category filter chip
 let bookFilter = 'all';     // active book filter chip (composes with above)
+let podFilter = 'all';      // active pod filter chip (composes with above)
+let podColors = new Map();  // pod key -> palette hue, first-seen order
 
 /* ==========================================================================
    Theme helpers (same approach as analysis.js)
@@ -327,6 +351,7 @@ function renderResults(report) {
     renderPendingSignals(report.pending_signals || []);
     renderEquityChart(report);
     renderDrawdownChart(report.drawdown_series || []);
+    renderPodAllocation(report);
     renderTrades(report.trades || []);
     renderTraderNotes(report);
     renderProvenance(report.data_sources || {});
@@ -394,6 +419,32 @@ function noteBook(note) {
         ? data.book : null;
 }
 
+/** note.data.pod (contract C9): any non-blank string, or null. Pod keys
+ *  are NOT whitelisted — they only ever render as escaped text/textContent
+ *  and never become CSS class suffixes (colors come from POD_PALETTE). */
+function notePod(note) {
+    const data = note.data;
+    return (data && typeof data === 'object' &&
+            typeof data.pod === 'string' && data.pod.trim() !== '')
+        ? data.pod : null;
+}
+
+/** Display label for a pod key: underscores read as spaces. */
+function podLabel(key) {
+    return String(key).replace(/_/g, ' ');
+}
+
+/** Palette hue for a pod key; assigns the next color on first sight.
+ *  A Map (not a plain object) so hostile keys like '__proto__' stay inert;
+ *  the ACCENT_RE check keeps anything else out of inline styles. */
+function podColorFor(key) {
+    if (!podColors.has(key)) {
+        podColors.set(key, POD_PALETTE[podColors.size % POD_PALETTE.length]);
+    }
+    const color = podColors.get(key);
+    return ACCENT_RE.test(color) ? color : WF_COLOR;
+}
+
 function renderTraderNotes(report) {
     const card = document.getElementById('traderNotesCard');
     if (!report.desk) {
@@ -406,8 +457,10 @@ function renderTraderNotes(report) {
     currentNotes = Array.isArray(report.trader_notes) ? report.trader_notes : [];
     noteFilter = 'all';
     bookFilter = 'all';
+    podFilter = 'all';
     paintNoteFilters();
     paintBookFilters();
+    paintPodFilters();
     paintNotes();
 }
 
@@ -473,9 +526,53 @@ function paintBookFilters() {
     });
 }
 
+/**
+ * Third filter-chip row (contract C9): one chip per pod present in
+ * note.data.pod, composing with the category (and book) filters. Hidden
+ * entirely when no note is pod-tagged, so non-citadel runs render exactly
+ * as before. Pod keys are arbitrary backend strings, so the chips are
+ * built with the DOM API (textContent/dataset) — never HTML interpolation.
+ */
+function paintPodFilters() {
+    const wrap = document.getElementById('notePodFilters');
+    wrap.textContent = '';
+    const counts = new Map(); // insertion order == first appearance
+    currentNotes.forEach((n) => {
+        const pod = notePod(n);
+        if (pod) counts.set(pod, (counts.get(pod) || 0) + 1);
+    });
+    if (counts.size === 0) {
+        wrap.classList.add('d-none');
+        return;
+    }
+    wrap.classList.remove('d-none');
+    const chips = [['all', `All pods (${currentNotes.length})`]].concat(
+        Array.from(counts, ([pod, n]) => [pod, `${podLabel(pod)} (${n})`]));
+    chips.forEach(([value, label]) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'note-filter-chip';
+        if (value !== 'all') {
+            btn.classList.add('note-pod-chip');
+            btn.style.setProperty('--pod-color', podColorFor(value));
+        }
+        if (value === podFilter) btn.classList.add('active');
+        btn.setAttribute('aria-pressed', String(value === podFilter));
+        btn.dataset.pod = value;
+        btn.textContent = label;
+        btn.addEventListener('click', () => {
+            podFilter = btn.dataset.pod;
+            paintPodFilters();
+            paintNotes();
+        });
+        wrap.appendChild(btn);
+    });
+}
+
 function noteItem(note) {
     const category = noteCategory(note);
     const book = noteBook(note); // whitelisted key or null
+    const pod = notePod(note);   // free-form key (escaped) or null
     const data = note.data && typeof note.data === 'object' ? note.data : null;
     const hasData = data !== null && Object.keys(data).length > 0;
     return (
@@ -484,6 +581,12 @@ function noteItem(note) {
         `<span class="note-cat-chip note-cat-${category}">${escapeHTML(category)}</span>` +
         (book
             ? `<span class="note-cat-chip note-book-${book}">${escapeHTML(NOTE_BOOKS[book])}</span>`
+            : '') +
+        (pod
+            // Fixed class + palette-only --pod-color; the key itself is
+            // escaped text and never reaches a class or style.
+            ? `<span class="note-cat-chip note-pod-chip" style="--pod-color: ${podColorFor(pod)};">` +
+              `${escapeHTML(podLabel(pod))}</span>`
             : '') +
         `<span class="note-msg">${escapeHTML(note.message ?? '')}</span>` +
         (hasData
@@ -497,7 +600,8 @@ function noteItem(note) {
 
 function noteVisible(note) {
     return (noteFilter === 'all' || noteCategory(note) === noteFilter) &&
-           (bookFilter === 'all' || noteBook(note) === bookFilter);
+           (bookFilter === 'all' || noteBook(note) === bookFilter) &&
+           (podFilter === 'all' || notePod(note) === podFilter);
 }
 
 /** Funnel empty state naming whichever filters are active. */
@@ -505,8 +609,9 @@ function filteredEmptyStateHTML() {
     const labels = [];
     if (noteFilter !== 'all') labels.push(noteFilter);
     if (bookFilter !== 'all') labels.push(NOTE_BOOKS[bookFilter]);
+    if (podFilter !== 'all') labels.push(podLabel(podFilter));
     return emptyStateHTML('bi-funnel', `No ${labels.join(' · ')} notes`,
-        bookFilter === 'all'
+        bookFilter === 'all' && podFilter === 'all'
             ? 'Pick another category filter.'
             : 'Pick another filter combination.');
 }
@@ -742,6 +847,202 @@ function renderDrawdownChart(series) {
     layout.showlegend = false;
     layout.yaxis.title = { text: 'DD (%)', font: { size: 10, color: t.muted } };
     Plotly.react(document.getElementById('drawdownChart'), traces, layout, PLOT_CONFIG);
+}
+
+/* ==========================================================================
+   Citadel pods (Phase 7, contract C8): the capital-allocation story —
+   per-pod status cards + a stacked pod-weight area chart with reallocation
+   and probation/cut event markers. Absent cleanly for every other run.
+   ========================================================================== */
+
+/** Contract-C8-shaped pod_history entries; [] when absent/empty/foreign. */
+function podHistory(report) {
+    return Array.isArray(report.pod_history)
+        ? report.pod_history.filter((entry) =>
+            entry && typeof entry.date === 'string' &&
+            entry.pods && typeof entry.pods === 'object')
+        : [];
+}
+
+/** 'rgba(r, g, b, alpha)' from a strict #rrggbb palette color. */
+function hexToRGBA(hex, alpha) {
+    const n = parseInt(hex.slice(1), 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
+function renderPodAllocation(report) {
+    const card = document.getElementById('podCard');
+    const cards = document.getElementById('podCards');
+    const chart = document.getElementById('podAllocChart');
+    podColors = new Map(); // fresh hue assignment per rendered report
+    const history = podHistory(report);
+    if (history.length === 0) {
+        card.classList.add('d-none');
+        cards.innerHTML = '';
+        // Plotly.purge (not innerHTML='') so a later citadel run can
+        // re-plot into the same div without stale internal state.
+        Plotly.purge(chart);
+        return;
+    }
+    card.classList.remove('d-none');
+
+    // Pods in first-seen order; podColorFor pins each to a palette hue that
+    // the cards, the chart bands, and the note tags all share.
+    const keys = [];
+    history.forEach((entry) => {
+        Object.keys(entry.pods).forEach((key) => {
+            if (!keys.includes(key)) keys.push(key);
+        });
+    });
+    keys.forEach((key) => podColorFor(key));
+
+    renderPodCards(cards, keys, history);
+    renderPodChart(chart, keys, history);
+}
+
+/**
+ * Per-pod summary cards (contract C8): name, final weight/NAV/status from
+ * the LAST pod_history entry, max drawdown = the most negative
+ * drawdown_pct (x100, <= 0) the pod printed across the run. Rendered in
+ * final-weight-descending order — the book of capital, biggest pod first.
+ */
+function renderPodCards(container, keys, history) {
+    const last = history[history.length - 1].pods;
+    const rows = keys.map((key) => {
+        const final = (last[key] && typeof last[key] === 'object') ? last[key] : {};
+        let minDD = 0;
+        history.forEach((entry) => {
+            const pod = entry.pods[key];
+            const dd = Number(pod && pod.drawdown_pct);
+            if (Number.isFinite(dd) && dd < minDD) minDD = dd;
+        });
+        return { key, weight: Number(final.weight) || 0,
+                 nav: final.nav, status: final.status, minDD };
+    });
+    rows.sort((a, b) => b.weight - a.weight);
+
+    container.innerHTML = rows.map((row) => {
+        const status = POD_STATUS_META[row.status] || { label: '—', cls: '' };
+        return '<div class="col-6 col-md-4 col-xl-3">' +
+            `<div class="metric-card pod-card" style="--pod-color: ${podColorFor(row.key)};">` +
+            '<div class="d-flex justify-content-between align-items-baseline gap-2">' +
+            `<div class="pod-name text-truncate">${escapeHTML(podLabel(row.key))}</div>` +
+            `<span class="pod-status-badge ${status.cls}">${escapeHTML(status.label)}</span>` +
+            '</div>' +
+            `<div class="metric-value num">${fmtPct(row.weight)}</div>` +
+            `<div class="pod-detail num">NAV ${fmtMoney(row.nav)} · ` +
+            `max DD ${row.minDD.toFixed(1)}%</div>` +
+            '</div></div>';
+    }).join('');
+}
+
+/**
+ * Stacked area of pod weights over time: one band per pod on a fixed
+ * 0-100% axis. Weights arrive as fractions (contract C8) and are plotted
+ * x100; vertical markers flag the days capital actually moved.
+ */
+function renderPodChart(el, keys, history) {
+    const t = plotlyTheme();
+    const dates = history.map((entry) => entry.date);
+    const traces = keys.map((key) => {
+        const color = podColorFor(key);
+        const label = escapeHTML(podLabel(key));
+        return {
+            type: 'scatter', name: label, mode: 'lines',
+            x: dates,
+            y: history.map((entry) => {
+                const pod = entry.pods[key];
+                const w = Number(pod && pod.weight);
+                return Number.isFinite(w) ? w * 100 : 0;
+            }),
+            stackgroup: 'pods',
+            line: { width: 0.75, color },
+            fillcolor: hexToRGBA(color, 0.45),
+            hovertemplate: `${label}: %{y:.1f}%<extra></extra>`,
+        };
+    });
+
+    const layout = baseLayout(t, 260);
+    layout.yaxis.title = { text: 'Weight (%)', font: { size: 10, color: t.muted } };
+    layout.yaxis.range = [0, 100];
+    addPodEventMarkers(history, traces, layout);
+    Plotly.react(el, traces, layout, PLOT_CONFIG);
+}
+
+/**
+ * Pod lifecycle events derived from consecutive pod_history entries:
+ * a weight step-change on any pod is one 'realloc' event for that date,
+ * and a status downgrade to probation/cut is its own event per pod.
+ */
+function podEvents(history) {
+    const events = [];
+    for (let i = 1; i < history.length; i++) {
+        const prev = history[i - 1].pods;
+        const cur = history[i].pods;
+        const date = history[i].date;
+        const shifts = [];
+        Object.keys(cur).forEach((key) => {
+            const before = prev[key];
+            const after = cur[key];
+            if (!before || !after) return;
+            const w0 = Number(before.weight);
+            const w1 = Number(after.weight);
+            if (Number.isFinite(w0) && Number.isFinite(w1) &&
+                Math.abs(w1 - w0) > 1e-6) {
+                shifts.push(`${podLabel(key)} ${(w0 * 100).toFixed(0)}%` +
+                            `→${(w1 * 100).toFixed(0)}%`);
+            }
+            if (after.status !== before.status &&
+                POD_EVENT_META[after.status]) {
+                const dd = Number(after.drawdown_pct);
+                events.push({
+                    date,
+                    kind: after.status,
+                    text: `Pod ${podLabel(key)} → ${after.status.toUpperCase()}` +
+                          (Number.isFinite(dd)
+                              ? ` (drawdown ${dd.toFixed(1)}%)` : ''),
+                });
+            }
+        });
+        if (shifts.length > 0) {
+            events.push({ date, kind: 'realloc',
+                          text: `Reallocation: ${shifts.join(', ')}` });
+        }
+    }
+    return events;
+}
+
+/**
+ * Vertical event markers on the pod chart: a dashed line per reallocation
+ * and a dotted line per probation/cut, plus one legend-bearing marker
+ * trace per kind whose hover text narrates the event (same anatomy as the
+ * walk-forward refit markers on the equity chart).
+ */
+function addPodEventMarkers(history, traces, layout) {
+    const events = podEvents(history);
+    if (events.length === 0) return;
+
+    layout.shapes = (layout.shapes || []).concat(events.map((ev) => ({
+        type: 'line', xref: 'x', yref: 'paper',
+        x0: ev.date, x1: ev.date, y0: 0, y1: 1,
+        line: { color: POD_EVENT_META[ev.kind].color, width: 1,
+                dash: ev.kind === 'realloc' ? 'dash' : 'dot' },
+    })));
+
+    Object.keys(POD_EVENT_META).forEach((kind) => {
+        const ofKind = events.filter((ev) => ev.kind === kind);
+        if (ofKind.length === 0) return;
+        const meta = POD_EVENT_META[kind];
+        traces.push({
+            type: 'scatter', name: meta.label, mode: 'markers',
+            x: ofKind.map((ev) => ev.date),
+            y: ofKind.map(() => 100),
+            marker: { symbol: 'line-ns-open', size: 9, color: meta.color,
+                      line: { width: 1.5, color: meta.color } },
+            text: ofKind.map((ev) => escapeHTML(ev.text)),
+            hovertemplate: '%{text}<extra></extra>',
+        });
+    });
 }
 
 function renderProvenance(dataSources) {

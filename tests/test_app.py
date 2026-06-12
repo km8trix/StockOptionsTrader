@@ -816,21 +816,23 @@ class TestFloorDesksRegistryContract:
             if desk['status'] == 'planned':
                 assert isinstance(desk['activates_in_phase'], int)
 
-    def test_foundation_and_renaissance_ready_with_planned_phases_7_8(
+    def test_desks_through_citadel_ready_with_janestreet_planned_phase_8(
             self, client):
-        """Phase 6 (contract C6): renaissance flips to ready with its accent
-        kept; citadel/janestreet stay the only planned desks."""
+        """Phase 7 (contract C10): citadel flips to ready with its pod-purple
+        accent kept; janestreet stays the only planned desk (Phase 8)."""
         desks = client.get('/api/floor/desks').get_json()['desks']
         by_key = {d['key']: d for d in desks}
 
         assert by_key['foundation']['status'] == 'ready'
-        if by_key['renaissance']['status'] != 'ready':
-            pytest.skip('renaissance not ready yet '
-                        '(parallel Phase 6 backend task, contract C6)')
+        assert by_key['renaissance']['status'] == 'ready'
         assert by_key['renaissance']['accent'] == '#58a6ff'
+        if by_key['citadel']['status'] != 'ready':
+            pytest.skip('citadel not ready yet '
+                        '(parallel Phase 7 backend task, contract C10)')
+        assert by_key['citadel']['accent'] == '#bc8cff'
         planned_phases = sorted(d['activates_in_phase'] for d in desks
                                 if d['status'] == 'planned')
-        assert planned_phases == [7, 8]
+        assert planned_phases == [8]
 
     def test_unknown_desk_key_returns_400_with_message(self, client):
         response = client.post('/api/backtest/run', json={
@@ -842,13 +844,13 @@ class TestFloorDesksRegistryContract:
         assert 'no-such-desk' in response.get_json()['error']
 
     def test_planned_desk_returns_400_mentioning_its_phase(self, client):
-        # citadel is the first still-planned desk after the Phase 6 flip.
+        # janestreet is the only still-planned desk after the Phase 7 flip.
         response = client.post('/api/backtest/run', json={
-            'symbols': 'AAA', 'desk': 'citadel',
+            'symbols': 'AAA', 'desk': 'janestreet',
             'start_date': '2023-01-01', 'end_date': '2023-12-31'})
 
         assert response.status_code == 400
-        assert 'Phase 7' in response.get_json()['error']
+        assert 'Phase 8' in response.get_json()['error']
 
 
 def _fake_desk_report():
@@ -991,6 +993,8 @@ class TestDeskModeBacktest:
         # Contract C5: a desk without a regime model must NOT gain
         # regime_series content — [] or absent are both acceptable.
         assert result.get('regime_series') in (None, [])
+        # Contract C8: same for pod_history on a non-citadel desk.
+        assert result.get('pod_history') in (None, [])
 
     def test_desk_run_saved_with_desk_prefixed_strategy(
             self, client, patch_desk_stack):
@@ -1122,6 +1126,12 @@ class TestDeskModeBacktest:
         assert 'id="deskChipRow"' in html
         # Phase 6: book filter-chip row (contract C7), painted by backtest.js.
         assert 'id="noteBookFilters"' in html
+        # Phase 7: pod allocation card + pod filter-chip row (contracts
+        # C8/C9), painted by backtest.js only for citadel runs.
+        assert 'id="podCard"' in html
+        assert 'id="podCards"' in html
+        assert 'id="podAllocChart"' in html
+        assert 'id="notePodFilters"' in html
 
 
 class TestRenaissanceDeskModeBacktest:
@@ -1217,6 +1227,169 @@ class TestRenaissanceDeskModeBacktest:
         rows = client.get('/api/backtests').get_json()['backtests']
         assert len(rows) == 1
         assert rows[0]['strategy'] == 'desk:renaissance'
+        assert rows[0]['total_return'] == pytest.approx(0.08)
+
+
+def _fake_citadel_report():
+    """Desk-mode report with the Phase 7 citadel additions: pod_history
+    (contract C8) and pod-tagged / reallocation / cut notes (contract C9)."""
+    report = _fake_engine_report()
+    report['desk'] = {'key': 'citadel', 'name': 'Citadel'}
+    report['trader_notes'] = [
+        {'timestamp': '2023-03-01T00:00:00', 'desk': 'citadel',
+         'category': 'signal', 'message': 'Trend pod long AAA on breakout',
+         'data': {'pod': 'trend', 'score': 0.7}},
+        {'timestamp': '2023-06-01T00:00:00', 'desk': 'citadel',
+         'category': 'allocation',
+         'message': 'Vol-targeted performance-weighted reallocation',
+         'data': {'allocations': {'trend': 0.45, 'mean_rev': 0.35,
+                                  'vol_arb': 0.20},
+                  'reason': 'performance-weighted reallocation'}},
+        {'timestamp': '2023-09-01T00:00:00', 'desk': 'citadel',
+         'category': 'risk', 'message': 'Pod vol_arb placed on probation',
+         'data': {'pod': 'vol_arb', 'drawdown_pct': -8.4}},
+        {'timestamp': '2023-10-02T00:00:00', 'desk': 'citadel',
+         'category': 'risk', 'message': 'Pod vol_arb cut by central risk book',
+         'data': {'pod': 'vol_arb', 'drawdown_pct': -12.6}},
+        # A note without data.pod must pass through unchanged too.
+        {'timestamp': '2023-12-29T00:00:00', 'desk': 'citadel',
+         'category': 'info', 'message': 'Desk heartbeat', 'data': {}},
+    ]
+    report['walk_forward'] = [
+        {'fit_date': '2023-06-01', 'train_start': '2023-01-03',
+         'train_end': '2023-05-31', 'n_samples': 103},
+    ]
+    # Contract C8: one entry per simulated day (three representative days
+    # here), weights as fractions, drawdown_pct x100 and <= 0.
+    report['pod_history'] = [
+        {'date': '2023-01-03',
+         'pods': {'trend': {'weight': 0.34, 'nav': 34000.0,
+                            'drawdown_pct': 0.0, 'status': 'active'},
+                  'mean_rev': {'weight': 0.33, 'nav': 33000.0,
+                               'drawdown_pct': 0.0, 'status': 'active'},
+                  'vol_arb': {'weight': 0.33, 'nav': 33000.0,
+                              'drawdown_pct': 0.0, 'status': 'active'}}},
+        {'date': '2023-06-01',
+         'pods': {'trend': {'weight': 0.45, 'nav': 40100.0,
+                            'drawdown_pct': -1.2, 'status': 'active'},
+                  'mean_rev': {'weight': 0.35, 'nav': 35200.0,
+                               'drawdown_pct': -2.5, 'status': 'active'},
+                  'vol_arb': {'weight': 0.20, 'nav': 30900.0,
+                              'drawdown_pct': -8.4, 'status': 'probation'}}},
+        {'date': '2023-10-02',
+         'pods': {'trend': {'weight': 0.55, 'nav': 47800.0,
+                            'drawdown_pct': -0.8, 'status': 'active'},
+                  'mean_rev': {'weight': 0.45, 'nav': 39100.0,
+                               'drawdown_pct': -3.1, 'status': 'active'},
+                  'vol_arb': {'weight': 0.0, 'nav': 28700.0,
+                              'drawdown_pct': -12.6, 'status': 'cut'}}},
+    ]
+    return report
+
+
+class TestCitadelDeskModeBacktest:
+    """Phase 7 passthrough: a desk-mode run whose engine report carries
+    pod_history (contract C8) and pod-tagged / reallocation / cut notes
+    (contract C9) must surface them all untouched in the async job result.
+    The desk stack is fully stubbed, so this pins the ROUTE/serialization
+    behavior independent of the real citadel desk landing."""
+
+    PAYLOAD = {
+        'symbols': 'AAA',
+        'desk': 'citadel',
+        'start_date': '2023-01-01',
+        'end_date': '2023-12-31',
+        'initial_capital': 100000,
+        'position_size': 0.1,
+    }
+
+    @pytest.fixture()
+    def patch_citadel_stack(self, monkeypatch, tmp_path):
+        """Stub create_desk + the whole engine; redirect the history DB."""
+        import gui.globals as gui_globals
+        from gui.routes import api_backtest
+
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'history.db'))
+        monkeypatch.setattr(gui_globals, '_db', None)
+
+        seen = {}
+
+        def fake_create_desk(key, capital_allocation=1.0):
+            seen['desk_key'] = key
+            return object()
+
+        class FakeEngine:
+            def __init__(self, strategy=None, desk=None,
+                         initial_capital=100000, **kwargs):
+                seen['ctor'] = {'strategy': strategy, 'desk': desk}
+                self.market_data = None
+
+            def run(self, symbols, start_date, end_date, position_size,
+                    progress_callback=None, benchmark_symbol='SPY'):
+                return _fake_citadel_report()
+
+        monkeypatch.setattr(api_backtest, 'create_desk', fake_create_desk)
+        monkeypatch.setattr(api_backtest, 'BacktestEngine', FakeEngine)
+        return seen
+
+    def test_pod_history_passes_through_untouched(
+            self, client, patch_citadel_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        assert patch_citadel_stack['desk_key'] == 'citadel'
+        assert patch_citadel_stack['ctor']['strategy'] is None
+
+        result = job['result']
+        assert result['desk'] == {'key': 'citadel', 'name': 'Citadel'}
+        # Contract C8: present, non-empty, byte-for-byte what the engine
+        # emitted (dates already ISO strings; pod stats JSON-safe floats).
+        assert result['pod_history'] == \
+            _fake_citadel_report()['pod_history']
+        for entry in result['pod_history']:
+            assert set(entry) == {'date', 'pods'}
+            for pod in entry['pods'].values():
+                assert set(pod) == {'weight', 'nav', 'drawdown_pct', 'status'}
+                assert pod['drawdown_pct'] <= 0
+                assert pod['status'] in ('active', 'probation', 'cut')
+        # ... while every existing report key keeps its legacy shape.
+        assert result['summary']['total_return_pct'] == pytest.approx(8.0)
+        assert result['trades'][0]['date'] == '2023-03-01'
+
+    def test_pod_tagged_notes_and_allocations_pass_through(
+            self, client, patch_citadel_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        result = job['result']
+        # Contract C9: data.pod survives on every pod-specific note; the
+        # untagged reallocation/heartbeat notes are unaffected.
+        pods = [n['data'].get('pod') for n in result['trader_notes']]
+        assert pods == ['trend', None, 'vol_arb', 'vol_arb', None]
+        # Reallocation note: data.allocations {pod: new_weight} + data.reason.
+        realloc = result['trader_notes'][1]['data']
+        assert realloc['allocations'] == {
+            'trend': 0.45, 'mean_rev': 0.35, 'vol_arb': 0.20}
+        assert realloc['reason'] == 'performance-weighted reallocation'
+        # Cut/probation notes: data.pod + data.drawdown_pct.
+        assert result['trader_notes'][2]['data']['drawdown_pct'] == \
+            pytest.approx(-8.4)
+        assert result['trader_notes'][3]['data']['drawdown_pct'] == \
+            pytest.approx(-12.6)
+
+    def test_citadel_run_saved_with_desk_prefixed_strategy(
+            self, client, patch_citadel_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        rows = client.get('/api/backtests').get_json()['backtests']
+        assert len(rows) == 1
+        assert rows[0]['strategy'] == 'desk:citadel'
+        assert rows[0]['name'] == 'desk:citadel AAA'
         assert rows[0]['total_return'] == pytest.approx(0.08)
 
 

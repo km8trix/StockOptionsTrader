@@ -7,6 +7,7 @@ import re
 import pytest
 
 from desks.base import Desk
+from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.registry import create_desk, list_desks
 from desks.renaissance import RenaissanceDesk
@@ -46,9 +47,12 @@ class TestListDesks:
         assert by_key['renaissance']['activates_in_phase'] is None
         assert by_key['renaissance']['accent'] == '#58a6ff'
 
-        assert by_key['citadel']['activates_in_phase'] == 7
+        # Contract C10: citadel is ready as of Phase 7; accent stays.
+        assert by_key['citadel']['status'] == 'ready'
+        assert by_key['citadel']['activates_in_phase'] is None
         assert by_key['citadel']['accent'] == '#bc8cff'
 
+        assert by_key['janestreet']['status'] == 'planned'
         assert by_key['janestreet']['activates_in_phase'] == 8
         assert by_key['janestreet']['accent'] == '#d29922'
 
@@ -78,14 +82,26 @@ class TestCreateDesk:
         desk = create_desk('renaissance', capital_allocation=0.3)
         assert desk.capital_allocation == 0.3
 
+    def test_creates_citadel_desk(self):
+        # Contract C10: create_desk('citadel') returns the desk.
+        desk = create_desk('citadel')
+        assert isinstance(desk, CitadelDesk)
+        assert isinstance(desk, Desk)
+        assert desk.key == 'citadel'
+        assert desk.accent == '#bc8cff'
+        assert desk.capital_allocation == 1.0
+
+    def test_citadel_capital_allocation_is_passed_through(self):
+        desk = create_desk('citadel', capital_allocation=0.4)
+        assert desk.capital_allocation == 0.4
+
     def test_unknown_key_raises_value_error(self):
         with pytest.raises(ValueError, match='Unknown desk: warrenbuffett'):
             create_desk('warrenbuffett')
 
-    @pytest.mark.parametrize('key,phase', [('citadel', 7),
-                                           ('janestreet', 8)])
+    @pytest.mark.parametrize('key,phase', [('janestreet', 8)])
     def test_planned_desks_raise_with_their_phase(self, key, phase):
-        # citadel/janestreet stay planned in Phase 6 (contract C6).
+        # janestreet stays planned phase 8 (contract C10).
         with pytest.raises(ValueError,
                            match=f"Desk '{key}' activates in Phase {phase}"):
             create_desk(key)
