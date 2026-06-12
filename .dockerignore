@@ -1,0 +1,33 @@
+# VCS / tooling
+.git
+.gitignore
+.claude/
+.vscode/
+.DS_Store
+
+# Virtualenv
+.venv
+
+# Secrets — NEVER baked into the image; passed at runtime via env_file.
+.env
+.env.*
+
+# Local databases — runtime state lives in the named volume at /data.
+*.db
+
+# Bytecode
+__pycache__/
+*.pyc
+
+# Tests, docs, legacy material — not needed at runtime
+tests/
+readme/
+PLAN.md
+OPENBB_MIGRATION.md
+
+# Dev scripts and scratch entrypoints
+examples*.py
+test_system.py
+
+# Build artifacts
+*.egg-info/

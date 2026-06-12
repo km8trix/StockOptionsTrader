@@ -1,0 +1,31 @@
+services:
+  app:
+    build: .
+    image: stockoptionstrader:latest
+    container_name: stockoptionstrader
+    ports:
+      - "5001:5001"
+    # .env must exist next to this file (see README). It carries the
+    # E*TRADE credentials and is injected at RUNTIME only — it is never
+    # copied into the image (.dockerignore excludes it).
+    env_file:
+      - .env
+    environment:
+      TRADING_DB_PATH: /data/trading_data.db
+    volumes:
+      - trading-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=4).status == 200 else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+
+volumes:
+  trading-data:

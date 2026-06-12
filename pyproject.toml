@@ -20,6 +20,7 @@ dependencies = [
     "requests==2.34.2",
     "python-dotenv==1.2.2",
     "requests-oauthlib==2.0.0",
+    "gunicorn==23.0.0",
 ]
 
 [project.optional-dependencies]

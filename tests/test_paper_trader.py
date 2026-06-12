@@ -9,6 +9,8 @@ reached, and the window tests re-stub fetch_stock_data with canned frames.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -239,3 +241,91 @@ class TestGetCurrentPriceWindow:
             assert trader.get_current_price("AAPL") is None
 
         assert any("No price data" in r.message for r in caplog.records)
+
+
+class TestConcurrency:
+    """Regression for the double-fill race under gunicorn --threads.
+
+    Without the per-instance RLock, two overlapping process_orders() calls
+    could both pass the fill check for the same pending order: double cash
+    deduction, doubled position, then ValueError from the second
+    pending_orders.remove(order). place_order's counter increment was
+    likewise an unlocked read-modify-write minting duplicate order ids.
+    """
+
+    N_THREADS = 8
+
+    @staticmethod
+    def _run_threads(n, target):
+        """Start n threads on target(i), join them, return raised exceptions."""
+        errors = []
+
+        def wrapper(i):
+            try:
+                target(i)
+            except Exception as e:  # noqa: BLE001 - record every failure
+                errors.append(e)
+
+        threads = [threading.Thread(target=wrapper, args=(i,))
+                   for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads), "thread deadlocked"
+        return errors
+
+    def test_concurrent_process_orders_fills_exactly_once(self, monkeypatch):
+        # A slow price fetch widens the check-then-remove window that the
+        # unlocked code raced on (barrier alone often missed it).
+        def slow_price(self, symbol):
+            time.sleep(0.005)
+            return CURRENT_PRICE
+
+        monkeypatch.setattr(PaperTrader, "get_current_price", slow_price)
+        trader = PaperTrader(initial_capital=100_000)
+
+        asset = _stock()
+        trader.place_order(asset, OrderType.BUY, 10, limit_price=None)
+
+        barrier = threading.Barrier(self.N_THREADS)
+
+        def poll(i):
+            barrier.wait(timeout=10)
+            # Mix the two entry points that both execute fills.
+            if i % 2:
+                trader.get_portfolio_status()
+            else:
+                trader.process_orders()
+
+        errors = self._run_threads(self.N_THREADS, poll)
+
+        assert errors == [], f"thread(s) raised: {errors!r}"
+        assert trader.pending_orders == []
+        pos = trader.portfolio.get_position(asset)
+        assert pos is not None
+        assert pos.quantity == 10  # exactly one fill, not doubled
+        # Cash deducted exactly once (incl. the 0.1% slippage).
+        expected_cash = 100_000 - 10 * CURRENT_PRICE * 1.001
+        assert trader.portfolio.cash == pytest.approx(expected_cash)
+
+    def test_concurrent_place_order_mints_unique_ids(self, trader):
+        barrier = threading.Barrier(self.N_THREADS)
+        order_ids = []
+        ids_lock = threading.Lock()
+
+        def place(i):
+            barrier.wait(timeout=10)
+            # Limit far below market so nothing ever fills here.
+            oid = trader.place_order(_stock(), OrderType.BUY, 1,
+                                     limit_price=1.0)
+            with ids_lock:
+                order_ids.append(oid)
+
+        errors = self._run_threads(self.N_THREADS, place)
+
+        assert errors == [], f"thread(s) raised: {errors!r}"
+        assert len(order_ids) == self.N_THREADS
+        assert len(set(order_ids)) == self.N_THREADS, (
+            f"duplicate order ids minted: {sorted(order_ids)}")
+        assert len(trader.pending_orders) == self.N_THREADS

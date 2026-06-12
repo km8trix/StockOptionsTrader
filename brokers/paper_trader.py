@@ -5,6 +5,7 @@ Paper Trader - Simulated trading for live market data
 from __future__ import annotations
 
 import logging
+import threading
 
 import numpy as np
 import pandas as pd
@@ -28,24 +29,31 @@ class PaperTrader(ExecutionBroker):
         self.order_id_counter = 0
         # Date of the close that served each symbol's last price quote.
         self.last_price_dates: Dict[str, date] = {}
+        # Guards order/portfolio mutation under gunicorn --threads: two
+        # overlapping status polls both run process_orders(), and without a
+        # lock both can pass the fill check for the same pending order
+        # (double fill, then ValueError on the second remove). RLock, not
+        # Lock, because get_portfolio_status() calls process_orders().
+        self._lock = threading.RLock()
 
     def place_order(self, asset: Asset, order_type: OrderType, quantity: int,
                    limit_price: Optional[float]) -> str:
         """Place a new order"""
-        self.order_id_counter += 1
-        order_id = f"ORD-{self.order_id_counter:06d}"
-        
-        order = Order(
-            asset=asset,
-            order_type=order_type,
-            quantity=quantity,
-            price=limit_price,
-            timestamp=datetime.now(),
-            order_id=order_id
-        )
-        
-        self.pending_orders.append(order)
-        return order_id
+        with self._lock:
+            self.order_id_counter += 1
+            order_id = f"ORD-{self.order_id_counter:06d}"
+
+            order = Order(
+                asset=asset,
+                order_type=order_type,
+                quantity=quantity,
+                price=limit_price,
+                timestamp=datetime.now(),
+                order_id=order_id
+            )
+
+            self.pending_orders.append(order)
+            return order_id
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending order by its order id.
@@ -53,14 +61,15 @@ class PaperTrader(ExecutionBroker):
         Returns True when the order was found and removed from the pending
         queue (its status is set to CANCELLED), False otherwise.
         """
-        for order in self.pending_orders:
-            if order.order_id == order_id:
-                order.status = OrderStatus.CANCELLED
-                self.pending_orders.remove(order)
-                logger.info("Cancelled pending order %s (%s %d %s)",
-                            order_id, order.order_type.value, order.quantity,
-                            order.asset.symbol)
-                return True
+        with self._lock:
+            for order in self.pending_orders:
+                if order.order_id == order_id:
+                    order.status = OrderStatus.CANCELLED
+                    self.pending_orders.remove(order)
+                    logger.info("Cancelled pending order %s (%s %d %s)",
+                                order_id, order.order_type.value,
+                                order.quantity, order.asset.symbol)
+                    return True
         logger.warning("cancel_order: no pending order with id %s", order_id)
         return False
 
@@ -109,27 +118,29 @@ class PaperTrader(ExecutionBroker):
     
     def process_orders(self):
         """Process pending orders at current market prices"""
-        for order in self.pending_orders[:]:
-            current_price = self.get_current_price(order.asset.symbol)
-            
-            if current_price is None:
-                continue
-            
-            # Check if order can be filled
-            filled = False
+        with self._lock:
+            for order in self.pending_orders[:]:
+                current_price = self.get_current_price(order.asset.symbol)
 
-            if order.price is None:
-                # Market order (limit_price=None per ExecutionBroker contract):
-                # immediately marketable for both BUY and SELL at current price.
-                filled = True
-            elif order.order_type == OrderType.BUY and current_price <= order.price:
-                filled = True
-            elif order.order_type == OrderType.SELL and current_price >= order.price:
-                filled = True
-            
-            if filled:
-                self._execute_order(order, current_price)
-                self.pending_orders.remove(order)
+                if current_price is None:
+                    continue
+
+                # Check if order can be filled
+                filled = False
+
+                if order.price is None:
+                    # Market order (limit_price=None per ExecutionBroker
+                    # contract): immediately marketable for both BUY and
+                    # SELL at current price.
+                    filled = True
+                elif order.order_type == OrderType.BUY and current_price <= order.price:
+                    filled = True
+                elif order.order_type == OrderType.SELL and current_price >= order.price:
+                    filled = True
+
+                if filled:
+                    self._execute_order(order, current_price)
+                    self.pending_orders.remove(order)
     
     def _execute_order(self, order: Order, execution_price: float):
         """Execute an order"""
@@ -169,23 +180,24 @@ class PaperTrader(ExecutionBroker):
     
     def get_portfolio_status(self) -> Dict:
         """Get current portfolio status"""
-        self.process_orders()
-        
-        return {
-            'timestamp': datetime.now().isoformat(),
-            'cash': self.portfolio.cash,
-            'portfolio_value': self.portfolio.get_portfolio_value(),
-            'unrealized_pnl': self.portfolio.get_portfolio_pnl(),
-            'positions': [
-                {
-                    'symbol': pos.asset.symbol,
-                    'quantity': pos.quantity,
-                    'entry_price': pos.avg_entry_price,
-                    'current_price': pos.current_price,
-                    'pnl': pos.pnl(),
-                    'pnl_pct': pos.pnl_pct()
-                }
-                for pos in self.portfolio.positions.values()
-            ],
-            'pending_orders': len(self.pending_orders)
-        }
+        with self._lock:
+            self.process_orders()
+
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'cash': self.portfolio.cash,
+                'portfolio_value': self.portfolio.get_portfolio_value(),
+                'unrealized_pnl': self.portfolio.get_portfolio_pnl(),
+                'positions': [
+                    {
+                        'symbol': pos.asset.symbol,
+                        'quantity': pos.quantity,
+                        'entry_price': pos.avg_entry_price,
+                        'current_price': pos.current_price,
+                        'pnl': pos.pnl(),
+                        'pnl_pct': pos.pnl_pct()
+                    }
+                    for pos in self.portfolio.positions.values()
+                ],
+                'pending_orders': len(self.pending_orders)
+            }

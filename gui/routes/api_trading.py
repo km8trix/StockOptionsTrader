@@ -6,6 +6,7 @@ from __future__ import annotations
 from flask import Blueprint, request, jsonify
 import logging
 import os
+import threading
 
 from gui.globals import alert_manager, risk_manager
 from brokers.paper_trader import PaperTrader
@@ -33,6 +34,11 @@ trading_bp = Blueprint('trading', __name__, url_prefix='/api')
 
 # ==================== TRADING SESSIONS ====================
 active_traders = {}
+# Guards registration only. Under gunicorn --threads, two concurrent
+# create_trader calls could otherwise silently replace a trader mid-mutation.
+# Reads stay lock-free: dict lookup is atomic, and entries are only ever
+# added/replaced under this lock.
+_active_traders_lock = threading.Lock()
 
 @trading_bp.route('/trader/create', methods=['POST'])
 def create_trader():
@@ -41,7 +47,8 @@ def create_trader():
         data = request.get_json(silent=True) or {}
         trader_id = data.get('trader_id', 'default')
         mode = data.get('mode', 'paper')
-        
+        replace = bool(data.get('replace', False))
+
         if mode == 'live':
             if LiveEtradeBroker is None:
                 return jsonify({
@@ -49,7 +56,7 @@ def create_trader():
                     'reason': LIVE_BROKER_IMPORT_ERROR,
                 }), 503
 
-            active_traders[trader_id] = LiveEtradeBroker(
+            trader = LiveEtradeBroker(
                 consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
                 consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),
                 access_token=os.getenv("ETRADE_ACCESS_TOKEN"),
@@ -58,8 +65,17 @@ def create_trader():
             )
         else:
             initial_capital = float(data.get('initial_capital', 50000))
-            active_traders[trader_id] = PaperTrader(initial_capital)
-            
+            trader = PaperTrader(initial_capital)
+
+        with _active_traders_lock:
+            if trader_id in active_traders and not replace:
+                return jsonify({
+                    'error': f'Trader {trader_id} already exists',
+                    'detail': "Pass 'replace': true to overwrite the "
+                              'existing trading session.',
+                }), 409
+            active_traders[trader_id] = trader
+
         return jsonify({'trader_id': trader_id, 'mode': mode, 'status': 'created'})
     except Exception:
         logger.error('Failed to create trading session', exc_info=True)
