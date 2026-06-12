@@ -9,6 +9,7 @@ import pytest
 from desks.base import Desk
 from desks.foundation import FoundationDesk
 from desks.registry import create_desk, list_desks
+from desks.renaissance import RenaissanceDesk
 
 EXPECTED_KEYS = {'key', 'name', 'firm_inspiration', 'description', 'status',
                  'activates_in_phase', 'accent'}
@@ -40,8 +41,9 @@ class TestListDesks:
         assert by_key['foundation']['accent'] == '#4493f8'
         assert by_key['foundation']['firm_inspiration'] == 'House'
 
-        assert by_key['renaissance']['status'] == 'planned'
-        assert by_key['renaissance']['activates_in_phase'] == 6
+        # Contract C6: renaissance is ready as of Phase 6; accent stays.
+        assert by_key['renaissance']['status'] == 'ready'
+        assert by_key['renaissance']['activates_in_phase'] is None
         assert by_key['renaissance']['accent'] == '#58a6ff'
 
         assert by_key['citadel']['activates_in_phase'] == 7
@@ -63,14 +65,27 @@ class TestCreateDesk:
         desk = create_desk('foundation', capital_allocation=0.25)
         assert desk.capital_allocation == 0.25
 
+    def test_creates_renaissance_desk(self):
+        # Contract C6: create_desk('renaissance') returns the desk.
+        desk = create_desk('renaissance')
+        assert isinstance(desk, RenaissanceDesk)
+        assert isinstance(desk, Desk)
+        assert desk.key == 'renaissance'
+        assert desk.accent == '#58a6ff'
+        assert desk.capital_allocation == 1.0
+
+    def test_renaissance_capital_allocation_is_passed_through(self):
+        desk = create_desk('renaissance', capital_allocation=0.3)
+        assert desk.capital_allocation == 0.3
+
     def test_unknown_key_raises_value_error(self):
         with pytest.raises(ValueError, match='Unknown desk: warrenbuffett'):
             create_desk('warrenbuffett')
 
-    @pytest.mark.parametrize('key,phase', [('renaissance', 6),
-                                           ('citadel', 7),
+    @pytest.mark.parametrize('key,phase', [('citadel', 7),
                                            ('janestreet', 8)])
     def test_planned_desks_raise_with_their_phase(self, key, phase):
+        # citadel/janestreet stay planned in Phase 6 (contract C6).
         with pytest.raises(ValueError,
                            match=f"Desk '{key}' activates in Phase {phase}"):
             create_desk(key)

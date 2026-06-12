@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from desks.base import Desk
 from desks.foundation import FoundationDesk
+from desks.renaissance import RenaissanceDesk
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +36,10 @@ _DESK_SPECS: Dict[str, Dict] = {
         'description': ('HMM regime detection, regime-conditioned '
                         'short-horizon mean reversion, nonlinear stat-arb, '
                         'and cointegration pairs.'),
-        'status': 'planned',
-        'activates_in_phase': 6,
+        'status': 'ready',
+        'activates_in_phase': None,
         'accent': '#58a6ff',
-        'factory': None,
+        'factory': RenaissanceDesk,
     },
     'citadel': {
         'name': 'Citadel Desk',

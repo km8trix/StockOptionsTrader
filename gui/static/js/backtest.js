@@ -1,7 +1,11 @@
 // Backtest page: async job submission + progress polling, result charts
 // (equity vs benchmark, drawdown), sortable trade table, saved history with
 // two-way comparison, and Phase 5 desk mode (desk picker, desk header chip,
-// trader's-notes timeline, walk-forward refit markers). Talks to:
+// trader's-notes timeline, walk-forward refit markers). Phase 6 adds the
+// Renaissance regime visualization (contract C5: translucent equity-chart
+// bands + a current-regime chip), book filter chips on the trader's notes
+// (contract C7: note.data.book), and per-model walk-forward marker colors
+// (fits MAY carry 'model'). Talks to:
 //   POST /api/backtest/run            -> {job_id} (strategy OR desk payload)
 //   GET  /api/backtest/status/<id>    -> JobManager record
 //   GET  /api/backtests               -> saved history rows
@@ -16,9 +20,33 @@ const POLL_MS = 1000;
 // Only a strict #rrggbb desk accent flows into inline styles.
 const ACCENT_RE = /^#[0-9a-fA-F]{6}$/;
 // Walk-forward refit markers: pod purple, same hue as the 'model' category.
+// Phase 6: fits MAY carry 'model' — those get a per-model hue instead.
 const WF_COLOR = '#bc8cff';
+const WF_MODEL_COLORS = {
+    regime: '#58a6ff',
+    stat_arb: '#d29922',
+    pairs: '#bc8cff',
+};
 // Trader's-notes categories, in filter-chip display order (contract C3).
 const NOTE_CATEGORIES = ['signal', 'risk', 'allocation', 'model', 'info'];
+// Renaissance books carried in note.data.book, in filter-chip display
+// order (contract C7). Keys double as CSS suffixes — whitelisted only.
+const NOTE_BOOKS = {
+    regime: 'Regime',
+    mean_reversion: 'Mean Reversion',
+    stat_arb: 'Stat Arb',
+    pairs: 'Pairs',
+};
+// Regime states (contract C5): equity-chart band tint (low alpha, behind
+// the traces) + solid hue for the legend swatch and current-regime chip.
+const REGIME_META = {
+    mean_reverting: { label: 'Mean-reverting',
+                      band: 'rgba(88, 166, 255, 0.10)', color: '#58a6ff' },
+    trending:       { label: 'Trending',
+                      band: 'rgba(63, 185, 80, 0.10)', color: '#3fb950' },
+    high_vol:       { label: 'High-vol',
+                      band: 'rgba(248, 81, 73, 0.10)', color: '#f85149' },
+};
 
 let pollTimer = null;
 let restoreRunBtn = null;
@@ -28,6 +56,7 @@ let hasResults = false;
 let desksByKey = {};        // ready desks from /api/floor/desks, keyed by key
 let currentNotes = [];      // trader_notes of the report on screen
 let noteFilter = 'all';     // active category filter chip
+let bookFilter = 'all';     // active book filter chip (composes with above)
 
 /* ==========================================================================
    Theme helpers (same approach as analysis.js)
@@ -293,7 +322,7 @@ function renderResults(report) {
     document.getElementById('compareSection').classList.add('d-none');
     document.getElementById('resultsSection').classList.remove('d-none');
 
-    renderDeskChip(report.desk);
+    renderDeskHeader(report);
     renderMetrics(report.summary || {});
     renderPendingSignals(report.pending_signals || []);
     renderEquityChart(report);
@@ -307,8 +336,9 @@ function renderResults(report) {
    Desk results (Phase 5): header chip + trader's-notes timeline
    ========================================================================== */
 
-function renderDeskChip(desk) {
+function renderDeskHeader(report) {
     const row = document.getElementById('deskChipRow');
+    const desk = report.desk;
     if (!desk || !desk.key) {
         row.classList.add('d-none');
         row.innerHTML = '';
@@ -320,11 +350,48 @@ function renderDeskChip(desk) {
     row.innerHTML =
         `<span class="desk-chip"${accent ? ` style="--desk-accent: ${accent};"` : ''}>` +
         '<i class="bi bi-building" aria-hidden="true"></i>' +
-        `${escapeHTML(desk.name || desk.key)} desk</span>`;
+        `${escapeHTML(desk.name || desk.key)} desk</span>` +
+        regimeChipHTML(report);
+}
+
+/**
+ * Regime entries with a whitelisted state (contract C5). Anything else —
+ * key absent, [], or an unknown state — drops out, so foundation/strategy
+ * runs render no regime UI at all.
+ */
+function regimeSeries(report) {
+    return Array.isArray(report.regime_series)
+        ? report.regime_series.filter(
+            (r) => r && Object.prototype.hasOwnProperty.call(REGIME_META, r.state))
+        : [];
+}
+
+/** 'Current regime' chip: the final entry's state + its max probability. */
+function regimeChipHTML(report) {
+    const series = regimeSeries(report);
+    if (series.length === 0) return '';
+    const last = series[series.length - 1];
+    const meta = REGIME_META[last.state]; // whitelisted color -> inline style
+    const probs = (last.probs && typeof last.probs === 'object')
+        ? Object.values(last.probs).map(Number).filter(Number.isFinite)
+        : [];
+    const conf = probs.length > 0
+        ? ` · ${(Math.max(...probs) * 100).toFixed(0)}%` : '';
+    return `<span class="regime-chip" style="--regime-color: ${meta.color};">` +
+        '<i class="bi bi-activity" aria-hidden="true"></i>' +
+        `Current regime: ${escapeHTML(meta.label)}${conf}</span>`;
 }
 
 function noteCategory(note) {
     return NOTE_CATEGORIES.includes(note.category) ? note.category : 'info';
+}
+
+/** Whitelisted note.data.book (contract C7), or null for untagged notes. */
+function noteBook(note) {
+    const data = note.data;
+    return (data && typeof data === 'object' &&
+            Object.prototype.hasOwnProperty.call(NOTE_BOOKS, data.book))
+        ? data.book : null;
 }
 
 function renderTraderNotes(report) {
@@ -338,7 +405,9 @@ function renderTraderNotes(report) {
     card.classList.remove('d-none');
     currentNotes = Array.isArray(report.trader_notes) ? report.trader_notes : [];
     noteFilter = 'all';
+    bookFilter = 'all';
     paintNoteFilters();
+    paintBookFilters();
     paintNotes();
 }
 
@@ -368,14 +437,54 @@ function paintNoteFilters() {
     });
 }
 
+/**
+ * Second filter-chip row (contract C7): one chip per book present in
+ * note.data.book, composing with the category filter. Hidden entirely when
+ * no note is book-tagged (foundation runs stay byte-identical on screen).
+ */
+function paintBookFilters() {
+    const wrap = document.getElementById('noteBookFilters');
+    const counts = {};
+    currentNotes.forEach((n) => {
+        const book = noteBook(n);
+        if (book) counts[book] = (counts[book] || 0) + 1;
+    });
+    const present = Object.keys(NOTE_BOOKS).filter((b) => counts[b]);
+    if (present.length === 0) {
+        wrap.classList.add('d-none');
+        wrap.innerHTML = '';
+        return;
+    }
+    wrap.classList.remove('d-none');
+    const chips = [['all', `All books (${currentNotes.length})`]].concat(
+        present.map((b) => [b, `${NOTE_BOOKS[b]} (${counts[b]})`]));
+    wrap.innerHTML = chips.map(([value, label]) =>
+        '<button type="button" class="note-filter-chip' +
+        `${value === 'all' ? '' : ` note-book-${value}`}` +
+        `${value === bookFilter ? ' active' : ''}"` +
+        ` data-book="${value}" aria-pressed="${value === bookFilter}">` +
+        `${escapeHTML(label)}</button>`).join('');
+    wrap.querySelectorAll('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            bookFilter = btn.dataset.book;
+            paintBookFilters();
+            paintNotes();
+        });
+    });
+}
+
 function noteItem(note) {
     const category = noteCategory(note);
+    const book = noteBook(note); // whitelisted key or null
     const data = note.data && typeof note.data === 'object' ? note.data : null;
     const hasData = data !== null && Object.keys(data).length > 0;
     return (
         '<li class="note-entry">' +
         `<span class="note-ts num">${escapeHTML(note.timestamp ?? '—')}</span>` +
         `<span class="note-cat-chip note-cat-${category}">${escapeHTML(category)}</span>` +
+        (book
+            ? `<span class="note-cat-chip note-book-${book}">${escapeHTML(NOTE_BOOKS[book])}</span>`
+            : '') +
         `<span class="note-msg">${escapeHTML(note.message ?? '')}</span>` +
         (hasData
             ? '<details class="note-data"><summary>data</summary>' +
@@ -386,12 +495,26 @@ function noteItem(note) {
     );
 }
 
+function noteVisible(note) {
+    return (noteFilter === 'all' || noteCategory(note) === noteFilter) &&
+           (bookFilter === 'all' || noteBook(note) === bookFilter);
+}
+
+/** Funnel empty state naming whichever filters are active. */
+function filteredEmptyStateHTML() {
+    const labels = [];
+    if (noteFilter !== 'all') labels.push(noteFilter);
+    if (bookFilter !== 'all') labels.push(NOTE_BOOKS[bookFilter]);
+    return emptyStateHTML('bi-funnel', `No ${labels.join(' · ')} notes`,
+        bookFilter === 'all'
+            ? 'Pick another category filter.'
+            : 'Pick another filter combination.');
+}
+
 function paintNotes() {
     const list = document.getElementById('notesTimeline');
     const emptyEl = document.getElementById('notesEmpty');
-    const visible = noteFilter === 'all'
-        ? currentNotes
-        : currentNotes.filter((n) => noteCategory(n) === noteFilter);
+    const visible = currentNotes.filter(noteVisible);
 
     if (visible.length === 0) {
         list.innerHTML = '';
@@ -399,8 +522,7 @@ function paintNotes() {
         emptyEl.innerHTML = currentNotes.length === 0
             ? emptyStateHTML('bi-journal-text', 'No trader notes',
                 'The desk logged nothing for this run.')
-            : emptyStateHTML('bi-funnel', `No ${noteFilter} notes`,
-                'Pick another category filter.');
+            : filteredEmptyStateHTML();
         return;
     }
     emptyEl.classList.add('d-none');
@@ -494,38 +616,115 @@ function renderEquityChart(report) {
     const layout = baseLayout(t, 320);
     layout.yaxis.title = { text: 'Value ($)', font: { size: 10, color: t.muted } };
     layout.yaxis.tickformat = ',.0f';
+    addRegimeBands(report, traces, layout);
     addWalkForwardMarkers(report, history, traces, layout);
     Plotly.react(document.getElementById('equityChart'), traces, layout, PLOT_CONFIG);
 }
 
 /**
+ * Regime background bands (contract C5): one translucent rect per run of
+ * consecutive same-state dates, drawn on layer 'below' so the equity and
+ * benchmark traces stay legible, plus one legend swatch per state present.
+ * Skips cleanly when regime_series is absent/empty (foundation/strategy).
+ */
+function addRegimeBands(report, traces, layout) {
+    const series = regimeSeries(report);
+    if (series.length === 0) return;
+
+    // Merge consecutive same-state entries; each band closes where the next
+    // one opens so the covered span tiles without gaps.
+    const bands = [];
+    series.forEach((entry) => {
+        const prev = bands[bands.length - 1];
+        if (prev && prev.state === entry.state) {
+            prev.end = entry.date;
+        } else {
+            if (prev) prev.end = entry.date;
+            bands.push({ state: entry.state, start: entry.date, end: entry.date });
+        }
+    });
+
+    layout.shapes = (layout.shapes || []).concat(bands.map((band) => ({
+        type: 'rect', xref: 'x', yref: 'paper', layer: 'below',
+        x0: band.start, x1: band.end, y0: 0, y1: 1,
+        fillcolor: REGIME_META[band.state].band,
+        line: { width: 0 },
+    })));
+
+    // Shapes never reach the legend — invisible marker traces carry one
+    // swatch per state present, in REGIME_META display order.
+    const present = new Set(series.map((entry) => entry.state));
+    Object.keys(REGIME_META).filter((state) => present.has(state))
+        .forEach((state) => {
+            const meta = REGIME_META[state];
+            traces.push({
+                type: 'scatter', mode: 'markers', x: [null], y: [null],
+                name: `${meta.label} regime`,
+                marker: { symbol: 'square', size: 9, color: meta.band,
+                          line: { width: 1, color: meta.color } },
+                hoverinfo: 'skip', showlegend: true,
+            });
+        });
+}
+
+/** Marker color for one walk-forward fit: per-model hue, legacy fallback. */
+function wfColor(wf) {
+    return WF_MODEL_COLORS[wf.model] || WF_COLOR;
+}
+
+/**
  * Walk-forward refit markers (desk mode, contract C3): a vertical dashed
- * line per report.walk_forward entry at its fit_date, plus one legend-bearing
- * marker trace whose hover text describes the training window. Skips cleanly
- * when the list is empty/absent (strategy runs) or there is no equity curve
- * to anchor the hover markers to.
+ * line per report.walk_forward entry at its fit_date, plus legend-bearing
+ * marker traces whose hover text describes the training window. Phase 6:
+ * fits MAY carry 'model' ('regime'|'stat_arb'|'pairs') — those are grouped
+ * into one color-coded legend entry per model, while untagged fits keep the
+ * legacy purple 'Walk-forward refit' entry (foundation back-compat). Skips
+ * cleanly when the list is empty/absent (strategy runs) or there is no
+ * equity curve to anchor the hover markers to.
  */
 function addWalkForwardMarkers(report, history, traces, layout) {
     const refits = Array.isArray(report.walk_forward) ? report.walk_forward : [];
     if (refits.length === 0 || history.length === 0) return;
 
-    layout.shapes = refits.map((wf) => ({
+    layout.shapes = (layout.shapes || []).concat(refits.map((wf) => ({
         type: 'line', xref: 'x', yref: 'paper',
         x0: wf.fit_date, x1: wf.fit_date, y0: 0, y1: 1,
-        line: { color: WF_COLOR, width: 1, dash: 'dash' },
-    }));
+        line: { color: wfColor(wf), width: 1, dash: 'dash' },
+    })));
 
     const top = Math.max(...history.map((h) => h.portfolio_value));
-    traces.push({
-        type: 'scatter', name: 'Walk-forward refit', mode: 'markers',
-        x: refits.map((wf) => wf.fit_date),
-        y: refits.map(() => top),
-        marker: { symbol: 'line-ns-open', size: 9, color: WF_COLOR,
-                  line: { width: 1.5, color: WF_COLOR } },
-        text: refits.map((wf) =>
-            `Refit: trained ${wf.train_start} → ${wf.train_end} ` +
-            `(${wf.n_samples} rows)`),
-        hovertemplate: '%{text}<extra></extra>',
+    const groups = []; // insertion-ordered: [{key, label, color, fits}]
+    refits.forEach((wf) => {
+        // Only whitelisted models get their own group; anything else
+        // (absent or unknown) falls back to the legacy uncolored entry.
+        const key = WF_MODEL_COLORS[wf.model] ? wf.model : '';
+        let group = groups.find((g) => g.key === key);
+        if (!group) {
+            group = {
+                key,
+                color: key ? WF_MODEL_COLORS[key] : WF_COLOR,
+                label: key ? `Refit · ${NOTE_BOOKS[key] || key}`
+                           : 'Walk-forward refit',
+                fits: [],
+            };
+            groups.push(group);
+        }
+        group.fits.push(wf);
+    });
+
+    groups.forEach((group) => {
+        traces.push({
+            type: 'scatter', name: group.label, mode: 'markers',
+            x: group.fits.map((wf) => wf.fit_date),
+            y: group.fits.map(() => top),
+            marker: { symbol: 'line-ns-open', size: 9, color: group.color,
+                      line: { width: 1.5, color: group.color } },
+            text: group.fits.map((wf) =>
+                `Refit${group.key ? ` [${group.key}]` : ''}: ` +
+                `trained ${wf.train_start} → ${wf.train_end} ` +
+                `(${wf.n_samples} rows)`),
+            hovertemplate: '%{text}<extra></extra>',
+        });
     });
 }
 

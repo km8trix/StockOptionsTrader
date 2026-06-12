@@ -39,9 +39,16 @@ class PortfolioManager:
         """Update cash balance"""
         self.cash += amount
     
-    def close_position(self, asset: Asset, exit_price: float, quantity: int, 
+    def close_position(self, asset: Asset, exit_price: float, quantity: int,
                        entry_time: datetime, exit_time: datetime):
-        """Close a position and record the trade"""
+        """Close (all or part of) a position and record the trade.
+
+        Sign convention for shorts: a short position has NEGATIVE quantity,
+        and `quantity` must carry the same sign as the position — a full
+        cover of a -100 position passes quantity=-100, a partial cover of
+        40 shares passes quantity=-40 (leaving -60 open). Trade.pnl =
+        quantity * (exit - entry) is sign-correct for negatives.
+        """
         if asset not in self.positions:
             return
         
@@ -62,7 +69,13 @@ class PortfolioManager:
             position.quantity -= quantity
     
     def get_portfolio_value(self) -> float:
-        """Calculate total portfolio value (cash + positions)"""
+        """Calculate total portfolio value (cash + positions).
+
+        Short positions (negative quantity) contribute NEGATIVE position
+        value — correct under the cash-account approximation, because the
+        short-sale proceeds already sit in cash; the net is the liquidation
+        value of covering at the current price.
+        """
         position_value = sum(pos.quantity * pos.current_price for pos in self.positions.values())
         return self.cash + position_value
     

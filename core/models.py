@@ -79,38 +79,56 @@ class Order:
 
 @dataclass
 class Position:
-    """Represents a current position in an asset"""
+    """Represents a current position in an asset.
+
+    quantity is NEGATIVE for short positions (desk-mode SHORT fills).
+    pnl() is sign-correct by construction: quantity * (current - entry).
+    """
     asset: Asset
     quantity: int
     avg_entry_price: float
     current_price: float
     timestamp: datetime
-    
+
     def pnl(self) -> float:
         """Calculate unrealized P&L"""
         return self.quantity * (self.current_price - self.avg_entry_price)
-    
+
     def pnl_pct(self) -> float:
-        """Calculate unrealized P&L percentage"""
+        """Calculate unrealized P&L percentage (direction-aware).
+
+        For shorts (quantity < 0) the sign is flipped so that a falling
+        price reports a POSITIVE percentage, consistent with pnl().
+        """
         if self.avg_entry_price == 0:
             return 0
-        return ((self.current_price - self.avg_entry_price) / self.avg_entry_price) * 100
+        direction = -1.0 if self.quantity < 0 else 1.0
+        return direction * ((self.current_price - self.avg_entry_price)
+                            / self.avg_entry_price) * 100
 
 
 @dataclass
 class Trade:
-    """Represents a completed trade"""
+    """Represents a completed trade.
+
+    quantity is NEGATIVE for closed short trades (desk-mode COVER fills).
+    pnl = quantity * (exit - entry) is sign-correct for negatives: a short
+    covered below entry (exit < entry, quantity < 0) yields a POSITIVE
+    pnl. pnl_pct mirrors that direction.
+    """
     asset: Asset
     entry_price: float
     exit_price: float
     quantity: int
     entry_time: datetime
     exit_time: datetime
-    
+
     def __post_init__(self):
         self._pnl = self.quantity * (self.exit_price - self.entry_price)
         if self.entry_price != 0:
-            self._pnl_pct = ((self.exit_price - self.entry_price) / self.entry_price) * 100
+            direction = -1.0 if self.quantity < 0 else 1.0
+            self._pnl_pct = direction * (
+                (self.exit_price - self.entry_price) / self.entry_price) * 100
         else:
             self._pnl_pct = 0
     

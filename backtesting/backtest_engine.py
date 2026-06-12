@@ -14,7 +14,14 @@ Two driving modes (exactly one per engine instance):
         then apply_risk each day); each fill is sized as portfolio_value *
         desk.capital_allocation * intent.size_fraction at fill time. The
         report additionally carries 'desk', 'trader_notes' and
-        'walk_forward' (contract C3).
+        'walk_forward' (contract C3), plus 'regime_series' when the desk
+        exposes a non-empty regime_series property (contract C5).
+
+        Desk mode also supports SHORT/COVER intents (contract C4): SHORT
+        opens a negative position (a short is a SELL, so adverse slippage
+        LOWERS the fill); COVER closes it (a buy: adverse slippage raises
+        the fill). Margin is NOT modeled — cash-account approximation,
+        short proceeds held as cash. Strategy mode has no short path.
 """
 
 from __future__ import annotations
@@ -239,13 +246,20 @@ class BacktestEngine:
                      fill_date, position_size: float) -> None:
         """Fill a queued intent at base_price (today's open) with slippage.
 
-        BUY fills at base_price * (1 + slippage_bps/10000); SELL fills at
+        Slippage is always adverse: buys (BUY, COVER) fill at
+        base_price * (1 + slippage_bps/10000); sells (SELL, SHORT) fill at
         base_price * (1 - slippage_bps/10000). Position size is the
         position_size fraction of portfolio value evaluated at fill time;
         desk-mode intents instead size to desk.capital_allocation *
         intent['size_fraction'] (still a fraction of fill-time portfolio
         value). Commission semantics: cost = qty * fill * (1 + commission)
-        on buy; proceeds = qty * fill * (1 - commission) on sell.
+        on a buy; proceeds = qty * fill * (1 - commission) on a sell.
+
+        SHORT/COVER (desk mode only, contract C4): SHORT opens a NEGATIVE
+        position of -qty shares with proceeds credited to cash (margin is
+        not modeled — cash-account approximation); COVER closes the full
+        short, debiting cash, and records the Trade with the negative
+        quantity (Trade.pnl = qty * (exit - entry) is sign-correct).
         """
         signal = intent['signal']
         slippage = self.slippage_bps / 10000.0
@@ -315,6 +329,64 @@ class BacktestEngine:
             })
             logger.info("SELL %d %s @ %.4f on %s (signal %s)",
                         quantity, asset.symbol, fill_price, fill_date,
+                        intent['signal_date'])
+
+        elif signal == 'SHORT' and self.desk is not None \
+                and (not existing_pos or existing_pos.quantity == 0):
+            # A short is a SELL: adverse slippage means a LOWER fill.
+            fill_price = base_price * (1 - slippage)
+            portfolio_value = self.portfolio.get_portfolio_value()
+            trade_value = portfolio_value * position_size
+            quantity = int(trade_value / fill_price)
+
+            if quantity == 0:
+                logger.warning(
+                    "Dropping SHORT intent for %s on %s: position sizes to 0 "
+                    "shares (trade value %.2f at fill price %.4f)",
+                    asset.symbol, fill_date, trade_value, fill_price)
+                return
+
+            proceeds = quantity * fill_price * (1 - self.commission)
+            self.portfolio.cash += proceeds
+            position = Position(
+                asset=asset,
+                quantity=-quantity,
+                avg_entry_price=fill_price,
+                current_price=fill_price,
+                timestamp=fill_date
+            )
+            self.portfolio.add_position(position)
+            self.trades_log.append({
+                'date': fill_date, 'signal_date': intent['signal_date'],
+                'symbol': asset.symbol, 'action': 'SHORT',
+                'quantity': quantity, 'price': fill_price,
+                'proceeds': proceeds
+            })
+            logger.info("SHORT %d %s @ %.4f on %s (signal %s)",
+                        quantity, asset.symbol, fill_price, fill_date,
+                        intent['signal_date'])
+
+        elif signal == 'COVER' and self.desk is not None \
+                and existing_pos and existing_pos.quantity < 0:
+            # A cover is a BUY: adverse slippage means a HIGHER fill.
+            fill_price = base_price * (1 + slippage)
+            quantity = existing_pos.quantity  # negative
+            cost = abs(quantity) * fill_price * (1 + self.commission)
+            # Closes always execute — even if cash dips negative the desk
+            # must be able to exit a losing short (margin is not modeled).
+            self.portfolio.cash -= cost
+            self.portfolio.close_position(
+                asset, fill_price, quantity,
+                existing_pos.timestamp, fill_date
+            )
+            self.portfolio.remove_position(asset)
+            self.trades_log.append({
+                'date': fill_date, 'signal_date': intent['signal_date'],
+                'symbol': asset.symbol, 'action': 'COVER',
+                'quantity': abs(quantity), 'price': fill_price, 'cost': cost
+            })
+            logger.info("COVER %d %s @ %.4f on %s (signal %s)",
+                        abs(quantity), asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
 
     def _build_benchmark(self, benchmark_symbol: str, start_date: str,
@@ -412,5 +484,10 @@ class BacktestEngine:
                                       for note in self.desk.notes]
             report['walk_forward'] = [fit.to_dict()
                                       for fit in self.desk.walk_forward_fits]
+            # Contract C5: desks with a regime model expose regime_series;
+            # included only when non-empty (FoundationDesk stays unchanged).
+            regime_series = getattr(self.desk, 'regime_series', None)
+            if regime_series:
+                report['regime_series'] = list(regime_series)
 
         return report

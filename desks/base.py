@@ -92,14 +92,28 @@ class TraderNote:
         }
 
 
+#: Allowed desk-intent actions (contract C4). SHORT/COVER are desk-mode
+#: only — strategy mode never produces them.
+INTENT_ACTIONS = ('BUY', 'SELL', 'SHORT', 'COVER')
+
+#: Actions that OPEN exposure (gated by the daily-loss circuit and the
+#: position-size check); SELL/COVER close exposure and always pass.
+OPENING_ACTIONS = ('BUY', 'SHORT')
+
+
 @dataclass
 class DeskIntent:
-    """A desk's wish to trade: BUY/SELL an asset with a sized fraction.
+    """A desk's wish to trade: BUY/SELL/SHORT/COVER an asset, sized.
 
     size_fraction is a fraction of the DESK'S capital (the engine converts
     it to dollars as portfolio_value * desk.capital_allocation *
-    size_fraction at fill time). SELL intents always close the full
-    position regardless of size_fraction.
+    size_fraction at fill time). SELL intents always close the full long
+    position and COVER intents always close the full short position,
+    regardless of size_fraction.
+
+    Flipping in one intent is forbidden (contract C4): a SHORT against an
+    open long — or a BUY against an open short — is blocked at apply_risk
+    with a 'risk' note; the desk must close first and open on a later day.
     """
     asset: Asset
     action: str
@@ -107,9 +121,10 @@ class DeskIntent:
     reason: str
 
     def __post_init__(self):
-        if self.action not in ('BUY', 'SELL'):
+        if self.action not in INTENT_ACTIONS:
             raise ValueError(
-                f"Invalid intent action '{self.action}'; must be BUY or SELL")
+                f"Invalid intent action '{self.action}'; "
+                f"must be one of {INTENT_ACTIONS}")
         if not (0.0 < self.size_fraction <= 1.0):
             raise ValueError(
                 f"size_fraction {self.size_fraction} must be in (0, 1]")
@@ -178,14 +193,23 @@ class Desk(ABC):
 
         1. Daily-loss circuit: if today's realized drawdown (current value
            vs the previous snapshot) breaches check_daily_loss_limit, ALL
-           new BUYs are blocked for the day (noted once).
-        2. Stop losses: any open position where should_close_position fires
-           gets a full-size SELL intent (noted with entry/current/stop).
-        3. Position sizing: a BUY whose dollar value
+           new BUYs AND SHORTs are blocked for the day (noted once).
+           Closing intents (SELL/COVER) always pass.
+        2. Stop losses, both-sided: a long closes (full-size SELL) when
+           should_close_position fires — price <= entry * (1 - stop); a
+           short closes (full-size COVER) when price >= entry * (1 + stop).
+           Both are noted with entry/current/stop.
+        3. Position sizing: a BUY or SHORT whose absolute dollar value
            (portfolio_value * capital_allocation * size_fraction) violates
            check_position_size is blocked (noted with the numbers).
+        4. No one-step flips (contract C4): a BUY against an open short or
+           a SHORT against an open long is blocked with a 'risk' note.
 
-        SELL intents always pass.
+        SELL and COVER intents always pass.
+
+        MARGIN IS NOT MODELED: shorts use a cash-account approximation —
+        short-sale proceeds are held as cash and no margin requirement or
+        borrow cost is simulated. Live shorting is gated to Phase 9.
         """
         approved: List[DeskIntent] = []
         portfolio_value = portfolio.get_portfolio_value()
@@ -207,50 +231,102 @@ class Desk(ABC):
                 daily_pnl=daily_pnl, portfolio_value=portfolio_value,
                 max_daily_loss=self.risk_manager.max_daily_loss)
 
-        # --- Stop-loss SELLs for open positions ------------------------
-        already_selling = {intent.asset for intent in intents
-                           if intent.action == 'SELL'}
+        # --- Stop-loss closes for open positions (both-sided) ----------
+        already_closing = {intent.asset for intent in intents
+                           if intent.action in ('SELL', 'COVER')}
         for asset, position in list(portfolio.positions.items()):
-            if position.quantity <= 0 or asset in already_selling:
+            if asset in already_closing:
                 continue
-            if self.risk_manager.should_close_position(position):
-                stop_price = self.risk_manager.calculate_position_stop_loss(
-                    position.avg_entry_price)
-                approved.append(DeskIntent(
-                    asset=asset, action='SELL', size_fraction=1.0,
-                    reason=(f"stop-loss: {position.current_price:.4f} <= "
-                            f"stop {stop_price:.4f}")))
-                already_selling.add(asset)
-                self.note(
-                    'risk',
-                    f"Stop-loss SELL {asset.symbol}: entry "
-                    f"{position.avg_entry_price:.4f}, current "
-                    f"{position.current_price:.4f} breached stop "
-                    f"{stop_price:.4f} "
-                    f"({self.risk_manager.position_stop_loss:.1%} below entry)",
-                    entry_price=position.avg_entry_price,
-                    current_price=position.current_price,
-                    stop_price=stop_price,
-                    stop_loss_pct=self.risk_manager.position_stop_loss)
+            if position.quantity > 0:
+                if self.risk_manager.should_close_position(position):
+                    stop_price = self.risk_manager.calculate_position_stop_loss(
+                        position.avg_entry_price)
+                    approved.append(DeskIntent(
+                        asset=asset, action='SELL', size_fraction=1.0,
+                        reason=(f"stop-loss: {position.current_price:.4f} <= "
+                                f"stop {stop_price:.4f}")))
+                    already_closing.add(asset)
+                    self.note(
+                        'risk',
+                        f"Stop-loss SELL {asset.symbol}: entry "
+                        f"{position.avg_entry_price:.4f}, current "
+                        f"{position.current_price:.4f} breached stop "
+                        f"{stop_price:.4f} "
+                        f"({self.risk_manager.position_stop_loss:.1%} below entry)",
+                        entry_price=position.avg_entry_price,
+                        current_price=position.current_price,
+                        stop_price=stop_price,
+                        stop_loss_pct=self.risk_manager.position_stop_loss)
+            elif position.quantity < 0:
+                # Short stop: adverse move is the price RISING above
+                # entry * (1 + stop). Mirror of the long-side semantics.
+                entry_price = position.avg_entry_price
+                if entry_price is None or entry_price <= 0:
+                    continue
+                stop_price = entry_price * (
+                    1 + self.risk_manager.position_stop_loss)
+                if position.current_price >= stop_price:
+                    approved.append(DeskIntent(
+                        asset=asset, action='COVER', size_fraction=1.0,
+                        reason=(f"stop-loss: {position.current_price:.4f} >= "
+                                f"stop {stop_price:.4f}")))
+                    already_closing.add(asset)
+                    self.note(
+                        'risk',
+                        f"Stop-loss COVER {asset.symbol}: entry "
+                        f"{entry_price:.4f}, current "
+                        f"{position.current_price:.4f} breached stop "
+                        f"{stop_price:.4f} "
+                        f"({self.risk_manager.position_stop_loss:.1%} above entry)",
+                        entry_price=entry_price,
+                        current_price=position.current_price,
+                        stop_price=stop_price,
+                        stop_loss_pct=self.risk_manager.position_stop_loss)
 
         # --- Per-intent checks -----------------------------------------
         for intent in intents:
-            if intent.action == 'SELL':
+            if intent.action in ('SELL', 'COVER'):
                 approved.append(intent)
                 continue
 
             if not buys_allowed:
-                # Already noted once above.
+                # Already noted once above; the circuit blocks all new
+                # exposure (BUYs and SHORTs alike).
                 continue
 
-            trade_value = (portfolio_value * self.capital_allocation
-                           * intent.size_fraction)
+            # No one-step flips (contract C4): close first, open later.
+            position = portfolio.get_position(intent.asset)
+            if intent.action == 'SHORT' and position is not None \
+                    and position.quantity > 0:
+                self.note(
+                    'risk',
+                    f"Blocked SHORT {intent.asset.symbol}: open long of "
+                    f"{position.quantity} shares — flipping in one intent "
+                    f"is forbidden (SELL first)",
+                    symbol=intent.asset.symbol,
+                    position_quantity=position.quantity,
+                    action=intent.action)
+                continue
+            if intent.action == 'BUY' and position is not None \
+                    and position.quantity < 0:
+                self.note(
+                    'risk',
+                    f"Blocked BUY {intent.asset.symbol}: open short of "
+                    f"{abs(position.quantity)} shares — flipping in one "
+                    f"intent is forbidden (COVER first)",
+                    symbol=intent.asset.symbol,
+                    position_quantity=position.quantity,
+                    action=intent.action)
+                continue
+
+            trade_value = abs(portfolio_value * self.capital_allocation
+                              * intent.size_fraction)
             if not self.risk_manager.check_position_size(portfolio_value,
                                                          trade_value):
                 self.note(
                     'risk',
-                    f"Blocked BUY {intent.asset.symbol}: trade value "
-                    f"{trade_value:,.2f} is "
+                    f"Blocked {intent.action} {intent.asset.symbol}: trade "
+                    f"value {trade_value:,.2f} is "
                     f"{trade_value / portfolio_value:.1%} of portfolio "
                     f"{portfolio_value:,.2f}, exceeding the "
                     f"{self.risk_manager.max_position_size:.1%} "

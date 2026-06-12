@@ -756,10 +756,10 @@ class TestFloorDesksEndpoint:
 
         desks = [
             make_desk_entry(),
-            make_desk_entry(key='renaissance', name='Renaissance',
-                            firm_inspiration='Renaissance Technologies',
-                            status='planned', activates_in_phase=6,
-                            accent='#58a6ff'),
+            make_desk_entry(key='citadel', name='Citadel',
+                            firm_inspiration='Citadel',
+                            status='planned', activates_in_phase=7,
+                            accent='#bc8cff'),
         ]
         monkeypatch.setattr(api_floor, 'list_desks', lambda: desks)
 
@@ -792,8 +792,9 @@ class TestFloorDesksEndpoint:
 class TestFloorDesksRegistryContract:
     """End-to-end /api/floor/desks against the REAL desks.registry.
 
-    Skips (instead of failing) while the parallel Phase 5 backend task that
-    owns desks/ has not landed in this tree yet.
+    Skips (instead of failing) while a parallel backend task that owns
+    desks/ has not landed in this tree yet (Phase 5: the package itself;
+    Phase 6: the renaissance status flip, contract C6).
     """
 
     @pytest.fixture(autouse=True)
@@ -815,14 +816,21 @@ class TestFloorDesksRegistryContract:
             if desk['status'] == 'planned':
                 assert isinstance(desk['activates_in_phase'], int)
 
-    def test_foundation_ready_and_three_planned_with_phases_6_7_8(self, client):
+    def test_foundation_and_renaissance_ready_with_planned_phases_7_8(
+            self, client):
+        """Phase 6 (contract C6): renaissance flips to ready with its accent
+        kept; citadel/janestreet stay the only planned desks."""
         desks = client.get('/api/floor/desks').get_json()['desks']
         by_key = {d['key']: d for d in desks}
 
         assert by_key['foundation']['status'] == 'ready'
+        if by_key['renaissance']['status'] != 'ready':
+            pytest.skip('renaissance not ready yet '
+                        '(parallel Phase 6 backend task, contract C6)')
+        assert by_key['renaissance']['accent'] == '#58a6ff'
         planned_phases = sorted(d['activates_in_phase'] for d in desks
                                 if d['status'] == 'planned')
-        assert planned_phases == [6, 7, 8]
+        assert planned_phases == [7, 8]
 
     def test_unknown_desk_key_returns_400_with_message(self, client):
         response = client.post('/api/backtest/run', json={
@@ -834,12 +842,13 @@ class TestFloorDesksRegistryContract:
         assert 'no-such-desk' in response.get_json()['error']
 
     def test_planned_desk_returns_400_mentioning_its_phase(self, client):
+        # citadel is the first still-planned desk after the Phase 6 flip.
         response = client.post('/api/backtest/run', json={
-            'symbols': 'AAA', 'desk': 'renaissance',
+            'symbols': 'AAA', 'desk': 'citadel',
             'start_date': '2023-01-01', 'end_date': '2023-12-31'})
 
         assert response.status_code == 400
-        assert 'Phase 6' in response.get_json()['error']
+        assert 'Phase 7' in response.get_json()['error']
 
 
 def _fake_desk_report():
@@ -857,6 +866,48 @@ def _fake_desk_report():
     report['walk_forward'] = [
         {'fit_date': '2023-06-01', 'train_start': '2023-01-03',
          'train_end': '2023-05-31', 'n_samples': 103},
+    ]
+    return report
+
+
+def _fake_renaissance_report():
+    """Desk-mode report with the Phase 6 renaissance additions:
+    regime_series (contract C5), book-tagged notes (contract C7), and
+    model-tagged walk-forward fits."""
+    report = _fake_engine_report()
+    report['desk'] = {'key': 'renaissance', 'name': 'Renaissance'}
+    report['trader_notes'] = [
+        {'timestamp': '2023-03-01T00:00:00', 'desk': 'renaissance',
+         'category': 'model', 'message': 'Regime flip: trending -> high_vol',
+         'data': {'book': 'regime', 'confidence': 0.91}},
+        {'timestamp': '2023-03-02T00:00:00', 'desk': 'renaissance',
+         'category': 'signal', 'message': 'Reversion entry AAA at z=-2.1',
+         'data': {'book': 'mean_reversion', 'zscore': -2.1}},
+        {'timestamp': '2023-03-03T00:00:00', 'desk': 'renaissance',
+         'category': 'signal', 'message': 'Pairs divergence AAA/BBB',
+         'data': {'book': 'pairs', 'half_life': 12.5}},
+        {'timestamp': '2023-03-06T00:00:00', 'desk': 'renaissance',
+         'category': 'risk', 'message': 'Stat-arb gross exposure capped',
+         'data': {'book': 'stat_arb'}},
+        # A note without data.book must pass through unchanged too.
+        {'timestamp': '2023-03-07T00:00:00', 'desk': 'renaissance',
+         'category': 'info', 'message': 'Desk heartbeat', 'data': {}},
+    ]
+    report['walk_forward'] = [
+        {'fit_date': '2023-06-01', 'train_start': '2023-01-03',
+         'train_end': '2023-05-31', 'n_samples': 103, 'model': 'regime'},
+        {'fit_date': '2023-06-01', 'train_start': '2023-01-03',
+         'train_end': '2023-05-31', 'n_samples': 103, 'model': 'stat_arb'},
+        {'fit_date': '2023-09-01', 'train_start': '2023-03-01',
+         'train_end': '2023-08-31', 'n_samples': 127, 'model': 'pairs'},
+    ]
+    report['regime_series'] = [
+        {'date': '2023-06-01', 'state': 'trending',
+         'probs': {'mean_reverting': 0.1, 'trending': 0.8, 'high_vol': 0.1}},
+        {'date': '2023-06-02', 'state': 'trending',
+         'probs': {'mean_reverting': 0.15, 'trending': 0.7, 'high_vol': 0.15}},
+        {'date': '2023-06-05', 'state': 'high_vol',
+         'probs': {'mean_reverting': 0.05, 'trending': 0.25, 'high_vol': 0.7}},
     ]
     return report
 
@@ -937,6 +988,9 @@ class TestDeskModeBacktest:
         assert result['summary']['total_return_pct'] == pytest.approx(8.0)
         assert result['trades'][0]['date'] == '2023-03-01'
         assert result['portfolio_history'][0]['timestamp'] == '2023-01-03'
+        # Contract C5: a desk without a regime model must NOT gain
+        # regime_series content — [] or absent are both acceptable.
+        assert result.get('regime_series') in (None, [])
 
     def test_desk_run_saved_with_desk_prefixed_strategy(
             self, client, patch_desk_stack):
@@ -993,15 +1047,15 @@ class TestDeskModeBacktest:
         from gui.routes import api_backtest
 
         def raising_create_desk(key, capital_allocation=1.0):
-            raise ValueError(f"Desk '{key}' activates in Phase 6")
+            raise ValueError(f"Desk '{key}' activates in Phase 7")
 
         monkeypatch.setattr(api_backtest, 'create_desk', raising_create_desk)
 
         response = client.post(
-            '/api/backtest/run', json={**self.PAYLOAD, 'desk': 'renaissance'})
+            '/api/backtest/run', json={**self.PAYLOAD, 'desk': 'citadel'})
 
         assert response.status_code == 400
-        assert 'Phase 6' in response.get_json()['error']
+        assert 'Phase 7' in response.get_json()['error']
 
     def test_desk_run_returns_503_when_framework_unavailable(
             self, client, monkeypatch):
@@ -1053,6 +1107,7 @@ class TestDeskModeBacktest:
         assert 'desk' not in result
         assert 'trader_notes' not in result
         assert 'walk_forward' not in result
+        assert 'regime_series' not in result
         assert result['summary']['total_return_pct'] == pytest.approx(8.0)
 
         rows = client.get('/api/backtests').get_json()['backtests']
@@ -1065,6 +1120,104 @@ class TestDeskModeBacktest:
         assert 'id="btDesk"' in html
         assert 'id="traderNotesCard"' in html
         assert 'id="deskChipRow"' in html
+        # Phase 6: book filter-chip row (contract C7), painted by backtest.js.
+        assert 'id="noteBookFilters"' in html
+
+
+class TestRenaissanceDeskModeBacktest:
+    """Phase 6 passthrough: a desk-mode run whose engine report carries
+    regime_series (contract C5), book-tagged trader notes (contract C7),
+    and model-tagged walk-forward fits must surface them all untouched in
+    the async job result. The desk stack is fully stubbed, so this pins the
+    ROUTE/serialization behavior independent of the real renaissance desk."""
+
+    PAYLOAD = {
+        'symbols': 'AAA',
+        'desk': 'renaissance',
+        'start_date': '2023-01-01',
+        'end_date': '2023-12-31',
+        'initial_capital': 100000,
+        'position_size': 0.1,
+    }
+
+    @pytest.fixture()
+    def patch_renaissance_stack(self, monkeypatch, tmp_path):
+        """Stub create_desk + the whole engine; redirect the history DB."""
+        import gui.globals as gui_globals
+        from gui.routes import api_backtest
+
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'history.db'))
+        monkeypatch.setattr(gui_globals, '_db', None)
+
+        seen = {}
+
+        def fake_create_desk(key, capital_allocation=1.0):
+            seen['desk_key'] = key
+            return object()
+
+        class FakeEngine:
+            def __init__(self, strategy=None, desk=None,
+                         initial_capital=100000, **kwargs):
+                seen['ctor'] = {'strategy': strategy, 'desk': desk}
+                self.market_data = None
+
+            def run(self, symbols, start_date, end_date, position_size,
+                    progress_callback=None, benchmark_symbol='SPY'):
+                return _fake_renaissance_report()
+
+        monkeypatch.setattr(api_backtest, 'create_desk', fake_create_desk)
+        monkeypatch.setattr(api_backtest, 'BacktestEngine', FakeEngine)
+        return seen
+
+    def test_regime_series_passes_through_untouched(
+            self, client, patch_renaissance_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        assert patch_renaissance_stack['desk_key'] == 'renaissance'
+
+        result = job['result']
+        assert result['desk'] == {'key': 'renaissance', 'name': 'Renaissance'}
+        # Contract C5: present, non-empty, byte-for-byte what the engine
+        # emitted (dates already ISO strings; probs floats per state).
+        assert result['regime_series'] == \
+            _fake_renaissance_report()['regime_series']
+        for entry in result['regime_series']:
+            assert set(entry) == {'date', 'state', 'probs'}
+            assert entry['state'] in ('mean_reverting', 'trending', 'high_vol')
+            for prob in entry['probs'].values():
+                assert isinstance(prob, float)
+
+    def test_book_tagged_notes_and_model_tagged_fits_pass_through(
+            self, client, patch_renaissance_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        result = job['result']
+        # Contract C7: data.book survives on every book-specific note; the
+        # untagged heartbeat note is unaffected.
+        books = [n['data'].get('book') for n in result['trader_notes']]
+        assert books == ['regime', 'mean_reversion', 'pairs', 'stat_arb', None]
+        assert result['trader_notes'][1]['data']['zscore'] == \
+            pytest.approx(-2.1)
+        # Phase 6 fits carry 'model' for the color-coded refit markers.
+        assert [wf['model'] for wf in result['walk_forward']] == \
+            ['regime', 'stat_arb', 'pairs']
+        assert result['walk_forward'][2]['fit_date'] == '2023-09-01'
+
+    def test_renaissance_run_saved_with_desk_prefixed_strategy(
+            self, client, patch_renaissance_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        rows = client.get('/api/backtests').get_json()['backtests']
+        assert len(rows) == 1
+        assert rows[0]['strategy'] == 'desk:renaissance'
+        assert rows[0]['total_return'] == pytest.approx(0.08)
 
 
 # ==================== PAPER TRADING PENDING ORDERS ====================

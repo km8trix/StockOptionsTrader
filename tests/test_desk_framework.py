@@ -66,8 +66,13 @@ class TestDeskABCContract:
         assert status['last_note']['message'] == 'hello'
 
     def test_intent_validation(self):
+        # Contract C4: BUY/SELL/SHORT/COVER are all valid actions.
+        for action in ('BUY', 'SELL', 'SHORT', 'COVER'):
+            intent = DeskIntent(asset=stock('A'), action=action,
+                                size_fraction=0.1, reason='x')
+            assert intent.action == action
         with pytest.raises(ValueError, match='action'):
-            DeskIntent(asset=stock('A'), action='SHORT', size_fraction=0.1,
+            DeskIntent(asset=stock('A'), action='HEDGE', size_fraction=0.1,
                        reason='x')
         for bad_fraction in (0.0, -0.1, 1.5):
             with pytest.raises(ValueError, match='size_fraction'):
