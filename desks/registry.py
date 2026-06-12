@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 from desks.base import Desk
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
+from desks.janestreet import JaneStreetDesk
 from desks.renaissance import RenaissanceDesk
 
 logger = logging.getLogger(__name__)
@@ -60,10 +61,12 @@ _DESK_SPECS: Dict[str, Dict] = {
         'description': ('Fair-value engine, market-making simulator '
                         '(simulation-only), and IV-rank-driven defined-risk '
                         'premium selling with an earnings IV-crush module.'),
-        'status': 'planned',
-        'activates_in_phase': 8,
+        # Contract C15: ready as of Phase 8; accent stays '#d29922'.
+        # All four desks are now live.
+        'status': 'ready',
+        'activates_in_phase': None,
         'accent': '#d29922',
-        'factory': None,
+        'factory': JaneStreetDesk,
     },
 }
 

@@ -75,8 +75,15 @@ class PortfolioManager:
         value — correct under the cash-account approximation, because the
         short-sale proceeds already sit in cash; the net is the liquidation
         value of covering at the current price.
+
+        OPTION positions (asset_type CALL/PUT) are valued per-share price
+        x quantity x the contract multiplier (100); stock positions
+        multiply by 1, so mixed stock/option books are exact and pure
+        stock books are byte-identical to pre-Phase-8 behavior.
         """
-        position_value = sum(pos.quantity * pos.current_price for pos in self.positions.values())
+        position_value = sum(
+            pos.quantity * pos.current_price * pos.asset.multiplier
+            for pos in self.positions.values())
         return self.cash + position_value
     
     def get_portfolio_pnl(self) -> float:

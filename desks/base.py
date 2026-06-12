@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from core.models import Asset
+from core.models import Asset, AssetType
 from portfolio.manager import PortfolioManager
 from portfolio.risk_manager import RiskManager
 
@@ -114,11 +114,20 @@ class DeskIntent:
     Flipping in one intent is forbidden (contract C4): a SHORT against an
     open long — or a BUY against an open short — is blocked at apply_risk
     with a 'risk' note; the desk must close first and open on a later day.
+
+    quantity (OPTIONAL, Phase 8, additive): an ABSOLUTE size — contracts
+    for options, shares for stock. When set, it OVERRIDES the
+    size_fraction dollar sizing at fill time (multi-leg option structures
+    need every leg filled in exact contract counts, not value-rounded
+    shares). size_fraction is still required and is what the shared risk
+    checks (position-size limit) evaluate, so set it to the intent's
+    approximate capital fraction.
     """
     asset: Asset
     action: str
     size_fraction: float
     reason: str
+    quantity: Optional[int] = None
 
     def __post_init__(self):
         if self.action not in INTENT_ACTIONS:
@@ -128,6 +137,10 @@ class DeskIntent:
         if not (0.0 < self.size_fraction <= 1.0):
             raise ValueError(
                 f"size_fraction {self.size_fraction} must be in (0, 1]")
+        if self.quantity is not None and self.quantity <= 0:
+            raise ValueError(
+                f"quantity {self.quantity} must be a positive integer "
+                f"(direction comes from the action, never the sign)")
 
 
 class Desk(ABC):
@@ -172,6 +185,18 @@ class Desk(ABC):
         logger.debug("[%s] %s note: %s", self.name, category, message)
         return trader_note
 
+    def risk_note_data(self, asset: Optional[Asset]) -> Dict:
+        """Extra data merged into the shared apply_risk notes.
+
+        Desks whose note contracts tag EVERY note (Jane Street's C14
+        data.book) override this to map the blocked/stopped asset —
+        ``None`` for desk-level notes like the daily-loss circuit — to
+        the owning tag(s). The keys returned must not collide with the
+        note's own kwargs. The base returns {} so the apply_risk notes
+        of desks without such contracts stay byte-identical.
+        """
+        return {}
+
     # ------------------------------------------------------------------
     # Strategy surface
     # ------------------------------------------------------------------
@@ -195,10 +220,18 @@ class Desk(ABC):
            vs the previous snapshot) breaches check_daily_loss_limit, ALL
            new BUYs AND SHORTs are blocked for the day (noted once).
            Closing intents (SELL/COVER) always pass.
-        2. Stop losses, both-sided: a long closes (full-size SELL) when
-           should_close_position fires — price <= entry * (1 - stop); a
-           short closes (full-size COVER) when price >= entry * (1 + stop).
-           Both are noted with entry/current/stop.
+        2. Stop losses, both-sided, STOCK POSITIONS ONLY: a long closes
+           (full-size SELL) when should_close_position fires — price <=
+           entry * (1 - stop); a short closes (full-size COVER) when
+           price >= entry * (1 + stop). Both are noted with
+           entry/current/stop. OPTION positions are EXEMPT (Phase 8):
+           per-leg price stops on defined-risk structures are
+           nonsensical — a long hedge wing decaying with theta while the
+           structure WINS would trigger a SELL that strips the hedge,
+           and short legs routinely move +/-5% daily. Options risk is
+           managed at the STRUCTURE level (profit target / stop-loss on
+           cost-to-close / time exit / regime flatten) plus the engine's
+           expiry-settlement backstop. Stock behavior is unchanged.
         3. Position sizing: a BUY or SHORT whose absolute dollar value
            (portfolio_value * capital_allocation * size_fraction) violates
            check_position_size is blocked (noted with the numbers).
@@ -229,13 +262,18 @@ class Desk(ABC):
                 f"{self.risk_manager.max_daily_loss:.1%} limit; all new "
                 f"BUYs blocked today",
                 daily_pnl=daily_pnl, portfolio_value=portfolio_value,
-                max_daily_loss=self.risk_manager.max_daily_loss)
+                max_daily_loss=self.risk_manager.max_daily_loss,
+                **self.risk_note_data(None))
 
         # --- Stop-loss closes for open positions (both-sided) ----------
         already_closing = {intent.asset for intent in intents
                            if intent.action in ('SELL', 'COVER')}
         for asset, position in list(portfolio.positions.items()):
             if asset in already_closing:
+                continue
+            if asset.asset_type is not AssetType.STOCK:
+                # Option legs are exempt from per-leg price stops (see
+                # the docstring): structure-level exits own that risk.
                 continue
             if position.quantity > 0:
                 if self.risk_manager.should_close_position(position):
@@ -256,7 +294,8 @@ class Desk(ABC):
                         entry_price=position.avg_entry_price,
                         current_price=position.current_price,
                         stop_price=stop_price,
-                        stop_loss_pct=self.risk_manager.position_stop_loss)
+                        stop_loss_pct=self.risk_manager.position_stop_loss,
+                        **self.risk_note_data(asset))
             elif position.quantity < 0:
                 # Short stop: adverse move is the price RISING above
                 # entry * (1 + stop). Mirror of the long-side semantics.
@@ -281,7 +320,8 @@ class Desk(ABC):
                         entry_price=entry_price,
                         current_price=position.current_price,
                         stop_price=stop_price,
-                        stop_loss_pct=self.risk_manager.position_stop_loss)
+                        stop_loss_pct=self.risk_manager.position_stop_loss,
+                        **self.risk_note_data(asset))
 
         # --- Per-intent checks -----------------------------------------
         for intent in intents:
@@ -305,7 +345,8 @@ class Desk(ABC):
                     f"is forbidden (SELL first)",
                     symbol=intent.asset.symbol,
                     position_quantity=position.quantity,
-                    action=intent.action)
+                    action=intent.action,
+                    **self.risk_note_data(intent.asset))
                 continue
             if intent.action == 'BUY' and position is not None \
                     and position.quantity < 0:
@@ -316,7 +357,8 @@ class Desk(ABC):
                     f"intent is forbidden (COVER first)",
                     symbol=intent.asset.symbol,
                     position_quantity=position.quantity,
-                    action=intent.action)
+                    action=intent.action,
+                    **self.risk_note_data(intent.asset))
                 continue
 
             trade_value = abs(portfolio_value * self.capital_allocation
@@ -335,7 +377,8 @@ class Desk(ABC):
                     portfolio_value=portfolio_value,
                     size_fraction=intent.size_fraction,
                     capital_allocation=self.capital_allocation,
-                    max_position_size=self.risk_manager.max_position_size)
+                    max_position_size=self.risk_manager.max_position_size,
+                    **self.risk_note_data(intent.asset))
                 continue
 
             approved.append(intent)

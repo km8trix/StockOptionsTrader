@@ -786,3 +786,123 @@ th.sortable .sort-arrow {
     color: var(--pod-color, #bc8cff);
     border-color: var(--pod-color, #bc8cff);
 }
+
+/* --------------------------------------------------------------------------
+   Jane Street desk (Phase 8): structures table, Greeks chart chrome,
+   book/structure note tags (contracts C11/C12/C14)
+   -------------------------------------------------------------------------- */
+/* Book colors (contract C14): vrp=vol gold (the desk accent), earnings=
+   ember orange, relative value=teal — alongside the Phase 6 book hues.
+   Class suffixes stay whitelisted via backtest.js bookClass(). */
+.note-book-vrp            { color: var(--warn); border-color: var(--warn); }
+.note-book-earnings       { color: #f0883e;     border-color: #f0883e; }
+.note-book-relative_value { color: #39c5cf;     border-color: #39c5cf; }
+
+/* Structure lifecycle tag on note entries (contract C14: data.structure_id)
+   — a small monospace id, quieter than the colored category/book chips. */
+.note-structure-tag {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    background-color: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    white-space: nowrap;
+}
+
+/* Structure lifecycle badge: OPEN blue / CLOSED muted / EXPIRED gold
+   (P&L color lives in the P&L column, not the badge). */
+.structure-status-badge {
+    font-size: 10px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+}
+
+.structure-status-open    { color: var(--accent); border-color: var(--accent); }
+.structure-status-closed  { color: var(--text-muted); border-color: var(--border); }
+.structure-status-expired { color: var(--warn); border-color: var(--warn); }
+
+/* close_reason chips (contract C11; suffixes whitelisted in backtest.js):
+   profit target green, stop loss red, regime flatten signal blue;
+   time exit / expiry keep the muted chip default. */
+.reason-profit_target  { color: var(--gain); border-color: var(--gain); }
+.reason-stop_loss      { color: var(--loss); border-color: var(--loss); }
+.reason-regime_flatten { color: #58a6ff;     border-color: #58a6ff; }
+
+/* Legs expander: a quiet chevron that rotates open */
+.structure-toggle-col { width: 28px; }
+
+.structure-toggle {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 0 var(--sp-1);
+    cursor: pointer;
+    line-height: 1;
+}
+
+.structure-toggle:hover { color: var(--text); }
+
+.structure-toggle .bi {
+    display: inline-block;
+    font-size: 12px;
+    transition: transform 0.15s ease;
+}
+
+.structure-toggle.open .bi { transform: rotate(90deg); }
+
+/* Expanded legs detail row: inset on the page background, one monospace
+   line per leg — action, right/strike/expiry, full contract string. */
+.structure-legs-row > td,
+.structure-legs-row:hover > td {
+    background-color: var(--bg);
+    padding: var(--sp-2) var(--sp-6);
+}
+
+.structure-legs {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+}
+
+.structure-leg {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-3);
+}
+
+.structure-leg-action {
+    flex: 0 0 3.5em;
+    font-weight: 600;
+}
+
+.structure-leg-instrument {
+    margin-left: auto;
+    color: var(--text-muted);
+}
+
+.structure-legs-empty {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* Trades table (contract C13): option fills show the full contract string
+   under the symbol — stocks stay a single line. */
+.trade-instrument {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    white-space: nowrap;
+}

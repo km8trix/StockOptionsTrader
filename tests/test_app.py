@@ -290,6 +290,13 @@ class TestViewsAndVendoredAssets:
         assert 'js/floor.js' in html
         # The cross-desk synergy footnote survives the JS-rendered rewrite.
         assert 'Cross-desk synergy' in html
+        # Phase 8 copy refresh: the footnote flags the MM simulator as
+        # simulation-only and drops the stale 'until Jane Street arrives'
+        # phrasing now that all four desks are ready.
+        assert 'simulation-only' in html
+        assert 'never trades live' in html
+        assert 'Until the Jane Street desk arrives' not in html
+        assert 'once that desk activates' not in html
 
     @pytest.mark.parametrize('rel_path', [
         'gui/static/vendor/bootstrap/bootstrap.min.css',
@@ -484,6 +491,9 @@ def _fake_engine_report():
             'date': ts, 'signal_date': ts - pd.Timedelta(days=1),
             'symbol': 'AAA', 'action': 'BUY', 'quantity': 10,
             'price': 100.0, 'cost': 1001.0,
+            # Contract C13 (Phase 8, additive): str(asset) — the bare
+            # symbol for stocks, the full contract string for options.
+            'instrument': 'AAA',
         }],
         'closed_trades': [],
         'portfolio_history': [
@@ -564,6 +574,9 @@ class TestAsyncBacktest:
         # Dates are normalized to ISO strings for the frontend.
         assert result['trades'][0]['date'] == '2023-03-01'
         assert result['trades'][0]['signal_date'] == '2023-02-28'
+        # Contract C13: the additive 'instrument' field survives the trade
+        # date normalization in strategy mode too.
+        assert result['trades'][0]['instrument'] == 'AAA'
         assert result['portfolio_history'][0]['timestamp'] == '2023-01-03'
         assert result['pending_signals'][0]['signal_date'] == '2023-12-29'
 
@@ -794,7 +807,8 @@ class TestFloorDesksRegistryContract:
 
     Skips (instead of failing) while a parallel backend task that owns
     desks/ has not landed in this tree yet (Phase 5: the package itself;
-    Phase 6: the renaissance status flip, contract C6).
+    Phase 6/7/8: the renaissance/citadel/janestreet status flips —
+    contracts C6, C10, C15).
     """
 
     @pytest.fixture(autouse=True)
@@ -816,23 +830,23 @@ class TestFloorDesksRegistryContract:
             if desk['status'] == 'planned':
                 assert isinstance(desk['activates_in_phase'], int)
 
-    def test_desks_through_citadel_ready_with_janestreet_planned_phase_8(
-            self, client):
-        """Phase 7 (contract C10): citadel flips to ready with its pod-purple
-        accent kept; janestreet stays the only planned desk (Phase 8)."""
+    def test_all_four_desks_ready(self, client):
+        """Phase 8 (contract C15): janestreet flips to ready with its vol-gold
+        accent — every registry desk is now ready and no planned desk remains
+        (the planned-badge plumbing stays for future desks)."""
         desks = client.get('/api/floor/desks').get_json()['desks']
         by_key = {d['key']: d for d in desks}
 
         assert by_key['foundation']['status'] == 'ready'
         assert by_key['renaissance']['status'] == 'ready'
         assert by_key['renaissance']['accent'] == '#58a6ff'
-        if by_key['citadel']['status'] != 'ready':
-            pytest.skip('citadel not ready yet '
-                        '(parallel Phase 7 backend task, contract C10)')
+        assert by_key['citadel']['status'] == 'ready'
         assert by_key['citadel']['accent'] == '#bc8cff'
-        planned_phases = sorted(d['activates_in_phase'] for d in desks
-                                if d['status'] == 'planned')
-        assert planned_phases == [8]
+        if by_key['janestreet']['status'] != 'ready':
+            pytest.skip('janestreet not ready yet '
+                        '(parallel Phase 8 backend task, contract C15)')
+        assert by_key['janestreet']['accent'] == '#d29922'
+        assert [d['key'] for d in desks if d['status'] == 'planned'] == []
 
     def test_unknown_desk_key_returns_400_with_message(self, client):
         response = client.post('/api/backtest/run', json={
@@ -843,14 +857,30 @@ class TestFloorDesksRegistryContract:
         assert 'Unknown desk' in response.get_json()['error']
         assert 'no-such-desk' in response.get_json()['error']
 
-    def test_planned_desk_returns_400_mentioning_its_phase(self, client):
-        # janestreet is the only still-planned desk after the Phase 7 flip.
+    def test_planned_desk_returns_400_mentioning_its_phase(
+            self, client, monkeypatch):
+        """No REAL planned desk remains after the Phase 8 flip, so a fake
+        planned desk is injected into the registry to keep pinning the
+        create_desk ValueError -> 400 path end to end (monkeypatch.setitem
+        restores the spec dict afterwards)."""
+        import desks.registry as desks_registry
+
+        monkeypatch.setitem(desks_registry._DESK_SPECS, 'futurefund', {
+            'name': 'Future Fund Desk',
+            'firm_inspiration': 'TBD',
+            'description': 'Synthetic planned desk pinning the 400 path.',
+            'status': 'planned',
+            'activates_in_phase': 99,
+            'accent': '#8b949e',
+            'factory': None,
+        })
+
         response = client.post('/api/backtest/run', json={
-            'symbols': 'AAA', 'desk': 'janestreet',
+            'symbols': 'AAA', 'desk': 'futurefund',
             'start_date': '2023-01-01', 'end_date': '2023-12-31'})
 
         assert response.status_code == 400
-        assert 'Phase 8' in response.get_json()['error']
+        assert 'Phase 99' in response.get_json()['error']
 
 
 def _fake_desk_report():
@@ -995,6 +1025,10 @@ class TestDeskModeBacktest:
         assert result.get('regime_series') in (None, [])
         # Contract C8: same for pod_history on a non-citadel desk.
         assert result.get('pod_history') in (None, [])
+        # Contracts C11/C12: same for the janestreet-only structures and
+        # greeks_series keys on a non-janestreet desk.
+        assert result.get('structures') in (None, [])
+        assert result.get('greeks_series') in (None, [])
 
     def test_desk_run_saved_with_desk_prefixed_strategy(
             self, client, patch_desk_stack):
@@ -1132,6 +1166,25 @@ class TestDeskModeBacktest:
         assert 'id="podCards"' in html
         assert 'id="podAllocChart"' in html
         assert 'id="notePodFilters"' in html
+        # Phase 8: structures table + portfolio-Greeks card (contracts
+        # C11/C12), painted by backtest.js only for janestreet runs.
+        assert 'id="structuresCard"' in html
+        assert 'id="structuresTable"' in html
+        assert 'id="structuresBody"' in html
+        assert 'id="greeksCard"' in html
+        assert 'id="greeksChart"' in html
+
+    def test_backtest_page_ships_synthetic_pricing_disclaimer(self, client):
+        """Phase 8: the estimated-pricing info callout is static template
+        markup (backtest.js only toggles its visibility for janestreet
+        reports), so the disclaimer wording is pinned at template level."""
+        html = client.get('/backtest').get_data(as_text=True)
+        assert 'id="syntheticPricingNote"' in html
+        # Shipped hidden — visible only once a janestreet report renders.
+        assert 'note-line mb-2 d-none' in html
+        assert 'Options are priced synthetically (Black-Scholes on' in html
+        assert 'backtest approximation' in html
+        assert 'E*TRADE quotes in Phase 9' in html
 
 
 class TestRenaissanceDeskModeBacktest:
@@ -1390,6 +1443,246 @@ class TestCitadelDeskModeBacktest:
         assert len(rows) == 1
         assert rows[0]['strategy'] == 'desk:citadel'
         assert rows[0]['name'] == 'desk:citadel AAA'
+        assert rows[0]['total_return'] == pytest.approx(0.08)
+
+
+def _fake_janestreet_report():
+    """Desk-mode report with the Phase 8 janestreet additions: structures
+    (contract C11), greeks_series (contract C12), option-contract
+    'instrument' strings on trades/closed_trades (contract C13), and
+    book/structure-tagged notes (contract C14). Option prices in the real
+    desk are SYNTHETIC (Black-Scholes on historical volatility) — this stub
+    only pins the route/serialization passthrough, not the pricing."""
+    report = _fake_engine_report()
+    report['desk'] = {'key': 'janestreet', 'name': 'Jane Street'}
+    # Contract C13: options trades carry the full contract string while
+    # 'symbol' stays the underlying.
+    report['trades'].append({
+        'date': pd.Timestamp('2023-06-02'),
+        'signal_date': pd.Timestamp('2023-06-01'),
+        'symbol': 'AAA', 'action': 'SELL', 'quantity': 2,
+        'price': 1.45, 'proceeds': 290.0,
+        'instrument': 'AAA 2023-07-21 95P',
+    })
+    report['closed_trades'] = [{
+        'symbol': 'AAA', 'quantity': 2, 'pnl': 145.0,
+        'instrument': 'AAA 2023-07-21 95P',
+    }]
+    # Contract C14: data.book in {regime, vrp, earnings, relative_value};
+    # structure lifecycle notes add data.structure_id + data.structure.
+    report['trader_notes'] = [
+        {'timestamp': '2023-03-01T00:00:00', 'desk': 'janestreet',
+         'category': 'model', 'message': 'Regime gate open: trending',
+         'data': {'book': 'regime', 'state': 'trending'}},
+        {'timestamp': '2023-06-02T00:00:00', 'desk': 'janestreet',
+         'category': 'signal',
+         'message': 'Opened iron condor on AAA (IV rank 0.82)',
+         'data': {'book': 'vrp', 'structure_id': 'JS-IC-0001',
+                  'structure': 'iron_condor', 'iv_rank': 0.82}},
+        {'timestamp': '2023-06-30T00:00:00', 'desk': 'janestreet',
+         'category': 'risk', 'message': 'Profit target hit on JS-IC-0001',
+         'data': {'book': 'vrp', 'structure_id': 'JS-IC-0001',
+                  'structure': 'iron_condor',
+                  'close_reason': 'profit_target'}},
+        {'timestamp': '2023-08-01T00:00:00', 'desk': 'janestreet',
+         'category': 'signal', 'message': 'Earnings IV-crush setup on AAA',
+         'data': {'book': 'earnings', 'days_to_earnings': 2}},
+        {'timestamp': '2023-09-01T00:00:00', 'desk': 'janestreet',
+         'category': 'info', 'message': 'ETF/constituent basis within band',
+         'data': {'book': 'relative_value', 'basis_bps': 3.1}},
+        # A note without data.book must pass through unchanged too.
+        {'timestamp': '2023-12-29T00:00:00', 'desk': 'janestreet',
+         'category': 'info', 'message': 'Desk heartbeat', 'data': {}},
+    ]
+    # Contract C11: one closed iron condor, one still-open put credit
+    # spread; credit/max_loss are $ at entry, max loss capped at entry by
+    # construction; pnl/close_reason null while open.
+    report['structures'] = [
+        {'id': 'JS-IC-0001', 'type': 'iron_condor', 'underlying': 'AAA',
+         'opened': '2023-06-02', 'closed': '2023-06-30',
+         'credit': 290.0, 'max_loss': 710.0, 'contracts': 2,
+         'status': 'closed', 'pnl': 145.0, 'close_reason': 'profit_target',
+         'legs': [
+             {'instrument': 'AAA 2023-07-21 95P', 'action': 'SELL',
+              'strike': 95.0, 'expiry': '2023-07-21', 'right': 'put'},
+             {'instrument': 'AAA 2023-07-21 90P', 'action': 'BUY',
+              'strike': 90.0, 'expiry': '2023-07-21', 'right': 'put'},
+             {'instrument': 'AAA 2023-07-21 115C', 'action': 'SELL',
+              'strike': 115.0, 'expiry': '2023-07-21', 'right': 'call'},
+             {'instrument': 'AAA 2023-07-21 120C', 'action': 'BUY',
+              'strike': 120.0, 'expiry': '2023-07-21', 'right': 'call'},
+         ]},
+        {'id': 'JS-PCS-0002', 'type': 'put_credit_spread',
+         'underlying': 'AAA', 'opened': '2023-11-01', 'closed': None,
+         'credit': 130.0, 'max_loss': 370.0, 'contracts': 1,
+         'status': 'open', 'pnl': None, 'close_reason': None,
+         'legs': [
+             {'instrument': 'AAA 2023-12-15 100P', 'action': 'SELL',
+              'strike': 100.0, 'expiry': '2023-12-15', 'right': 'put'},
+             {'instrument': 'AAA 2023-12-15 95P', 'action': 'BUY',
+              'strike': 95.0, 'expiry': '2023-12-15', 'right': 'put'},
+         ]},
+    ]
+    # Contract C12: daily desk-level dollar Greeks; all 0.0 on option-free
+    # days (short-premium book: theta positive, vega negative when on).
+    report['greeks_series'] = [
+        {'date': '2023-01-03', 'delta': 0.0, 'gamma': 0.0,
+         'theta': 0.0, 'vega': 0.0},
+        {'date': '2023-06-02', 'delta': -4.2, 'gamma': -0.31,
+         'theta': 12.6, 'vega': -88.0},
+        {'date': '2023-06-30', 'delta': -1.1, 'gamma': -0.05,
+         'theta': 3.2, 'vega': -21.5},
+    ]
+    return report
+
+
+class TestJaneStreetDeskModeBacktest:
+    """Phase 8 passthrough: a desk-mode run whose engine report carries
+    structures (contract C11), greeks_series (contract C12), 'instrument'
+    fields (contract C13), and book/structure-tagged notes (contract C14)
+    must surface them all untouched in the async job result. The desk stack
+    is fully stubbed, so this pins the ROUTE/serialization behavior
+    independent of the real janestreet desk landing."""
+
+    PAYLOAD = {
+        'symbols': 'AAA',
+        'desk': 'janestreet',
+        'start_date': '2023-01-01',
+        'end_date': '2023-12-31',
+        'initial_capital': 100000,
+        'position_size': 0.1,
+    }
+
+    @pytest.fixture()
+    def patch_janestreet_stack(self, monkeypatch, tmp_path):
+        """Stub create_desk + the whole engine; redirect the history DB."""
+        import gui.globals as gui_globals
+        from gui.routes import api_backtest
+
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'history.db'))
+        monkeypatch.setattr(gui_globals, '_db', None)
+
+        seen = {}
+
+        def fake_create_desk(key, capital_allocation=1.0):
+            seen['desk_key'] = key
+            return object()
+
+        class FakeEngine:
+            def __init__(self, strategy=None, desk=None,
+                         initial_capital=100000, **kwargs):
+                seen['ctor'] = {'strategy': strategy, 'desk': desk}
+                self.market_data = None
+
+            def run(self, symbols, start_date, end_date, position_size,
+                    progress_callback=None, benchmark_symbol='SPY'):
+                return _fake_janestreet_report()
+
+        monkeypatch.setattr(api_backtest, 'create_desk', fake_create_desk)
+        monkeypatch.setattr(api_backtest, 'BacktestEngine', FakeEngine)
+        return seen
+
+    def test_structures_pass_through_untouched(
+            self, client, patch_janestreet_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        assert patch_janestreet_stack['desk_key'] == 'janestreet'
+        assert patch_janestreet_stack['ctor']['strategy'] is None
+
+        result = job['result']
+        assert result['desk'] == {'key': 'janestreet', 'name': 'Jane Street'}
+        # Contract C11: present, non-empty, byte-for-byte what the engine
+        # emitted (dates already ISO strings; $ amounts JSON-safe floats).
+        assert result['structures'] == \
+            _fake_janestreet_report()['structures']
+        for structure in result['structures']:
+            assert set(structure) == {
+                'id', 'type', 'underlying', 'opened', 'closed', 'credit',
+                'max_loss', 'contracts', 'status', 'pnl', 'close_reason',
+                'legs'}
+            assert structure['type'] in (
+                'iron_condor', 'put_credit_spread', 'call_credit_spread')
+            assert structure['status'] in ('open', 'closed', 'expired')
+            assert structure['max_loss'] > 0
+            for leg in structure['legs']:
+                assert set(leg) == {
+                    'instrument', 'action', 'strike', 'expiry', 'right'}
+                assert leg['right'] in ('call', 'put')
+        # Open structures have null pnl/close_reason/closed.
+        open_structure = result['structures'][1]
+        assert open_structure['status'] == 'open'
+        assert open_structure['pnl'] is None
+        assert open_structure['close_reason'] is None
+        assert open_structure['closed'] is None
+        # ... while every existing report key keeps its legacy shape.
+        assert result['summary']['total_return_pct'] == pytest.approx(8.0)
+        assert result['trades'][0]['date'] == '2023-03-01'
+
+    def test_greeks_series_passes_through_untouched(
+            self, client, patch_janestreet_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        result = job['result']
+        # Contract C12: present, non-empty, byte-for-byte what the engine
+        # emitted; all four Greeks 0.0 on option-free days.
+        assert result['greeks_series'] == \
+            _fake_janestreet_report()['greeks_series']
+        for entry in result['greeks_series']:
+            assert set(entry) == {'date', 'delta', 'gamma', 'theta', 'vega'}
+        option_free = result['greeks_series'][0]
+        assert [option_free[k] for k in
+                ('delta', 'gamma', 'theta', 'vega')] == [0.0, 0.0, 0.0, 0.0]
+
+    def test_instrument_fields_pass_through_on_trades_and_closed_trades(
+            self, client, patch_janestreet_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        result = job['result']
+        # Contract C13: stocks carry the bare symbol, options the full
+        # contract string — surviving the trade date normalization.
+        assert result['trades'][0]['instrument'] == 'AAA'
+        assert result['trades'][1]['instrument'] == 'AAA 2023-07-21 95P'
+        assert result['trades'][1]['date'] == '2023-06-02'
+        assert result['closed_trades'][0]['instrument'] == \
+            'AAA 2023-07-21 95P'
+
+    def test_book_and_structure_tagged_notes_pass_through(
+            self, client, patch_janestreet_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        result = job['result']
+        # Contract C14: data.book in {regime, vrp, earnings,
+        # relative_value}; the untagged heartbeat note is unaffected.
+        books = [n['data'].get('book') for n in result['trader_notes']]
+        assert books == ['regime', 'vrp', 'vrp', 'earnings',
+                         'relative_value', None]
+        # Structure lifecycle notes carry structure_id + structure.
+        opened = result['trader_notes'][1]['data']
+        assert opened['structure_id'] == 'JS-IC-0001'
+        assert opened['structure'] == 'iron_condor'
+        closed = result['trader_notes'][2]['data']
+        assert closed['structure_id'] == 'JS-IC-0001'
+        assert closed['close_reason'] == 'profit_target'
+
+    def test_janestreet_run_saved_with_desk_prefixed_strategy(
+            self, client, patch_janestreet_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        rows = client.get('/api/backtests').get_json()['backtests']
+        assert len(rows) == 1
+        assert rows[0]['strategy'] == 'desk:janestreet'
+        assert rows[0]['name'] == 'desk:janestreet AAA'
         assert rows[0]['total_return'] == pytest.approx(0.08)
 
 

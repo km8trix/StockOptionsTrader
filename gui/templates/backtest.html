@@ -120,6 +120,18 @@
                  desk identity + Phase 6 current-regime chip, contract C5) -->
             <div id="deskChipRow" class="desk-chip-row mb-2 d-none"></div>
 
+            <!-- Phase 8 estimated-pricing disclaimer: backtest.js unhides this
+                 for janestreet reports only. Free providers carry no historical
+                 options chains, so backtest option prices are SYNTHETIC
+                 (Black-Scholes from the underlying's OHLCV with IV modeled
+                 from realized vol) — an info callout, never an error. -->
+            <div id="syntheticPricingNote" class="note-line mb-2 d-none">
+                <i class="bi bi-info-circle" aria-hidden="true"></i>
+                <span>Options are priced synthetically (Black-Scholes on
+                historical volatility) &mdash; backtest approximation. Live
+                pricing arrives with E*TRADE quotes in Phase 9.</span>
+            </div>
+
             <div class="row g-2 mb-2">
                 <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
                     <div class="metric-label">Total return</div>
@@ -166,6 +178,20 @@
                 </div>
             </div>
 
+            <!-- Jane Street portfolio Greeks (Phase 8, contract C12): daily
+                 desk-level delta/gamma/theta/vega. Painted by backtest.js only
+                 when the report carries a non-empty greeks_series; delta and
+                 vega are primary lines, gamma/theta toggle via legend click. -->
+            <div class="card mb-2 d-none" id="greeksCard">
+                <div class="card-header">
+                    Portfolio Greeks
+                    <span class="provenance-caption">(delta / vega primary &middot; click legend for gamma / theta)</span>
+                </div>
+                <div class="card-body p-2">
+                    <div id="greeksChart" style="min-height: 240px;"></div>
+                </div>
+            </div>
+
             <!-- Citadel pods (Phase 7, contract C8): per-pod status cards +
                  stacked pod-weight allocation chart with reallocation and
                  probation/cut markers. Painted by backtest.js only when the
@@ -178,6 +204,39 @@
                 <div class="card-body p-2">
                     <div class="row g-2 mb-2" id="podCards"></div>
                     <div id="podAllocChart" style="min-height: 260px;"></div>
+                </div>
+            </div>
+
+            <!-- Jane Street structures (Phase 8, contract C11): sortable
+                 defined-risk option-structure table with an expandable legs
+                 detail per row. Painted by backtest.js only when the report
+                 carries a non-empty structures list. Credit/max-loss are $ at
+                 entry; max loss is capped at entry by construction. -->
+            <div class="card mb-2 d-none" id="structuresCard">
+                <div class="card-header">
+                    Structures <span class="provenance-caption">(defined-risk option structures &middot; credit / max loss at entry)</span>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table" id="structuresTable" aria-label="Option structures">
+                            <thead>
+                                <tr>
+                                    <th scope="col" class="structure-toggle-col"><span class="visually-hidden">Legs</span></th>
+                                    <th class="sortable" data-key="type" data-type="str" scope="col">Type<span class="sort-arrow"></span></th>
+                                    <th class="sortable" data-key="underlying" data-type="str" scope="col">Underlying<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="contracts" data-type="num" scope="col">Contracts<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="opened" data-type="str" scope="col">Opened<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="closed" data-type="str" scope="col">Closed<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="credit" data-type="num" scope="col">Credit<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="max_loss" data-type="num" scope="col">Max loss<span class="sort-arrow"></span></th>
+                                    <th class="sortable num" data-key="pnl" data-type="num" scope="col">P&amp;L<span class="sort-arrow"></span></th>
+                                    <th class="sortable" data-key="status" data-type="str" scope="col">Status<span class="sort-arrow"></span></th>
+                                    <th scope="col">Reason</th>
+                                </tr>
+                            </thead>
+                            <tbody id="structuresBody"></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 

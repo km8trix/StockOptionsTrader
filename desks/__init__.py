@@ -5,6 +5,7 @@ Trading-desk framework: firm-persona desks, walk-forward harness, registry.
 from desks.base import Desk, DeskIntent, TraderNote
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
+from desks.janestreet import JaneStreetDesk
 from desks.ml_model import GradientBoostingModel
 from desks.pairs import PairsCointegrationModel
 from desks.pods import MeanReversionPod, MomentumPod, Pod, StatArbPod
@@ -23,6 +24,7 @@ __all__ = [
     'TraderNote',
     'FoundationDesk',
     'GradientBoostingModel',
+    'JaneStreetDesk',
     'MeanReversionPod',
     'MomentumPod',
     'PairsCointegrationModel',

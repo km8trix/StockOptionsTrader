@@ -43,6 +43,15 @@ per-position Greeks feed that does not exist yet: configuring either
 limit makes check() raise NotImplementedError until Phase 8 wires the
 options data in. They must never be silently ignored — a configured risk
 limit that cannot be evaluated is a hard error, not a no-op.
+
+PHASE 8 STATUS: JaneStreetDesk wires its vega cap through
+register_limit('short_vega', ...) — the desk owns the Greeks feed (its
+synthetic pricing engine), so the limit is evaluated as a custom check
+with the desk's live portfolio-vega state, and whole multi-leg
+structures are judged ATOMICALLY (the structure's net vega rides on its
+first short leg; blocking individual legs would leave naked wings). The
+raw constructor parameters remain reserved (and still raise) until a
+desk-agnostic per-position Greeks feed exists.
 """
 
 from __future__ import annotations

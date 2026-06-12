@@ -22,6 +22,29 @@ Two driving modes (exactly one per engine instance):
         LOWERS the fill); COVER closes it (a buy: adverse slippage raises
         the fill). Margin is NOT modeled — cash-account approximation,
         short proceeds held as cash. Strategy mode has no short path.
+
+OPTIONS IN DESK MODE (Phase 8 — SYNTHETIC PRICING, see desks/options_pricing):
+    Free providers carry no historical option chains, so option prices are
+    SYNTHETIC — Black-Scholes from the underlying's OHLCV with IV modeled
+    from realized vol. NO-LOOKAHEAD: fills price with vol from closes
+    STRICTLY BEFORE the fill date and spot = the fill-day OPEN; end-of-day
+    mark-to-market uses spot = the session CLOSE. Real chain pricing
+    arrives in Phase 9 (E*TRADE).
+
+    OPTIONS COST MODEL (replaces slippage_bps for option assets): traded
+    price = model price + haircut when buying / - haircut when selling,
+    haircut = max(model price * spread_pct, $0.05) (spread_pct default
+    0.02), plus per_contract_commission (default $0.65) per contract per
+    leg, cash-only. All option cash flows, position values and P&L carry
+    the x100 contract multiplier. The fractional stock commission and
+    slippage_bps do NOT apply to options.
+
+    EXPIRY SETTLEMENT (safety net): any option position whose expiry has
+    PASSED (expiration_date < current date) is force-settled at intrinsic
+    value computed from the underlying's close on the last session <= the
+    expiry date — cash settle, x100, no spread cost, no commission, trade
+    logged with reason 'expiry settlement'. Desks normally exit before
+    expiry; this is the backstop.
 """
 
 from __future__ import annotations
@@ -43,6 +66,9 @@ logger = logging.getLogger(__name__)
 #: Trading days an intent may wait for a usable bar before being dropped.
 MAX_PENDING_DAYS = 5
 
+#: Minimum absolute half-spread haircut per option fill ($/share).
+MIN_OPTION_HAIRCUT = 0.05
+
 
 class BacktestEngine:
     """Simulates trading strategies on historical data"""
@@ -50,7 +76,9 @@ class BacktestEngine:
     def __init__(self, strategy: Optional[Strategy] = None,
                  initial_capital: float = 100000,
                  commission: float = 0.001, slippage_bps: float = 5.0,
-                 desk: Optional[Desk] = None):
+                 desk: Optional[Desk] = None,
+                 spread_pct: float = 0.02,
+                 per_contract_commission: float = 0.65):
         if (strategy is None) == (desk is None):
             raise ValueError(
                 "Provide exactly one of strategy= or desk= to BacktestEngine")
@@ -59,6 +87,9 @@ class BacktestEngine:
         self.portfolio = PortfolioManager(initial_capital)
         self.commission = commission
         self.slippage_bps = slippage_bps
+        # Options cost model (module docstring); option assets only.
+        self.spread_pct = spread_pct
+        self.per_contract_commission = per_contract_commission
         self.market_data = MarketDataHandler()
         self.trades_log: List[Dict] = []
         self.signals_log: List[Dict] = []
@@ -117,6 +148,10 @@ class BacktestEngine:
         # Simulate sequential historical trading day by day
         total_days = len(sorted_dates)
         for day_number, date in enumerate(sorted_dates, start=1):
+            # --- PHASE 0 (desk mode): SETTLE OPTIONS PAST EXPIRY ---
+            if self.desk is not None:
+                self._settle_expired_options(all_data, date)
+
             # --- PHASE 1: FILL PENDING INTENTS AT TODAY'S OPEN ---
             self._fill_pending_intents(all_data, date, position_size)
 
@@ -128,6 +163,8 @@ class BacktestEngine:
                 existing_pos = self.portfolio.get_position(asset)
                 if existing_pos:
                     existing_pos.current_price = float(data.loc[date, 'close'])
+            if self.desk is not None:
+                self._mark_option_positions(all_data, date)
 
             # --- PHASE 3: SIGNALS ON DATA THROUGH TODAY, QUEUED FOR TOMORROW ---
             if self.desk is not None:
@@ -206,6 +243,9 @@ class BacktestEngine:
                 'signal_date': date,
                 'days_waiting': 0,
                 'size_fraction': intent.size_fraction,
+                # Absolute size override (contracts/shares); None defers
+                # to size_fraction dollar sizing at fill time.
+                'quantity': intent.quantity,
             }
 
     def _fill_pending_intents(self, all_data: Dict[str, pd.DataFrame],
@@ -214,6 +254,12 @@ class BacktestEngine:
 
         Intents without a usable bar today (no row, or both open and close
         NaN) accrue a waiting day and are dropped after MAX_PENDING_DAYS.
+
+        OPTION assets (desk mode): the symbol is the UNDERLYING ticker;
+        the fill base is the desk's synthetic fair value priced with
+        spot = the underlying's open today and vol from closes strictly
+        before today (no-lookahead, module docstring). An unpriceable
+        option (insufficient prior history) waits like a missing bar.
         """
         for asset in list(self.pending_intents.keys()):
             intent = self.pending_intents[asset]
@@ -228,19 +274,225 @@ class BacktestEngine:
                     # Missing/NaN open: fall back to today's close.
                     fill_base = row['close']
 
+            is_option = asset.asset_type in (AssetType.CALL, AssetType.PUT)
+            if is_option and not pd.isna(fill_base):
+                # Fill spot = the underlying's OPEN today (fill_base).
+                model_price = self.desk.price_option(
+                    asset, data[data.index <= date], date,
+                    spot=float(fill_base))
+                fill_base = (float(model_price) if model_price is not None
+                             else float('nan'))
+
             if pd.isna(fill_base):
                 intent['days_waiting'] += 1
                 if intent['days_waiting'] >= MAX_PENDING_DAYS:
                     logger.warning(
                         "Dropping %s intent for %s (signal %s): no usable bar "
                         "for %d trading days",
-                        intent['signal'], asset.symbol, intent['signal_date'],
+                        intent['signal'], str(asset), intent['signal_date'],
                         intent['days_waiting'])
                     del self.pending_intents[asset]
                 continue
 
-            self._fill_intent(asset, intent, float(fill_base), date, position_size)
+            if is_option:
+                self._fill_option_intent(asset, intent, float(fill_base), date)
+            else:
+                self._fill_intent(asset, intent, float(fill_base), date,
+                                  position_size)
             del self.pending_intents[asset]
+
+    # ------------------------------------------------------------------
+    # Options: cost model, fills, MTM, expiry settlement (desk mode)
+    # ------------------------------------------------------------------
+    def _option_traded_price(self, model_price: float, buying: bool) -> float:
+        """Traded price under the options cost model (module docstring).
+
+        haircut = max(model_price * spread_pct, MIN_OPTION_HAIRCUT);
+        buys pay model + haircut, sells receive model - haircut (floored
+        at 0.0 — nobody pays you to take a worthless option).
+        """
+        haircut = max(model_price * self.spread_pct, MIN_OPTION_HAIRCUT)
+        if buying:
+            return model_price + haircut
+        return max(0.0, model_price - haircut)
+
+    def _fill_option_intent(self, asset: Asset, intent: Dict,
+                            model_price: float, fill_date) -> None:
+        """Fill a queued OPTION intent at the synthetic fair value with
+        the options cost model and the x100 contract multiplier.
+
+        Sizing: intent['quantity'] (absolute contracts) when set, else
+        value-sized like stock: contracts = int(trade_value / (traded
+        price x 100)). SELL closes the full long, COVER the full short.
+        Commission = per_contract_commission x contracts, cash-only
+        (never baked into entry/exit prices — consistent with stock).
+        """
+        signal = intent['signal']
+        existing_pos = self.portfolio.get_position(asset)
+
+        if signal in ('BUY', 'SHORT') \
+                and (not existing_pos or existing_pos.quantity == 0):
+            buying = signal == 'BUY'
+            fill_price = self._option_traded_price(model_price, buying=buying)
+            if buying and fill_price <= 0:
+                logger.warning("Skipping BUY fill for %s on %s: non-positive "
+                               "traded price %.4f", str(asset), fill_date,
+                               fill_price)
+                return
+            quantity = intent.get('quantity')
+            if quantity is None:
+                size_fraction = (self.desk.capital_allocation
+                                 * intent.get('size_fraction', 0.0))
+                trade_value = (self.portfolio.get_portfolio_value()
+                               * size_fraction)
+                per_contract = max(fill_price, MIN_OPTION_HAIRCUT) * asset.multiplier
+                quantity = int(trade_value / per_contract)
+            if quantity <= 0:
+                logger.warning(
+                    "Dropping %s intent for %s on %s: sizes to 0 contracts",
+                    signal, str(asset), fill_date)
+                return
+
+            commission = quantity * self.per_contract_commission
+            if buying:
+                cost = quantity * fill_price * asset.multiplier + commission
+                if self.portfolio.cash < cost:
+                    logger.warning(
+                        "Dropping BUY intent for %s on %s: insufficient cash "
+                        "(needed %.2f, available %.2f)",
+                        str(asset), fill_date, cost, self.portfolio.cash)
+                    return
+                self.portfolio.cash -= cost
+                signed_quantity = quantity
+                log_extra = {'cost': cost}
+            else:
+                # Sell-to-open: proceeds credited (cash-account approx).
+                proceeds = (quantity * fill_price * asset.multiplier
+                            - commission)
+                self.portfolio.cash += proceeds
+                signed_quantity = -quantity
+                log_extra = {'proceeds': proceeds}
+
+            self.portfolio.add_position(Position(
+                asset=asset, quantity=signed_quantity,
+                avg_entry_price=fill_price, current_price=fill_price,
+                timestamp=fill_date))
+            self.trades_log.append({
+                'date': fill_date, 'signal_date': intent['signal_date'],
+                'symbol': asset.symbol, 'instrument': str(asset),
+                'action': signal, 'quantity': quantity,
+                'price': fill_price, 'commission': commission, **log_extra})
+            logger.info("%s %d %s @ %.4f on %s (model %.4f)", signal,
+                        quantity, str(asset), fill_price, fill_date,
+                        model_price)
+
+        elif signal == 'SELL' and existing_pos and existing_pos.quantity > 0:
+            fill_price = self._option_traded_price(model_price, buying=False)
+            quantity = existing_pos.quantity
+            commission = quantity * self.per_contract_commission
+            proceeds = quantity * fill_price * asset.multiplier - commission
+            self.portfolio.cash += proceeds
+            self.portfolio.close_position(asset, fill_price, quantity,
+                                          existing_pos.timestamp, fill_date)
+            self.portfolio.remove_position(asset)
+            self.trades_log.append({
+                'date': fill_date, 'signal_date': intent['signal_date'],
+                'symbol': asset.symbol, 'instrument': str(asset),
+                'action': 'SELL', 'quantity': quantity, 'price': fill_price,
+                'commission': commission, 'proceeds': proceeds})
+            logger.info("SELL %d %s @ %.4f on %s", quantity, str(asset),
+                        fill_price, fill_date)
+
+        elif signal == 'COVER' and existing_pos and existing_pos.quantity < 0:
+            # Buy-to-close the short: debit cash; closes always execute.
+            fill_price = self._option_traded_price(model_price, buying=True)
+            quantity = existing_pos.quantity  # negative
+            commission = abs(quantity) * self.per_contract_commission
+            cost = abs(quantity) * fill_price * asset.multiplier + commission
+            self.portfolio.cash -= cost
+            self.portfolio.close_position(asset, fill_price, quantity,
+                                          existing_pos.timestamp, fill_date)
+            self.portfolio.remove_position(asset)
+            self.trades_log.append({
+                'date': fill_date, 'signal_date': intent['signal_date'],
+                'symbol': asset.symbol, 'instrument': str(asset),
+                'action': 'COVER', 'quantity': abs(quantity),
+                'price': fill_price, 'commission': commission, 'cost': cost})
+            logger.info("COVER %d %s @ %.4f on %s", abs(quantity),
+                        str(asset), fill_price, fill_date)
+
+    def _mark_option_positions(self, all_data: Dict[str, pd.DataFrame],
+                               date) -> None:
+        """Mark option positions to the synthetic fair value at the CLOSE
+        (spot = today's close; the IV model still uses strictly-prior
+        closes — see desks/options_pricing). Positions whose underlying
+        has no bar (or no priceable IV) keep their last mark."""
+        for asset, position in self.portfolio.positions.items():
+            if asset.asset_type not in (AssetType.CALL, AssetType.PUT):
+                continue
+            data = all_data.get(asset.symbol)
+            if data is None or date not in data.index:
+                continue
+            close = data.loc[date, 'close']
+            if pd.isna(close):
+                continue
+            price = self.desk.price_option(
+                asset, data[data.index <= date], date, spot=float(close))
+            if price is not None:
+                position.current_price = float(price)
+
+    def _settle_expired_options(self, all_data: Dict[str, pd.DataFrame],
+                                date) -> None:
+        """Force-settle option positions whose expiry has PASSED at
+        intrinsic value (module docstring: cash settle, x100, no spread,
+        no commission). Intrinsic uses the underlying's close on the
+        last session <= the expiry date; with no usable close the option
+        settles at 0.0 (logged) — the desk should never let it get
+        there."""
+        current = pd.Timestamp(date).date()
+        for asset in sorted(
+                (a for a in self.portfolio.positions
+                 if a.asset_type in (AssetType.CALL, AssetType.PUT)),
+                key=str):
+            expiry = pd.Timestamp(asset.expiration_date).date()
+            if expiry >= current:
+                continue
+            position = self.portfolio.positions[asset]
+            intrinsic = 0.0
+            data = all_data.get(asset.symbol)
+            if data is not None and not data.empty:
+                closes = data.loc[data.index <= pd.Timestamp(expiry),
+                                  'close'].dropna()
+                if not closes.empty:
+                    spot = float(closes.iloc[-1])
+                    if asset.asset_type is AssetType.CALL:
+                        intrinsic = max(0.0, spot - asset.strike_price)
+                    else:
+                        intrinsic = max(0.0, asset.strike_price - spot)
+                else:
+                    logger.warning("Expiry settlement of %s: no underlying "
+                                   "close <= %s; settling at 0.0",
+                                   str(asset), expiry)
+            quantity = position.quantity
+            # Sign-correct both ways: longs are PAID intrinsic, shorts
+            # PAY it (quantity carries the sign).
+            settlement = quantity * intrinsic * asset.multiplier
+            self.portfolio.cash += settlement
+            self.portfolio.close_position(asset, intrinsic, quantity,
+                                          position.timestamp, date)
+            self.portfolio.remove_position(asset)
+            action = 'SELL' if quantity > 0 else 'COVER'
+            entry = {
+                'date': date, 'signal_date': date, 'symbol': asset.symbol,
+                'instrument': str(asset), 'action': action,
+                'quantity': abs(quantity), 'price': intrinsic,
+                'reason': 'expiry settlement',
+            }
+            entry['proceeds' if quantity > 0 else 'cost'] = abs(settlement)
+            self.trades_log.append(entry)
+            logger.info(
+                "Expiry settlement: %s %d %s at intrinsic %.4f on %s",
+                action, abs(quantity), str(asset), intrinsic, date)
 
     def _fill_intent(self, asset: Asset, intent: Dict, base_price: float,
                      fill_date, position_size: float) -> None:
@@ -277,7 +529,9 @@ class BacktestEngine:
             fill_price = base_price * (1 + slippage)
             portfolio_value = self.portfolio.get_portfolio_value()
             trade_value = portfolio_value * position_size
-            quantity = int(trade_value / fill_price)
+            # Desk intents may carry an absolute share count (Phase 8);
+            # it overrides the dollar sizing. Strategy mode never sets it.
+            quantity = intent.get('quantity') or int(trade_value / fill_price)
 
             if quantity == 0:
                 logger.warning(
@@ -305,7 +559,7 @@ class BacktestEngine:
             self.portfolio.add_position(position)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
-                'symbol': asset.symbol, 'action': 'BUY',
+                'symbol': asset.symbol, 'instrument': str(asset), 'action': 'BUY',
                 'quantity': quantity, 'price': fill_price, 'cost': cost
             })
             logger.info("BUY %d %s @ %.4f on %s (signal %s)",
@@ -324,7 +578,7 @@ class BacktestEngine:
             self.portfolio.remove_position(asset)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
-                'symbol': asset.symbol, 'action': 'SELL',
+                'symbol': asset.symbol, 'instrument': str(asset), 'action': 'SELL',
                 'quantity': quantity, 'price': fill_price, 'proceeds': proceeds
             })
             logger.info("SELL %d %s @ %.4f on %s (signal %s)",
@@ -337,7 +591,7 @@ class BacktestEngine:
             fill_price = base_price * (1 - slippage)
             portfolio_value = self.portfolio.get_portfolio_value()
             trade_value = portfolio_value * position_size
-            quantity = int(trade_value / fill_price)
+            quantity = intent.get('quantity') or int(trade_value / fill_price)
 
             if quantity == 0:
                 logger.warning(
@@ -358,7 +612,7 @@ class BacktestEngine:
             self.portfolio.add_position(position)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
-                'symbol': asset.symbol, 'action': 'SHORT',
+                'symbol': asset.symbol, 'instrument': str(asset), 'action': 'SHORT',
                 'quantity': quantity, 'price': fill_price,
                 'proceeds': proceeds
             })
@@ -382,7 +636,7 @@ class BacktestEngine:
             self.portfolio.remove_position(asset)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
-                'symbol': asset.symbol, 'action': 'COVER',
+                'symbol': asset.symbol, 'instrument': str(asset), 'action': 'COVER',
                 'quantity': abs(quantity), 'price': fill_price, 'cost': cost
             })
             logger.info("COVER %d %s @ %.4f on %s (signal %s)",
@@ -455,6 +709,9 @@ class BacktestEngine:
             'closed_trades': [
                 {
                     'symbol': trade.asset.symbol,
+                    # Contract C13 (additive): full instrument string —
+                    # stocks are the bare symbol, options the contract.
+                    'instrument': str(trade.asset),
                     'entry_price': trade.entry_price,
                     'exit_price': trade.exit_price,
                     'quantity': trade.quantity,
@@ -495,5 +752,15 @@ class BacktestEngine:
             pod_history = getattr(self.desk, 'pod_history', None)
             if pod_history:
                 report['pod_history'] = list(pod_history)
+            # Contract C11: desks with multi-leg options structures
+            # expose structures_report (janestreet only; other desks
+            # lack the attribute, so their reports are byte-identical).
+            structures = getattr(self.desk, 'structures_report', None)
+            if structures is not None:
+                report['structures'] = list(structures)
+            # Contract C12: daily desk-level portfolio Greeks series.
+            greeks_series = getattr(self.desk, 'greeks_series', None)
+            if greeks_series is not None:
+                report['greeks_series'] = list(greeks_series)
 
         return report

@@ -9,6 +9,7 @@ import pytest
 from desks.base import Desk
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
+from desks.janestreet import JaneStreetDesk
 from desks.registry import create_desk, list_desks
 from desks.renaissance import RenaissanceDesk
 
@@ -52,8 +53,10 @@ class TestListDesks:
         assert by_key['citadel']['activates_in_phase'] is None
         assert by_key['citadel']['accent'] == '#bc8cff'
 
-        assert by_key['janestreet']['status'] == 'planned'
-        assert by_key['janestreet']['activates_in_phase'] == 8
+        # Contract C15: janestreet is ready as of Phase 8; accent stays.
+        # All four desks are now live.
+        assert by_key['janestreet']['status'] == 'ready'
+        assert by_key['janestreet']['activates_in_phase'] is None
         assert by_key['janestreet']['accent'] == '#d29922'
 
 
@@ -99,9 +102,19 @@ class TestCreateDesk:
         with pytest.raises(ValueError, match='Unknown desk: warrenbuffett'):
             create_desk('warrenbuffett')
 
-    @pytest.mark.parametrize('key,phase', [('janestreet', 8)])
-    def test_planned_desks_raise_with_their_phase(self, key, phase):
-        # janestreet stays planned phase 8 (contract C10).
-        with pytest.raises(ValueError,
-                           match=f"Desk '{key}' activates in Phase {phase}"):
-            create_desk(key)
+    def test_creates_janestreet_desk(self):
+        # Contract C15: create_desk('janestreet') returns the desk.
+        desk = create_desk('janestreet')
+        assert isinstance(desk, JaneStreetDesk)
+        assert isinstance(desk, Desk)
+        assert desk.key == 'janestreet'
+        assert desk.accent == '#d29922'
+        assert desk.capital_allocation == 1.0
+
+    def test_janestreet_capital_allocation_is_passed_through(self):
+        desk = create_desk('janestreet', capital_allocation=0.2)
+        assert desk.capital_allocation == 0.2
+
+    def test_no_planned_desks_remain(self):
+        # Phase 8 flipped the last planned desk; every entry is ready.
+        assert all(entry['status'] == 'ready' for entry in list_desks())

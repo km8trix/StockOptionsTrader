@@ -9,7 +9,15 @@
 // (contract C8: report.pod_history -> stacked pod-weight allocation chart
 // with reallocation/probation/cut event markers + per-pod status cards) and
 // pod filter chips on the trader's notes (contract C9: note.data.pod,
-// composing with the category filter exactly like books). Talks to:
+// composing with the category filter exactly like books). Phase 8 adds the
+// Jane Street panels: a sortable option-structures table with expandable
+// legs (contract C11: report.structures), a daily portfolio-Greeks chart
+// (contract C12: report.greeks_series), an estimated-pricing disclaimer on
+// janestreet reports (backtest option prices are SYNTHETIC — Black-Scholes
+// on historical volatility; real chains arrive with E*TRADE in Phase 9),
+// generalized book chips (contract C14 adds vrp/earnings/relative_value)
+// and monospace structure tags on notes carrying data.structure_id, plus an
+// additive 'instrument' line in the trades table (contract C13). Talks to:
 //   POST /api/backtest/run            -> {job_id} (strategy OR desk payload)
 //   GET  /api/backtest/status/<id>    -> JobManager record
 //   GET  /api/backtests               -> saved history rows
@@ -33,13 +41,20 @@ const WF_MODEL_COLORS = {
 };
 // Trader's-notes categories, in filter-chip display order (contract C3).
 const NOTE_CATEGORIES = ['signal', 'risk', 'allocation', 'model', 'info'];
-// Renaissance books carried in note.data.book, in filter-chip display
-// order (contract C7). Keys double as CSS suffixes — whitelisted only.
+// Known note.data.book keys -> display label (contracts C7 + C14). Phase 8
+// generalizes books: ANY non-blank data.book string now renders a chip (the
+// key only ever reaches the DOM as escaped text/textContent), but ONLY the
+// keys listed here additionally get a note-book-<key> color class — CSS
+// suffixes stay whitelisted. Known keys also fix the filter-chip display
+// order (declaration order), with unknown books appended first-seen.
 const NOTE_BOOKS = {
     regime: 'Regime',
     mean_reversion: 'Mean Reversion',
     stat_arb: 'Stat Arb',
     pairs: 'Pairs',
+    vrp: 'VRP',
+    earnings: 'Earnings',
+    relative_value: 'Relative Value',
 };
 // Citadel pods (contract C8): pod keys are dynamic backend strings, so
 // unlike NOTE_BOOKS there is no whitelist — each pod is assigned the next
@@ -58,6 +73,29 @@ const POD_EVENT_META = {
     realloc:   { label: 'Reallocation',  color: '#bc8cff' },
     probation: { label: 'Pod probation', color: '#d29922' },
     cut:       { label: 'Pod cut',       color: '#f85149' },
+};
+// Jane Street structures (contract C11): whitelisted structure types ->
+// display label. Unknown types render as escaped text with no extra class.
+const STRUCTURE_TYPE_LABELS = {
+    iron_condor: 'Iron condor',
+    put_credit_spread: 'Put credit spread',
+    call_credit_spread: 'Call credit spread',
+};
+// Structure lifecycle states (contract C11) -> status-badge label + CSS
+// class (same anatomy as the pod status badges).
+const STRUCTURE_STATUS_META = {
+    open:    { label: 'OPEN',    cls: 'structure-status-open' },
+    closed:  { label: 'CLOSED',  cls: 'structure-status-closed' },
+    expired: { label: 'EXPIRED', cls: 'structure-status-expired' },
+};
+// close_reason chip labels (contract C11). Only these keys get a
+// reason-<key> color class; unknown reasons render as escaped text only.
+const CLOSE_REASON_LABELS = {
+    profit_target: 'profit target',
+    stop_loss: 'stop loss',
+    time_exit: 'time exit',
+    regime_flatten: 'regime flatten',
+    expiry: 'expiry',
 };
 // Regime states (contract C5): equity-chart band tint (low alpha, behind
 // the traces) + solid hue for the legend swatch and current-regime chip.
@@ -81,6 +119,9 @@ let noteFilter = 'all';     // active category filter chip
 let bookFilter = 'all';     // active book filter chip (composes with above)
 let podFilter = 'all';      // active pod filter chip (composes with above)
 let podColors = new Map();  // pod key -> palette hue, first-seen order
+let currentStructures = [];           // report.structures on screen (C11)
+let structSort = { key: 'opened', dir: 1 };
+let expandedStructures = new Set();   // structure _key -> legs row open
 
 /* ==========================================================================
    Theme helpers (same approach as analysis.js)
@@ -347,14 +388,32 @@ function renderResults(report) {
     document.getElementById('resultsSection').classList.remove('d-none');
 
     renderDeskHeader(report);
+    renderSyntheticPricingNote(report);
     renderMetrics(report.summary || {});
     renderPendingSignals(report.pending_signals || []);
     renderEquityChart(report);
     renderDrawdownChart(report.drawdown_series || []);
+    renderGreeksChart(report);
     renderPodAllocation(report);
+    renderStructures(report);
     renderTrades(report.trades || []);
     renderTraderNotes(report);
     renderProvenance(report.data_sources || {});
+}
+
+/**
+ * Estimated-pricing disclaimer (Phase 8): every janestreet report gets the
+ * info callout shipped in backtest.html — backtest option prices are
+ * SYNTHETIC (Black-Scholes from the underlying's history; free providers
+ * carry no historical chains), so the desk's P&L validates LOGIC, not
+ * executable prices. Real chain pricing arrives via E*TRADE in Phase 9.
+ * The markup is static in the template; this only toggles visibility, so
+ * every other desk and strategy mode render exactly as before.
+ */
+function renderSyntheticPricingNote(report) {
+    const note = document.getElementById('syntheticPricingNote');
+    const janestreet = Boolean(report.desk && report.desk.key === 'janestreet');
+    note.classList.toggle('d-none', !janestreet);
 }
 
 /* ==========================================================================
@@ -411,12 +470,39 @@ function noteCategory(note) {
     return NOTE_CATEGORIES.includes(note.category) ? note.category : 'info';
 }
 
-/** Whitelisted note.data.book (contract C7), or null for untagged notes. */
+/** note.data.book (contracts C7/C14): any non-blank string, or null.
+ *  Phase 8 generalized this beyond the renaissance whitelist so new desks'
+ *  books (vrp/earnings/relative_value, and whatever comes next) get chips
+ *  without frontend changes. Book keys only ever render as escaped
+ *  text/textContent; bookClass() keeps CSS suffixes whitelisted. */
 function noteBook(note) {
     const data = note.data;
     return (data && typeof data === 'object' &&
-            Object.prototype.hasOwnProperty.call(NOTE_BOOKS, data.book))
+            typeof data.book === 'string' && data.book.trim() !== '')
         ? data.book : null;
+}
+
+/** Display label for a book key: known label, else underscores as spaces. */
+function bookLabel(key) {
+    return Object.prototype.hasOwnProperty.call(NOTE_BOOKS, key)
+        ? NOTE_BOOKS[key] : String(key).replace(/_/g, ' ');
+}
+
+/** 'note-book-<key>' for KNOWN books only — arbitrary backend strings must
+ *  never become CSS class suffixes. Unknown books get '' (default chip). */
+function bookClass(key) {
+    return Object.prototype.hasOwnProperty.call(NOTE_BOOKS, key)
+        ? `note-book-${key}` : '';
+}
+
+/** note.data.structure_id (contract C14): non-blank string, or null. Only
+ *  ever rendered as escaped text (a small monospace tag on the note). */
+function noteStructureId(note) {
+    const data = note.data;
+    return (data && typeof data === 'object' &&
+            typeof data.structure_id === 'string' &&
+            data.structure_id.trim() !== '')
+        ? data.structure_id : null;
 }
 
 /** note.data.pod (contract C9): any non-blank string, or null. Pod keys
@@ -491,38 +577,49 @@ function paintNoteFilters() {
 }
 
 /**
- * Second filter-chip row (contract C7): one chip per book present in
- * note.data.book, composing with the category filter. Hidden entirely when
- * no note is book-tagged (foundation runs stay byte-identical on screen).
+ * Second filter-chip row (contracts C7/C14): one chip per DISTINCT book
+ * present in note.data.book, composing with the category filter. Hidden
+ * entirely when no note is book-tagged (foundation runs stay byte-identical
+ * on screen). Phase 8: book keys are no longer whitelisted, so the chips
+ * are built with the DOM API (textContent/dataset) — never HTML
+ * interpolation; known books keep their color class and lead the row in
+ * NOTE_BOOKS declaration order, unknown books follow first-seen.
  */
 function paintBookFilters() {
     const wrap = document.getElementById('noteBookFilters');
-    const counts = {};
+    wrap.textContent = '';
+    const counts = new Map(); // insertion order == first appearance
     currentNotes.forEach((n) => {
         const book = noteBook(n);
-        if (book) counts[book] = (counts[book] || 0) + 1;
+        if (book) counts.set(book, (counts.get(book) || 0) + 1);
     });
-    const present = Object.keys(NOTE_BOOKS).filter((b) => counts[b]);
-    if (present.length === 0) {
+    if (counts.size === 0) {
         wrap.classList.add('d-none');
-        wrap.innerHTML = '';
         return;
     }
     wrap.classList.remove('d-none');
+    const known = Object.keys(NOTE_BOOKS).filter((b) => counts.has(b));
+    const present = known.concat(
+        Array.from(counts.keys()).filter((b) => !known.includes(b)));
     const chips = [['all', `All books (${currentNotes.length})`]].concat(
-        present.map((b) => [b, `${NOTE_BOOKS[b]} (${counts[b]})`]));
-    wrap.innerHTML = chips.map(([value, label]) =>
-        '<button type="button" class="note-filter-chip' +
-        `${value === 'all' ? '' : ` note-book-${value}`}` +
-        `${value === bookFilter ? ' active' : ''}"` +
-        ` data-book="${value}" aria-pressed="${value === bookFilter}">` +
-        `${escapeHTML(label)}</button>`).join('');
-    wrap.querySelectorAll('button').forEach((btn) => {
+        present.map((b) => [b, `${bookLabel(b)} (${counts.get(b)})`]));
+    chips.forEach(([value, label]) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'note-filter-chip';
+        if (value !== 'all' && bookClass(value)) {
+            btn.classList.add(bookClass(value)); // whitelisted suffix only
+        }
+        if (value === bookFilter) btn.classList.add('active');
+        btn.setAttribute('aria-pressed', String(value === bookFilter));
+        btn.dataset.book = value;
+        btn.textContent = label;
         btn.addEventListener('click', () => {
             bookFilter = btn.dataset.book;
             paintBookFilters();
             paintNotes();
         });
+        wrap.appendChild(btn);
     });
 }
 
@@ -571,8 +668,9 @@ function paintPodFilters() {
 
 function noteItem(note) {
     const category = noteCategory(note);
-    const book = noteBook(note); // whitelisted key or null
+    const book = noteBook(note); // free-form key (escaped) or null
     const pod = notePod(note);   // free-form key (escaped) or null
+    const structureId = noteStructureId(note); // escaped-text-only or null
     const data = note.data && typeof note.data === 'object' ? note.data : null;
     const hasData = data !== null && Object.keys(data).length > 0;
     return (
@@ -580,7 +678,14 @@ function noteItem(note) {
         `<span class="note-ts num">${escapeHTML(note.timestamp ?? '—')}</span>` +
         `<span class="note-cat-chip note-cat-${category}">${escapeHTML(category)}</span>` +
         (book
-            ? `<span class="note-cat-chip note-book-${book}">${escapeHTML(NOTE_BOOKS[book])}</span>`
+            // bookClass() yields a whitelisted suffix or '' — the key itself
+            // only reaches the DOM escaped, inside the label.
+            ? `<span class="note-cat-chip${bookClass(book) ? ` ${bookClass(book)}` : ''}">` +
+              `${escapeHTML(bookLabel(book))}</span>`
+            : '') +
+        (structureId
+            // Structure lifecycle tag (contract C14): small monospace id.
+            ? `<span class="note-structure-tag num">${escapeHTML(structureId)}</span>`
             : '') +
         (pod
             // Fixed class + palette-only --pod-color; the key itself is
@@ -608,7 +713,7 @@ function noteVisible(note) {
 function filteredEmptyStateHTML() {
     const labels = [];
     if (noteFilter !== 'all') labels.push(noteFilter);
-    if (bookFilter !== 'all') labels.push(NOTE_BOOKS[bookFilter]);
+    if (bookFilter !== 'all') labels.push(bookLabel(bookFilter));
     if (podFilter !== 'all') labels.push(podLabel(podFilter));
     return emptyStateHTML('bi-funnel', `No ${labels.join(' · ')} notes`,
         bookFilter === 'all' && podFilter === 'all'
@@ -850,6 +955,79 @@ function renderDrawdownChart(series) {
 }
 
 /* ==========================================================================
+   Jane Street portfolio Greeks (Phase 8, contract C12): one entry per
+   simulated day in report.greeks_series. AXIS CONVENTION (the backend's
+   desks/options_pricing.py black_scholes_greeks conventions: per-share
+   greeks with theta PER CALENDAR DAY and vega PER 1.00 VOL POINT, summed
+   at desk level across open option legs x signed quantity x the 100 share
+   multiplier): values are DESK-LEVEL DOLLAR AGGREGATES — delta is $ P&L
+   per $1 underlying move, gamma is the delta change per $1 move, theta is
+   $ per calendar day (POSITIVE for the desk's short-premium structures:
+   time decay is collected, not paid), vega is $ per 1.0 vol-point
+   (negative when net short vol). All four are exactly 0.0 on option-free
+   days, so a flat line at zero reads as 'no options on'. One shared $
+   y-axis: delta and vega carry the story and render as primary lines;
+   gamma and theta (different magnitudes) start legend-toggled off
+   ('legendonly' — click the legend to show them). A dotted zero-line
+   anchors sign flips. Absent cleanly otherwise.
+   ========================================================================== */
+
+/** Contract-C12-shaped greeks_series entries; [] when absent/empty. */
+function greeksSeries(report) {
+    return Array.isArray(report.greeks_series)
+        ? report.greeks_series.filter(
+            (g) => g && typeof g.date === 'string')
+        : [];
+}
+
+function renderGreeksChart(report) {
+    const card = document.getElementById('greeksCard');
+    const el = document.getElementById('greeksChart');
+    const series = greeksSeries(report);
+    if (series.length === 0) {
+        card.classList.add('d-none');
+        // Plotly.purge (not innerHTML='') so a later janestreet run can
+        // re-plot into the same div without stale internal state.
+        Plotly.purge(el);
+        return;
+    }
+    card.classList.remove('d-none');
+
+    const t = plotlyTheme();
+    const dates = series.map((g) => g.date);
+    // Delta=accent blue, vega=vol gold (the desk accent), gamma=pod purple,
+    // theta=teal — fixed hues so legend-toggling stays color-stable.
+    const metas = [
+        { key: 'delta', label: 'Delta', color: t.accent, primary: true },
+        { key: 'vega',  label: 'Vega',  color: '#d29922', primary: true },
+        { key: 'gamma', label: 'Gamma', color: '#bc8cff', primary: false },
+        { key: 'theta', label: 'Theta', color: '#39c5cf', primary: false },
+    ];
+    const traces = metas.map((m) => ({
+        type: 'scatter', name: m.label, mode: 'lines',
+        x: dates,
+        y: series.map((g) => {
+            const v = Number(g[m.key]);
+            return Number.isFinite(v) ? v : 0;
+        }),
+        line: { color: m.color, width: m.primary ? 1.5 : 1.25,
+                dash: m.primary ? 'solid' : 'dot' },
+        visible: m.primary ? true : 'legendonly',
+        hovertemplate: `${m.label}: %{y:,.2f}<extra></extra>`,
+    }));
+
+    const layout = baseLayout(t, 240);
+    layout.yaxis.title = { text: 'Greeks ($)', font: { size: 10, color: t.muted } };
+    // Zero-line reference: sign is the signal (short vega / long delta).
+    layout.shapes = [{
+        type: 'line', xref: 'paper', yref: 'y',
+        x0: 0, x1: 1, y0: 0, y1: 0,
+        line: { color: t.muted, width: 1, dash: 'dot' },
+    }];
+    Plotly.react(el, traces, layout, PLOT_CONFIG);
+}
+
+/* ==========================================================================
    Citadel pods (Phase 7, contract C8): the capital-allocation story —
    per-pod status cards + a stacked pod-weight area chart with reallocation
    and probation/cut event markers. Absent cleanly for every other run.
@@ -1045,6 +1223,223 @@ function addPodEventMarkers(history, traces, layout) {
     });
 }
 
+/* ==========================================================================
+   Jane Street structures (Phase 8, contract C11): a sortable table of
+   defined-risk option structures — type, underlying, contracts, lifecycle
+   dates, credit received, max loss (capped at entry by construction), P&L,
+   status badge, close-reason chip — with an expandable per-row legs detail
+   (full option-contract instrument strings). Every cell is built with the
+   DOM API and textContent: structure ids, underlyings, and instrument
+   strings are arbitrary backend text and never reach innerHTML. Absent
+   cleanly for every non-janestreet run.
+   ========================================================================== */
+
+/** Contract-C11-shaped structures; [] when absent/empty/foreign. Each kept
+ *  entry is stamped with a stable _key for the expanded-legs Set. */
+function reportStructures(report) {
+    if (!Array.isArray(report.structures)) return [];
+    return report.structures
+        .filter((s) => s && typeof s === 'object')
+        .map((s, i) => ({
+            ...s,
+            _key: (typeof s.id === 'string' && s.id !== '')
+                ? `id:${s.id}` : `idx:${i}`,
+        }));
+}
+
+function renderStructures(report) {
+    const card = document.getElementById('structuresCard');
+    const body = document.getElementById('structuresBody');
+    currentStructures = reportStructures(report);
+    expandedStructures = new Set();
+    if (currentStructures.length === 0) {
+        card.classList.add('d-none');
+        body.textContent = '';
+        return;
+    }
+    card.classList.remove('d-none');
+    structSort = { key: 'opened', dir: 1 };
+    sortAndPaintStructures();
+}
+
+/** <td> with textContent (never markup) and optional classes. */
+function structCell(text, cls) {
+    const td = document.createElement('td');
+    if (cls) td.className = cls;
+    td.textContent = text;
+    return td;
+}
+
+/** Display label for a structure type: whitelisted, else underscores read
+ *  as spaces (escaped text only). */
+function structureTypeLabel(type) {
+    return STRUCTURE_TYPE_LABELS[type] ||
+        String(type ?? '—').replace(/_/g, ' ');
+}
+
+function sortAndPaintStructures() {
+    const { key, dir } = structSort;
+    const sorted = currentStructures.slice().sort((a, b) => {
+        const av = a[key]; const bv = b[key];
+        if (av === bv) return 0;
+        if (av === undefined || av === null) return 1;
+        if (bv === undefined || bv === null) return -1;
+        return (av < bv ? -1 : 1) * dir;
+    });
+
+    const body = document.getElementById('structuresBody');
+    body.textContent = '';
+    sorted.forEach((s) => {
+        const legsRow = structureLegsRow(s);
+        body.append(structureRow(s, legsRow), legsRow);
+    });
+
+    document.querySelectorAll('#structuresTable th.sortable').forEach((th) => {
+        const arrow = th.querySelector('.sort-arrow');
+        const active = th.dataset.key === key;
+        arrow.textContent = active ? (dir > 0 ? '▲' : '▼') : '';
+        th.setAttribute('aria-sort',
+            active ? (dir > 0 ? 'ascending' : 'descending') : 'none');
+    });
+}
+
+/** Main table row; the toggle button shows/hides the paired legs row. */
+function structureRow(s, legsRow) {
+    const tr = document.createElement('tr');
+    tr.className = 'structure-row';
+
+    // Legs expander (chevron) — only when there is leg detail to show.
+    const tdToggle = document.createElement('td');
+    tdToggle.className = 'structure-toggle-cell';
+    if (Array.isArray(s.legs) && s.legs.length > 0) {
+        const expanded = expandedStructures.has(s._key);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `structure-toggle${expanded ? ' open' : ''}`;
+        btn.setAttribute('aria-expanded', String(expanded));
+        btn.setAttribute('aria-label',
+            `Toggle legs for structure ${typeof s.id === 'string' ? s.id : ''}`);
+        const icon = document.createElement('i');
+        icon.className = 'bi bi-chevron-right';
+        icon.setAttribute('aria-hidden', 'true');
+        btn.appendChild(icon);
+        btn.addEventListener('click', () => {
+            const nowOpen = legsRow.classList.toggle('d-none') === false;
+            btn.setAttribute('aria-expanded', String(nowOpen));
+            btn.classList.toggle('open', nowOpen);
+            if (nowOpen) expandedStructures.add(s._key);
+            else expandedStructures.delete(s._key);
+        });
+        tdToggle.appendChild(btn);
+    }
+    tr.appendChild(tdToggle);
+
+    tr.appendChild(structCell(structureTypeLabel(s.type)));
+    tr.appendChild(structCell(String(s.underlying ?? '—')));
+    tr.appendChild(structCell(fmtNum(s.contracts, 0), 'num'));
+    tr.appendChild(structCell(s.opened ?? '—', 'num'));
+    tr.appendChild(structCell(s.closed ?? '—', 'num'));
+    tr.appendChild(structCell(fmtMoney(s.credit), 'num'));
+    tr.appendChild(structCell(fmtMoney(s.max_loss), 'num'));
+
+    // P&L: realized $ when closed/expired (contract C11), em dash while
+    // open — colored by sign, like every other P&L in the app.
+    const pnlOpen = s.pnl === null || s.pnl === undefined;
+    tr.appendChild(structCell(
+        pnlOpen ? '—' : fmtMoney(s.pnl, { sign: true }),
+        `num ${pnlOpen ? 'pnl-flat' : pnlClass(s.pnl)}`));
+
+    // Status badge: OPEN / CLOSED / EXPIRED (whitelisted classes only).
+    const tdStatus = document.createElement('td');
+    const statusMeta = STRUCTURE_STATUS_META[s.status] ||
+        { label: '—', cls: '' };
+    const badge = document.createElement('span');
+    badge.className =
+        `structure-status-badge${statusMeta.cls ? ` ${statusMeta.cls}` : ''}`;
+    badge.textContent = statusMeta.label;
+    tdStatus.appendChild(badge);
+    tr.appendChild(tdStatus);
+
+    // close_reason chip: whitelisted reasons get a color class; any other
+    // non-blank string renders as a default chip (textContent only).
+    const tdReason = document.createElement('td');
+    if (typeof s.close_reason === 'string' && s.close_reason.trim() !== '') {
+        const chip = document.createElement('span');
+        chip.className = 'note-cat-chip';
+        if (CLOSE_REASON_LABELS[s.close_reason]) {
+            chip.classList.add(`reason-${s.close_reason}`);
+        }
+        chip.textContent = CLOSE_REASON_LABELS[s.close_reason] ||
+            s.close_reason.replace(/_/g, ' ');
+        tdReason.appendChild(chip);
+    } else {
+        tdReason.textContent = '—';
+        tdReason.className = 'pnl-flat';
+    }
+    tr.appendChild(tdReason);
+
+    return tr;
+}
+
+/** Hidden detail row: one line per leg — action, right/strike/expiry, and
+ *  the full instrument contract string (textContent only). */
+function structureLegsRow(s) {
+    const tr = document.createElement('tr');
+    tr.className = 'structure-legs-row';
+    if (!expandedStructures.has(s._key)) tr.classList.add('d-none');
+
+    const td = document.createElement('td');
+    td.colSpan = 11;
+    const legs = Array.isArray(s.legs) ? s.legs : [];
+    if (legs.length === 0) {
+        td.className = 'structure-legs-empty';
+        td.textContent = 'No leg detail for this structure.';
+    } else {
+        const list = document.createElement('ul');
+        list.className = 'structure-legs list-unstyled mb-0';
+        legs.forEach((leg) => {
+            if (!leg || typeof leg !== 'object') return;
+            const li = document.createElement('li');
+            li.className = 'structure-leg';
+
+            const action = String(leg.action ?? '').toUpperCase();
+            const actionEl = document.createElement('span');
+            actionEl.className = 'structure-leg-action ' +
+                (action === 'BUY' ? 'pnl-pos' : 'pnl-neg');
+            actionEl.textContent = action || '—';
+
+            const descEl = document.createElement('span');
+            descEl.className = 'structure-leg-desc';
+            descEl.textContent =
+                `${String(leg.right ?? '').toUpperCase() || '—'} ` +
+                `${fmtMoney(leg.strike)} · exp ${leg.expiry ?? '—'}`;
+
+            const instrumentEl = document.createElement('span');
+            instrumentEl.className = 'structure-leg-instrument';
+            instrumentEl.textContent = String(leg.instrument ?? '');
+
+            li.append(actionEl, descEl, instrumentEl);
+            list.appendChild(li);
+        });
+        td.appendChild(list);
+    }
+    tr.appendChild(td);
+    return tr;
+}
+
+function initStructureSorting() {
+    document.querySelectorAll('#structuresTable th.sortable').forEach((th) => {
+        th.addEventListener('click', () => {
+            const key = th.dataset.key;
+            structSort = {
+                key,
+                dir: structSort.key === key ? -structSort.dir : 1,
+            };
+            if (currentStructures.length > 0) sortAndPaintStructures();
+        });
+    });
+}
+
 function renderProvenance(dataSources) {
     const parts = [];
     const failures = [];
@@ -1099,10 +1494,21 @@ function sortAndPaintTrades() {
 
     document.getElementById('tradesBody').innerHTML = sorted.map((trade) => {
         const buy = trade.action === 'BUY';
+        // Contract C13 (additive): 'instrument' is str(asset) — the bare
+        // symbol for stocks, the full contract string for options. Only
+        // option fills get the extra monospace line (stocks would just
+        // repeat the Symbol cell).
+        const instrument =
+            typeof trade.instrument === 'string' ? trade.instrument : '';
+        const showInstrument = instrument && instrument !== trade.symbol;
         return '<tr>' +
             `<td class="num">${escapeHTML(trade.signal_date ?? '—')}</td>` +
             `<td class="num">${escapeHTML(trade.date ?? '—')}</td>` +
-            `<td>${escapeHTML(trade.symbol ?? '')}</td>` +
+            `<td>${escapeHTML(trade.symbol ?? '')}` +
+            (showInstrument
+                ? `<div class="trade-instrument">${escapeHTML(instrument)}</div>`
+                : '') +
+            '</td>' +
             `<td class="${buy ? 'pnl-pos' : 'pnl-neg'}">${escapeHTML(trade.action ?? '')}</td>` +
             `<td class="num">${fmtNum(trade.quantity, 0)}</td>` +
             `<td class="num">${fmtMoney(trade.price)}</td>` +
@@ -1324,6 +1730,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initDeskMode();
     loadSaved();
     initTradeSorting();
+    initStructureSorting();
     document.getElementById('backtestForm').addEventListener('submit', onRun);
     document.getElementById('reloadSavedBtn').addEventListener('click', loadSaved);
     document.getElementById('compareBtn').addEventListener('click', onCompare);

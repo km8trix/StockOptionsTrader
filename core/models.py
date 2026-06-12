@@ -43,6 +43,19 @@ class Asset:
     strike_price: Optional[float] = None
     expiration_date: Optional[str] = None
 
+    @property
+    def multiplier(self) -> int:
+        """Contract multiplier: 100 for options (CALL/PUT), 1 for stock.
+
+        Every position value, P&L and cash flow involving an option is
+        the per-share price x this multiplier — the classic place sign
+        and scale errors blow up an options book, so it lives in ONE
+        spot and every consumer (Position, Trade, PortfolioManager,
+        BacktestEngine) goes through it. Stock paths multiply by 1 and
+        are byte-identical to their pre-Phase-8 behavior.
+        """
+        return 100 if self.asset_type in (AssetType.CALL, AssetType.PUT) else 1
+
     def __eq__(self, other):
         """Ensures assets with identical options parameters evaluate as the same key."""
         if not isinstance(other, Asset):
@@ -83,6 +96,10 @@ class Position:
 
     quantity is NEGATIVE for short positions (desk-mode SHORT fills).
     pnl() is sign-correct by construction: quantity * (current - entry).
+
+    For OPTION assets quantity is in CONTRACTS and prices are per-share,
+    so pnl() and position value carry the asset's contract multiplier
+    (x100); stock paths multiply by 1 and are unchanged.
     """
     asset: Asset
     quantity: int
@@ -91,8 +108,9 @@ class Position:
     timestamp: datetime
 
     def pnl(self) -> float:
-        """Calculate unrealized P&L"""
-        return self.quantity * (self.current_price - self.avg_entry_price)
+        """Calculate unrealized P&L (contract-multiplier aware)."""
+        return (self.quantity * (self.current_price - self.avg_entry_price)
+                * self.asset.multiplier)
 
     def pnl_pct(self) -> float:
         """Calculate unrealized P&L percentage (direction-aware).
@@ -115,6 +133,11 @@ class Trade:
     pnl = quantity * (exit - entry) is sign-correct for negatives: a short
     covered below entry (exit < entry, quantity < 0) yields a POSITIVE
     pnl. pnl_pct mirrors that direction.
+
+    For OPTION assets quantity is in CONTRACTS and prices per-share, so
+    pnl carries the asset's contract multiplier (x100): a short option
+    sold at 2.00 and covered at 1.00 (quantity -3) realizes
+    -3 * (1.00 - 2.00) * 100 = +300. Stock pnl is unchanged (x1).
     """
     asset: Asset
     entry_price: float
@@ -124,7 +147,8 @@ class Trade:
     exit_time: datetime
 
     def __post_init__(self):
-        self._pnl = self.quantity * (self.exit_price - self.entry_price)
+        self._pnl = (self.quantity * (self.exit_price - self.entry_price)
+                     * self.asset.multiplier)
         if self.entry_price != 0:
             direction = -1.0 if self.quantity < 0 else 1.0
             self._pnl_pct = direction * (
