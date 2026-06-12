@@ -906,3 +906,242 @@ th.sortable .sort-arrow {
     color: var(--text-muted);
     white-space: nowrap;
 }
+
+/* --------------------------------------------------------------------------
+   Live Trading (Phase 9): environment badge, kill switch, audit log,
+   reconciliation. System state must be unmistakable at a glance:
+   SANDBOX amber / PRODUCTION red; kill switch engaged = red everywhere.
+   -------------------------------------------------------------------------- */
+/* Environment badge: large, always visible at the top of the live page. */
+.env-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    border-radius: 4px;
+    padding: var(--sp-1) var(--sp-3);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    background-color: var(--surface);
+}
+
+.env-badge.env-sandbox {
+    color: var(--warn);
+    border-color: var(--warn);
+    background-color: rgba(210, 153, 34, 0.12);
+}
+
+.env-badge.env-production {
+    color: #fff;
+    border-color: var(--loss);
+    background-color: var(--loss);
+}
+
+/* Auth-state badge in the connection card header */
+.auth-state-badge {
+    font-size: 10px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+
+.auth-state-badge.auth-ok    { color: var(--gain); border-color: var(--gain); }
+.auth-state-badge.auth-warn  { color: var(--warn); border-color: var(--warn); }
+.auth-state-badge.auth-err   { color: var(--loss); border-color: var(--loss); }
+.auth-state-badge.auth-muted { color: var(--text-muted); }
+
+.conn-line {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-bottom: var(--sp-3);
+}
+
+.conn-line.conn-ok   { color: var(--gain); }
+.conn-line.conn-warn { color: var(--warn); }
+
+.token-times {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--sp-1) var(--sp-4);
+    font-size: 12px;
+    margin-bottom: var(--sp-3);
+}
+
+.token-times dt {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.token-times dd { margin: 0; }
+
+.verifier-input { width: 160px; }
+
+/* Kill switch: oversized state line + full-width action button */
+.ks-state {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-family: var(--font-mono);
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+}
+
+.ks-state.ks-engaged { color: var(--loss); }
+.ks-state.ks-off     { color: var(--gain); }
+.ks-state.ks-unknown { color: var(--text-muted); }
+
+.ks-detail {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.btn-kill {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: var(--sp-2) var(--sp-3);
+}
+
+.btn-danger {
+    --bs-btn-bg: var(--loss);
+    --bs-btn-border-color: var(--loss);
+    --bs-btn-hover-bg: #fa6a63;
+    --bs-btn-hover-border-color: #fa6a63;
+    --bs-btn-active-bg: #e0443d;
+    --bs-btn-active-border-color: #e0443d;
+}
+
+.ks-footnote {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+/* Global kill-switch banner (base.html): unmistakable on every page. */
+.kill-banner {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
+    background-color: var(--loss);
+    color: #fff;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    padding: var(--sp-2) var(--sp-4);
+}
+
+.kill-banner-link {
+    color: #fff;
+    text-decoration: underline;
+    font-weight: 600;
+}
+
+.kill-banner-link:hover { color: #fff; }
+
+/* Nav env/connection dot next to the Live link (painted by live.js only) */
+.nav-live-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: var(--text-muted);
+    vertical-align: middle;
+    margin-left: 2px;
+}
+
+.nav-live-dot.ok    { background-color: var(--gain); }
+.nav-live-dot.warn  { background-color: var(--warn); }
+.nav-live-dot.error { background-color: var(--loss); }
+.nav-live-dot.off   { background-color: var(--text-muted); }
+
+/* Card-header hint (working orders) */
+.card-header-hint {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    text-transform: none;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+/* Audit log: event chip, payload details, pager, verify chip */
+.audit-event {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+}
+
+.audit-payload details summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.audit-filter { width: auto; min-width: 160px; }
+
+.audit-pager {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-3);
+    padding: var(--sp-2) var(--sp-3);
+    border-top: 1px solid var(--border);
+}
+
+.audit-page-info {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+}
+
+.verify-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    font-size: 10px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+
+.verify-chip.verify-ok  { color: var(--gain); border-color: var(--gain); }
+.verify-chip.verify-bad { color: var(--loss); border-color: var(--loss); }
+
+/* Reconciliation result line: green in-sync / red mismatch */
+.recon-result {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.recon-result.recon-ok  { color: var(--gain); }
+.recon-result.recon-bad { color: var(--loss); }

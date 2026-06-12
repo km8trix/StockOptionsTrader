@@ -101,6 +101,14 @@ class RiskManager:
         A zero/negative portfolio value is an automatic violation (fail
         closed) and halts trading, since this check is the kill switch and
         the loss percentage cannot be computed.
+
+        BOUNDARY SEMANTICS: this desk rail is STRICT (loss > limit
+        violates; a loss exactly AT the limit still trades) and
+        deliberately diverges from the live daily-loss breaker
+        (brokers.circuit_breaker.DailyLossCircuitBreaker), which is
+        INCLUSIVE (loss >= limit breaches). The divergence fails safe:
+        in live trading the inclusive breaker is the stricter outer
+        rail, so do not "align" the two conventions.
         """
         if portfolio_value <= 0:
             self.trading_allowed = False

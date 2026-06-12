@@ -23,6 +23,10 @@ def analysis_page():
 def floor_page():
     return render_template('floor.html')
 
+@views_bp.route('/live')
+def live_page():
+    return render_template('live.html')
+
 @views_bp.route('/trading_floor')
 def trading_floor_page():
     # Back-compat alias for the Stage 1 nav link; same page as /floor.

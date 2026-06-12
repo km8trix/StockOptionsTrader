@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+
+{% block title %}Live Trading · StockOptionsTrader{% endblock %}
+
+{% block content %}
+<!-- Phase 9 Live Trading console. ALL dynamic state is painted by live.js
+     from GET /api/live/status (contract C20) — this page is the only page
+     in the app that polls live status. Auth is NEVER auto-started here:
+     every OAuth step begins with an explicit button click. -->
+<div class="d-flex align-items-baseline flex-wrap gap-3 mb-3">
+    <h1 class="page-title">Live Trading</h1>
+    <p class="page-subtitle">E*TRADE · sandbox-first · defined-risk only</p>
+    <!-- Environment badge: large, always visible, painted by live.js
+         (SANDBOX amber / PRODUCTION red / muted while unknown). -->
+    <span id="envBadge" class="env-badge env-unknown ms-auto">CHECKING…</span>
+</div>
+
+<div class="row g-3">
+    <!-- ==================== CONNECTION ==================== -->
+    <div class="col-lg-7">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-plug" aria-hidden="true"></i> Connection</span>
+                <span id="authStateBadge" class="auth-state-badge auth-unknown">checking…</span>
+            </div>
+            <div class="card-body" id="connectionBody" aria-live="polite">
+                <div class="empty-state">
+                    <i class="bi bi-plug" aria-hidden="true"></i>
+                    <div class="empty-msg">Checking connection…</div>
+                    <div class="empty-hint">Reading auth status from the server.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== KILL SWITCH ==================== -->
+    <div class="col-lg-5">
+        <div class="card h-100" id="killSwitchCard">
+            <div class="card-header">
+                <i class="bi bi-sign-stop" aria-hidden="true"></i> Kill switch
+            </div>
+            <div class="card-body d-flex flex-column gap-2" aria-live="polite">
+                <div id="ksState" class="ks-state ks-unknown">
+                    <i class="bi bi-question-circle" aria-hidden="true"></i>
+                    <span id="ksStateLabel">UNKNOWN</span>
+                </div>
+                <p id="ksStateDetail" class="ks-detail">
+                    Kill-switch state has not been read yet.
+                </p>
+                <button type="button" class="btn btn-danger btn-kill" id="btnKillSwitch" disabled>
+                    Engage kill switch
+                </button>
+                <p class="ks-footnote">
+                    Engaging blocks every live order placement (preview and place)
+                    until explicitly disengaged. Cancels, order status and quotes
+                    stay allowed. Both directions require confirmation and are
+                    audit-logged.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== WORKING ORDERS ==================== -->
+    <div class="col-lg-7">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-hourglass-split" aria-hidden="true"></i> Working orders</span>
+                <span class="card-header-hint">patient executor · limit-at-mid</span>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table" id="workingOrdersTable">
+                        <thead>
+                            <tr>
+                                <th>Instrument</th>
+                                <th>Side</th>
+                                <th class="num">Qty</th>
+                                <th class="num">Limit</th>
+                                <th class="num">Steps</th>
+                                <th class="num">Elapsed</th>
+                                <th class="num">Remaining</th>
+                                <th aria-label="Actions"></th>
+                            </tr>
+                        </thead>
+                        <tbody id="workingOrdersBody"></tbody>
+                    </table>
+                </div>
+                <div id="workingOrdersEmpty"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== RECONCILIATION ==================== -->
+    <div class="col-lg-5">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-check2-square" aria-hidden="true"></i> Reconciliation</span>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="btnReconcile">
+                    <i class="bi bi-arrow-repeat" aria-hidden="true"></i> Run now
+                </button>
+            </div>
+            <div class="card-body" id="reconBody" aria-live="polite">
+                <div class="empty-state">
+                    <i class="bi bi-check2-square" aria-hidden="true"></i>
+                    <div class="empty-msg">No reconciliation yet</div>
+                    <div class="empty-hint">Compares the local book against E*TRADE
+                        positions and cash. Mismatches engage the kill switch.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== AUDIT LOG ==================== -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <span><i class="bi bi-journal-text" aria-hidden="true"></i> Audit log</span>
+                <div class="d-flex align-items-center gap-2">
+                    <span id="auditVerify" class="verify-chip verify-unknown">
+                        <i class="bi bi-shield" aria-hidden="true"></i> chain unverified
+                    </span>
+                    <label class="visually-hidden" for="auditEventType">Event type filter</label>
+                    <select class="form-select form-select-sm audit-filter" id="auditEventType">
+                        <option value="">All event types</option>
+                    </select>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table" id="auditTable">
+                        <thead>
+                            <tr>
+                                <th class="num">Seq</th>
+                                <th>Timestamp</th>
+                                <th>Env</th>
+                                <th>Actor</th>
+                                <th>Event</th>
+                                <th>Payload</th>
+                            </tr>
+                        </thead>
+                        <tbody id="auditBody"></tbody>
+                    </table>
+                </div>
+                <div id="auditEmpty"></div>
+                <div class="audit-pager">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" id="auditPrev" disabled>
+                        <i class="bi bi-chevron-left" aria-hidden="true"></i> Newer
+                    </button>
+                    <span id="auditPageInfo" class="audit-page-info">—</span>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" id="auditNext" disabled>
+                        Older <i class="bi bi-chevron-right" aria-hidden="true"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Kill-switch confirm modal: confirmation is required in BOTH directions;
+     the reason field is shown (and required) only when engaging. -->
+<div class="modal fade" id="ksConfirmModal" tabindex="-1" aria-labelledby="ksModalTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 class="modal-title fs-6" id="ksModalTitle">Engage kill switch?</h2>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cancel"></button>
+            </div>
+            <div class="modal-body">
+                <p id="ksModalBody" class="mb-2"></p>
+                <div id="ksReasonGroup">
+                    <label class="form-label" for="ksReason">Reason (required)</label>
+                    <input type="text" class="form-control" id="ksReason"
+                           maxlength="200" placeholder="Why is trading being halted?">
+                    <div class="invalid-feedback">A reason is required to engage the kill switch.</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="ksModalConfirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/live.js') }}"></script>
+{% endblock %}

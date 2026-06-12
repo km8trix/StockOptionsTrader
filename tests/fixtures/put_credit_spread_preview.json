@@ -1,0 +1,45 @@
+{
+  "PreviewOrderRequest": {
+    "Order": [
+      {
+        "Instrument": [
+          {
+            "Product": {
+              "callPut": "PUT",
+              "expiryDay": 16,
+              "expiryMonth": 1,
+              "expiryYear": 2026,
+              "securityType": "OPTN",
+              "strikePrice": 195.0,
+              "symbol": "IWM"
+            },
+            "orderAction": "SELL_OPEN",
+            "orderedQuantity": 3,
+            "quantity": 3
+          },
+          {
+            "Product": {
+              "callPut": "PUT",
+              "expiryDay": 16,
+              "expiryMonth": 1,
+              "expiryYear": 2026,
+              "securityType": "OPTN",
+              "strikePrice": 190.0,
+              "symbol": "IWM"
+            },
+            "orderAction": "BUY_OPEN",
+            "orderedQuantity": 3,
+            "quantity": 3
+          }
+        ],
+        "allOrNone": false,
+        "limitPrice": 1.15,
+        "marketSession": "REGULAR",
+        "orderTerm": "GOOD_FOR_DAY",
+        "priceType": "NET_CREDIT"
+      }
+    ],
+    "clientOrderId": "GOLDENPUTCS00001",
+    "orderType": "SPREADS"
+  }
+}

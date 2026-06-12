@@ -40,6 +40,26 @@ def make_provenance_info(provider='cboe'):
     }
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_singletons(monkeypatch, tmp_path):
+    """Keep every test away from the developer's REAL trading_data.db.
+
+    kill_switch_engaged() (the base-template banner source, hit on every
+    page render) reads through to persisted SQLite state when
+    TRADING_DB_PATH is set OR the default db file already exists — and
+    pytest runs from the repo root, which may well hold a real
+    trading_data.db. Point the env at a per-test temp file and reset
+    api_live's process-wide singletons so no test reads, mutates, or
+    leaks live-trading state (real or another test's).
+    """
+    import gui.routes.api_live as api_live
+
+    monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'live-test.db'))
+    monkeypatch.setattr(api_live, '_auth_manager', None)
+    monkeypatch.setattr(api_live, '_kill_switch', None)
+    monkeypatch.setattr(api_live, '_audit_log', None)
+
+
 @pytest.fixture()
 def app():
     """A fresh app per test, built through the factory with TESTING on."""
@@ -247,7 +267,7 @@ class TestViewsAndVendoredAssets:
 
     # /trading_floor is the Stage 1 alias for /floor; both must keep working.
     PAGES = ['/', '/analysis', '/backtest', '/paper_trade', '/floor',
-             '/trading_floor']
+             '/trading_floor', '/live']
 
     @pytest.mark.parametrize('path', PAGES)
     def test_page_renders_200(self, client, path):
@@ -1738,3 +1758,780 @@ class TestPaperPendingOrders:
         assert client.get('/api/trader/nope-x/orders').status_code == 404
         assert client.post(
             '/api/trader/nope-x/order/ORD-000001/cancel').status_code == 404
+
+
+# ==================== LIVE TRADING (Phase 9, contract C20) ====================
+# The backend C16-C19 surfaces (brokers/etrade_auth, utils/kill_switch,
+# utils/audit, brokers/reconcile) land in a parallel task, so every test
+# below runs against MOCKED surfaces injected into gui.routes.api_live —
+# pinning the ROUTE behavior with zero network and zero real OAuth state.
+
+
+class FakeAuthManager:
+    """Contract-C16-shaped auth manager covering the full state machine."""
+
+    def __init__(self, state='disconnected', env='sandbox'):
+        self.state = state
+        self.env = env
+        self.authorize_url = None
+        self.verifier_codes = []
+        self.renew_calls = 0
+        self.renew_result = True
+
+    def status(self):
+        return {
+            'state': self.state,
+            'env': self.env,
+            'authorize_url': (self.authorize_url
+                              if self.state == 'pending_verifier' else None),
+            'token_issued_at': ('2026-06-12T08:00:00-04:00'
+                                if self.state == 'connected' else None),
+            'renewed_at': ('2026-06-12T09:30:00-04:00'
+                           if self.renew_calls else None),
+        }
+
+    def start_auth(self):
+        self.state = 'pending_verifier'
+        self.authorize_url = 'https://us.etrade.com/e/t/etws/authorize?key=K'
+        return self.authorize_url
+
+    def submit_verifier(self, code):
+        self.verifier_codes.append(code)
+        self.state = 'connected'
+        return self.status()
+
+    def renew(self):
+        self.renew_calls += 1
+        return self.renew_result
+
+    def disconnect(self):
+        self.state = 'disconnected'
+
+
+class FakeKillSwitch:
+    """Contract-C17-shaped kill switch recording every flip."""
+
+    def __init__(self, engaged=False):
+        self._engaged = engaged
+        self.events = []
+
+    def engaged(self):
+        return self._engaged
+
+    def engage(self, reason, actor):
+        self._engaged = True
+        self.events.append(('engage', reason, actor))
+
+    def disengage(self, actor):
+        self._engaged = False
+        self.events.append(('disengage', actor))
+
+
+class FakeAuditLog:
+    """Contract-C18-shaped audit log over a canned in-memory list."""
+
+    def __init__(self, n=0):
+        self.rows = [
+            {'seq': i + 1, 'ts': f'2026-06-12T10:{i % 60:02d}:00-04:00',
+             'env': 'sandbox',
+             'actor': 'gui' if i % 2 else 'system',
+             'event_type': 'order_place' if i % 3 else 'kill_switch',
+             'payload': {'i': i}}
+            for i in range(n)
+        ]
+        self.verify_result = {'ok': True, 'first_bad_seq': None}
+
+    def entries(self, limit, offset, event_type=None):
+        rows = [r for r in self.rows
+                if event_type is None or r['event_type'] == event_type]
+        return rows[offset:offset + limit]
+
+    def verify_chain(self):
+        return self.verify_result
+
+
+@pytest.fixture()
+def patch_live(monkeypatch):
+    """Inject fake C16/C17/C18 surfaces into api_live; reset module state."""
+    import gui.routes.api_live as api_live
+
+    fakes = {
+        'auth': FakeAuthManager(),
+        'kill': FakeKillSwitch(),
+        'audit': FakeAuditLog(n=120),
+    }
+    monkeypatch.setattr(api_live, 'get_auth_manager', lambda: fakes['auth'])
+    monkeypatch.setattr(api_live, 'get_kill_switch', lambda: fakes['kill'])
+    monkeypatch.setattr(api_live, 'get_audit_log', lambda: fakes['audit'])
+    monkeypatch.setattr(api_live, '_last_reconciliation', None)
+    return fakes
+
+
+class TestLivePageAndChrome:
+    """The /live page + base-template chrome (nav link, dot, banner)."""
+
+    def test_live_page_ships_all_panels_and_script(self, client):
+        html = client.get('/live').get_data(as_text=True)
+        for marker in (
+            'id="envBadge"', 'id="connectionBody"', 'id="authStateBadge"',
+            'id="btnKillSwitch"', 'id="ksConfirmModal"', 'id="ksReason"',
+            'id="workingOrdersBody"', 'id="workingOrdersTable"',
+            'id="auditBody"', 'id="auditEventType"', 'id="auditVerify"',
+            'id="auditPrev"', 'id="auditNext"',
+            'id="reconBody"', 'id="btnReconcile"',
+            'js/live.js',
+        ):
+            assert marker in html, f'/live missing {marker}'
+
+    def test_nav_has_live_link_with_hidden_dot_on_every_page(self, client):
+        for path in TestViewsAndVendoredAssets.PAGES:
+            html = client.get(path).get_data(as_text=True)
+            assert 'href="/live"' in html, f'{path} missing Live nav link'
+            # The dot ships hidden; ONLY live.js (live page poll) paints it.
+            assert 'id="navLiveDot"' in html
+            assert 'nav-live-dot d-none' in html
+
+    def test_kill_switch_banner_ships_hidden_by_default(self, client):
+        """Static banner markup on every page, no polling: hidden until the
+        server (context processor) or the live page's poll knows better."""
+        for path in TestViewsAndVendoredAssets.PAGES:
+            html = client.get(path).get_data(as_text=True)
+            assert 'id="killSwitchBanner"' in html
+            assert 'kill-banner d-none' in html, \
+                f'{path} banner should be hidden while disengaged'
+
+    def test_kill_switch_banner_visible_when_engaged(self, client, monkeypatch):
+        """Server-rendered engaged state shows the red banner on EVERY page
+        (kill_switch_engaged reads an existing singleton — no polling)."""
+        import gui.routes.api_live as api_live
+
+        monkeypatch.setattr(api_live, '_kill_switch', FakeKillSwitch(engaged=True))
+
+        for path in ('/', '/backtest', '/live'):
+            html = client.get(path).get_data(as_text=True)
+            assert 'id="killSwitchBanner"' in html
+            assert 'kill-banner d-none' not in html, \
+                f'{path} banner must be visible while engaged'
+            assert 'KILL SWITCH ENGAGED' in html
+
+    def test_banner_survives_restart_via_default_db_file(
+            self, client, monkeypatch, tmp_path):
+        """An engaged switch persisted in the DEFAULT db file (no
+        TRADING_DB_PATH) still banners every page after a process restart:
+        kill_switch_engaged reads through when trading_data.db already
+        exists on disk."""
+        import gui.routes.api_live as api_live
+        from utils.kill_switch import KillSwitch
+
+        monkeypatch.delenv('TRADING_DB_PATH', raising=False)
+        monkeypatch.chdir(tmp_path)
+        # 'Previous run': engage and persist into the default-path db file.
+        KillSwitch(str(tmp_path / 'trading_data.db')).engage(
+            'reconcile mismatch drill', 'test')
+        # 'Restart': this process has no singleton yet.
+        monkeypatch.setattr(api_live, '_kill_switch', None)
+
+        for path in ('/', '/backtest'):
+            html = client.get(path).get_data(as_text=True)
+            assert 'kill-banner d-none' not in html, \
+                f'{path} banner must be visible after a restart'
+            assert 'KILL SWITCH ENGAGED' in html
+
+    def test_banner_check_never_creates_a_db_file(
+            self, client, monkeypatch, tmp_path):
+        """Without TRADING_DB_PATH and with no existing default db file,
+        the per-render banner check must NOT create one (no filesystem
+        side effects from arbitrary page renders)."""
+        monkeypatch.delenv('TRADING_DB_PATH', raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        html = client.get('/').get_data(as_text=True)
+
+        assert 'kill-banner d-none' in html
+        assert list(tmp_path.rglob('*.db')) == []
+
+    def test_no_live_polling_on_other_pages(self, client):
+        """live.js (the only /api/live poller) loads ONLY on /live."""
+        for path in TestViewsAndVendoredAssets.PAGES:
+            html = client.get(path).get_data(as_text=True)
+            if path == '/live':
+                assert 'js/live.js' in html
+            else:
+                assert 'js/live.js' not in html, f'{path} must not poll live'
+                assert '/api/live/' not in html
+
+
+class TestLiveStatusEndpoint:
+    """GET /api/live/status (contract C20)."""
+
+    def test_status_shape_disconnected(self, client, patch_live):
+        response = client.get('/api/live/status')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert set(body) == {'auth', 'env', 'kill_switch', 'reconciliation'}
+        assert body['auth']['state'] == 'disconnected'
+        assert body['env'] == 'sandbox'
+        assert body['kill_switch'] == {'engaged': False}
+        assert body['reconciliation'] is None
+
+    def test_status_production_env_and_engaged_switch(self, client, patch_live):
+        patch_live['auth'].env = 'production'
+        patch_live['kill']._engaged = True
+
+        body = client.get('/api/live/status').get_json()
+        assert body['env'] == 'production'
+        assert body['kill_switch'] == {'engaged': True}
+
+    def test_status_503_when_auth_surface_unavailable(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic etrade_auth import failure'
+        monkeypatch.setattr(api_live, 'get_auth_manager', lambda: None)
+        monkeypatch.setattr(api_live, 'ETRADE_AUTH_IMPORT_ERROR', sentinel)
+
+        response = client.get('/api/live/status')
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Live trading unavailable', 'reason': sentinel}
+
+    def test_status_503_when_kill_switch_unavailable(self, client, monkeypatch):
+        """An ambiguous kill-switch state must never read as fine."""
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic kill_switch import failure'
+        monkeypatch.setattr(api_live, 'get_auth_manager',
+                            lambda: FakeAuthManager())
+        monkeypatch.setattr(api_live, 'get_kill_switch', lambda: None)
+        monkeypatch.setattr(api_live, 'KILL_SWITCH_IMPORT_ERROR', sentinel)
+
+        response = client.get('/api/live/status')
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Kill switch unavailable', 'reason': sentinel}
+
+
+class TestLiveAuthFlow:
+    """POST /api/live/auth/* against the mocked C16 state machine."""
+
+    def test_start_returns_authorize_url_and_pending_state(
+            self, client, patch_live):
+        response = client.post('/api/live/auth/start')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['authorize_url'].startswith('https://us.etrade.com/')
+        assert body['auth']['state'] == 'pending_verifier'
+        assert body['auth']['authorize_url'] == body['authorize_url']
+
+    def test_verifier_completes_the_flow(self, client, patch_live):
+        client.post('/api/live/auth/start')
+        response = client.post('/api/live/auth/verifier',
+                               json={'code': ' A1B2C '})
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['auth']['state'] == 'connected'
+        assert body['auth']['token_issued_at'] is not None
+        # The code is trimmed before it reaches the manager.
+        assert patch_live['auth'].verifier_codes == ['A1B2C']
+
+    @pytest.mark.parametrize('payload', [None, {}, {'code': ''},
+                                         {'code': '   '}])
+    def test_verifier_requires_a_code(self, client, patch_live, payload):
+        response = client.post('/api/live/auth/verifier', json=payload)
+        assert response.status_code == 400
+        assert 'code' in response.get_json()['error'].lower()
+        assert patch_live['auth'].verifier_codes == []
+
+    def test_renew_round_trip(self, client, patch_live):
+        patch_live['auth'].state = 'connected'
+        response = client.post('/api/live/auth/renew')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['renewed'] is True
+        assert body['auth']['renewed_at'] is not None
+        assert patch_live['auth'].renew_calls == 1
+
+    def test_failed_renew_reports_false(self, client, patch_live):
+        patch_live['auth'].renew_result = False
+        assert client.post('/api/live/auth/renew').get_json()['renewed'] is False
+
+    def test_disconnect_returns_disconnected_status(self, client, patch_live):
+        patch_live['auth'].state = 'connected'
+        response = client.post('/api/live/auth/disconnect')
+
+        assert response.status_code == 200
+        assert response.get_json()['auth']['state'] == 'disconnected'
+
+    def test_start_returns_503_when_not_configured(self, client, patch_live):
+        """EtradeNotConfigured (C16) surfaces as 503-with-reason."""
+        import gui.routes.api_live as api_live
+
+        def raising_start():
+            raise api_live.EtradeNotConfigured('consumer keys absent')
+
+        patch_live['auth'].start_auth = raising_start
+        response = client.post('/api/live/auth/start')
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'E*TRADE not configured', 'reason': 'consumer keys absent'}
+
+    @pytest.mark.parametrize('path,method', [
+        ('/api/live/auth/start', 'post'),
+        ('/api/live/auth/verifier', 'post'),
+        ('/api/live/auth/renew', 'post'),
+        ('/api/live/auth/disconnect', 'post'),
+    ])
+    def test_auth_routes_503_when_surface_unavailable(
+            self, client, monkeypatch, path, method):
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic etrade_auth import failure'
+        monkeypatch.setattr(api_live, 'get_auth_manager', lambda: None)
+        monkeypatch.setattr(api_live, 'ETRADE_AUTH_IMPORT_ERROR', sentinel)
+
+        response = getattr(client, method)(path, json={'code': 'X'})
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Live trading unavailable', 'reason': sentinel}
+
+
+class TestLiveKillSwitchEndpoint:
+    """POST /api/live/killswitch round trip (contract C17/C20)."""
+
+    def test_engage_then_disengage_round_trip(self, client, patch_live):
+        engage = client.post('/api/live/killswitch', json={
+            'engaged': True, 'reason': 'fat-finger drill'})
+        assert engage.status_code == 200
+        assert engage.get_json() == {'engaged': True}
+        assert patch_live['kill'].events == [
+            ('engage', 'fat-finger drill', 'gui')]
+        assert client.get(
+            '/api/live/status').get_json()['kill_switch']['engaged'] is True
+
+        disengage = client.post('/api/live/killswitch', json={'engaged': False})
+        assert disengage.status_code == 200
+        assert disengage.get_json() == {'engaged': False}
+        assert patch_live['kill'].events[-1] == ('disengage', 'gui')
+
+    @pytest.mark.parametrize('payload', [
+        {'engaged': True}, {'engaged': True, 'reason': '  '}])
+    def test_engage_requires_a_reason(self, client, patch_live, payload):
+        response = client.post('/api/live/killswitch', json=payload)
+        assert response.status_code == 400
+        assert 'reason' in response.get_json()['error'].lower()
+        assert patch_live['kill'].events == []
+
+    @pytest.mark.parametrize('engaged', [None, 'true', 1, 'yes'])
+    def test_non_boolean_engaged_rejected(self, client, patch_live, engaged):
+        response = client.post('/api/live/killswitch',
+                               json={'engaged': engaged, 'reason': 'x'})
+        assert response.status_code == 400
+        assert 'boolean' in response.get_json()['error']
+
+    def test_503_when_kill_switch_unavailable(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic kill_switch import failure'
+        monkeypatch.setattr(api_live, 'get_kill_switch', lambda: None)
+        monkeypatch.setattr(api_live, 'KILL_SWITCH_IMPORT_ERROR', sentinel)
+
+        response = client.post('/api/live/killswitch',
+                               json={'engaged': True, 'reason': 'x'})
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Kill switch unavailable', 'reason': sentinel}
+
+
+class TestLiveAuditEndpoint:
+    """GET /api/live/audit paging / filtering / verify (contract C18/C20)."""
+
+    def test_default_page_is_first_fifty(self, client, patch_live):
+        body = client.get('/api/live/audit').get_json()
+
+        assert body['limit'] == 50
+        assert body['offset'] == 0
+        assert body['event_type'] is None
+        assert len(body['entries']) == 50
+        assert body['entries'][0]['seq'] == 1
+        assert 'verify' not in body
+        assert set(body['entries'][0]) == {
+            'seq', 'ts', 'env', 'actor', 'event_type', 'payload'}
+
+    def test_paging_with_limit_and_offset(self, client, patch_live):
+        body = client.get('/api/live/audit?limit=10&offset=100').get_json()
+
+        assert [e['seq'] for e in body['entries']] == list(range(101, 111))
+        assert body['limit'] == 10
+        assert body['offset'] == 100
+
+    def test_event_type_filter_passes_through(self, client, patch_live):
+        body = client.get('/api/live/audit?event_type=kill_switch').get_json()
+
+        assert body['event_type'] == 'kill_switch'
+        assert body['entries']
+        assert all(e['event_type'] == 'kill_switch' for e in body['entries'])
+
+    def test_verify_param_runs_chain_verification(self, client, patch_live):
+        body = client.get('/api/live/audit?verify=1').get_json()
+        assert body['verify'] == {'ok': True, 'first_bad_seq': None}
+
+        patch_live['audit'].verify_result = {'ok': False, 'first_bad_seq': 7}
+        body = client.get('/api/live/audit?verify=true').get_json()
+        assert body['verify'] == {'ok': False, 'first_bad_seq': 7}
+
+    @pytest.mark.parametrize('query', [
+        'limit=0', 'limit=501', 'limit=abc', 'offset=-1', 'offset=x'])
+    def test_bad_paging_params_are_400(self, client, patch_live, query):
+        response = client.get(f'/api/live/audit?{query}')
+        assert response.status_code == 400
+        assert 'error' in response.get_json()
+
+    def test_503_when_audit_unavailable(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic audit import failure'
+        monkeypatch.setattr(api_live, 'get_audit_log', lambda: None)
+        monkeypatch.setattr(api_live, 'AUDIT_IMPORT_ERROR', sentinel)
+
+        response = client.get('/api/live/audit')
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Audit log unavailable', 'reason': sentinel}
+
+
+class TestLiveReconcileEndpoint:
+    """POST /api/live/reconcile (contract C19/C20)."""
+
+    @staticmethod
+    def _ok_result():
+        return {'ok': True, 'mismatches': [],
+                'checked_at': '2026-06-12T10:00:00-04:00'}
+
+    @staticmethod
+    def _mismatch_result():
+        return {'ok': False,
+                'mismatches': [
+                    {'kind': 'position', 'symbol': 'AAPL',
+                     'local': 10.0, 'broker': 12.0},
+                    {'kind': 'cash', 'symbol': None,
+                     'local': 5000.0, 'broker': 4910.5},
+                ],
+                'checked_at': '2026-06-12T10:00:00-04:00'}
+
+    @pytest.fixture()
+    def patch_reconcile(self, monkeypatch, patch_live):
+        """Wire a fake reconcile fn + a fake live broker into api_live."""
+        import gui.routes.api_live as api_live
+
+        class FakeBroker:
+            local_positions = {'AAPL': 10.0}
+            local_cash = 5000.0
+
+        seen = {'result': self._ok_result(), 'calls': []}
+
+        def fake_reconcile(local_positions, local_cash, broker):
+            seen['calls'].append((local_positions, local_cash, broker))
+            return seen['result']
+
+        broker = FakeBroker()
+        monkeypatch.setattr(api_live, 'reconcile', fake_reconcile)
+        monkeypatch.setattr(api_live, '_find_live_broker', lambda: broker)
+        seen['broker'] = broker
+        return {**patch_live, **seen, 'seen': seen}
+
+    def test_ok_result_passes_through_and_is_remembered(
+            self, client, patch_reconcile):
+        response = client.post('/api/live/reconcile')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['ok'] is True
+        assert body['mismatches'] == []
+        assert body['kill_switch_engaged'] is False
+        # The broker's local book reached the C19 call.
+        local_positions, local_cash, broker = patch_reconcile['calls'][0]
+        assert local_positions == {'AAPL': 10.0}
+        assert local_cash == pytest.approx(5000.0)
+        assert broker is patch_reconcile['broker']
+        # Kill switch untouched; status remembers the result.
+        assert patch_reconcile['kill'].events == []
+        status = client.get('/api/live/status').get_json()
+        assert status['reconciliation']['ok'] is True
+
+    def test_mismatch_engages_kill_switch(self, client, patch_reconcile):
+        patch_reconcile['seen']['result'] = self._mismatch_result()
+        response = client.post('/api/live/reconcile')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['ok'] is False
+        assert len(body['mismatches']) == 2
+        assert body['mismatches'][0] == {
+            'kind': 'position', 'symbol': 'AAPL', 'local': 10.0, 'broker': 12.0}
+        assert body['kill_switch_engaged'] is True
+        # C19: the caller (this route) engaged the switch, audit-attributed.
+        kind, reason, actor = patch_reconcile['kill'].events[0]
+        assert kind == 'engage'
+        assert 'mismatch' in reason.lower()
+        assert actor == 'reconcile'
+        status = client.get('/api/live/status').get_json()
+        assert status['kill_switch']['engaged'] is True
+        assert status['reconciliation']['kill_switch_engaged'] is True
+
+    def test_409_when_no_live_session(self, client, patch_live, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        monkeypatch.setattr(api_live, 'reconcile',
+                            lambda *a, **k: self._ok_result())
+        monkeypatch.setattr(api_live, '_find_live_broker', lambda: None)
+
+        response = client.post('/api/live/reconcile')
+        assert response.status_code == 409
+        assert response.get_json()['error'] == 'No live broker session'
+
+    def test_503_when_reconcile_unavailable(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic reconcile import failure'
+        monkeypatch.setattr(api_live, 'reconcile', None)
+        monkeypatch.setattr(api_live, 'RECONCILE_IMPORT_ERROR', sentinel)
+
+        response = client.post('/api/live/reconcile')
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Reconciliation unavailable', 'reason': sentinel}
+
+
+class TestLiveWorkingOrders:
+    """GET /api/live/orders + cancel (patient-executor panel)."""
+
+    def test_empty_without_a_live_session(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        monkeypatch.setattr(api_live, '_find_live_broker', lambda: None)
+        response = client.get('/api/live/orders')
+
+        assert response.status_code == 200
+        assert response.get_json() == {'orders': [], 'count': 0}
+
+    def test_orders_pass_through_from_patient_executor(
+            self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        order = {
+            'order_id': 'PX-1', 'instrument': 'AAA 2026-07-17 95P',
+            'side': 'SELL', 'quantity': 2, 'limit_price': 1.45,
+            'steps': [{'limit': 1.5}, {'limit': 1.45}],
+            'started_at': '2026-06-12T10:00:00-04:00',
+            'remaining_seconds': 90,
+        }
+
+        class FakeBroker:
+            def working_orders(self):
+                return [order]
+
+        monkeypatch.setattr(api_live, '_find_live_broker', lambda: FakeBroker())
+        body = client.get('/api/live/orders').get_json()
+
+        assert body['count'] == 1
+        assert body['orders'] == [order]
+
+    def test_cancel_round_trip_and_unknown_id(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        cancelled = []
+
+        class FakeBroker:
+            def cancel_order(self, order_id):
+                cancelled.append(order_id)
+                return order_id == 'PX-1'
+
+        monkeypatch.setattr(api_live, '_find_live_broker', lambda: FakeBroker())
+
+        ok = client.post('/api/live/orders/PX-1/cancel')
+        assert ok.status_code == 200
+        assert ok.get_json() == {'message': 'Order cancelled',
+                                 'order_id': 'PX-1'}
+
+        missing = client.post('/api/live/orders/PX-9/cancel')
+        assert missing.status_code == 404
+        assert cancelled == ['PX-1', 'PX-9']
+
+    def test_cancel_409_without_live_session(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        monkeypatch.setattr(api_live, '_find_live_broker', lambda: None)
+        response = client.post('/api/live/orders/PX-1/cancel')
+        assert response.status_code == 409
+        assert response.get_json()['error'] == 'No live broker session'
+
+
+class TestLiveTraderConstruction:
+    """api_trading's live construction site now goes through the C16 auth
+    manager (Phase 9) — the env-token constructor is gone."""
+
+    def test_create_live_trader_uses_auth_manager(self, client, monkeypatch):
+        """The broker gets the C16 auth manager PLUS the shared kill switch
+        and audit log — EtradeClient only gates preview/place on a kill
+        switch it was handed, so dropping it here would be a safety hole."""
+        import gui.routes.api_trading as api_trading
+        import gui.routes.api_live as api_live
+
+        seen = {}
+
+        class FakeBroker:
+            def __init__(self, auth=None, account_id_key=None,
+                         kill_switch=None, audit=None):
+                seen['auth'] = auth
+                seen['account_id_key'] = account_id_key
+                seen['kill_switch'] = kill_switch
+                seen['audit'] = audit
+
+        sentinel_manager = object()
+        sentinel_kill = FakeKillSwitch()
+        sentinel_audit = FakeAuditLog()
+        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', FakeBroker)
+        monkeypatch.setattr(api_live, 'get_auth_manager',
+                            lambda: sentinel_manager)
+        monkeypatch.setattr(api_live, 'get_kill_switch',
+                            lambda: sentinel_kill)
+        monkeypatch.setattr(api_live, 'get_audit_log',
+                            lambda: sentinel_audit)
+        monkeypatch.setenv('ETRADE_ACCOUNT_ID_KEY', 'ACCT-KEY-1')
+
+        try:
+            response = client.post('/api/trader/create', json={
+                'trader_id': 't-live-ctor', 'mode': 'live'})
+            assert response.status_code == 200
+            assert response.get_json()['mode'] == 'live'
+            assert seen['auth'] is sentinel_manager
+            assert seen['account_id_key'] == 'ACCT-KEY-1'
+            assert seen['kill_switch'] is sentinel_kill
+            assert seen['audit'] is sentinel_audit
+        finally:
+            api_trading.active_traders.pop('t-live-ctor', None)
+
+    def test_create_live_trader_503_when_auth_manager_unavailable(
+            self, client, monkeypatch):
+        import gui.routes.api_trading as api_trading
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic etrade_auth import failure'
+        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
+        monkeypatch.setattr(api_live, 'get_auth_manager', lambda: None)
+        monkeypatch.setattr(api_live, 'ETRADE_AUTH_IMPORT_ERROR', sentinel)
+
+        response = client.post('/api/trader/create', json={
+            'trader_id': 't-live-noauth', 'mode': 'live'})
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Live trading unavailable', 'reason': sentinel}
+        assert 't-live-noauth' not in api_trading.active_traders
+
+    def test_create_live_trader_503_when_kill_switch_unavailable(
+            self, client, monkeypatch):
+        """Fail CLOSED: a broker built with kill_switch=None would have no
+        preview/place gate at all (EtradeClient only checks a switch it was
+        handed), so an unavailable kill switch must refuse construction."""
+        import gui.routes.api_trading as api_trading
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic kill_switch import failure'
+        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
+        monkeypatch.setattr(api_live, 'get_auth_manager',
+                            lambda: FakeAuthManager())
+        monkeypatch.setattr(api_live, 'get_kill_switch', lambda: None)
+        monkeypatch.setattr(api_live, 'KILL_SWITCH_IMPORT_ERROR', sentinel)
+
+        response = client.post('/api/trader/create', json={
+            'trader_id': 't-live-noks', 'mode': 'live'})
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Live trading unavailable', 'reason': sentinel}
+        assert 't-live-noks' not in api_trading.active_traders
+
+    def test_create_live_trader_503_when_kill_switch_construction_fails(
+            self, client, monkeypatch):
+        """Construction failure (import fine, KILL_SWITCH_IMPORT_ERROR is
+        None) still 503s with a non-null reason."""
+        import gui.routes.api_trading as api_trading
+        import gui.routes.api_live as api_live
+
+        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
+        monkeypatch.setattr(api_live, 'get_auth_manager',
+                            lambda: FakeAuthManager())
+        monkeypatch.setattr(api_live, 'get_kill_switch', lambda: None)
+        monkeypatch.setattr(api_live, 'KILL_SWITCH_IMPORT_ERROR', None)
+
+        response = client.post('/api/trader/create', json={
+            'trader_id': 't-live-ksctor', 'mode': 'live'})
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Live trading unavailable',
+            'reason': 'KillSwitch construction failed'}
+        assert 't-live-ksctor' not in api_trading.active_traders
+
+    def test_create_live_trader_503_when_audit_log_unavailable(
+            self, client, monkeypatch):
+        """Fail CLOSED on the audit log too: live orders must never trade
+        unrecorded."""
+        import gui.routes.api_trading as api_trading
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic audit import failure'
+        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
+        monkeypatch.setattr(api_live, 'get_auth_manager',
+                            lambda: FakeAuthManager())
+        monkeypatch.setattr(api_live, 'get_kill_switch',
+                            lambda: FakeKillSwitch())
+        monkeypatch.setattr(api_live, 'get_audit_log', lambda: None)
+        monkeypatch.setattr(api_live, 'AUDIT_IMPORT_ERROR', sentinel)
+
+        response = client.post('/api/trader/create', json={
+            'trader_id': 't-live-noaudit', 'mode': 'live'})
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Live trading unavailable', 'reason': sentinel}
+        assert 't-live-noaudit' not in api_trading.active_traders
+
+
+class TestLauncherEnvHygiene:
+    """run_gui.py must never let Flask bulk-load the repo-root .env.
+
+    Flask's app.run() calls cli.load_dotenv() whenever python-dotenv is
+    installed, silently injecting the operator's real
+    ETRADE_CONSUMER_KEY/SECRET into os.environ — even when the operator
+    explicitly stripped all ETRADE_* vars. The auth manager then reports
+    'disconnected' (configured) instead of 'unconfigured', and a single
+    POST /api/live/auth/start makes a REAL HTTPS request to E*TRADE.
+    Credentials enter the process only by explicit operator action, so
+    the launcher must pass load_dotenv=False (Phase 9 QA regression).
+    """
+
+    def test_run_gui_disables_flask_dotenv_loading(self, monkeypatch):
+        import runpy
+
+        import flask
+
+        captured = {}
+
+        def fake_run(self, *args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+
+        # Stub the server out entirely: nothing binds a port, and the
+        # dotenv-loading branch inside the real run() never executes.
+        monkeypatch.setattr(flask.Flask, 'run', fake_run)
+
+        runpy.run_path(str(REPO_ROOT / 'run_gui.py'), run_name='__main__')
+
+        assert 'kwargs' in captured, 'launcher never called app.run()'
+        assert captured['kwargs'].get('load_dotenv') is False

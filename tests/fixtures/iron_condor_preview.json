@@ -1,0 +1,73 @@
+{
+  "PreviewOrderRequest": {
+    "Order": [
+      {
+        "Instrument": [
+          {
+            "Product": {
+              "callPut": "PUT",
+              "expiryDay": 17,
+              "expiryMonth": 7,
+              "expiryYear": 2026,
+              "securityType": "OPTN",
+              "strikePrice": 440.0,
+              "symbol": "SPY"
+            },
+            "orderAction": "SELL_OPEN",
+            "orderedQuantity": 2,
+            "quantity": 2
+          },
+          {
+            "Product": {
+              "callPut": "PUT",
+              "expiryDay": 17,
+              "expiryMonth": 7,
+              "expiryYear": 2026,
+              "securityType": "OPTN",
+              "strikePrice": 430.0,
+              "symbol": "SPY"
+            },
+            "orderAction": "BUY_OPEN",
+            "orderedQuantity": 2,
+            "quantity": 2
+          },
+          {
+            "Product": {
+              "callPut": "CALL",
+              "expiryDay": 17,
+              "expiryMonth": 7,
+              "expiryYear": 2026,
+              "securityType": "OPTN",
+              "strikePrice": 480.0,
+              "symbol": "SPY"
+            },
+            "orderAction": "SELL_OPEN",
+            "orderedQuantity": 2,
+            "quantity": 2
+          },
+          {
+            "Product": {
+              "callPut": "CALL",
+              "expiryDay": 17,
+              "expiryMonth": 7,
+              "expiryYear": 2026,
+              "securityType": "OPTN",
+              "strikePrice": 490.0,
+              "symbol": "SPY"
+            },
+            "orderAction": "BUY_OPEN",
+            "orderedQuantity": 2,
+            "quantity": 2
+          }
+        ],
+        "allOrNone": false,
+        "limitPrice": 2.4,
+        "marketSession": "REGULAR",
+        "orderTerm": "GOOD_FOR_DAY",
+        "priceType": "NET_CREDIT"
+      }
+    ],
+    "clientOrderId": "GOLDENCONDOR0001",
+    "orderType": "SPREADS"
+  }
+}

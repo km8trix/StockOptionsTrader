@@ -23,5 +23,11 @@ if __name__ == '__main__':
     print("📱 Press CTRL+C to stop the server\n")
     print("=" * 70 + "\n")
 
-    # 3. Run the application
-    create_app().run(host=host, port=port, debug=debug)
+    # 3. Run the application.
+    # load_dotenv=False is load-bearing: Flask's run() otherwise calls
+    # cli.load_dotenv() (python-dotenv is installed) and silently injects the
+    # repo-root .env — including real ETRADE_CONSUMER_KEY/SECRET — into
+    # os.environ, even when the operator explicitly stripped ETRADE_* vars.
+    # E*TRADE credentials must only enter the process via explicit operator
+    # action; the launcher must never bulk-load secret files behind their back.
+    create_app().run(host=host, port=port, debug=debug, load_dotenv=False)

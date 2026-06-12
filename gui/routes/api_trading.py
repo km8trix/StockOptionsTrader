@@ -56,12 +56,48 @@ def create_trader():
                     'reason': LIVE_BROKER_IMPORT_ERROR,
                 }), 503
 
+            # Phase 9: the broker authenticates through the shared C16
+            # auth manager (gui/routes/api_live owns the singleton; the
+            # manager reads ETRADE_* config itself) instead of raw env
+            # tokens, and the shared kill switch + audit log MUST ride
+            # along: EtradeClient only gates preview/place on a kill
+            # switch it was given. Imported lazily — api_live and this
+            # module only reference each other inside functions (no
+            # import cycle).
+            from gui.routes.api_live import (
+                AUDIT_IMPORT_ERROR, KILL_SWITCH_IMPORT_ERROR,
+                auth_unavailable_reason, get_audit_log, get_auth_manager,
+                get_kill_switch)
+            auth_manager = get_auth_manager()
+            if auth_manager is None:
+                return jsonify({
+                    'error': 'Live trading unavailable',
+                    'reason': auth_unavailable_reason(),
+                }), 503
+            # Fail CLOSED on the safety surfaces: a live broker built with
+            # kill_switch=None has NO preview/place gate (EtradeClient only
+            # checks a switch it was handed), and audit=None would trade
+            # unrecorded. Match /api/live/status, which already 503s loudly
+            # when the kill switch is unavailable.
+            kill_switch = get_kill_switch()
+            if kill_switch is None:
+                return jsonify({
+                    'error': 'Live trading unavailable',
+                    'reason': (KILL_SWITCH_IMPORT_ERROR
+                               or 'KillSwitch construction failed'),
+                }), 503
+            audit_log = get_audit_log()
+            if audit_log is None:
+                return jsonify({
+                    'error': 'Live trading unavailable',
+                    'reason': (AUDIT_IMPORT_ERROR
+                               or 'AuditLog construction failed'),
+                }), 503
             trader = LiveEtradeBroker(
-                consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
-                consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),
-                access_token=os.getenv("ETRADE_ACCESS_TOKEN"),
-                access_secret=os.getenv("ETRADE_ACCESS_SECRET"),
-                account_id_key=os.getenv("ETRADE_ACCOUNT_ID_KEY")
+                auth=auth_manager,
+                account_id_key=os.getenv("ETRADE_ACCOUNT_ID_KEY"),
+                kill_switch=kill_switch,
+                audit=audit_log,
             )
         else:
             initial_capital = float(data.get('initial_capital', 50000))

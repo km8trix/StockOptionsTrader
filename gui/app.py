@@ -74,12 +74,29 @@ def create_app(config: dict | None = None) -> Flask:
     from gui.routes.api_backtest import backtest_bp
     from gui.routes.api_trading import trading_bp
     from gui.routes.api_floor import floor_bp
+    from gui.routes.api_live import live_bp
 
     app.register_blueprint(views_bp)
     app.register_blueprint(analysis_bp)
     app.register_blueprint(backtest_bp)
     app.register_blueprint(trading_bp)
     app.register_blueprint(floor_bp)
+    app.register_blueprint(live_bp)
+
+    @app.context_processor
+    def inject_kill_switch_banner():
+        """Kill-switch banner state for base.html (Phase 9).
+
+        Server-rendered so the red banner can show on EVERY page without
+        adding JS status polling anywhere but the Live page (the only
+        poller). kill_switch_engaged() is best-effort and never raises:
+        it reads the existing singleton, or the persisted SQLite state
+        when TRADING_DB_PATH is set or the default db file already exists
+        (so an engaged switch survives restarts), and degrades to False
+        while the backend kill-switch surface has not landed.
+        """
+        from gui.routes.api_live import kill_switch_engaged
+        return {'kill_switch_engaged': kill_switch_engaged()}
 
     @app.route('/health')
     def health():

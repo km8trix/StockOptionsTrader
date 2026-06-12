@@ -1,10 +1,34 @@
-"""Shared fixtures: deterministic synthetic OHLCV data. No network, ever."""
+"""Shared fixtures: deterministic synthetic OHLCV data. No network, ever.
+
+"No network" is ENFORCED, not aspirational: an autouse fixture below
+hard-blocks every socket connection (connect / create_connection /
+getaddrinfo), so any code path that tries to reach a real host —
+apisb.etrade.com and api.etrade.com very much included — fails loudly
+instead of phoning home. Phase-9 E*TRADE code is exercised exclusively
+through injected fake transports.
+"""
 
 from __future__ import annotations
+
+import socket
 
 import numpy as np
 import pandas as pd
 import pytest
+
+
+def _network_blocked(*_args, **_kwargs):
+    raise RuntimeError(
+        "Network access is hard-blocked in the offline test suite — "
+        "inject a fake transport instead of making a real connection.")
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Hard-block sockets for every test (keep it that way)."""
+    monkeypatch.setattr(socket.socket, "connect", _network_blocked)
+    monkeypatch.setattr(socket, "create_connection", _network_blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", _network_blocked)
 
 
 @pytest.fixture

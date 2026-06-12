@@ -28,18 +28,36 @@
                         ('/backtest', 'Backtest'),
                         ('/paper_trade', 'Paper Trading'),
                         ('/floor', 'Trading Floor'),
+                        ('/live', 'Live'),
                     ] %}
                     {% for href, label in nav_items %}
                     <li class="nav-item">
                         <a class="nav-link{% if request.path == href %} active{% endif %}"
                            {% if request.path == href %}aria-current="page"{% endif %}
-                           href="{{ href }}">{{ label }}</a>
+                           href="{{ href }}">{{ label }}{% if href == '/live' %}
+                            <!-- env/connection dot: hidden until live.js (the
+                                 only status poller) paints it on the Live page;
+                                 it stays absent everywhere else by design. -->
+                            <span id="navLiveDot" class="nav-live-dot d-none"
+                                  aria-hidden="true"></span>{% endif %}</a>
                     </li>
                     {% endfor %}
                 </ul>
             </div>
         </div>
     </nav>
+
+    <!-- Kill-switch banner (Phase 9): the markup ships on every page so the
+         engaged state is unmistakable everywhere WITHOUT adding status
+         polling to non-live pages. The server renders it visible when it
+         already knows the switch is engaged (context processor in
+         gui/app.py); live.js — the only live-status poller, loaded on the
+         Live page only — keeps it current dynamically. Phase 9 M1 choice. -->
+    <div id="killSwitchBanner" class="kill-banner{% if not kill_switch_engaged %} d-none{% endif %}" role="alert">
+        <i class="bi bi-sign-stop-fill" aria-hidden="true"></i>
+        <span class="kill-banner-text">KILL SWITCH ENGAGED — live order placement is blocked</span>
+        <a class="kill-banner-link" href="/live">Manage on the Live page</a>
+    </div>
 
     <!-- Toast container (top-right); utils.js showToast() appends here -->
     <div id="toastContainer" class="toast-container-app" aria-live="polite" aria-atomic="false"></div>
