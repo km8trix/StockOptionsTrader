@@ -29,7 +29,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["core*", "data*", "brokers*", "portfolio*", "backtesting*", "strategies*", "utils*", "gui*"]
+include = ["core*", "data*", "brokers*", "portfolio*", "backtesting*", "strategies*", "desks*", "utils*", "gui*"]
 exclude = ["readme*", "tests*"]
 
 [tool.pytest.ini_options]

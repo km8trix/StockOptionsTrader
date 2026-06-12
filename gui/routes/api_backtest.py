@@ -23,6 +23,22 @@ from utils.jobs import get_job_manager
 
 logger = logging.getLogger(__name__)
 
+# The desks package is built in the parallel Phase 5 backend task. Legacy
+# strategy backtests must keep working without it, so the import is guarded
+# (mirroring the LiveEtradeBroker pattern in api_trading); desk-mode requests
+# surface a loud 503 instead of an ImportError 500.
+DESK_REGISTRY_IMPORT_ERROR: str | None
+try:
+    from desks.registry import create_desk
+    DESK_REGISTRY_IMPORT_ERROR = None
+except Exception as e:  # noqa: BLE001 - any import failure disables desk mode
+    create_desk = None
+    DESK_REGISTRY_IMPORT_ERROR = f'{type(e).__name__}: {e}'
+    logger.error(
+        'Failed to import desks.registry — desk-mode backtests are '
+        'unavailable: %s', DESK_REGISTRY_IMPORT_ERROR,
+    )
+
 backtest_bp = Blueprint('backtest', __name__, url_prefix='/api')
 
 # Unified strategy mapping
@@ -184,17 +200,14 @@ def _save_report(name, symbols, start_date, end_date, initial_capital,
                        exc_info=True)
 
 
-def _run_backtest_job(symbols, strategy_name, start_date, end_date,
-                      initial_capital, position_size, name, progress=None):
-    """JobManager job body: run the engine and return a JSON-safe report.
+def _execute_engine_job(backtester, symbols, start_date, end_date,
+                        initial_capital, position_size, name, strategy_label,
+                        progress):
+    """Shared job tail: run an engine, attach provenance, persist, return.
 
-    The JobManager injects ``progress`` (callable taking float 0-100); it is
-    wired straight into BacktestEngine.run's progress_callback. Raising here
-    marks the job 'error' with the exception message.
+    ``strategy_label`` is what the saved-history row stores in its strategy
+    column — the strategy key for legacy runs, ``desk:<key>`` for desk runs.
     """
-    strategy_instance = STRATEGIES[strategy_name]()
-    backtester = BacktestEngine(strategy_instance,
-                                initial_capital=initial_capital)
     results = backtester.run(symbols, start_date, end_date, position_size,
                              progress_callback=progress,
                              benchmark_symbol='SPY')
@@ -208,13 +221,52 @@ def _run_backtest_job(symbols, strategy_name, start_date, end_date,
     }
     report = _json_safe_report(results)
     _save_report(name, symbols, start_date, end_date, initial_capital,
-                 strategy_name, position_size, report)
+                 strategy_label, position_size, report)
     return report
+
+
+def _run_backtest_job(symbols, strategy_name, start_date, end_date,
+                      initial_capital, position_size, name, progress=None):
+    """JobManager job body: run the engine and return a JSON-safe report.
+
+    The JobManager injects ``progress`` (callable taking float 0-100); it is
+    wired straight into BacktestEngine.run's progress_callback. Raising here
+    marks the job 'error' with the exception message.
+    """
+    strategy_instance = STRATEGIES[strategy_name]()
+    backtester = BacktestEngine(strategy_instance,
+                                initial_capital=initial_capital)
+    return _execute_engine_job(backtester, symbols, start_date, end_date,
+                               initial_capital, position_size, name,
+                               strategy_name, progress)
+
+
+def _run_desk_backtest_job(symbols, desk, desk_key, start_date, end_date,
+                           initial_capital, position_size, name,
+                           progress=None):
+    """JobManager job body (desk mode): engine built per contract C2.
+
+    The report comes back with the additive desk keys (contract C3:
+    ``desk`` / ``trader_notes`` / ``walk_forward``) which pass through
+    :func:`_json_safe_report` untouched — they are JSON-safe by contract.
+    The saved-history row stores the strategy as ``desk:<key>`` so desk runs
+    stay distinguishable in the history/compare/export UIs (additive: the
+    column still holds a plain string).
+    """
+    backtester = BacktestEngine(desk=desk, initial_capital=initial_capital)
+    return _execute_engine_job(backtester, symbols, start_date, end_date,
+                               initial_capital, position_size, name,
+                               f'desk:{desk_key}', progress)
 
 
 @backtest_bp.route('/backtest/run', methods=['POST'])
 def run_backtest_async():
-    """Submit a backtest to the JobManager; returns {'job_id'} immediately."""
+    """Submit a backtest to the JobManager; returns {'job_id'} immediately.
+
+    Accepts EITHER 'strategy' (legacy, default 'momentum') or 'desk' (a
+    desks.registry key, Phase 5). Desk mode builds the engine through
+    desks.registry.create_desk + BacktestEngine(desk=...) — contract C2.
+    """
     # silent=True: a missing/malformed JSON body degrades to {} and gets a
     # specific 400 below, instead of werkzeug's HTML BadRequest page.
     data = request.get_json(silent=True) or {}
@@ -226,9 +278,29 @@ def run_backtest_async():
     if not symbols:
         return jsonify({'error': 'No symbols provided'}), 400
 
-    strategy_name = data.get('strategy', 'momentum').lower()
-    if strategy_name not in STRATEGIES:
-        return jsonify({'error': f'Unknown strategy: {strategy_name}'}), 400
+    desk_key = data.get('desk')
+    desk = None
+    strategy_name = None
+    if desk_key is not None:
+        if 'strategy' in data:
+            return jsonify({'error': "Provide either 'strategy' or 'desk', "
+                                     'not both'}), 400
+        if not isinstance(desk_key, str) or not desk_key.strip():
+            return jsonify({'error': 'desk must be a non-empty desk key'}), 400
+        if create_desk is None:
+            return jsonify({'error': 'Desk framework unavailable',
+                            'reason': DESK_REGISTRY_IMPORT_ERROR}), 503
+        desk_key = desk_key.strip().lower()
+        try:
+            desk = create_desk(desk_key)
+        except ValueError as exc:
+            # Contract C1 messages pass straight through: 'Unknown desk: ...'
+            # or "Desk '<key>' activates in Phase N".
+            return jsonify({'error': str(exc)}), 400
+    else:
+        strategy_name = data.get('strategy', 'momentum').lower()
+        if strategy_name not in STRATEGIES:
+            return jsonify({'error': f'Unknown strategy: {strategy_name}'}), 400
 
     start_date = data.get('start_date', '2023-01-01')
     end_date = data.get('end_date', '2023-12-31')
@@ -244,6 +316,16 @@ def run_backtest_async():
         return jsonify({'error': 'initial_capital must be positive'}), 400
     if not 0 < position_size <= 1:
         return jsonify({'error': 'position_size must be in (0, 1]'}), 400
+
+    if desk is not None:
+        name = (data.get('name') or '').strip() or \
+            f"desk:{desk_key} {','.join(symbols)}"
+        job_id = get_job_manager().submit(
+            _run_desk_backtest_job, symbols, desk, desk_key, start_date,
+            end_date, initial_capital, position_size, name)
+        logger.info('Desk backtest job %s submitted (desk:%s on %s)', job_id,
+                    desk_key, symbols)
+        return jsonify({'job_id': job_id}), 202
 
     name = (data.get('name') or '').strip() or \
         f"{strategy_name} {','.join(symbols)}"

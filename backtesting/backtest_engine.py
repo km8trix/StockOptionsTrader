@@ -6,6 +6,15 @@ Execution model (no same-bar lookahead):
     filled at day T+1's OPEN, adjusted for slippage. Signals generated on the
     final simulated day therefore never fill; they are surfaced in the report
     under 'pending_signals'.
+
+Two driving modes (exactly one per engine instance):
+    strategy mode — a strategies.base.Strategy emits per-symbol BUY/SELL
+        signals; position sizing is the run() position_size fraction.
+    desk mode — a desks.base.Desk emits DeskIntent objects (generate_intents
+        then apply_risk each day); each fill is sized as portfolio_value *
+        desk.capital_allocation * intent.size_fraction at fill time. The
+        report additionally carries 'desk', 'trader_notes' and
+        'walk_forward' (contract C3).
 """
 
 from __future__ import annotations
@@ -17,6 +26,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 from core.models import Asset, AssetType, Order, OrderType, OrderStatus, Position
+from desks.base import Desk
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
 from strategies.base import Strategy
@@ -30,9 +40,15 @@ MAX_PENDING_DAYS = 5
 class BacktestEngine:
     """Simulates trading strategies on historical data"""
 
-    def __init__(self, strategy: Strategy, initial_capital: float = 100000,
-                 commission: float = 0.001, slippage_bps: float = 5.0):
+    def __init__(self, strategy: Optional[Strategy] = None,
+                 initial_capital: float = 100000,
+                 commission: float = 0.001, slippage_bps: float = 5.0,
+                 desk: Optional[Desk] = None):
+        if (strategy is None) == (desk is None):
+            raise ValueError(
+                "Provide exactly one of strategy= or desk= to BacktestEngine")
         self.strategy = strategy
+        self.desk = desk
         self.portfolio = PortfolioManager(initial_capital)
         self.commission = commission
         self.slippage_bps = slippage_bps
@@ -42,7 +58,9 @@ class BacktestEngine:
         # Pending intents keyed by Asset. Each value is a dict with keys:
         # 'signal' ('BUY'/'SELL'), 'signal_date', and 'days_waiting' (count of
         # trading days the intent has waited because the symbol had no usable
-        # bar). A new intent for an asset replaces an older pending one.
+        # bar). Desk-mode BUY intents additionally carry 'size_fraction'
+        # (fraction of the DESK'S capital). A new intent for an asset
+        # replaces an older pending one.
         self.pending_intents: Dict[Asset, Dict] = {}
 
     def run(self, symbols: List[str], start_date: str, end_date: str,
@@ -105,27 +123,30 @@ class BacktestEngine:
                     existing_pos.current_price = float(data.loc[date, 'close'])
 
             # --- PHASE 3: SIGNALS ON DATA THROUGH TODAY, QUEUED FOR TOMORROW ---
-            for symbol, data in all_data.items():
-                if date not in data.index:
-                    continue
+            if self.desk is not None:
+                self._queue_desk_intents(all_data, date)
+            else:
+                for symbol, data in all_data.items():
+                    if date not in data.index:
+                        continue
 
-                # Slice historical data strictly up to the current simulated date
-                historical_data = data[data.index <= date]
+                    # Slice historical data strictly up to the current simulated date
+                    historical_data = data[data.index <= date]
 
-                # Run indicator calculations purely on the known past data window
-                historical_data_with_indicators = self.market_data.calculate_indicators(
-                    historical_data.copy())
+                    # Run indicator calculations purely on the known past data window
+                    historical_data_with_indicators = self.market_data.calculate_indicators(
+                        historical_data.copy())
 
-                asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
-                signal = self.strategy.generate_signals(historical_data_with_indicators, asset)
+                    asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
+                    signal = self.strategy.generate_signals(historical_data_with_indicators, asset)
 
-                if signal in ('BUY', 'SELL'):
-                    # A new intent for an asset replaces an older pending one.
-                    self.pending_intents[asset] = {
-                        'signal': signal,
-                        'signal_date': date,
-                        'days_waiting': 0,
-                    }
+                    if signal in ('BUY', 'SELL'):
+                        # A new intent for an asset replaces an older pending one.
+                        self.pending_intents[asset] = {
+                            'signal': signal,
+                            'signal_date': date,
+                            'days_waiting': 0,
+                        }
 
             # --- PHASE 4: RECORD SNAPSHOT ---
             self.portfolio.record_snapshot(date)
@@ -141,6 +162,44 @@ class BacktestEngine:
 
         return self._generate_report(benchmark_symbol=benchmark_symbol,
                                      start_date=start_date, end_date=end_date)
+
+    def _queue_desk_intents(self, all_data: Dict[str, pd.DataFrame],
+                            date) -> None:
+        """Desk-mode PHASE 3: ask the desk for intents, risk-check, queue.
+
+        Builds the per-symbol indicator-enriched frames sliced through the
+        current simulation date (same expanding-window pattern as strategy
+        mode, so no future context can leak into the desk), sets the
+        desk's simulation clock, then runs generate_intents -> apply_risk.
+        Approved intents are queued as pending fills for the next bar's
+        open; BUY records carry the intent's size_fraction.
+        """
+        self.desk.set_clock(date)
+
+        enriched: Dict[str, pd.DataFrame] = {}
+        for symbol, data in all_data.items():
+            # Slice historical data strictly up to the current simulated date
+            historical_data = data[data.index <= date]
+            if historical_data.empty:
+                continue
+            # Run indicator calculations purely on the known past data window
+            enriched[symbol] = self.market_data.calculate_indicators(
+                historical_data.copy())
+
+        if not enriched:
+            return
+
+        intents = self.desk.generate_intents(enriched, date, self.portfolio)
+        approved = self.desk.apply_risk(intents, self.portfolio, enriched, date)
+
+        for intent in approved:
+            # A new intent for an asset replaces an older pending one.
+            self.pending_intents[intent.asset] = {
+                'signal': intent.action,
+                'signal_date': date,
+                'days_waiting': 0,
+                'size_fraction': intent.size_fraction,
+            }
 
     def _fill_pending_intents(self, all_data: Dict[str, pd.DataFrame],
                               date, position_size: float) -> None:
@@ -182,12 +241,16 @@ class BacktestEngine:
 
         BUY fills at base_price * (1 + slippage_bps/10000); SELL fills at
         base_price * (1 - slippage_bps/10000). Position size is the
-        position_size fraction of portfolio value evaluated at fill time.
-        Commission semantics: cost = qty * fill * (1 + commission) on buy;
-        proceeds = qty * fill * (1 - commission) on sell.
+        position_size fraction of portfolio value evaluated at fill time;
+        desk-mode intents instead size to desk.capital_allocation *
+        intent['size_fraction'] (still a fraction of fill-time portfolio
+        value). Commission semantics: cost = qty * fill * (1 + commission)
+        on buy; proceeds = qty * fill * (1 - commission) on sell.
         """
         signal = intent['signal']
         slippage = self.slippage_bps / 10000.0
+        if self.desk is not None and 'size_fraction' in intent:
+            position_size = self.desk.capital_allocation * intent['size_fraction']
 
         if base_price <= 0:
             logger.warning("Skipping %s fill for %s on %s: non-positive price %s",
@@ -297,7 +360,12 @@ class BacktestEngine:
     def _generate_report(self, benchmark_symbol: Optional[str] = None,
                          start_date: Optional[str] = None,
                          end_date: Optional[str] = None) -> Dict:
-        """Generate backtest report"""
+        """Generate backtest report.
+
+        Strategy-mode reports are unchanged. Desk-mode reports carry the
+        same keys plus 'desk', 'trader_notes' and 'walk_forward'
+        (contract C3); 'strategy' holds the desk name in that mode.
+        """
         summary = self.portfolio.get_summary()
 
         benchmark = None
@@ -305,8 +373,9 @@ class BacktestEngine:
             benchmark = self._build_benchmark(benchmark_symbol,
                                               start_date, end_date)
 
-        return {
-            'strategy': self.strategy.name,
+        report = {
+            'strategy': (self.strategy.name if self.strategy is not None
+                         else self.desk.name),
             'summary': summary,
             'benchmark': benchmark,
             'drawdown_series': self.portfolio.get_drawdown_series(),
@@ -336,3 +405,12 @@ class BacktestEngine:
                 for asset, intent in self.pending_intents.items()
             ],
         }
+
+        if self.desk is not None:
+            report['desk'] = {'key': self.desk.key, 'name': self.desk.name}
+            report['trader_notes'] = [note.to_dict()
+                                      for note in self.desk.notes]
+            report['walk_forward'] = [fit.to_dict()
+                                      for fit in self.desk.walk_forward_fits]
+
+        return report

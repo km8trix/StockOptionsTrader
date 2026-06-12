@@ -73,11 +73,13 @@ def create_app(config: dict | None = None) -> Flask:
     from gui.routes.api_analysis import analysis_bp
     from gui.routes.api_backtest import backtest_bp
     from gui.routes.api_trading import trading_bp
+    from gui.routes.api_floor import floor_bp
 
     app.register_blueprint(views_bp)
     app.register_blueprint(analysis_bp)
     app.register_blueprint(backtest_bp)
     app.register_blueprint(trading_bp)
+    app.register_blueprint(floor_bp)
 
     @app.route('/health')
     def health():

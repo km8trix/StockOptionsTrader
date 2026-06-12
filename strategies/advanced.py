@@ -16,6 +16,16 @@ class MachineLearningStrategy(Strategy):
     """
     Machine Learning-based strategy using Random Forest
     Trains on historical features and predicts BUY/SELL signals
+
+    .. deprecated:: Phase 5
+        This strategy trains once inside generate_signals on the expanding
+        window it is handed, so early signals in a backtest come from a
+        model that has already seen later prices (look-ahead
+        contamination, flagged in Phase 1). Prefer
+        desks.ml_model.GradientBoostingModel driven by
+        desks.walk_forward.WalkForwardController, which enforces
+        leakage-free walk-forward fitting by construction. This class
+        remains importable and functional for backward compatibility.
     """
     
     def __init__(self, lookback: int = 50):

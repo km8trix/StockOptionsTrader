@@ -358,6 +358,39 @@ class TestBenchmark:
         assert report['benchmark'] is None
 
 
+class TestEngineModeSelection:
+    """Exactly one of strategy=/desk= drives the engine (contract C2)."""
+
+    def test_both_strategy_and_desk_raises(self):
+        from desks.registry import create_desk
+        with pytest.raises(ValueError, match='exactly one'):
+            BacktestEngine(strategy=ScriptedStrategy(),
+                           desk=create_desk('foundation'),
+                           initial_capital=100000.0)
+
+    def test_neither_strategy_nor_desk_raises(self):
+        with pytest.raises(ValueError, match='exactly one'):
+            BacktestEngine(initial_capital=100000.0)
+
+    def test_strategy_mode_report_carries_no_desk_keys(self, make_ohlcv,
+                                                       patch_market_data):
+        df = make_ohlcv(n_days=20, seed=67)
+        patch_market_data({'TEST': df})
+
+        strategy = ScriptedStrategy(buy_date=df.index[5])
+        engine = BacktestEngine(strategy, initial_capital=100000.0,
+                                commission=COMMISSION)
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31',
+                            position_size=0.1, benchmark_symbol=None)
+
+        assert 'error' not in report
+        # Backward compatibility: strategy-mode reports are unchanged.
+        assert 'desk' not in report
+        assert 'trader_notes' not in report
+        assert 'walk_forward' not in report
+        assert report['strategy'] == 'Scripted Strategy'
+
+
 class TestDrawdownSeries:
     def test_hand_computed_sequence(self):
         # Values: 100 -> 110 -> 99 -> 104.5 -> 88.

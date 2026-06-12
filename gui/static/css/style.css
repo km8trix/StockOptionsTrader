@@ -563,3 +563,134 @@ th.sortable .sort-arrow {
 }
 
 .desk-footnote .bi { color: var(--accent); }
+
+/* Ready-desk badge: the green counterpart of .badge-phase */
+.badge-ready {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--gain);
+    border: 1px solid var(--gain);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+}
+
+/* Firm-inspiration tag on a desk card */
+.desk-firm-tag {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--desk-accent, var(--accent));
+    margin-bottom: var(--sp-2);
+}
+
+/* --------------------------------------------------------------------------
+   Desk backtest results (Phase 5): header chip + trader's-notes timeline
+   -------------------------------------------------------------------------- */
+.desk-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--text);
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--desk-accent, var(--accent));
+    border-radius: 4px;
+    padding: 3px 10px;
+}
+
+.desk-chip .bi { color: var(--desk-accent, var(--accent)); }
+
+.notes-timeline {
+    max-height: 320px;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+
+.note-entry {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: 1px solid var(--border);
+}
+
+.note-entry:last-child { border-bottom: none; }
+
+.note-ts {
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.note-msg {
+    flex: 1 1 60%;
+    min-width: 200px;
+}
+
+.note-data {
+    flex-basis: 100%;
+    font-size: 11px;
+}
+
+.note-data summary {
+    cursor: pointer;
+    color: var(--text-muted);
+}
+
+.note-data-json {
+    margin: var(--sp-1) 0 0;
+    padding: var(--sp-2);
+    background-color: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: pre-wrap;
+}
+
+/* Note category chips: per-note labels and the clickable filter row */
+.note-cat-chip,
+.note-filter-chip {
+    font-size: 10px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1px 8px;
+    white-space: nowrap;
+    color: var(--text-muted);
+    background: transparent;
+}
+
+.note-filter-chip { cursor: pointer; }
+.note-filter-chip:hover { color: var(--text); }
+
+.note-filter-chip.active {
+    background-color: var(--surface-2);
+    color: var(--text);
+}
+
+/* Category colors: signal=accent, risk=red, model=purple,
+   allocation=yellow, info=muted (matches the trader-notes contract). */
+.note-cat-signal     { color: var(--accent); border-color: var(--accent); }
+.note-cat-risk       { color: var(--loss);   border-color: var(--loss); }
+.note-cat-model      { color: #bc8cff;       border-color: #bc8cff; }
+.note-cat-allocation { color: var(--warn);   border-color: var(--warn); }
+.note-cat-info       { color: var(--text-muted); border-color: var(--border); }
+
+.note-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-1);
+}

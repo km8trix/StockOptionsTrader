@@ -16,8 +16,26 @@
             <div class="card-body">
                 <form id="backtestForm" novalidate>
                     <div class="mb-3">
+                        <span class="form-label d-block" id="btModeLabel">Mode</span>
+                        <div class="btn-group btn-group-sm w-100" role="group"
+                             aria-labelledby="btModeLabel">
+                            <input type="radio" class="btn-check" name="btMode"
+                                   id="modeStrategy" value="strategy" checked>
+                            <label class="btn btn-outline-secondary" for="modeStrategy">Strategy</label>
+                            <input type="radio" class="btn-check" name="btMode"
+                                   id="modeDesk" value="desk">
+                            <label class="btn btn-outline-secondary" for="modeDesk">Desk</label>
+                        </div>
+                    </div>
+                    <div class="mb-3" id="strategyField">
                         <label class="form-label" for="btStrategy">Strategy</label>
                         <select class="form-select" id="btStrategy"></select>
+                    </div>
+                    <div class="mb-3 d-none" id="deskField">
+                        <label class="form-label" for="btDesk">Desk</label>
+                        <select class="form-select" id="btDesk"></select>
+                        <div class="invalid-feedback">Pick a desk.</div>
+                        <div class="provenance-caption mt-1" id="deskHint"></div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label" for="btSymbols">Symbols (comma-separated)</label>
@@ -98,6 +116,9 @@
 
         <!-- Results -->
         <div id="resultsSection" class="d-none">
+            <!-- Desk header chip (desk-mode runs only; painted by backtest.js) -->
+            <div id="deskChipRow" class="mb-2 d-none"></div>
+
             <div class="row g-2 mb-2">
                 <div class="col-6 col-md-4 col-xl-2"><div class="metric-card">
                     <div class="metric-label">Total return</div>
@@ -166,6 +187,19 @@
                         </table>
                     </div>
                     <div id="tradesEmpty" class="d-none"></div>
+                </div>
+            </div>
+
+            <!-- Trader's notes (desk-mode runs only; painted by backtest.js) -->
+            <div class="card mt-2 d-none" id="traderNotesCard">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <span>Trader's notes</span>
+                    <div class="note-filters" id="noteFilters" role="group"
+                         aria-label="Filter trader notes by category"></div>
+                </div>
+                <div class="card-body p-0">
+                    <ol class="notes-timeline list-unstyled mb-0" id="notesTimeline"></ol>
+                    <div id="notesEmpty" class="d-none"></div>
                 </div>
             </div>
         </div>

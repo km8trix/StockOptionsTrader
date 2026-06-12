@@ -1,0 +1,285 @@
+"""
+Desk framework — the firm-persona abstraction every trading desk implements.
+
+A Desk owns a strategy stack, a capital allocation (fraction of the whole
+portfolio it may deploy), a RiskManager wired into its order flow, and a
+running log of trader's notes explaining every decision with real numbers.
+Desks emit DeskIntent objects; the BacktestEngine (desk mode) fills approved
+intents at the next bar's open exactly like strategy-mode signals.
+
+Phases 6-8 (Renaissance / Citadel / Jane Street desks) subclass Desk and
+plug their models into desks.walk_forward.WalkForwardController so that
+every model fit/predict honors the no-future-leakage invariant by
+construction.
+"""
+
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import date as date_type, datetime
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from core.models import Asset
+from portfolio.manager import PortfolioManager
+from portfolio.risk_manager import RiskManager
+
+logger = logging.getLogger(__name__)
+
+#: Allowed trader-note categories.
+NOTE_CATEGORIES = ('signal', 'risk', 'allocation', 'model', 'info')
+
+
+def json_safe(value):
+    """Coerce a value (recursively) into JSON-serializable builtins.
+
+    numpy scalars/arrays become Python ints/floats/bools/lists; datetimes
+    and dates become ISO strings; dicts/lists/tuples are walked recursively.
+    Anything already JSON-native passes through unchanged.
+    """
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.ndarray):
+        return [json_safe(v) for v in value.tolist()]
+    if isinstance(value, (datetime, date_type)):
+        # pd.Timestamp is a datetime subclass, so it is covered here too.
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value
+
+
+@dataclass
+class TraderNote:
+    """One timestamped, categorized desk decision with its supporting data.
+
+    timestamp carries the SIMULATION date (the engine drives Desk.set_clock
+    each day), never the wall clock, so notes line up with the bars that
+    produced them. data values are coerced to JSON-serializable builtins at
+    construction time.
+    """
+    timestamp: datetime
+    desk: str
+    category: str
+    message: str
+    data: Dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.category not in NOTE_CATEGORIES:
+            raise ValueError(
+                f"Invalid note category '{self.category}'; "
+                f"must be one of {NOTE_CATEGORIES}")
+        self.data = {str(k): json_safe(v) for k, v in self.data.items()}
+
+    def to_dict(self) -> Dict:
+        """Serialize to the report shape (contract C3)."""
+        return {
+            'timestamp': self.timestamp.isoformat(),
+            'desk': self.desk,
+            'category': self.category,
+            'message': self.message,
+            'data': self.data,
+        }
+
+
+@dataclass
+class DeskIntent:
+    """A desk's wish to trade: BUY/SELL an asset with a sized fraction.
+
+    size_fraction is a fraction of the DESK'S capital (the engine converts
+    it to dollars as portfolio_value * desk.capital_allocation *
+    size_fraction at fill time). SELL intents always close the full
+    position regardless of size_fraction.
+    """
+    asset: Asset
+    action: str
+    size_fraction: float
+    reason: str
+
+    def __post_init__(self):
+        if self.action not in ('BUY', 'SELL'):
+            raise ValueError(
+                f"Invalid intent action '{self.action}'; must be BUY or SELL")
+        if not (0.0 < self.size_fraction <= 1.0):
+            raise ValueError(
+                f"size_fraction {self.size_fraction} must be in (0, 1]")
+
+
+class Desk(ABC):
+    """Abstract base class for firm-persona trading desks.
+
+    Subclasses implement generate_intents(); the shared apply_risk() wires
+    the desk's RiskManager into its order flow (position sizing, stop
+    losses, daily-loss circuit breaker) so no desk can bypass risk checks.
+    """
+
+    def __init__(self, key: str, name: str, description: str, accent: str,
+                 capital_allocation: float = 1.0,
+                 risk_manager: Optional[RiskManager] = None):
+        self.key = key
+        self.name = name
+        self.description = description
+        self.accent = accent
+        self.capital_allocation = capital_allocation
+        self.risk_manager = risk_manager if risk_manager is not None else RiskManager()
+        self.notes: List[TraderNote] = []
+        # Simulation clock; the engine calls set_clock(date) each simulated
+        # day so notes carry simulation dates, not the wall clock.
+        self._clock: Optional[datetime] = None
+
+    # ------------------------------------------------------------------
+    # Simulation clock + notes
+    # ------------------------------------------------------------------
+    def set_clock(self, date) -> None:
+        """Set the simulation date used to stamp subsequent notes."""
+        self._clock = pd.Timestamp(date)
+
+    def note(self, category: str, message: str, **data) -> TraderNote:
+        """Record a TraderNote stamped with the simulation clock.
+
+        Falls back to the wall clock only if the engine never set a clock
+        (e.g. ad-hoc use outside a simulation).
+        """
+        timestamp = self._clock if self._clock is not None else datetime.now()
+        trader_note = TraderNote(timestamp=timestamp, desk=self.name,
+                                 category=category, message=message, data=data)
+        self.notes.append(trader_note)
+        logger.debug("[%s] %s note: %s", self.name, category, message)
+        return trader_note
+
+    # ------------------------------------------------------------------
+    # Strategy surface
+    # ------------------------------------------------------------------
+    @abstractmethod
+    def generate_intents(self, all_data: Dict[str, pd.DataFrame], date,
+                         portfolio: PortfolioManager) -> List[DeskIntent]:
+        """Produce the desk's trade intents for the current simulation day.
+
+        all_data values are indicator-enriched frames sliced through the
+        current simulation date — the engine guarantees no row beyond
+        `date` is ever present.
+        """
+
+    def apply_risk(self, intents: List[DeskIntent],
+                   portfolio: PortfolioManager,
+                   all_data: Dict[str, pd.DataFrame],
+                   date) -> List[DeskIntent]:
+        """Run the desk's RiskManager over its intents (shared, concrete).
+
+        1. Daily-loss circuit: if today's realized drawdown (current value
+           vs the previous snapshot) breaches check_daily_loss_limit, ALL
+           new BUYs are blocked for the day (noted once).
+        2. Stop losses: any open position where should_close_position fires
+           gets a full-size SELL intent (noted with entry/current/stop).
+        3. Position sizing: a BUY whose dollar value
+           (portfolio_value * capital_allocation * size_fraction) violates
+           check_position_size is blocked (noted with the numbers).
+
+        SELL intents always pass.
+        """
+        approved: List[DeskIntent] = []
+        portfolio_value = portfolio.get_portfolio_value()
+
+        # --- Daily-loss circuit breaker -------------------------------
+        daily_pnl = 0.0
+        if portfolio.portfolio_history:
+            daily_pnl = (portfolio_value
+                         - portfolio.portfolio_history[-1]['portfolio_value'])
+        buys_allowed = self.risk_manager.check_daily_loss_limit(
+            daily_pnl, portfolio_value)
+        if not buys_allowed:
+            self.note(
+                'risk',
+                f"Daily-loss circuit breaker: P&L {daily_pnl:,.2f} on "
+                f"portfolio {portfolio_value:,.2f} breaches the "
+                f"{self.risk_manager.max_daily_loss:.1%} limit; all new "
+                f"BUYs blocked today",
+                daily_pnl=daily_pnl, portfolio_value=portfolio_value,
+                max_daily_loss=self.risk_manager.max_daily_loss)
+
+        # --- Stop-loss SELLs for open positions ------------------------
+        already_selling = {intent.asset for intent in intents
+                           if intent.action == 'SELL'}
+        for asset, position in list(portfolio.positions.items()):
+            if position.quantity <= 0 or asset in already_selling:
+                continue
+            if self.risk_manager.should_close_position(position):
+                stop_price = self.risk_manager.calculate_position_stop_loss(
+                    position.avg_entry_price)
+                approved.append(DeskIntent(
+                    asset=asset, action='SELL', size_fraction=1.0,
+                    reason=(f"stop-loss: {position.current_price:.4f} <= "
+                            f"stop {stop_price:.4f}")))
+                already_selling.add(asset)
+                self.note(
+                    'risk',
+                    f"Stop-loss SELL {asset.symbol}: entry "
+                    f"{position.avg_entry_price:.4f}, current "
+                    f"{position.current_price:.4f} breached stop "
+                    f"{stop_price:.4f} "
+                    f"({self.risk_manager.position_stop_loss:.1%} below entry)",
+                    entry_price=position.avg_entry_price,
+                    current_price=position.current_price,
+                    stop_price=stop_price,
+                    stop_loss_pct=self.risk_manager.position_stop_loss)
+
+        # --- Per-intent checks -----------------------------------------
+        for intent in intents:
+            if intent.action == 'SELL':
+                approved.append(intent)
+                continue
+
+            if not buys_allowed:
+                # Already noted once above.
+                continue
+
+            trade_value = (portfolio_value * self.capital_allocation
+                           * intent.size_fraction)
+            if not self.risk_manager.check_position_size(portfolio_value,
+                                                         trade_value):
+                self.note(
+                    'risk',
+                    f"Blocked BUY {intent.asset.symbol}: trade value "
+                    f"{trade_value:,.2f} is "
+                    f"{trade_value / portfolio_value:.1%} of portfolio "
+                    f"{portfolio_value:,.2f}, exceeding the "
+                    f"{self.risk_manager.max_position_size:.1%} "
+                    f"position-size limit",
+                    symbol=intent.asset.symbol, trade_value=trade_value,
+                    portfolio_value=portfolio_value,
+                    size_fraction=intent.size_fraction,
+                    capital_allocation=self.capital_allocation,
+                    max_position_size=self.risk_manager.max_position_size)
+                continue
+
+            approved.append(intent)
+
+        return approved
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+    def get_status(self) -> Dict:
+        """Snapshot of the desk for dashboards and reports."""
+        return {
+            'key': self.key,
+            'name': self.name,
+            'capital_allocation': self.capital_allocation,
+            'notes_count': len(self.notes),
+            'last_note': self.notes[-1].to_dict() if self.notes else None,
+        }
+
+    @property
+    def walk_forward_fits(self) -> List:
+        """Walk-forward fit events (desks with controllers override this)."""
+        return []

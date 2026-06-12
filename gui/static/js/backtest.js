@@ -1,21 +1,33 @@
 // Backtest page: async job submission + progress polling, result charts
 // (equity vs benchmark, drawdown), sortable trade table, saved history with
-// two-way comparison. Talks to:
-//   POST /api/backtest/run            -> {job_id}
+// two-way comparison, and Phase 5 desk mode (desk picker, desk header chip,
+// trader's-notes timeline, walk-forward refit markers). Talks to:
+//   POST /api/backtest/run            -> {job_id} (strategy OR desk payload)
 //   GET  /api/backtest/status/<id>    -> JobManager record
 //   GET  /api/backtests               -> saved history rows
 //   GET  /api/backtest/<id>           -> saved detail (results blob)
+//   GET  /api/floor/desks             -> desk registry (contract C1)
 
 'use strict';
 
 const SYMBOLS_RE = /^[A-Za-z][A-Za-z.\-]{0,9}$/;
 const POLL_MS = 1000;
 
+// Only a strict #rrggbb desk accent flows into inline styles.
+const ACCENT_RE = /^#[0-9a-fA-F]{6}$/;
+// Walk-forward refit markers: pod purple, same hue as the 'model' category.
+const WF_COLOR = '#bc8cff';
+// Trader's-notes categories, in filter-chip display order (contract C3).
+const NOTE_CATEGORIES = ['signal', 'risk', 'allocation', 'model', 'info'];
+
 let pollTimer = null;
 let restoreRunBtn = null;
 let currentTrades = [];
 let tradeSort = { key: 'date', dir: 1 };
 let hasResults = false;
+let desksByKey = {};        // ready desks from /api/floor/desks, keyed by key
+let currentNotes = [];      // trader_notes of the report on screen
+let noteFilter = 'all';     // active category filter chip
 
 /* ==========================================================================
    Theme helpers (same approach as analysis.js)
@@ -82,6 +94,66 @@ async function loadStrategies() {
     }
 }
 
+/* ==========================================================================
+   Desk mode (Phase 5): toggle, desk list, ?desk=<key> deep link
+   ========================================================================== */
+
+function currentMode() {
+    return document.getElementById('modeDesk').checked ? 'desk' : 'strategy';
+}
+
+function applyMode() {
+    const desk = currentMode() === 'desk';
+    document.getElementById('strategyField').classList.toggle('d-none', desk);
+    document.getElementById('deskField').classList.toggle('d-none', !desk);
+}
+
+/** Populate #btDesk with READY desks; returns them (empty array on error). */
+async function loadDesks() {
+    const select = document.getElementById('btDesk');
+    const hint = document.getElementById('deskHint');
+    let ready = [];
+    try {
+        const data = await fetchJSON('/api/floor/desks', { silent: true });
+        ready = (data.desks || []).filter((d) => d.status === 'ready');
+    } catch (_) {
+        hint.textContent = 'Could not load desk list — reload the page.';
+        document.getElementById('modeDesk').disabled = true;
+        return [];
+    }
+    desksByKey = {};
+    ready.forEach((d) => {
+        desksByKey[d.key] = d;
+        const opt = document.createElement('option');
+        opt.value = d.key;
+        opt.textContent = d.name;
+        select.appendChild(opt);
+    });
+    if (ready.length === 0) {
+        hint.textContent = 'No desks are ready yet — they activate in later phases.';
+        document.getElementById('modeDesk').disabled = true;
+    }
+    return ready;
+}
+
+/** Wire the mode toggle and honor a /backtest?desk=<key> deep link. */
+async function initDeskMode() {
+    document.querySelectorAll('input[name="btMode"]').forEach((radio) => {
+        radio.addEventListener('change', applyMode);
+    });
+    const ready = await loadDesks();
+    const deskParam = new URLSearchParams(window.location.search).get('desk');
+    if (!deskParam) return;
+    if (ready.some((d) => d.key === deskParam)) {
+        document.getElementById('modeDesk').checked = true;
+        document.getElementById('btDesk').value = deskParam;
+        applyMode();
+    } else {
+        showToast('warning',
+            `Desk '${deskParam}' is not available for backtests yet`);
+    }
+}
+
 function parseSymbols() {
     return document.getElementById('btSymbols').value
         .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
@@ -118,6 +190,13 @@ function validateForm() {
     sizeEl.classList.toggle('is-invalid', !sizeOk);
     ok = ok && sizeOk;
 
+    if (currentMode() === 'desk') {
+        const deskEl = document.getElementById('btDesk');
+        const deskOk = Boolean(deskEl.value);
+        deskEl.classList.toggle('is-invalid', !deskOk);
+        ok = ok && deskOk;
+    }
+
     return ok;
 }
 
@@ -128,12 +207,17 @@ async function onRun(event) {
 
     const payload = {
         symbols: parseSymbols().join(','),
-        strategy: document.getElementById('btStrategy').value,
         start_date: document.getElementById('startDate').value,
         end_date: document.getElementById('endDate').value,
         initial_capital: Number(document.getElementById('btCapital').value),
         position_size: Number(document.getElementById('btPositionSize').value) / 100,
     };
+    // Exactly one of strategy/desk crosses the wire (contract C2 mirrors it).
+    if (currentMode() === 'desk') {
+        payload.desk = document.getElementById('btDesk').value;
+    } else {
+        payload.strategy = document.getElementById('btStrategy').value;
+    }
 
     restoreRunBtn = btnLoading(document.getElementById('runBtn'));
     showProgress('submitting…', 0);
@@ -209,12 +293,118 @@ function renderResults(report) {
     document.getElementById('compareSection').classList.add('d-none');
     document.getElementById('resultsSection').classList.remove('d-none');
 
+    renderDeskChip(report.desk);
     renderMetrics(report.summary || {});
     renderPendingSignals(report.pending_signals || []);
     renderEquityChart(report);
     renderDrawdownChart(report.drawdown_series || []);
     renderTrades(report.trades || []);
+    renderTraderNotes(report);
     renderProvenance(report.data_sources || {});
+}
+
+/* ==========================================================================
+   Desk results (Phase 5): header chip + trader's-notes timeline
+   ========================================================================== */
+
+function renderDeskChip(desk) {
+    const row = document.getElementById('deskChipRow');
+    if (!desk || !desk.key) {
+        row.classList.add('d-none');
+        row.innerHTML = '';
+        return;
+    }
+    const meta = desksByKey[desk.key] || {};
+    const accent = ACCENT_RE.test(meta.accent || '') ? meta.accent : '';
+    row.classList.remove('d-none');
+    row.innerHTML =
+        `<span class="desk-chip"${accent ? ` style="--desk-accent: ${accent};"` : ''}>` +
+        '<i class="bi bi-building" aria-hidden="true"></i>' +
+        `${escapeHTML(desk.name || desk.key)} desk</span>`;
+}
+
+function noteCategory(note) {
+    return NOTE_CATEGORIES.includes(note.category) ? note.category : 'info';
+}
+
+function renderTraderNotes(report) {
+    const card = document.getElementById('traderNotesCard');
+    if (!report.desk) {
+        // Strategy-mode runs have no desk rationale to show.
+        card.classList.add('d-none');
+        currentNotes = [];
+        return;
+    }
+    card.classList.remove('d-none');
+    currentNotes = Array.isArray(report.trader_notes) ? report.trader_notes : [];
+    noteFilter = 'all';
+    paintNoteFilters();
+    paintNotes();
+}
+
+function paintNoteFilters() {
+    const counts = {};
+    currentNotes.forEach((n) => {
+        const cat = noteCategory(n);
+        counts[cat] = (counts[cat] || 0) + 1;
+    });
+    const chips = [['all', `All (${currentNotes.length})`]].concat(
+        NOTE_CATEGORIES.filter((c) => counts[c])
+            .map((c) => [c, `${c} (${counts[c]})`]));
+
+    const wrap = document.getElementById('noteFilters');
+    wrap.innerHTML = chips.map(([value, label]) =>
+        '<button type="button" class="note-filter-chip' +
+        `${value === 'all' ? '' : ` note-cat-${value}`}` +
+        `${value === noteFilter ? ' active' : ''}"` +
+        ` data-category="${value}" aria-pressed="${value === noteFilter}">` +
+        `${escapeHTML(label)}</button>`).join('');
+    wrap.querySelectorAll('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            noteFilter = btn.dataset.category;
+            paintNoteFilters();
+            paintNotes();
+        });
+    });
+}
+
+function noteItem(note) {
+    const category = noteCategory(note);
+    const data = note.data && typeof note.data === 'object' ? note.data : null;
+    const hasData = data !== null && Object.keys(data).length > 0;
+    return (
+        '<li class="note-entry">' +
+        `<span class="note-ts num">${escapeHTML(note.timestamp ?? '—')}</span>` +
+        `<span class="note-cat-chip note-cat-${category}">${escapeHTML(category)}</span>` +
+        `<span class="note-msg">${escapeHTML(note.message ?? '')}</span>` +
+        (hasData
+            ? '<details class="note-data"><summary>data</summary>' +
+              `<pre class="note-data-json">${escapeHTML(JSON.stringify(data, null, 2))}</pre>` +
+              '</details>'
+            : '') +
+        '</li>'
+    );
+}
+
+function paintNotes() {
+    const list = document.getElementById('notesTimeline');
+    const emptyEl = document.getElementById('notesEmpty');
+    const visible = noteFilter === 'all'
+        ? currentNotes
+        : currentNotes.filter((n) => noteCategory(n) === noteFilter);
+
+    if (visible.length === 0) {
+        list.innerHTML = '';
+        emptyEl.classList.remove('d-none');
+        emptyEl.innerHTML = currentNotes.length === 0
+            ? emptyStateHTML('bi-journal-text', 'No trader notes',
+                'The desk logged nothing for this run.')
+            : emptyStateHTML('bi-funnel', `No ${noteFilter} notes`,
+                'Pick another category filter.');
+        return;
+    }
+    emptyEl.classList.add('d-none');
+    list.innerHTML = visible.map(noteItem).join('');
 }
 
 function setMetric(id, text, signedValue) {
@@ -304,7 +494,39 @@ function renderEquityChart(report) {
     const layout = baseLayout(t, 320);
     layout.yaxis.title = { text: 'Value ($)', font: { size: 10, color: t.muted } };
     layout.yaxis.tickformat = ',.0f';
+    addWalkForwardMarkers(report, history, traces, layout);
     Plotly.react(document.getElementById('equityChart'), traces, layout, PLOT_CONFIG);
+}
+
+/**
+ * Walk-forward refit markers (desk mode, contract C3): a vertical dashed
+ * line per report.walk_forward entry at its fit_date, plus one legend-bearing
+ * marker trace whose hover text describes the training window. Skips cleanly
+ * when the list is empty/absent (strategy runs) or there is no equity curve
+ * to anchor the hover markers to.
+ */
+function addWalkForwardMarkers(report, history, traces, layout) {
+    const refits = Array.isArray(report.walk_forward) ? report.walk_forward : [];
+    if (refits.length === 0 || history.length === 0) return;
+
+    layout.shapes = refits.map((wf) => ({
+        type: 'line', xref: 'x', yref: 'paper',
+        x0: wf.fit_date, x1: wf.fit_date, y0: 0, y1: 1,
+        line: { color: WF_COLOR, width: 1, dash: 'dash' },
+    }));
+
+    const top = Math.max(...history.map((h) => h.portfolio_value));
+    traces.push({
+        type: 'scatter', name: 'Walk-forward refit', mode: 'markers',
+        x: refits.map((wf) => wf.fit_date),
+        y: refits.map(() => top),
+        marker: { symbol: 'line-ns-open', size: 9, color: WF_COLOR,
+                  line: { width: 1.5, color: WF_COLOR } },
+        text: refits.map((wf) =>
+            `Refit: trained ${wf.train_start} → ${wf.train_end} ` +
+            `(${wf.n_samples} rows)`),
+        hovertemplate: '%{text}<extra></extra>',
+    });
 }
 
 function renderDrawdownChart(series) {
@@ -599,6 +821,7 @@ function paintInitialEmptyState() {
 document.addEventListener('DOMContentLoaded', () => {
     paintInitialEmptyState();
     loadStrategies();
+    initDeskMode();
     loadSaved();
     initTradeSorting();
     document.getElementById('backtestForm').addEventListener('submit', onRun);

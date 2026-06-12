@@ -7,6 +7,7 @@ Flask's test client only.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -281,12 +282,14 @@ class TestViewsAndVendoredAssets:
         template = (REPO_ROOT / 'gui' / 'templates' / 'base.html').read_text()
         assert 'cdn.' not in template
 
-    def test_floor_page_shows_three_desks_with_phase_badges(self, client):
+    def test_floor_page_renders_desk_grid_and_floor_js(self, client):
+        """Phase 5: desk cards are JS-rendered from GET /api/floor/desks,
+        so the page ships the grid container + script, not hardcoded cards."""
         html = client.get('/floor').get_data(as_text=True)
-        for desk in ('Renaissance', 'Citadel', 'Jane Street'):
-            assert desk in html
-        for phase in ('Phase 6', 'Phase 7', 'Phase 8'):
-            assert f'Activates in {phase}' in html
+        assert 'id="deskGrid"' in html
+        assert 'js/floor.js' in html
+        # The cross-desk synergy footnote survives the JS-rendered rewrite.
+        assert 'Cross-desk synergy' in html
 
     @pytest.mark.parametrize('rel_path', [
         'gui/static/vendor/bootstrap/bootstrap.min.css',
@@ -714,6 +717,354 @@ class TestAsyncBacktest:
         response = client.get('/api/backtest/status/no-such-job')
         assert response.status_code == 404
         assert response.get_json() == {'error': 'Unknown job id'}
+
+
+# ==================== TRADING FLOOR DESKS (Phase 5) ====================
+
+# SHARED INTERFACE CONTRACT C1: desks.registry.list_desks() entries carry
+# exactly these keys.
+DESK_CONTRACT_KEYS = {
+    'key', 'name', 'firm_inspiration', 'description', 'status',
+    'activates_in_phase', 'accent',
+}
+
+
+def make_desk_entry(**overrides):
+    """A contract-C1-shaped desk dict for stubbing list_desks."""
+    entry = {
+        'key': 'foundation',
+        'name': 'Foundation',
+        'firm_inspiration': 'In-house',
+        'description': 'Baseline desk wrapping the classic strategies.',
+        'status': 'ready',
+        'activates_in_phase': None,
+        'accent': '#3fb950',
+    }
+    entry.update(overrides)
+    return entry
+
+
+class TestFloorDesksEndpoint:
+    """GET /api/floor/desks proxies desks.registry.list_desks (contract C1).
+
+    These tests stub the registry binding inside the route module, so they
+    pin the ROUTE's behavior regardless of registry contents.
+    """
+
+    def test_returns_desks_from_registry(self, client, monkeypatch):
+        from gui.routes import api_floor
+
+        desks = [
+            make_desk_entry(),
+            make_desk_entry(key='renaissance', name='Renaissance',
+                            firm_inspiration='Renaissance Technologies',
+                            status='planned', activates_in_phase=6,
+                            accent='#58a6ff'),
+        ]
+        monkeypatch.setattr(api_floor, 'list_desks', lambda: desks)
+
+        response = client.get('/api/floor/desks')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body == {'desks': desks}
+        for desk in body['desks']:
+            assert set(desk) == DESK_CONTRACT_KEYS
+
+    def test_returns_503_when_desk_framework_unavailable(
+            self, client, monkeypatch):
+        """Mirrors the live-broker pattern: a failed desks import is LOUD."""
+        from gui.routes import api_floor
+
+        sentinel = 'ImportError: synthetic desks import failure'
+        monkeypatch.setattr(api_floor, 'list_desks', None)
+        monkeypatch.setattr(api_floor, 'DESK_REGISTRY_IMPORT_ERROR', sentinel)
+
+        response = client.get('/api/floor/desks')
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Desk framework unavailable',
+            'reason': sentinel,
+        }
+
+
+class TestFloorDesksRegistryContract:
+    """End-to-end /api/floor/desks against the REAL desks.registry.
+
+    Skips (instead of failing) while the parallel Phase 5 backend task that
+    owns desks/ has not landed in this tree yet.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_desks(self):
+        pytest.importorskip(
+            'desks.registry',
+            reason='desks package not present (parallel Phase 5 backend task)')
+
+    def test_every_desk_matches_contract_shape(self, client):
+        response = client.get('/api/floor/desks')
+
+        assert response.status_code == 200
+        desks = response.get_json()['desks']
+        assert desks, 'registry returned no desks'
+        for desk in desks:
+            assert set(desk) == DESK_CONTRACT_KEYS
+            assert desk['status'] in ('ready', 'planned')
+            assert re.fullmatch(r'#[0-9a-fA-F]{6}', desk['accent'])
+            if desk['status'] == 'planned':
+                assert isinstance(desk['activates_in_phase'], int)
+
+    def test_foundation_ready_and_three_planned_with_phases_6_7_8(self, client):
+        desks = client.get('/api/floor/desks').get_json()['desks']
+        by_key = {d['key']: d for d in desks}
+
+        assert by_key['foundation']['status'] == 'ready'
+        planned_phases = sorted(d['activates_in_phase'] for d in desks
+                                if d['status'] == 'planned')
+        assert planned_phases == [6, 7, 8]
+
+    def test_unknown_desk_key_returns_400_with_message(self, client):
+        response = client.post('/api/backtest/run', json={
+            'symbols': 'AAA', 'desk': 'no-such-desk',
+            'start_date': '2023-01-01', 'end_date': '2023-12-31'})
+
+        assert response.status_code == 400
+        assert 'Unknown desk' in response.get_json()['error']
+        assert 'no-such-desk' in response.get_json()['error']
+
+    def test_planned_desk_returns_400_mentioning_its_phase(self, client):
+        response = client.post('/api/backtest/run', json={
+            'symbols': 'AAA', 'desk': 'renaissance',
+            'start_date': '2023-01-01', 'end_date': '2023-12-31'})
+
+        assert response.status_code == 400
+        assert 'Phase 6' in response.get_json()['error']
+
+
+def _fake_desk_report():
+    """Desk-mode engine report: the strategy report + contract C3 additions."""
+    report = _fake_engine_report()
+    report['desk'] = {'key': 'foundation', 'name': 'Foundation'}
+    report['trader_notes'] = [
+        {'timestamp': '2023-03-01T00:00:00', 'desk': 'foundation',
+         'category': 'signal', 'message': 'BUY AAA on momentum confirmation',
+         'data': {'score': 0.82}},
+        {'timestamp': '2023-06-01T00:00:00', 'desk': 'foundation',
+         'category': 'risk', 'message': 'Position capped by risk limits',
+         'data': {}},
+    ]
+    report['walk_forward'] = [
+        {'fit_date': '2023-06-01', 'train_start': '2023-01-03',
+         'train_end': '2023-05-31', 'n_samples': 103},
+    ]
+    return report
+
+
+class TestDeskModeBacktest:
+    """POST /api/backtest/run with 'desk' instead of 'strategy' (contract C2/C3)."""
+
+    PAYLOAD = {
+        'symbols': 'AAA',
+        'desk': 'foundation',
+        'start_date': '2023-01-01',
+        'end_date': '2023-12-31',
+        'initial_capital': 100000,
+        'position_size': 0.1,
+    }
+
+    @pytest.fixture()
+    def patch_desk_stack(self, monkeypatch, tmp_path):
+        """Stub create_desk + the whole engine; redirect the history DB."""
+        import gui.globals as gui_globals
+        from gui.routes import api_backtest
+
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'history.db'))
+        monkeypatch.setattr(gui_globals, '_db', None)
+
+        seen = {}
+        desk_sentinel = object()
+
+        def fake_create_desk(key, capital_allocation=1.0):
+            seen['desk_key'] = key
+            return desk_sentinel
+
+        class FakeEngine:
+            """Contract C2 stand-in: desk-mode construction, run() unchanged."""
+
+            def __init__(self, strategy=None, desk=None,
+                         initial_capital=100000, **kwargs):
+                seen['ctor'] = {'strategy': strategy, 'desk': desk,
+                                'initial_capital': initial_capital}
+                # _fetch_info getattr-guards a missing provenance method.
+                self.market_data = None
+
+            def run(self, symbols, start_date, end_date, position_size,
+                    progress_callback=None, benchmark_symbol='SPY'):
+                seen['run_symbols'] = list(symbols)
+                if progress_callback is not None:
+                    progress_callback(50.0)
+                return _fake_desk_report()
+
+        monkeypatch.setattr(api_backtest, 'create_desk', fake_create_desk)
+        monkeypatch.setattr(api_backtest, 'BacktestEngine', FakeEngine)
+        return seen
+
+    def test_desk_run_returns_report_with_desk_additions(
+            self, client, patch_desk_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        # Contract C2: the engine was built in desk mode, not strategy mode.
+        assert patch_desk_stack['desk_key'] == 'foundation'
+        assert patch_desk_stack['ctor']['strategy'] is None
+        assert patch_desk_stack['ctor']['desk'] is not None
+        assert patch_desk_stack['run_symbols'] == ['AAA']
+
+        result = job['result']
+        # Contract C3 additive keys survive JSON-safing untouched.
+        assert result['desk'] == {'key': 'foundation', 'name': 'Foundation'}
+        assert [n['category'] for n in result['trader_notes']] == \
+            ['signal', 'risk']
+        assert result['trader_notes'][0]['data'] == {'score': 0.82}
+        assert result['walk_forward'] == [
+            {'fit_date': '2023-06-01', 'train_start': '2023-01-03',
+             'train_end': '2023-05-31', 'n_samples': 103}]
+        # ... while every existing report key keeps its legacy shape.
+        assert result['summary']['total_return_pct'] == pytest.approx(8.0)
+        assert result['trades'][0]['date'] == '2023-03-01'
+        assert result['portfolio_history'][0]['timestamp'] == '2023-01-03'
+
+    def test_desk_run_saved_with_desk_prefixed_strategy(
+            self, client, patch_desk_stack):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        rows = client.get('/api/backtests').get_json()['backtests']
+        assert len(rows) == 1
+        assert rows[0]['strategy'] == 'desk:foundation'
+        assert rows[0]['name'] == 'desk:foundation AAA'
+        assert rows[0]['total_return'] == pytest.approx(0.08)
+
+        # The export/compare surfaces still render a desk-saved run.
+        report = client.get(f"/api/export/report/{rows[0]['id']}")
+        assert report.status_code == 200
+        text = report.get_data(as_text=True)
+        assert 'desk:foundation' in text
+        assert 'Total Return: 8.00%' in text
+
+    def test_desk_and_strategy_together_rejected(self, client):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'strategy': 'momentum'})
+
+        assert response.status_code == 400
+        assert 'not both' in response.get_json()['error']
+
+    @pytest.mark.parametrize('bad_desk', ['   ', '', 123, ['foundation']])
+    def test_non_string_or_blank_desk_rejected(self, client, bad_desk):
+        response = client.post(
+            '/api/backtest/run', json={**self.PAYLOAD, 'desk': bad_desk})
+
+        assert response.status_code == 400
+        assert 'desk' in response.get_json()['error']
+
+    def test_unknown_desk_returns_400_with_registry_message(
+            self, client, monkeypatch):
+        from gui.routes import api_backtest
+
+        def raising_create_desk(key, capital_allocation=1.0):
+            raise ValueError(f'Unknown desk: {key}')
+
+        monkeypatch.setattr(api_backtest, 'create_desk', raising_create_desk)
+
+        response = client.post(
+            '/api/backtest/run', json={**self.PAYLOAD, 'desk': 'no-such-desk'})
+
+        assert response.status_code == 400
+        assert response.get_json()['error'] == 'Unknown desk: no-such-desk'
+
+    def test_planned_desk_returns_400_mentioning_phase(
+            self, client, monkeypatch):
+        from gui.routes import api_backtest
+
+        def raising_create_desk(key, capital_allocation=1.0):
+            raise ValueError(f"Desk '{key}' activates in Phase 6")
+
+        monkeypatch.setattr(api_backtest, 'create_desk', raising_create_desk)
+
+        response = client.post(
+            '/api/backtest/run', json={**self.PAYLOAD, 'desk': 'renaissance'})
+
+        assert response.status_code == 400
+        assert 'Phase 6' in response.get_json()['error']
+
+    def test_desk_run_returns_503_when_framework_unavailable(
+            self, client, monkeypatch):
+        from gui.routes import api_backtest
+
+        sentinel = 'ImportError: synthetic desks import failure'
+        monkeypatch.setattr(api_backtest, 'create_desk', None)
+        monkeypatch.setattr(
+            api_backtest, 'DESK_REGISTRY_IMPORT_ERROR', sentinel)
+
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Desk framework unavailable',
+            'reason': sentinel,
+        }
+
+    def test_legacy_strategy_run_unaffected_by_desk_support(
+            self, client, monkeypatch, tmp_path):
+        """A strategy-only payload takes the legacy path bit-identically:
+        same engine call, no desk keys in the report, plain strategy name
+        in the saved-history row."""
+        import gui.globals as gui_globals
+        from gui.routes import api_backtest
+
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'history.db'))
+        monkeypatch.setattr(gui_globals, '_db', None)
+
+        def fake_run(self, symbols, start_date, end_date, position_size,
+                     progress_callback=None, benchmark_symbol='SPY'):
+            return _fake_engine_report()
+
+        monkeypatch.setattr(api_backtest.BacktestEngine, 'run', fake_run)
+        monkeypatch.setattr(
+            MarketDataHandler, 'get_last_fetch_info',
+            lambda self, symbol: None, raising=False)
+
+        response = client.post('/api/backtest/run', json={
+            'symbols': 'AAA', 'strategy': 'momentum',
+            'start_date': '2023-01-01', 'end_date': '2023-12-31',
+            'initial_capital': 100000, 'position_size': 0.1})
+
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+        result = job['result']
+        assert 'desk' not in result
+        assert 'trader_notes' not in result
+        assert 'walk_forward' not in result
+        assert result['summary']['total_return_pct'] == pytest.approx(8.0)
+
+        rows = client.get('/api/backtests').get_json()['backtests']
+        assert rows[0]['strategy'] == 'momentum'
+
+    def test_backtest_page_ships_desk_mode_controls(self, client):
+        """The page carries the mode toggle + desk picker for backtest.js."""
+        html = client.get('/backtest').get_data(as_text=True)
+        assert 'id="modeDesk"' in html
+        assert 'id="btDesk"' in html
+        assert 'id="traderNotesCard"' in html
+        assert 'id="deskChipRow"' in html
 
 
 # ==================== PAPER TRADING PENDING ORDERS ====================
