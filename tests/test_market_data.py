@@ -49,3 +49,17 @@ def test_atr_valid_at_bar_14(make_ohlcv):
     assert result['atr'].iloc[:13].isna().all()
     assert not np.isnan(result['atr'].iloc[13])
     assert result['atr'].iloc[13] == pytest.approx(result['tr'].iloc[:14].mean())
+
+
+def test_provider_list_is_valid_for_equity_historical():
+    """Regression: backtests returned 'No data available' because the
+    provider list held names the installed OpenBB rejects for
+    equity.price.historical. The free, keyless 'yfinance' provider must be
+    present (and first), and the known-invalid names must be gone."""
+    providers = MarketDataHandler().providers
+    assert 'yfinance' in providers, 'free keyless provider must be present'
+    assert providers[0] == 'yfinance', 'free provider should be tried first'
+    invalid = {'cboe', 'tmx', 'polygon', 'alpha_vantage', 'tradier'}
+    assert not (invalid & set(providers)), (
+        f'invalid equity-historical providers still listed: '
+        f'{invalid & set(providers)}')

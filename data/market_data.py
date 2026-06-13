@@ -29,16 +29,19 @@ class MarketDataHandler:
         """
         self.stock_data: Dict[str, pd.DataFrame] = {}
         self.cache: Dict[str, pd.DataFrame] = {}
-        # OpenBB providers for equity historical data. Some providers require API keys.
+        # OpenBB providers for equity.price.historical, tried in order.
+        # yfinance is FREE and needs no API key (the working default in a
+        # stock install). fmp / intrinio / tiingo are valid too but require
+        # credentials, so they only succeed once those keys are configured.
+        # NOTE: cboe/tmx/polygon/alpha_vantage/tradier are NOT valid
+        # equity-historical providers in the installed OpenBB build (they
+        # raise "Input should be 'fmp', 'intrinio', 'tiingo' or 'yfinance'")
+        # and were the reason backtests returned "No data available".
         self.providers = [
-            'cboe',
-            'tmx',
+            'yfinance',
             'fmp',
             'intrinio',
-            'polygon',
             'tiingo',
-            'alpha_vantage',
-            'tradier',
         ]
         self._sqlite_cache: Optional[OHLCVCache] = (
             cache if isinstance(cache, OHLCVCache) else None
