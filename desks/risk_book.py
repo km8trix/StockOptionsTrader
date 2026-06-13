@@ -33,34 +33,42 @@ MARGIN IS NOT MODELED: max_gross defaults to 1.0x desk capital (no
 leverage) under the cash-account approximation used desk-wide.
 
 --------------------------------------------------------------------------
-PHASE 8 PLACEHOLDER — GREEKS LIMITS (short_vega / short_gamma)
+GREEKS LIMITS (short_vega / short_gamma)
 --------------------------------------------------------------------------
 The Jane Street desk introduces options positions whose aggregate short
-vega and short gamma must be capped desk-wide through this same book.
-The constructor already accepts ``short_vega_limit`` / ``short_gamma_limit``
-so the configuration surface is stable, but evaluating them requires a
-per-position Greeks feed that does not exist yet: configuring either
-limit makes check() raise NotImplementedError until Phase 8 wires the
-options data in. They must never be silently ignored — a configured risk
-limit that cannot be evaluated is a hard error, not a no-op.
+vega and short gamma can be capped desk-wide through this same book.
+Evaluating ``short_vega_limit`` / ``short_gamma_limit`` requires a
+per-position Greeks feed: inject a ``PortfolioGreeksAggregator`` as
+``greeks_aggregator`` and check() evaluates them (see
+_apply_greeks_overlay). Configuring either limit WITHOUT a feed still
+raises NotImplementedError — a configured risk limit that cannot be
+evaluated is a hard error, never a silent no-op.
 
-PHASE 8 STATUS: JaneStreetDesk wires its vega cap through
-register_limit('short_vega', ...) — the desk owns the Greeks feed (its
-synthetic pricing engine), so the limit is evaluated as a custom check
-with the desk's live portfolio-vega state, and whole multi-leg
-structures are judged ATOMICALLY (the structure's net vega rides on its
-first short leg; blocking individual legs would leave naked wings). The
-raw constructor parameters remain reserved (and still raise) until a
-desk-agnostic per-position Greeks feed exists.
+TWO INDEPENDENT MECHANISMS, which compose:
+  * COARSE desk-wide gate (this overlay): with a greeks_aggregator and a
+    raw short_vega/short_gamma limit, the HELD book's aggregate short
+    Greeks are measured each check(); once over budget, ALL opening
+    intents in the batch are blocked all-or-nothing (closes always pass),
+    so it can never leave a naked wing. Measured on the current book, so
+    it backstops accumulation rather than judging a single trade.
+  * PRECISE per-structure check (custom limit): JaneStreetDesk wires its
+    vega cap through register_limit('short_vega', ...) — it owns the
+    Greeks feed (its synthetic pricing engine) and judges whole multi-leg
+    structures ATOMICALLY post-trade (the structure's net vega rides on
+    its first short leg; blocking individual legs would leave naked
+    wings). This stays the desk's primary control.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING, Tuple
 
 from desks.base import DeskIntent
 from portfolio.manager import PortfolioManager
+
+if TYPE_CHECKING:  # annotation only — avoids a runtime import edge
+    from portfolio.greeks_aggregator import PortfolioGreeksAggregator
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +100,9 @@ class CentralRiskBook:
                  max_symbol: float = 0.10,
                  max_net: float = 0.60,
                  short_vega_limit: Optional[float] = None,
-                 short_gamma_limit: Optional[float] = None):
+                 short_gamma_limit: Optional[float] = None,
+                 greeks_aggregator: Optional['PortfolioGreeksAggregator']
+                 = None):
         if not (0.0 < capital_allocation <= 1.0):
             raise ValueError(
                 f"capital_allocation {capital_allocation} must be in (0, 1]")
@@ -105,10 +115,12 @@ class CentralRiskBook:
         self.max_gross = max_gross
         self.max_symbol = max_symbol
         self.max_net = max_net
-        # Phase 8 placeholder (see module docstring): accepted, not yet
-        # evaluable — check() raises while either is configured.
+        # Greeks limits (see module docstring): evaluated as a desk-wide
+        # gate when a greeks_aggregator is injected; configured WITHOUT one
+        # makes check() fail loudly (_require_greeks_feed), never silently.
         self.short_vega_limit = short_vega_limit
         self.short_gamma_limit = short_gamma_limit
+        self.greeks_aggregator = greeks_aggregator
         #: name -> check_fn, evaluated in registration order (dicts
         #: preserve insertion order).
         self._custom_limits: Dict[str, Callable] = {}
@@ -166,7 +178,7 @@ class CentralRiskBook:
         the running exposure state when approved (see module docstring
         for ordering, conservatism and boundary semantics).
         """
-        self._raise_if_greeks_configured()
+        self._require_greeks_feed()
 
         approved: List[DeskIntent] = []
         blocked: List[Tuple[DeskIntent, str]] = []
@@ -248,20 +260,82 @@ class CentralRiskBook:
             per_symbol[symbol] = candidate_symbol
             approved.append(intent)
 
+        self._apply_greeks_overlay(approved, blocked, portfolio)
         return approved, blocked
 
     # ------------------------------------------------------------------
-    # Phase 8 placeholder: Greeks limits (short_vega / short_gamma)
+    # Greeks limits (short_vega / short_gamma) — evaluated via an injected
+    # PortfolioGreeksAggregator; fail loud without one.
     # ------------------------------------------------------------------
-    def _raise_if_greeks_configured(self) -> None:
-        """Greeks limits cannot be evaluated without options data (Phase 8).
+    def _require_greeks_feed(self) -> None:
+        """A configured Greeks limit needs a feed to evaluate.
 
-        A configured-but-unevaluable risk limit must fail loudly rather
-        than be silently skipped.
+        short_vega_limit / short_gamma_limit cannot be evaluated without a
+        per-position Greeks feed. When one is configured but no
+        greeks_aggregator is injected the limit must fail LOUDLY rather
+        than be silently skipped — a configured-but-unevaluable risk limit
+        is a hard error. Inject a PortfolioGreeksAggregator to evaluate
+        them (see _apply_greeks_overlay).
         """
-        if self.short_vega_limit is not None \
-                or self.short_gamma_limit is not None:
+        if (self.short_vega_limit is not None
+                or self.short_gamma_limit is not None) \
+                and self.greeks_aggregator is None:
             raise NotImplementedError(
-                "short_vega/short_gamma limits are configured but Greeks "
-                "evaluation requires the Phase 8 options data feed; "
-                "remove the limits or upgrade to Phase 8")
+                "short_vega/short_gamma limits are configured but no "
+                "greeks_aggregator is injected to evaluate them (the "
+                "Phase 8 options Greeks feed); inject a "
+                "PortfolioGreeksAggregator or remove the limits")
+
+    def _apply_greeks_overlay(self, approved: List[DeskIntent],
+                              blocked: List[Tuple[DeskIntent, str]],
+                              portfolio: PortfolioManager) -> None:
+        """Desk-wide Greeks gate over the approved opening intents.
+
+        With a short_vega/short_gamma limit configured AND a
+        greeks_aggregator injected, the aggregator's CURRENT
+        share-equivalent portfolio Greeks are measured (vega in $ per 1.00
+        vol point, the greeks_series convention; short premium -> negative
+        vega/gamma, so short exposure = max(0, -greek)). If the held book's
+        short vega or short gamma already EXCEEDS its cap (strict >; exactly
+        at the cap passes, matching the dollar-limit boundary semantics),
+        every OPENING intent is moved from approved to blocked — the desk is
+        over its Greeks budget and must not add risk. CLOSING intents
+        (SELL/COVER) always stay approved (they relieve exposure).
+
+        This is a COARSE desk-wide backstop measured on the HELD book, not a
+        per-structure post-trade check: it blocks the batch's opens
+        all-or-nothing, so it can never leave a naked option wing. A desk
+        needing precise per-structure atomic post-trade vega judging
+        registers a custom limit instead (JaneStreetDesk does this via
+        register_limit('short_vega', ...)); the two mechanisms are
+        independent and compose.
+        """
+        if self.short_vega_limit is None and self.short_gamma_limit is None:
+            return
+        if self.greeks_aggregator is None:  # _require_greeks_feed already
+            return                          # raised if a limit was set
+        greeks = self.greeks_aggregator.aggregate(portfolio)
+        breaches: List[str] = []
+        short_vega = max(0.0, -greeks['vega'])
+        if self.short_vega_limit is not None \
+                and short_vega > self.short_vega_limit:
+            breaches.append(f"short vega {short_vega:,.2f} exceeds the "
+                            f"limit {self.short_vega_limit:,.2f}")
+        short_gamma = max(0.0, -greeks['gamma'])
+        if self.short_gamma_limit is not None \
+                and short_gamma > self.short_gamma_limit:
+            breaches.append(f"short gamma {short_gamma:,.2f} exceeds the "
+                            f"limit {self.short_gamma_limit:,.2f}")
+        if not breaches:
+            return
+        reason = ("portfolio Greeks over budget (" + "; ".join(breaches)
+                  + "); no new opening intents admitted")
+        still_approved: List[DeskIntent] = []
+        for intent in approved:
+            if intent.action in _CLOSING_ACTIONS:
+                still_approved.append(intent)
+            else:
+                blocked.append((intent, reason))
+                logger.debug("CentralRiskBook Greeks gate blocked %s %s: %s",
+                             intent.action, intent.asset.symbol, reason)
+        approved[:] = still_approved

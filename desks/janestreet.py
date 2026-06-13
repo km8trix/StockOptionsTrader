@@ -109,6 +109,7 @@ from desks.risk_book import CentralRiskBook
 from desks.structures import (StructureTracker, build_iron_condor,
                               max_loss_per_contract, size_contracts)
 from desks.walk_forward import WalkForwardController
+from portfolio.greeks_aggregator import PortfolioGreeksAggregator
 from portfolio.manager import PortfolioManager
 from portfolio.risk_manager import RiskManager
 
@@ -254,6 +255,12 @@ class JaneStreetDesk(Desk):
         self._regime_series: List[Dict] = []
         self._current_regime: Optional[Dict] = None
         self._greeks_series: List[Dict] = []
+        #: Desk-agnostic C12 aggregator; _update_greeks delegates to it.
+        #: _leg_greeks (the provider) takes only an Asset, so it reads the
+        #: per-day market context set at the top of _update_greeks.
+        self._greeks_aggregator = PortfolioGreeksAggregator(self._leg_greeks)
+        self._greeks_all_data: Dict[str, pd.DataFrame] = {}
+        self._greeks_date = None
         #: live vega state read by the short_vega risk-book limit
         self._current_vega = 0.0
         self._committed_vega = 0.0
@@ -447,27 +454,33 @@ class JaneStreetDesk(Desk):
         t_years = (expiry - pd.Timestamp(date).date()).days / 365.0
         return spot, iv, t_years
 
+    def _leg_greeks(self, asset: Asset) -> Optional[Dict[str, float]]:
+        """GreeksProvider for the portfolio aggregator (C12): this option
+        leg's per-share Black-Scholes greeks at today's close, or None when
+        the underlying has no bar/IV today — the leg then contributes
+        nothing (the same skip + WARNING the old inline loop emitted).
+        Reads the per-day context set by _update_greeks because a
+        GreeksProvider takes only an Asset."""
+        inputs = self._leg_inputs(asset, self._greeks_all_data,
+                                  self._greeks_date)
+        if inputs is None:
+            logger.warning("Greeks: no inputs for %s on %s; leg "
+                           "contributes nothing today", str(asset),
+                           self._greeks_date)
+            return None
+        spot, iv, t_years = inputs
+        return black_scholes_greeks(spot, asset.strike_price, t_years, iv,
+                                    self.rate, asset.asset_type.value)
+
     def _update_greeks(self, all_data: Dict[str, pd.DataFrame], date,
                        portfolio: PortfolioManager) -> None:
-        totals = {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
-        for asset in sorted((a for a in portfolio.positions
-                             if a.asset_type in (AssetType.CALL,
-                                                 AssetType.PUT)), key=str):
-            position = portfolio.positions[asset]
-            if position.quantity == 0:
-                continue
-            inputs = self._leg_inputs(asset, all_data, date)
-            if inputs is None:
-                logger.warning("Greeks: no inputs for %s on %s; leg "
-                               "contributes nothing today", str(asset), date)
-                continue
-            spot, iv, t_years = inputs
-            greeks = black_scholes_greeks(spot, asset.strike_price, t_years,
-                                          iv, self.rate,
-                                          asset.asset_type.value)
-            scale = position.quantity * asset.multiplier
-            for key in totals:
-                totals[key] += greeks[key] * scale
+        """Append today's C12 share-equivalent portfolio Greeks. Delegates
+        the aggregation to PortfolioGreeksAggregator (the desk-agnostic
+        primitive) via the _leg_greeks provider; the totals are bit-for-bit
+        identical to the previous inline loop (golden-file gated)."""
+        self._greeks_all_data = all_data
+        self._greeks_date = date
+        totals = self._greeks_aggregator.aggregate(portfolio)
         self._greeks_series.append({
             'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
             **{key: float(value) for key, value in totals.items()},

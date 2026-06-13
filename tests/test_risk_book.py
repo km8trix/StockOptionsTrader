@@ -213,8 +213,9 @@ class TestRegisterLimit:
 
 
 class TestGreeksStub:
-    """Phase 8 placeholder: configured Greeks limits must raise loudly
-    because no options data exists to evaluate them yet."""
+    """Configured Greeks limits with NO greeks_aggregator injected must
+    raise loudly (the feed needed to evaluate them is absent) rather than
+    be silently skipped. The aggregator-present path is TestGreeksGate."""
 
     def test_short_vega_configured_raises(self):
         book = CentralRiskBook(short_vega_limit=1_000.0)
@@ -253,3 +254,103 @@ class TestConstructionValidation:
     def test_non_positive_limits_raise(self, kwargs):
         with pytest.raises(ValueError, match='must be > 0'):
             CentralRiskBook(**kwargs)
+
+
+class _FakeGreeks:
+    """Minimal greeks_aggregator stand-in: returns a fixed aggregate so the
+    gate logic is tested independently of the aggregator's own math (that
+    math is covered in test_greeks_aggregator)."""
+
+    def __init__(self, vega: float = 0.0, gamma: float = 0.0):
+        self._totals = {'delta': 0.0, 'gamma': gamma, 'theta': 0.0,
+                        'vega': vega}
+
+    def aggregate(self, portfolio):
+        return dict(self._totals)
+
+
+class TestGreeksGate:
+    """short_vega/short_gamma evaluate as a desk-wide gate once a
+    greeks_aggregator is injected: when the HELD book's aggregate short
+    Greeks exceed the cap, every opening intent is blocked all-or-nothing
+    (closes always pass). Without an aggregator a configured limit still
+    fails loudly (TestGreeksStub)."""
+
+    def test_over_vega_budget_blocks_opens_keeps_closes(self):
+        book = CentralRiskBook(short_vega_limit=1_000.0,
+                               greeks_aggregator=_FakeGreeks(vega=-1_500.0))
+        buy = intent('AAA', 'BUY', 0.1)
+        short = intent('BBB', 'SHORT', 0.1)
+        sell = intent('CCC', 'SELL', 1.0)
+        approved, blocked = book.check([buy, short, sell], cash_portfolio())
+        assert approved == [sell]                      # close still passes
+        blocked_intents = [i for i, _ in blocked]
+        assert buy in blocked_intents and short in blocked_intents
+        assert all('Greeks over budget' in r for _, r in blocked)
+        assert any('short vega' in r for _, r in blocked)
+
+    def test_under_vega_budget_is_a_no_op(self):
+        book = CentralRiskBook(short_vega_limit=2_000.0,
+                               greeks_aggregator=_FakeGreeks(vega=-1_500.0))
+        approved, blocked = book.check([intent('AAA', 'BUY', 0.1)],
+                                       cash_portfolio())
+        assert len(approved) == 1 and blocked == []
+
+    def test_exactly_at_vega_limit_passes(self):
+        # Boundary: |short vega| exactly at the cap passes (strict >).
+        book = CentralRiskBook(short_vega_limit=1_500.0,
+                               greeks_aggregator=_FakeGreeks(vega=-1_500.0))
+        approved, _ = book.check([intent('AAA', 'BUY', 0.1)],
+                                 cash_portfolio())
+        assert len(approved) == 1
+
+    def test_long_vega_never_trips_short_gate(self):
+        # Positive (long) aggregate vega is not short exposure -> no block.
+        book = CentralRiskBook(short_vega_limit=10.0,
+                               greeks_aggregator=_FakeGreeks(vega=5_000.0))
+        approved, blocked = book.check([intent('AAA', 'BUY', 0.1)],
+                                       cash_portfolio())
+        assert len(approved) == 1 and blocked == []
+
+    def test_short_gamma_gate(self):
+        book = CentralRiskBook(short_gamma_limit=2.0,
+                               greeks_aggregator=_FakeGreeks(gamma=-5.0))
+        approved, blocked = book.check([intent('AAA', 'BUY', 0.1)],
+                                       cash_portfolio())
+        assert approved == []
+        assert any('short gamma' in r for _, r in blocked)
+
+    def test_empty_intents_with_aggregator_does_not_raise(self):
+        book = CentralRiskBook(short_vega_limit=1.0,
+                               greeks_aggregator=_FakeGreeks(vega=-9_999.0))
+        assert book.check([], cash_portfolio()) == ([], [])
+
+    def test_builtin_block_is_not_reclassified_by_the_gate(self):
+        # An intent the gross cap already blocks never reaches `approved`,
+        # so the Greeks gate leaves it with its original gross reason.
+        book = CentralRiskBook(max_gross=0.05, short_vega_limit=1_000.0,
+                               greeks_aggregator=_FakeGreeks(vega=-2_000.0))
+        approved, blocked = book.check([intent('AAA', 'BUY', 0.1)],
+                                       cash_portfolio())
+        assert approved == []
+        assert len(blocked) == 1 and 'gross' in blocked[0][1]
+
+    def test_real_aggregator_blocks_open(self):
+        # End-to-end with the real PortfolioGreeksAggregator: a held short
+        # call (-5 contracts, +8 per-share vega) -> short vega 4,000 > cap.
+        from portfolio.greeks_aggregator import PortfolioGreeksAggregator
+        opt = Asset(symbol='AAA', asset_type=AssetType.CALL,
+                    strike_price=105.0, expiration_date='2022-03-18')
+        portfolio = cash_portfolio()
+        portfolio.add_position(Position(
+            asset=opt, quantity=-5, avg_entry_price=1.0, current_price=1.0,
+            timestamp=datetime(2022, 1, 3)))
+        agg = PortfolioGreeksAggregator(
+            lambda a: {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0,
+                       'vega': 8.0})
+        book = CentralRiskBook(short_vega_limit=1_000.0,
+                               greeks_aggregator=agg)
+        approved, blocked = book.check([intent('BBB', 'BUY', 0.1)],
+                                       portfolio)
+        assert approved == []
+        assert any('short vega' in r for _, r in blocked)
