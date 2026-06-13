@@ -87,3 +87,22 @@ def test_multiple_keys_keep_preference_order_then_yfinance(monkeypatch):
     # Preference order (fmp, tiingo, intrinio) filtered to configured keys,
     # then yfinance — fmp absent because its key is unset.
     assert providers == ['tiingo', 'intrinio', 'yfinance']
+
+
+def test_ensure_ssl_certs_points_at_certifi_when_unset(monkeypatch):
+    """aiohttp-based providers (Tiingo) fail with 'certificate verify failed'
+    on python.org macOS builds; the handler points SSL_CERT_FILE at the
+    certifi bundle when nothing is configured."""
+    import os
+    import certifi
+    monkeypatch.delenv('SSL_CERT_FILE', raising=False)
+    monkeypatch.delenv('REQUESTS_CA_BUNDLE', raising=False)
+    MarketDataHandler._ensure_ssl_certs()
+    assert os.environ.get('SSL_CERT_FILE') == certifi.where()
+
+
+def test_ensure_ssl_certs_respects_existing(monkeypatch):
+    import os
+    monkeypatch.setenv('SSL_CERT_FILE', '/custom/ca.pem')
+    MarketDataHandler._ensure_ssl_certs()
+    assert os.environ['SSL_CERT_FILE'] == '/custom/ca.pem'

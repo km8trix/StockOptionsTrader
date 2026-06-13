@@ -31,6 +31,27 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", _network_blocked)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_provider_env(monkeypatch):
+    """Keep tests independent of the developer's real .env: clear every data-
+    provider AND broker credential so credential-resolution assertions
+    (provider order, E*TRADE 'unconfigured'/scoped-key behavior) are
+    deterministic whether or not pytest was run with `.env` sourced. Tests
+    that need a specific key present set it themselves. Runs before
+    per-test env fixtures (autouse), so their setenv()s win."""
+    for env in (
+        # OpenBB data providers
+        "FMP_API_KEY", "TIINGO_TOKEN", "INTRINIO_API_KEY",
+        # E*TRADE: generic + env-scoped consumer pairs, tokens, account, mode
+        "ETRADE_CONSUMER_KEY", "ETRADE_CONSUMER_SECRET",
+        "ETRADE_SANDBOX_CONSUMER_KEY", "ETRADE_SANDBOX_CONSUMER_SECRET",
+        "ETRADE_PROD_CONSUMER_KEY", "ETRADE_PROD_CONSUMER_SECRET",
+        "ETRADE_ACCESS_TOKEN", "ETRADE_ACCESS_SECRET", "ETRADE_ACCOUNT_ID_KEY",
+        "ETRADE_ENV", "ETRADE_PRODUCTION_ACK", "ETRADE_ALLOW_NETWORK",
+    ):
+        monkeypatch.delenv(env, raising=False)
+
+
 @pytest.fixture
 def make_ohlcv():
     """Factory producing seeded synthetic OHLCV DataFrames.

@@ -93,9 +93,27 @@ class MarketDataHandler:
                 logger.warning("Could not apply %s credential to OpenBB: %s",
                                name, e)
 
+    @staticmethod
+    def _ensure_ssl_certs() -> None:
+        """Point Python's TLS at the certifi CA bundle if no cert file is
+        configured. python.org macOS builds ship without system CA certs, so
+        OpenBB providers that use aiohttp (e.g. Tiingo) otherwise fail with
+        'certificate verify failed'. Idempotent and non-destructive: respects
+        an SSL_CERT_FILE the user/system already set."""
+        if os.environ.get('SSL_CERT_FILE'):
+            return
+        try:
+            import certifi
+            bundle = certifi.where()
+            os.environ.setdefault('SSL_CERT_FILE', bundle)
+            os.environ.setdefault('REQUESTS_CA_BUNDLE', bundle)
+        except Exception as e:  # noqa: BLE001 — cert plumbing is best-effort
+            logger.warning("Could not configure SSL_CERT_FILE from certifi: %s", e)
+
     def _get_openbb(self):
         """Import OpenBB only when it is needed; initialization can touch user-level files."""
         try:
+            self._ensure_ssl_certs()
             from openbb import obb
             self._apply_credentials(obb)
             return obb
