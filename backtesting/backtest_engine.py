@@ -162,7 +162,22 @@ class BacktestEngine:
                 asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
                 existing_pos = self.portfolio.get_position(asset)
                 if existing_pos:
-                    existing_pos.current_price = float(data.loc[date, 'close'])
+                    close = float(data.loc[date, 'close'])
+                    # A non-finite close (NaN from a missing/halted bar, or a
+                    # +/-inf from a provider parse glitch) must NOT overwrite
+                    # the mark: a single bad value flows through
+                    # get_portfolio_value() and turns the WHOLE equity curve —
+                    # and every downstream metric (Sharpe, drawdown, Calmar) —
+                    # into NaN/inf while the backtest still "completes"
+                    # silently. np.isfinite catches NaN AND inf (np.isnan
+                    # would let inf through). Keep the prior mark and surface.
+                    if not np.isfinite(close):
+                        logger.warning(
+                            "Non-finite close (%s) for %s on %s; keeping prior "
+                            "mark %s", close, symbol, date,
+                            existing_pos.current_price)
+                    else:
+                        existing_pos.current_price = close
             if self.desk is not None:
                 self._mark_option_positions(all_data, date)
 

@@ -188,6 +188,63 @@ class TestMissingOpenFallback:
         assert trade['price'] == pytest.approx(expected_fill)
 
 
+class TestNaNCloseMarkGuard:
+    """Phase 0: a NaN close on a mark-to-market day must NOT overwrite an open
+    position's price. Before the guard, one NaN flowed through
+    get_portfolio_value() and turned the WHOLE equity curve — and every
+    metric — into NaN while the backtest still 'completed'."""
+
+    def test_nan_close_keeps_prior_mark_and_metrics_stay_finite(
+            self, make_ohlcv, patch_market_data):
+        df = make_ohlcv(n_days=20, seed=23)
+        dates = df.index
+        # Open a position early (buy at dates[3] -> fills dates[4]), then a
+        # later mark day (dates[8]) reports a NaN close.
+        df.loc[dates[8], 'close'] = np.nan
+        patch_market_data({'TEST': df})
+
+        strategy = ScriptedStrategy(buy_date=dates[3])
+        engine = BacktestEngine(strategy, initial_capital=100000.0,
+                                commission=COMMISSION)
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31',
+                            position_size=0.1)
+
+        # 1. No snapshot is poisoned to NaN.
+        values = [h['portfolio_value'] for h in report['portfolio_history']]
+        assert len(values) == len(dates)
+        assert all(np.isfinite(v) for v in values)
+
+        # 2. On the NaN-close day the position kept its PRIOR (dates[7]) mark.
+        buy = engine.trades_log[0]
+        cash_after_buy = 100000.0 - buy['cost']
+        prior_close = float(df.loc[dates[7], 'close'])
+        expected = cash_after_buy + buy['quantity'] * prior_close
+        assert report['portfolio_history'][8]['portfolio_value'] == pytest.approx(
+            expected)
+
+        # 3. Downstream metrics are real numbers, not NaN.
+        assert np.isfinite(engine.portfolio.get_sharpe_ratio())
+        assert np.isfinite(report['summary']['current_value'])
+
+    def test_inf_close_is_also_rejected(self, make_ohlcv, patch_market_data):
+        # np.isnan would let +inf through; the guard uses np.isfinite, so an
+        # inf close (provider parse glitch) cannot poison the equity curve.
+        df = make_ohlcv(n_days=20, seed=29)
+        dates = df.index
+        df.loc[dates[8], 'close'] = np.inf
+        patch_market_data({'TEST': df})
+
+        strategy = ScriptedStrategy(buy_date=dates[3])
+        engine = BacktestEngine(strategy, initial_capital=100000.0,
+                                commission=COMMISSION)
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31',
+                            position_size=0.1)
+
+        values = [h['portfolio_value'] for h in report['portfolio_history']]
+        assert all(np.isfinite(v) for v in values)
+        assert np.isfinite(engine.portfolio.get_sharpe_ratio())
+
+
 class TestLastDaySignals:
     def test_signal_on_final_day_never_fills_and_is_reported_pending(
             self, make_ohlcv, patch_market_data):

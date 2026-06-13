@@ -266,11 +266,33 @@ class OptionsDataHandler:
         df = raw.copy()
 
         df['dte'] = df['expiration'].map(lambda d: (d - today).days)
+        # Only trust a bid/ask midpoint when BOTH are positive AND the spread
+        # is not inverted (bid <= ask). A provider glitch like bid=100/ask=50
+        # would otherwise yield a nonsensical mid (75) that silently corrupts
+        # moneyness filtering and IV selection; fall back to last in that case.
+        inverted = (df['bid'] > 0) & (df['ask'] > 0) & (df['bid'] > df['ask'])
+        n_inverted = int(inverted.sum())
+        if n_inverted:
+            logger.warning(
+                "%d contracts have an inverted bid/ask spread (bid > ask); "
+                "using last for mid", n_inverted)
+        valid_quote = (df['bid'] > 0) & (df['ask'] > 0) & (df['bid'] <= df['ask'])
         df['mid'] = np.where(
-            (df['bid'] > 0) & (df['ask'] > 0),
+            valid_quote,
             (df['bid'] + df['ask']) / 2.0,
             df['last'],
         )
+        # A contract with no valid quote AND no last (illiquid/new strikes)
+        # leaves mid as NaN. We keep the row (sparse contracts are retained by
+        # contract — see _normalize_raw), but a NaN mid that flows silently
+        # into moneyness/IV math is exactly the corruption to surface: warn so
+        # downstream consumers know to guard rather than discovering it as a
+        # mystery NaN.
+        n_nan_mid = int(df['mid'].isna().sum())
+        if n_nan_mid:
+            logger.warning(
+                "%d contracts have no usable mid (no valid quote and no last); "
+                "mid is NaN — consumers must guard", n_nan_mid)
 
         df = df[df['dte'] >= min_dte]
         if max_dte is not None:

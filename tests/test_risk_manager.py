@@ -4,6 +4,7 @@ regression test for the entry_price -> avg_entry_price crash (Phase 1 B1)."""
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,9 +203,110 @@ class TestReporting:
     def test_get_report_shape(self):
         rm = RiskManager()
         report = rm.get_report()
+        # 'unevaluated' is on the reporting surface so a consumer seeing
+        # violations=[] can still tell that correlation/sector caps were
+        # SKIPPED, not passed (no false green).
         assert set(report.keys()) == {
-            'timestamp', 'trading_allowed', 'violations',
+            'timestamp', 'trading_allowed', 'violations', 'unevaluated',
             'daily_loss', 'max_daily_loss',
         }
         assert report['trading_allowed'] is True
         assert report['violations'] == []
+        assert report['unevaluated'] == []
+
+    def test_get_report_surfaces_unevaluated_after_skipped_limits(self):
+        rm = RiskManager()
+        # No sector tags, no returns -> both caps unevaluated, recorded.
+        rm.check_all_constraints({}, 100000.0, 0.0)
+        report = rm.get_report()
+        assert report['violations'] == []
+        assert any('correlation' in u for u in report['unevaluated'])
+        assert any('sector' in u for u in report['unevaluated'])
+
+
+def _sector_pos(sector, notional):
+    """A position whose asset carries a 'sector' tag (core.models.Asset has
+    none, so concentration tests synthesize one)."""
+    return SimpleNamespace(asset=SimpleNamespace(sector=sector),
+                           current_price=notional, quantity=1)
+
+
+class TestCheckCorrelation:
+    """Phase 0: max_correlation was dead config — now a real, enforced check."""
+
+    def test_perfectly_correlated_pair_violates(self):
+        rm = RiskManager(max_correlation=0.8)
+        a = [0.01, -0.02, 0.03, -0.01, 0.02]
+        returns = {'A': a, 'B': [2 * x + 1 for x in a]}  # corr == 1.0
+        assert rm.check_correlation(returns) is False
+        assert any('Correlation' in v for v in rm.violations)
+
+    def test_anticorrelated_pair_also_violates_on_abs(self):
+        rm = RiskManager(max_correlation=0.8)
+        a = [0.01, -0.02, 0.03, -0.01, 0.02]
+        returns = {'A': a, 'B': [-x for x in a]}  # corr == -1.0, |corr| == 1
+        assert rm.check_correlation(returns) is False
+
+    def test_orthogonal_pair_passes(self):
+        rm = RiskManager(max_correlation=0.8)
+        returns = {'A': [1.0, -1.0, 1.0, -1.0, 0.0],
+                   'B': [1.0, 1.0, -1.0, -1.0, 0.0]}  # corr == 0.0
+        assert rm.check_correlation(returns) is True
+        assert rm.violations == []
+
+    def test_too_few_series_is_noop(self):
+        rm = RiskManager(max_correlation=0.8)
+        assert rm.check_correlation({'A': [0.01, 0.02, 0.03]}) is True
+        assert rm.violations == []
+
+    def test_short_series_recorded_unevaluated(self):
+        rm = RiskManager(max_correlation=0.8)
+        assert rm.check_correlation({'A': [0.01, 0.02], 'B': [0.01, 0.02]}) is True
+        assert any('correlation' in u for u in rm.unevaluated)
+
+
+class TestCheckPortfolioSectorConcentration:
+    def test_over_concentration_violates(self):
+        rm = RiskManager(max_sector_exposure=0.3)
+        positions = {'X': _sector_pos('tech', 40000.0)}  # 40% of 100k
+        assert rm.check_portfolio_sector_concentration(positions, 100000.0) is False
+        assert any('tech' in v for v in rm.violations)
+
+    def test_within_limit_passes(self):
+        rm = RiskManager(max_sector_exposure=0.3)
+        positions = {'X': _sector_pos('tech', 20000.0)}  # 20%
+        assert rm.check_portfolio_sector_concentration(positions, 100000.0) is True
+
+    def test_positions_without_sector_are_noop(self):
+        rm = RiskManager(max_sector_exposure=0.3)
+        # core.models.Asset has no 'sector' field -> ignored, never crashes.
+        positions = {'AAPL': _position(quantity=900, current=100.0)}  # 90k
+        assert rm.check_portfolio_sector_concentration(positions, 100000.0) is True
+
+    def test_fails_closed_on_nonpositive_value(self):
+        rm = RiskManager()
+        assert rm.check_portfolio_sector_concentration(
+            {'X': _sector_pos('tech', 10000.0)}, 0.0) is False
+        assert 'failing closed' in rm.violations[0]
+
+
+class TestCheckAllConstraintsAdditions:
+    def test_correlation_enforced_when_returns_supplied(self):
+        rm = RiskManager()
+        positions = {'AAPL': _position(quantity=100, current=100.0)}  # 10k, ok
+        a = [0.01, -0.02, 0.03, -0.01, 0.02]
+        returns = {'A': a, 'B': [2 * x for x in a]}  # corr == 1.0 > 0.8
+        assert rm.check_all_constraints(positions, 100000.0, 500.0,
+                                        returns=returns) is False
+        assert any('Correlation' in v for v in rm.violations)
+
+    def test_unevaluated_recorded_when_no_data(self):
+        # Sector + correlation cannot be evaluated (no tags, no returns) but
+        # must NOT be silently ignored: they land in `unevaluated`, and the
+        # call still passes on a clean book.
+        rm = RiskManager()
+        positions = {'AAPL': _position(quantity=100, current=100.0)}
+        assert rm.check_all_constraints(positions, 100000.0, 500.0) is True
+        assert rm.violations == []
+        assert any('sector' in u for u in rm.unevaluated)
+        assert any('correlation' in u for u in rm.unevaluated)

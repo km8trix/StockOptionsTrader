@@ -306,9 +306,20 @@ class MarketDataHandler:
         return self._last_fetch_info.get(symbol)
 
     def _empty_data(self, symbol: str) -> pd.DataFrame:
-        """Return an empty result when OpenBB cannot provide data."""
+        """Return a properly-SHAPED empty OHLCV frame when no data is available.
+
+        A bare pd.DataFrame() has zero columns, so a failure-path frame makes
+        downstream data['close'] / .iloc[-1] raise KeyError/IndexError — a
+        hollow frame silently poisons indicator math. This empty frame still
+        carries the OHLCV columns and a named DatetimeIndex, so `.empty` stays
+        True (callers and the cache still detect "no data") while column
+        access remains safe.
+        """
         logger.warning("No OpenBB data available for %s", symbol)
-        return pd.DataFrame()
+        return pd.DataFrame(
+            columns=['open', 'high', 'low', 'close', 'volume'],
+            index=pd.DatetimeIndex([], name='date'),
+        )
     
     def get_current_price(self, symbol: str, date: datetime) -> Optional[float]:
         """Get price for a specific date"""
@@ -365,12 +376,29 @@ class MarketDataHandler:
         
         return data
     
-    def estimate_option_price(self, stock_price: float, strike: float, 
+    def estimate_option_price(self, stock_price: float, strike: float,
                              time_to_expiry: float, volatility: float,
                              option_type: str = 'call', rate: float = 0.05) -> float:
-        """Estimate option price using Black-Scholes"""
+        """Estimate option price using Black-Scholes.
+
+        Guards the degenerate inputs that would otherwise divide by zero in
+        d1 — volatility <= 0 or time_to_expiry <= 0 — and a NaN volatility
+        coming from calculate_volatility on a short window. In those cases
+        returns the discounted intrinsic value (clamped >= 0) rather than
+        raising ZeroDivisionError or returning inf/NaN, which would silently
+        poison any pricing/hedging math downstream.
+        """
         from scipy.stats import norm
-        
+
+        if (not np.isfinite(volatility) or volatility <= 0.0
+                or not np.isfinite(time_to_expiry) or time_to_expiry <= 0.0):
+            discount = np.exp(-rate * max(float(time_to_expiry), 0.0))
+            if option_type.lower() == 'call':
+                intrinsic = stock_price - strike * discount
+            else:
+                intrinsic = strike * discount - stock_price
+            return float(max(intrinsic, 0.0))
+
         d1 = (np.log(stock_price / strike) + (rate + 0.5 * volatility ** 2) * time_to_expiry) / (volatility * np.sqrt(time_to_expiry))
         d2 = d1 - volatility * np.sqrt(time_to_expiry)
         
@@ -382,6 +410,25 @@ class MarketDataHandler:
         return max(price, 0)
     
     def calculate_volatility(self, data: pd.DataFrame, window: int = 20) -> float:
-        """Calculate historical volatility"""
+        """Annualized historical volatility from the trailing `window` returns.
+
+        Returns NaN — never an IndexError on an empty frame, and never a
+        silent value computed from too little data — when there are fewer
+        than `window` + 1 closes (one is consumed by pct_change, so a full
+        `window`-length return sample needs window + 1 bars). A NaN here is
+        an explicit "undefined" that callers must check; estimate_option_price
+        already treats NaN volatility as degenerate and falls back to
+        intrinsic value rather than dividing by zero.
+
+        Note the two distinct sentinels: NaN means "undefined" (too little
+        data), whereas a genuinely flat price series returns 0.0 — real *zero*
+        realized volatility, not undefined. estimate_option_price treats both
+        vol <= 0 and NaN as degenerate, so either is handled safely there.
+        """
+        if data is None or 'close' not in data.columns or len(data) < window + 1:
+            logger.warning(
+                "calculate_volatility: %d closes < required %d; volatility undefined",
+                0 if data is None else len(data), window + 1)
+            return float('nan')
         returns = data['close'].pct_change()
-        return returns.rolling(window=window).std().iloc[-1] * np.sqrt(252)
+        return float(returns.rolling(window=window).std().iloc[-1] * np.sqrt(252))

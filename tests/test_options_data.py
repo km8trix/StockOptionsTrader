@@ -308,3 +308,45 @@ class TestIVHistory:
 
         assert len(bounded) == 1
         assert bounded["atm_iv"].iloc[0] == pytest.approx(0.21)
+
+
+class TestInvertedSpreadGuard:
+    """Phase 0: an inverted bid/ask (bid > ask, a provider glitch) must NOT
+    produce a midpoint between them — it falls back to last."""
+
+    def test_mid_falls_back_to_last_on_inverted_spread(self, tmp_path,
+                                                        monkeypatch):
+        # bid=2.0 > ask=1.0 at an in-band strike; mid must be last (1.75),
+        # not the nonsensical (2.0 + 1.0)/2 = 1.5 the OLD code returned.
+        inverted = [_contract(EXP_30, 100.0, 'call', bid=2.0, ask=1.0,
+                              last=1.75)]
+        fake = FakeOBB(inverted)
+        h = OptionsDataHandler(db_path=str(tmp_path / "inv.db"),
+                               now_fn=lambda: FIXED_NOW)
+        monkeypatch.setattr(OptionsDataHandler, "_get_openbb",
+                            lambda self: fake)
+
+        chain = h.fetch_chain("SPY")
+        row = chain.iloc[0]
+        inverted_midpoint = (2.0 + 1.0) / 2  # = 1.5, what the OLD code returned
+        assert row["mid"] == pytest.approx(1.75)            # == last
+        assert row["mid"] != pytest.approx(inverted_midpoint)
+
+    def test_no_quote_and_nan_last_warns_about_unusable_mid(
+            self, tmp_path, monkeypatch, caplog):
+        # bid>0/ask=0 (not inverted, just one-sided) with a NaN last leaves
+        # mid NaN. The row is KEPT (sparse contracts are retained), but the
+        # NaN must be SURFACED, not silently propagated into moneyness/IV math.
+        bad = [_contract(EXP_30, 100.0, 'call', bid=1.0, ask=0.0,
+                         last=float('nan'))]
+        fake = FakeOBB(bad)
+        h = OptionsDataHandler(db_path=str(tmp_path / "nanmid.db"),
+                               now_fn=lambda: FIXED_NOW)
+        monkeypatch.setattr(OptionsDataHandler, "_get_openbb",
+                            lambda self: fake)
+
+        with caplog.at_level(logging.WARNING):
+            chain = h.fetch_chain("SPY")
+
+        assert np.isnan(chain.iloc[0]["mid"])
+        assert any("no usable mid" in r.message for r in caplog.records)
