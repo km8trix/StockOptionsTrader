@@ -54,12 +54,15 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from core.models import Asset, AssetType, Order, OrderType, OrderStatus, Position
 from desks.base import Desk
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
 from strategies.base import Strategy
+
+if TYPE_CHECKING:  # annotation only — avoids any import-order coupling
+    from desks.orchestrator import FundOrchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +81,20 @@ class BacktestEngine:
                  commission: float = 0.001, slippage_bps: float = 5.0,
                  desk: Optional[Desk] = None,
                  spread_pct: float = 0.02,
-                 per_contract_commission: float = 0.65):
-        if (strategy is None) == (desk is None):
+                 per_contract_commission: float = 0.65,
+                 orchestrator: Optional['FundOrchestrator'] = None):
+        if sum(driver is not None
+               for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
-                "Provide exactly one of strategy= or desk= to BacktestEngine")
+                "Provide exactly one of strategy=, desk= or orchestrator= "
+                "to BacktestEngine")
         self.strategy = strategy
         self.desk = desk
+        # Fund mode: an orchestrator drives N desks against the shared
+        # portfolio. It exposes the desk read surface the engine needs
+        # (capital_allocation, price_option, notes, walk_forward_fits), so
+        # the desk-mode fill/mark/settle/report paths work for it too.
+        self.orchestrator = orchestrator
         self.portfolio = PortfolioManager(initial_capital)
         self.commission = commission
         self.slippage_bps = slippage_bps
@@ -100,6 +111,25 @@ class BacktestEngine:
         # (fraction of the DESK'S capital). A new intent for an asset
         # replaces an older pending one.
         self.pending_intents: Dict[Asset, Dict] = {}
+
+    @property
+    def _desk_mode(self) -> bool:
+        """True when a desk OR an orchestrator drives the engine — the modes
+        that settle/mark/queue options and emit desk reports."""
+        return self.desk is not None or self.orchestrator is not None
+
+    @property
+    def _driver(self):
+        """The desk or orchestrator driving this run (None in strategy mode).
+        Both expose key/name/notes/walk_forward_fits/price_option, so the
+        desk-mode paths read whichever is set off this one accessor."""
+        return self.desk if self.desk is not None else self.orchestrator
+
+    def _price_option(self, asset: Asset, underlying_frame: pd.DataFrame,
+                      date, spot: float) -> Optional[float]:
+        """Synthetic option fair value via the driver (desk or orchestrator;
+        the orchestrator routes to the owning options desk)."""
+        return self._driver.price_option(asset, underlying_frame, date, spot)
 
     def run(self, symbols: List[str], start_date: str, end_date: str,
             position_size: float = 0.1,
@@ -149,7 +179,7 @@ class BacktestEngine:
         total_days = len(sorted_dates)
         for day_number, date in enumerate(sorted_dates, start=1):
             # --- PHASE 0 (desk mode): SETTLE OPTIONS PAST EXPIRY ---
-            if self.desk is not None:
+            if self._desk_mode:
                 self._settle_expired_options(all_data, date)
 
             # --- PHASE 1: FILL PENDING INTENTS AT TODAY'S OPEN ---
@@ -178,11 +208,13 @@ class BacktestEngine:
                             existing_pos.current_price)
                     else:
                         existing_pos.current_price = close
-            if self.desk is not None:
+            if self._desk_mode:
                 self._mark_option_positions(all_data, date)
 
             # --- PHASE 3: SIGNALS ON DATA THROUGH TODAY, QUEUED FOR TOMORROW ---
-            if self.desk is not None:
+            if self.orchestrator is not None:
+                self._run_orchestrator_step(all_data, date)
+            elif self.desk is not None:
                 self._queue_desk_intents(all_data, date)
             else:
                 for symbol, data in all_data.items():
@@ -263,6 +295,43 @@ class BacktestEngine:
                 'quantity': intent.quantity,
             }
 
+    def _run_orchestrator_step(self, all_data: Dict[str, pd.DataFrame],
+                               date) -> None:
+        """Fund-mode PHASE 3: drive N desks through the orchestrator and
+        queue the netted, risk-approved intents for the next bar's open.
+
+        Mirrors _queue_desk_intents: builds the same per-symbol
+        indicator-enriched frames sliced through today (no future leakage),
+        sets the orchestrator clock (which cascades to every sub-desk), and
+        runs orchestrator.step (generate_intents per desk -> net -> one
+        account-wide apply_risk). Approved intents carry an ACCOUNT-ABSOLUTE
+        size_fraction, so _fill_intent sizes them with no per-desk capital
+        math (orchestrator.capital_allocation is 1.0).
+        """
+        self.orchestrator.set_clock(date)
+
+        enriched: Dict[str, pd.DataFrame] = {}
+        for symbol, data in all_data.items():
+            historical_data = data[data.index <= date]
+            if historical_data.empty:
+                continue
+            enriched[symbol] = self.market_data.calculate_indicators(
+                historical_data.copy())
+
+        if not enriched:
+            return
+
+        approved = self.orchestrator.step(enriched, date, self.portfolio)
+        for intent in approved:
+            # A new intent for an asset replaces an older pending one.
+            self.pending_intents[intent.asset] = {
+                'signal': intent.action,
+                'signal_date': date,
+                'days_waiting': 0,
+                'size_fraction': intent.size_fraction,
+                'quantity': intent.quantity,
+            }
+
     def _fill_pending_intents(self, all_data: Dict[str, pd.DataFrame],
                               date, position_size: float) -> None:
         """Fill intents queued on previous days at today's open price.
@@ -292,7 +361,7 @@ class BacktestEngine:
             is_option = asset.asset_type in (AssetType.CALL, AssetType.PUT)
             if is_option and not pd.isna(fill_base):
                 # Fill spot = the underlying's OPEN today (fill_base).
-                model_price = self.desk.price_option(
+                model_price = self._price_option(
                     asset, data[data.index <= date], date,
                     spot=float(fill_base))
                 fill_base = (float(model_price) if model_price is not None
@@ -356,8 +425,12 @@ class BacktestEngine:
                 return
             quantity = intent.get('quantity')
             if quantity is None:
-                size_fraction = (self.desk.capital_allocation
-                                 * intent.get('size_fraction', 0.0))
+                if self.orchestrator is not None:
+                    # Orchestrator intents are already account-absolute.
+                    size_fraction = intent.get('size_fraction', 0.0)
+                else:
+                    size_fraction = (self.desk.capital_allocation
+                                     * intent.get('size_fraction', 0.0))
                 trade_value = (self.portfolio.get_portfolio_value()
                                * size_fraction)
                 per_contract = max(fill_price, MIN_OPTION_HAIRCUT) * asset.multiplier
@@ -451,7 +524,7 @@ class BacktestEngine:
             close = data.loc[date, 'close']
             if pd.isna(close):
                 continue
-            price = self.desk.price_option(
+            price = self._price_option(
                 asset, data[data.index <= date], date, spot=float(close))
             if price is not None:
                 position.current_price = float(price)
@@ -522,15 +595,20 @@ class BacktestEngine:
         value). Commission semantics: cost = qty * fill * (1 + commission)
         on a buy; proceeds = qty * fill * (1 - commission) on a sell.
 
-        SHORT/COVER (desk mode only, contract C4): SHORT opens a NEGATIVE
+        SHORT/COVER (desk OR fund mode, contract C4): SHORT opens a NEGATIVE
         position of -qty shares with proceeds credited to cash (margin is
         not modeled — cash-account approximation); COVER closes the full
         short, debiting cash, and records the Trade with the negative
-        quantity (Trade.pnl = qty * (exit - entry) is sign-correct).
+        quantity (Trade.pnl = qty * (exit - entry) is sign-correct). Gated on
+        self._desk_mode, so a fund's netted-SHORT residual and account-level
+        COVER fill the same way a single desk's do.
         """
         signal = intent['signal']
         slippage = self.slippage_bps / 10000.0
-        if self.desk is not None and 'size_fraction' in intent:
+        if self.orchestrator is not None and 'size_fraction' in intent:
+            # Orchestrator intents are already account-absolute fractions.
+            position_size = intent['size_fraction']
+        elif self.desk is not None and 'size_fraction' in intent:
             position_size = self.desk.capital_allocation * intent['size_fraction']
 
         if base_price <= 0:
@@ -600,7 +678,7 @@ class BacktestEngine:
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
 
-        elif signal == 'SHORT' and self.desk is not None \
+        elif signal == 'SHORT' and self._desk_mode \
                 and (not existing_pos or existing_pos.quantity == 0):
             # A short is a SELL: adverse slippage means a LOWER fill.
             fill_price = base_price * (1 - slippage)
@@ -635,7 +713,7 @@ class BacktestEngine:
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
 
-        elif signal == 'COVER' and self.desk is not None \
+        elif signal == 'COVER' and self._desk_mode \
                 and existing_pos and existing_pos.quantity < 0:
             # A cover is a BUY: adverse slippage means a HIGHER fill.
             fill_price = base_price * (1 + slippage)
@@ -716,7 +794,7 @@ class BacktestEngine:
 
         report = {
             'strategy': (self.strategy.name if self.strategy is not None
-                         else self.desk.name),
+                         else self._driver.name),
             'summary': summary,
             'benchmark': benchmark,
             'drawdown_series': self.portfolio.get_drawdown_series(),
@@ -750,32 +828,44 @@ class BacktestEngine:
             ],
         }
 
-        if self.desk is not None:
-            report['desk'] = {'key': self.desk.key, 'name': self.desk.name}
+        if self._desk_mode:
+            driver = self._driver
+            report['desk'] = {'key': driver.key, 'name': driver.name}
             report['trader_notes'] = [note.to_dict()
-                                      for note in self.desk.notes]
+                                      for note in driver.notes]
             report['walk_forward'] = [fit.to_dict()
-                                      for fit in self.desk.walk_forward_fits]
+                                      for fit in driver.walk_forward_fits]
             # Contract C5: desks with a regime model expose regime_series;
             # included only when non-empty (FoundationDesk stays unchanged).
-            regime_series = getattr(self.desk, 'regime_series', None)
+            regime_series = getattr(driver, 'regime_series', None)
             if regime_series:
                 report['regime_series'] = list(regime_series)
             # Contract C8: desks with pod accounting expose pod_history;
             # included only when non-empty (Foundation/Renaissance reports
             # stay byte-identical).
-            pod_history = getattr(self.desk, 'pod_history', None)
+            pod_history = getattr(driver, 'pod_history', None)
             if pod_history:
                 report['pod_history'] = list(pod_history)
             # Contract C11: desks with multi-leg options structures
             # expose structures_report (janestreet only; other desks
             # lack the attribute, so their reports are byte-identical).
-            structures = getattr(self.desk, 'structures_report', None)
+            structures = getattr(driver, 'structures_report', None)
             if structures is not None:
                 report['structures'] = list(structures)
             # Contract C12: daily desk-level portfolio Greeks series.
-            greeks_series = getattr(self.desk, 'greeks_series', None)
+            greeks_series = getattr(driver, 'greeks_series', None)
             if greeks_series is not None:
                 report['greeks_series'] = list(greeks_series)
+            # Fund mode (additive): per-desk roster + capital + conflicts.
+            # Single-desk reports carry NO 'orchestrator' key (byte-identical).
+            if self.orchestrator is not None:
+                report['orchestrator'] = {
+                    'desks': [{'key': d.key, 'name': d.name,
+                               'capital_allocation': d.capital_allocation,
+                               'notes_count': len(d.notes)}
+                              for d in self.orchestrator.desks],
+                    'active_capital': self.orchestrator.active_capital,
+                    'conflicts_resolved': self.orchestrator.conflicts_resolved,
+                }
 
         return report
