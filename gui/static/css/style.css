@@ -1168,3 +1168,77 @@ th.sortable .sort-arrow {
 
 .recon-result.recon-ok  { color: var(--gain); }
 .recon-result.recon-bad { color: var(--loss); }
+
+/* ==========================================================================
+   Live trading surface: account metric chips, quotes, order ticket
+   ========================================================================== */
+
+/* Balance metric chips (net value / cash available) */
+.metric-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+}
+
+.metric-chip {
+    flex: 1 1 140px;
+    background-color: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: var(--sp-2) var(--sp-3);
+}
+
+.metric-chip-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+}
+
+.metric-chip-value {
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.account-select,
+.quote-input { min-width: 180px; }
+
+.quote-note { font-style: italic; }
+
+/* Order ticket */
+.ticket-account-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+.ticket-pane {
+    border-top: 1px solid var(--border);
+    padding-top: var(--sp-3);
+}
+
+.ticket-leg-caption {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: var(--sp-2) 0;
+}
+
+.ticket-kill-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--loss);
+}
+
+.preview-result:empty { display: none; }
+
+.preview-ok {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--gain);
+}

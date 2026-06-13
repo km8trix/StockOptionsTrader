@@ -60,6 +60,305 @@
         </div>
     </div>
 
+    <!-- ==================== ACCOUNT ==================== -->
+    <!-- Populated by live.js ONLY while connected: an account <select>
+         (type + desc + masked number), balance metric chips, and a
+         positions table. All values painted with textContent. -->
+    <div class="col-lg-7">
+        <div class="card h-100" id="accountCard">
+            <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <span><i class="bi bi-wallet2" aria-hidden="true"></i> Account</span>
+                <div class="d-flex align-items-center gap-2">
+                    <label class="visually-hidden" for="accountSelect">Account</label>
+                    <select class="form-select form-select-sm account-select d-none" id="accountSelect"></select>
+                </div>
+            </div>
+            <div class="card-body" id="accountBody" aria-live="polite">
+                <div class="empty-state">
+                    <i class="bi bi-wallet2" aria-hidden="true"></i>
+                    <div class="empty-msg">Connect to load accounts</div>
+                    <div class="empty-hint">Once an E*TRADE session is connected,
+                        your accounts, balances and positions appear here.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== QUOTES ==================== -->
+    <div class="col-lg-5">
+        <div class="card h-100" id="quoteCard">
+            <div class="card-header">
+                <i class="bi bi-graph-up" aria-hidden="true"></i> Quotes
+            </div>
+            <div class="card-body d-flex flex-column gap-2" aria-live="polite">
+                <div class="d-flex flex-wrap align-items-end gap-2">
+                    <div class="flex-grow-1">
+                        <label class="form-label" for="quoteSymbols">Symbols (comma-separated)</label>
+                        <input type="text" class="form-control quote-input" id="quoteSymbols"
+                               maxlength="200" autocomplete="off" placeholder="SPY, AAPL, QQQ">
+                    </div>
+                    <button type="button" class="btn btn-outline-secondary" id="btnQuotes">
+                        <i class="bi bi-search" aria-hidden="true"></i> Look up
+                    </button>
+                </div>
+                <p class="quote-note ks-footnote mb-1">
+                    Sandbox quotes are canned and may not match the requested
+                    symbol — that is expected from E*TRADE's sandbox.
+                </p>
+                <div class="table-responsive">
+                    <table class="table d-none" id="quoteTable">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th class="num">Bid</th>
+                                <th class="num">Ask</th>
+                                <th class="num">Last</th>
+                            </tr>
+                        </thead>
+                        <tbody id="quoteBody"></tbody>
+                    </table>
+                </div>
+                <div id="quoteEmpty"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== ORDER TICKET ==================== -->
+    <!-- The core. Equity + defined-risk spread (vertical / iron condor) +
+         optional single-leg option. PREVIEW (POST /order/preview) returns
+         an order_ref and the estimated cost/margin; PLACE (POST
+         /order/place) submits ONLY that previewed ref. The Place button is
+         disabled until a fresh preview exists and re-disables on ANY field
+         edit, so a stale preview is never placeable. The kill-switch banner
+         disables Place with an explanatory tooltip while engaged. -->
+    <div class="col-12">
+        <div class="card" id="orderTicketCard">
+            <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <span><i class="bi bi-receipt" aria-hidden="true"></i> Order ticket</span>
+                <span class="card-header-hint">preview → place · defined-risk</span>
+            </div>
+            <div class="card-body" aria-live="polite">
+                <div id="ticketDisconnected" class="empty-state">
+                    <i class="bi bi-lock" aria-hidden="true"></i>
+                    <div class="empty-msg">Order ticket locked</div>
+                    <div class="empty-hint">Connect to E*TRADE and select an
+                        account to build an order.</div>
+                </div>
+
+                <form id="orderTicketForm" class="d-none" autocomplete="off">
+                    <div class="d-flex flex-wrap align-items-end gap-3 mb-3">
+                        <div>
+                            <label class="form-label" for="ticketKind">Order kind</label>
+                            <select class="form-select ticket-input" id="ticketKind">
+                                <option value="equity">Equity</option>
+                                <option value="option">Option (single leg)</option>
+                                <option value="spread">Spread (vertical / iron condor)</option>
+                            </select>
+                        </div>
+                        <div id="ticketAccountWrap">
+                            <span class="form-label d-block">Account</span>
+                            <span id="ticketAccountLabel" class="ticket-account-label num">—</span>
+                        </div>
+                    </div>
+
+                    <!-- EQUITY -->
+                    <div class="ticket-pane" id="paneEquity">
+                        <div class="row g-2">
+                            <div class="col-sm-3">
+                                <label class="form-label" for="eqSymbol">Symbol</label>
+                                <input type="text" class="form-control ticket-input" id="eqSymbol"
+                                       maxlength="12" placeholder="SPY">
+                            </div>
+                            <div class="col-sm-3">
+                                <label class="form-label" for="eqSide">Side</label>
+                                <select class="form-select ticket-input" id="eqSide">
+                                    <option value="BUY">BUY</option>
+                                    <option value="SELL">SELL</option>
+                                </select>
+                            </div>
+                            <div class="col-sm-3">
+                                <label class="form-label" for="eqQty">Quantity</label>
+                                <input type="number" class="form-control ticket-input" id="eqQty"
+                                       min="1" step="1" inputmode="numeric" placeholder="100">
+                            </div>
+                            <div class="col-sm-3">
+                                <label class="form-label" for="eqLimit">Limit price (optional)</label>
+                                <input type="number" class="form-control ticket-input" id="eqLimit"
+                                       min="0" step="0.01" inputmode="decimal" placeholder="market">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- OPTION (single leg) -->
+                    <div class="ticket-pane d-none" id="paneOption">
+                        <div class="row g-2">
+                            <div class="col-sm-2">
+                                <label class="form-label" for="optSymbol">Underlying</label>
+                                <input type="text" class="form-control ticket-input" id="optSymbol"
+                                       maxlength="12" placeholder="SPY">
+                            </div>
+                            <div class="col-sm-2">
+                                <label class="form-label" for="optCallPut">Type</label>
+                                <select class="form-select ticket-input" id="optCallPut">
+                                    <option value="CALL">CALL</option>
+                                    <option value="PUT">PUT</option>
+                                </select>
+                            </div>
+                            <div class="col-sm-2">
+                                <label class="form-label" for="optStrike">Strike</label>
+                                <input type="number" class="form-control ticket-input" id="optStrike"
+                                       min="0" step="0.5" inputmode="decimal" placeholder="450">
+                            </div>
+                            <div class="col-sm-2">
+                                <label class="form-label" for="optExpiry">Expiry</label>
+                                <input type="date" class="form-control ticket-input" id="optExpiry">
+                            </div>
+                            <div class="col-sm-2">
+                                <label class="form-label" for="optAction">Action</label>
+                                <select class="form-select ticket-input" id="optAction">
+                                    <option value="BUY_OPEN">BUY_OPEN</option>
+                                    <option value="SELL_OPEN">SELL_OPEN</option>
+                                    <option value="BUY_CLOSE">BUY_CLOSE</option>
+                                    <option value="SELL_CLOSE">SELL_CLOSE</option>
+                                </select>
+                            </div>
+                            <div class="col-sm-2">
+                                <label class="form-label" for="optQty">Contracts</label>
+                                <input type="number" class="form-control ticket-input" id="optQty"
+                                       min="1" step="1" inputmode="numeric" placeholder="1">
+                            </div>
+                            <div class="col-sm-2">
+                                <label class="form-label" for="optLimit">Limit (optional)</label>
+                                <input type="number" class="form-control ticket-input" id="optLimit"
+                                       min="0" step="0.01" inputmode="decimal" placeholder="market">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SPREAD (vertical / iron condor) -->
+                    <div class="ticket-pane d-none" id="paneSpread">
+                        <div class="row g-2 mb-2">
+                            <div class="col-sm-3">
+                                <label class="form-label" for="spPreset">Preset</label>
+                                <select class="form-select ticket-input" id="spPreset">
+                                    <option value="vertical">Vertical (2 legs)</option>
+                                    <option value="iron_condor">Iron condor (4 legs)</option>
+                                </select>
+                            </div>
+                            <div class="col-sm-3">
+                                <label class="form-label" for="spSymbol">Underlying</label>
+                                <input type="text" class="form-control ticket-input" id="spSymbol"
+                                       maxlength="12" placeholder="SPY">
+                            </div>
+                            <div class="col-sm-3">
+                                <label class="form-label" for="spExpiry">Expiry</label>
+                                <input type="date" class="form-control ticket-input" id="spExpiry">
+                            </div>
+                            <div class="col-sm-3">
+                                <label class="form-label" for="spNetCredit">Net credit (+) / debit (−)</label>
+                                <input type="number" class="form-control ticket-input" id="spNetCredit"
+                                       step="0.01" inputmode="decimal" placeholder="1.25">
+                            </div>
+                        </div>
+                        <div id="spVertical">
+                            <p class="ticket-leg-caption">Vertical: short leg (sold) + long leg (bought, the defined-risk wing).</p>
+                            <div class="row g-2">
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spVType">Right</label>
+                                    <select class="form-select ticket-input" id="spVType">
+                                        <option value="PUT">PUT</option>
+                                        <option value="CALL">CALL</option>
+                                    </select>
+                                </div>
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spVShort">Short strike</label>
+                                    <input type="number" class="form-control ticket-input" id="spVShort"
+                                           min="0" step="0.5" inputmode="decimal" placeholder="450">
+                                </div>
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spVLong">Long strike</label>
+                                    <input type="number" class="form-control ticket-input" id="spVLong"
+                                           min="0" step="0.5" inputmode="decimal" placeholder="445">
+                                </div>
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spVQty">Contracts</label>
+                                    <input type="number" class="form-control ticket-input" id="spVQty"
+                                           min="1" step="1" inputmode="numeric" placeholder="1">
+                                </div>
+                            </div>
+                        </div>
+                        <div id="spCondor" class="d-none">
+                            <p class="ticket-leg-caption">Iron condor: short put + long put (lower wing) and short call + long call (upper wing).</p>
+                            <div class="row g-2">
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spCShortPut">Short put</label>
+                                    <input type="number" class="form-control ticket-input" id="spCShortPut"
+                                           min="0" step="0.5" inputmode="decimal" placeholder="445">
+                                </div>
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spCLongPut">Long put</label>
+                                    <input type="number" class="form-control ticket-input" id="spCLongPut"
+                                           min="0" step="0.5" inputmode="decimal" placeholder="440">
+                                </div>
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spCShortCall">Short call</label>
+                                    <input type="number" class="form-control ticket-input" id="spCShortCall"
+                                           min="0" step="0.5" inputmode="decimal" placeholder="460">
+                                </div>
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spCLongCall">Long call</label>
+                                    <input type="number" class="form-control ticket-input" id="spCLongCall"
+                                           min="0" step="0.5" inputmode="decimal" placeholder="465">
+                                </div>
+                                <div class="col-sm-3">
+                                    <label class="form-label" for="spCQty">Contracts</label>
+                                    <input type="number" class="form-control ticket-input" id="spCQty"
+                                           min="1" step="1" inputmode="numeric" placeholder="1">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- PREVIEW RESULT + ACTIONS -->
+                    <div class="d-flex flex-wrap align-items-center gap-2 mt-3">
+                        <button type="button" class="btn btn-outline-secondary" id="btnPreview">
+                            <i class="bi bi-eye" aria-hidden="true"></i> Preview
+                        </button>
+                        <button type="button" class="btn btn-primary" id="btnPlace" disabled
+                                title="Preview an order first.">
+                            <i class="bi bi-send" aria-hidden="true"></i> Place order
+                        </button>
+                        <span id="ticketKillNote" class="ticket-kill-note d-none">
+                            <i class="bi bi-sign-stop-fill" aria-hidden="true"></i>
+                            Kill switch engaged — placement blocked.
+                        </span>
+                    </div>
+                    <div id="previewResult" class="preview-result mt-3"></div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Place-order confirm modal -->
+    <div class="modal fade" id="placeConfirmModal" tabindex="-1" aria-labelledby="placeModalTitle" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title fs-6" id="placeModalTitle">Place this order?</h2>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cancel"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-2">This submits the previewed order to E*TRADE. Confirm only the order you just previewed.</p>
+                    <pre id="placeModalSummary" class="note-data-json"></pre>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="placeModalConfirm">Place order</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- ==================== WORKING ORDERS ==================== -->
     <div class="col-lg-7">
         <div class="card h-100">

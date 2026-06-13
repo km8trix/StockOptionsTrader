@@ -334,11 +334,19 @@ async function disconnect() {
     confirm). */
 function applyStatusPatch(auth) {
     if (!auth) { refreshStatus(); return; }
+    const wasConnected = isConnected();
     liveStatus = { ...(liveStatus || {}), auth, env: auth.env };
     renderEnvBadge(auth.env, true);
     renderAuthBadge(auth.state, true);
     renderNavDot(auth.state, true);
     renderConnection(auth);
+    if (isConnected() && (!wasConnected || !accountsLoaded)) {
+        loadAccounts();
+    } else if (!isConnected()) {
+        accountsLoaded = false;
+        renderAccountBody('expired');
+    }
+    syncOrderTicketGate();
 }
 
 /* ==========================================================================
@@ -438,6 +446,7 @@ async function confirmKillSwitch() {
             kill_switch: { engaged: !!data.engaged },
         };
         renderKillSwitch(liveStatus.kill_switch);
+        syncOrderTicketGate(); // a flip enables/blocks the Place button
         loadAudit(); // every flip is audit-logged — show it immediately
     } catch (_) {
         // toasted by fetchJSON
@@ -713,6 +722,557 @@ async function runReconcile() {
 }
 
 /* ==========================================================================
+   Account panel + quotes + order ticket (live trading surface)
+
+   Render rules (mirror the connection panel / scheduler protections):
+   * The account <select>, the quote input and EVERY order-ticket field
+     belong to the operator — the 10s status poll NEVER rebuilds them. The
+     account select rebuilds only when the set of accounts actually changes
+     (render-keyed); balances/positions repaint on explicit selection.
+   * A fresh PREVIEW is required before PLACE; ANY ticket-field edit voids
+     the preview so a stale preview can never be placed.
+   ========================================================================== */
+
+let accountsLoaded = false;        // accounts fetched at least once this connection
+let lastAccountsKey = null;        // render-key of the account <select>
+let selectedAccountKey = null;     // currently-selected accountIdKey
+let knownAccounts = [];            // last accounts payload (for the ticket label)
+let currentOrderRef = null;        // fresh preview's order_ref (null = stale/none)
+
+/** Is the live session connected right now? */
+function isConnected() {
+    return !!(liveStatus && liveStatus.auth && liveStatus.auth.state === 'connected');
+}
+
+function killSwitchEngaged() {
+    return !!(liveStatus && liveStatus.kill_switch && liveStatus.kill_switch.engaged);
+}
+
+/* -------------------- Account panel -------------------- */
+
+function accountOptionLabel(acct) {
+    const parts = [];
+    if (acct.accountType) parts.push(acct.accountType);
+    if (acct.accountDesc) parts.push(acct.accountDesc);
+    if (acct.accountId_masked) parts.push(acct.accountId_masked);
+    return parts.join(' · ') || (acct.accountIdKey || 'account');
+}
+
+function accountsRenderKey(accounts) {
+    return JSON.stringify(accounts.map((a) => [
+        a.accountIdKey ?? null, a.accountType ?? null,
+        a.accountDesc ?? null, a.accountId_masked ?? null,
+    ]));
+}
+
+function renderAccountSelect(accounts) {
+    const select = document.getElementById('accountSelect');
+    if (!select) return;
+    const key = accountsRenderKey(accounts);
+    if (key === lastAccountsKey) return; // nothing changed — keep selection
+    lastAccountsKey = key;
+
+    select.innerHTML = '';
+    accounts.forEach((acct) => {
+        const opt = document.createElement('option');
+        opt.value = acct.accountIdKey || '';
+        opt.textContent = accountOptionLabel(acct); // textContent only
+        select.appendChild(opt);
+    });
+    select.classList.toggle('d-none', accounts.length === 0);
+
+    // Preserve a still-present selection; otherwise pick the first account.
+    if (selectedAccountKey &&
+        accounts.some((a) => a.accountIdKey === selectedAccountKey)) {
+        select.value = selectedAccountKey;
+    } else if (accounts.length) {
+        selectedAccountKey = accounts[0].accountIdKey;
+        select.value = selectedAccountKey;
+    } else {
+        selectedAccountKey = null;
+    }
+    updateTicketAccountLabel(accounts);
+}
+
+function updateTicketAccountLabel(accounts) {
+    const label = document.getElementById('ticketAccountLabel');
+    if (!label) return;
+    const acct = (accounts || []).find(
+        (a) => a.accountIdKey === selectedAccountKey);
+    label.textContent = acct ? accountOptionLabel(acct) : '—';
+}
+
+function renderAccountBody(state) {
+    // state: 'loading' | 'empty' | 'expired'
+    const body = document.getElementById('accountBody');
+    if (!body) return;
+    if (state === 'expired') {
+        body.innerHTML = emptyStateHTML('bi-plug',
+            'Session not connected',
+            'Connect to E*TRADE to load accounts, balances and positions.');
+    } else if (state === 'loading') {
+        body.innerHTML = emptyStateHTML('bi-hourglass', 'Loading accounts…',
+            'Reading your E*TRADE accounts.');
+    } else {
+        body.innerHTML = emptyStateHTML('bi-wallet2', 'No accounts',
+            'E*TRADE returned no accounts for this session.');
+    }
+}
+
+/** Metric chips + positions table for the selected account. */
+function renderAccountDetail(balances, positions) {
+    const body = document.getElementById('accountBody');
+    if (!body) return;
+    const netValue = pickBalance(balances,
+        ['netAccountValue', 'netValue', 'accountValue']);
+    const cash = pickBalance(balances,
+        ['cashAvailableForInvestment', 'cashBalance',
+            'netCash', 'cashAvailable']);
+
+    const chips =
+        '<div class="metric-chips mb-2">' +
+        metricChip('Net account value', fmtMoney(netValue)) +
+        metricChip('Cash available', fmtMoney(cash)) +
+        '</div>';
+
+    const rows = (positions || []).map(positionRow).join('');
+    const table = (positions && positions.length)
+        ? '<div class="table-responsive"><table class="table">' +
+          '<thead><tr><th>Symbol</th><th class="num">Qty</th>' +
+          '<th class="num">Market value</th><th class="num">P&amp;L</th>' +
+          '</tr></thead>' + `<tbody>${rows}</tbody></table></div>`
+        : emptyStateHTML('bi-inboxes', 'No open positions',
+            'This account holds no positions right now.');
+    body.innerHTML = chips + table;
+}
+
+/** First finite numeric value among candidate balance keys (nested-safe). */
+function pickBalance(balances, keys) {
+    if (!balances || typeof balances !== 'object') return null;
+    for (const key of keys) {
+        const v = deepFind(balances, key);
+        if (Number.isFinite(Number(v))) return Number(v);
+    }
+    return null;
+}
+
+function deepFind(obj, key, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 4) return undefined;
+    if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
+    for (const val of Object.values(obj)) {
+        if (val && typeof val === 'object') {
+            const found = deepFind(val, key, depth + 1);
+            if (found !== undefined) return found;
+        }
+    }
+    return undefined;
+}
+
+function metricChip(label, value) {
+    return '<div class="metric-chip">' +
+        `<div class="metric-chip-label">${escapeHTML(label)}</div>` +
+        `<div class="metric-chip-value num">${escapeHTML(value)}</div></div>`;
+}
+
+function positionRow(pos) {
+    const symbol = pos.symbolDescription || pos.symbol ||
+        (pos.Product && pos.Product.symbol) || '—';
+    const qty = pos.quantity ?? pos.qty;
+    const mv = pos.marketValue ?? pos.totalMarketValue ??
+        (pos.Complete && pos.Complete.marketValue);
+    const pnl = pos.totalGainPct !== undefined ? null
+        : (pos.totalGain ?? pos.totalGainLoss ?? pos.daysGain);
+    const pnlCell = (pnl === undefined || pnl === null || pnl === '')
+        ? '<td class="num">—</td>'
+        : `<td class="num ${pnlClass(Number(pnl))}">${fmtMoney(pnl)}</td>`;
+    return '<tr>' +
+        `<td class="num">${escapeHTML(String(symbol))}</td>` +
+        `<td class="num">${fmtNum(qty, 0)}</td>` +
+        `<td class="num">${fmtMoney(mv)}</td>` +
+        pnlCell + '</tr>';
+}
+
+async function loadAccounts() {
+    if (!isConnected()) {
+        accountsLoaded = false;
+        lastAccountsKey = null;
+        renderAccountBody('expired');
+        const select = document.getElementById('accountSelect');
+        if (select) select.classList.add('d-none');
+        syncOrderTicketGate();
+        return;
+    }
+    let data;
+    try {
+        data = await fetchJSON('/api/live/accounts', { silent: true });
+    } catch (err) {
+        if (err.status === 401) renderAccountBody('expired');
+        else renderAccountBody('empty');
+        return;
+    }
+    accountsLoaded = true;
+    const accounts = data.accounts || [];
+    knownAccounts = accounts;
+    renderAccountSelect(accounts);
+    if (accounts.length === 0) {
+        renderAccountBody('empty');
+    } else {
+        loadAccountDetail(selectedAccountKey);
+    }
+    syncOrderTicketGate();
+}
+
+async function loadAccountDetail(idKey) {
+    if (!idKey) { renderAccountBody('empty'); return; }
+    renderAccountBody('loading');
+    let balances = {};
+    let positions = [];
+    try {
+        const b = await fetchJSON(
+            `/api/live/accounts/${encodeURIComponent(idKey)}/balances`,
+            { silent: true });
+        balances = b.balances || {};
+    } catch (err) {
+        if (err.status === 401) { renderAccountBody('expired'); return; }
+    }
+    try {
+        const p = await fetchJSON(
+            `/api/live/accounts/${encodeURIComponent(idKey)}/portfolio`,
+            { silent: true });
+        positions = p.positions || [];
+    } catch (_) {
+        // A balances-only render is still useful; leave positions empty.
+    }
+    renderAccountDetail(balances, positions);
+}
+
+/* -------------------- Quotes -------------------- */
+
+function quoteRow(symbol, q) {
+    return '<tr>' +
+        `<td class="num">${escapeHTML(symbol)}</td>` +
+        `<td class="num">${fmtMoney(q && q.bid)}</td>` +
+        `<td class="num">${fmtMoney(q && q.ask)}</td>` +
+        `<td class="num">${fmtMoney(q && q.last)}</td></tr>`;
+}
+
+function renderQuotes(quotes, requested) {
+    const table = document.getElementById('quoteTable');
+    const body = document.getElementById('quoteBody');
+    const empty = document.getElementById('quoteEmpty');
+    if (!table || !body || !empty) return;
+    const syms = requested && requested.length
+        ? requested : Object.keys(quotes || {});
+    if (!syms.length) {
+        table.classList.add('d-none');
+        body.innerHTML = '';
+        empty.innerHTML = emptyStateHTML('bi-graph-up',
+            'No quotes', 'Enter one or more symbols and look them up.');
+        return;
+    }
+    empty.innerHTML = '';
+    table.classList.remove('d-none');
+    body.innerHTML = syms.map((s) => quoteRow(s, (quotes || {})[s])).join('');
+}
+
+async function lookupQuotes() {
+    const input = document.getElementById('quoteSymbols');
+    const raw = (input ? input.value : '').trim();
+    if (!raw) {
+        showToast('warning', 'Enter at least one symbol.');
+        return;
+    }
+    const symbols = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    if (symbols.length > 25) {
+        showToast('warning', 'Up to 25 symbols at a time.');
+        return;
+    }
+    const restore = btnLoading(document.getElementById('btnQuotes'));
+    try {
+        const params = new URLSearchParams({ symbols: symbols.join(',') });
+        const data = await fetchJSON(`/api/live/quotes?${params}`);
+        renderQuotes(data.quotes || {}, data.requested || symbols);
+    } catch (_) {
+        // toasted by fetchJSON
+    } finally {
+        restore();
+    }
+}
+
+/* -------------------- Order ticket -------------------- */
+
+const TICKET_KINDS = ['equity', 'option', 'spread'];
+
+/** Read the current ticket kind ('equity' fallback). */
+function ticketKind() {
+    const sel = document.getElementById('ticketKind');
+    const v = sel ? sel.value : 'equity';
+    return TICKET_KINDS.includes(v) ? v : 'equity';
+}
+
+/** Show only the active kind's pane and the right spread sub-pane. */
+function renderTicketPanes() {
+    const kind = ticketKind();
+    [['paneEquity', 'equity'], ['paneOption', 'option'],
+     ['paneSpread', 'spread']].forEach(([id, k]) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('d-none', k !== kind);
+    });
+    const preset = (document.getElementById('spPreset') || {}).value
+        || 'vertical';
+    const vert = document.getElementById('spVertical');
+    const condor = document.getElementById('spCondor');
+    if (vert) vert.classList.toggle('d-none', preset !== 'vertical');
+    if (condor) condor.classList.toggle('d-none', preset !== 'iron_condor');
+}
+
+function numVal(id) {
+    const el = document.getElementById(id);
+    if (!el) return null;
+    const raw = (el.value || '').trim();
+    if (raw === '') return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : NaN;
+}
+
+function strVal(id) {
+    const el = document.getElementById(id);
+    return el ? (el.value || '').trim() : '';
+}
+
+/** Build the POST /order/preview body from the ticket, or null + a toast. */
+function buildPreviewBody() {
+    const kind = ticketKind();
+    const account_id_key = selectedAccountKey;
+    if (!account_id_key) {
+        showToast('warning', 'Select an account first.');
+        return null;
+    }
+    const body = { account_id_key, kind };
+    if (kind === 'equity') {
+        body.symbol = strVal('eqSymbol').toUpperCase();
+        body.side = strVal('eqSide').toUpperCase();
+        body.quantity = numVal('eqQty');
+        const limit = numVal('eqLimit');
+        if (limit !== null) body.limit_price = limit;
+        if (!body.symbol || !(body.quantity > 0)) {
+            showToast('warning', 'Symbol and a positive quantity are required.');
+            return null;
+        }
+    } else if (kind === 'option') {
+        body.symbol = strVal('optSymbol').toUpperCase();
+        body.call_put = strVal('optCallPut').toUpperCase();
+        body.strike = numVal('optStrike');
+        body.expiry = strVal('optExpiry');
+        body.action = strVal('optAction').toUpperCase();
+        body.quantity = numVal('optQty');
+        const limit = numVal('optLimit');
+        if (limit !== null) body.limit_price = limit;
+        if (!body.symbol || !(body.strike > 0) || !body.expiry ||
+            !(body.quantity > 0)) {
+            showToast('warning',
+                'Underlying, strike, expiry and quantity are required.');
+            return null;
+        }
+    } else {
+        const legs = buildSpreadLegs();
+        if (!legs) return null; // toasted inside
+        body.legs = legs;
+        const net = numVal('spNetCredit');
+        if (net === null || !Number.isFinite(net) || net === 0) {
+            showToast('warning',
+                'Net credit/debit must be a non-zero number.');
+            return null;
+        }
+        body.net_price = net;
+    }
+    return body;
+}
+
+/** Vertical (2) or iron-condor (4) legs from the spread pane, or null. */
+function buildSpreadLegs() {
+    const symbol = strVal('spSymbol').toUpperCase();
+    const expiry = strVal('spExpiry');
+    const preset = (document.getElementById('spPreset') || {}).value
+        || 'vertical';
+    if (!symbol || !expiry) {
+        showToast('warning', 'Underlying and expiry are required.');
+        return null;
+    }
+    if (preset === 'vertical') {
+        const right = strVal('spVType').toUpperCase();
+        const shortK = numVal('spVShort');
+        const longK = numVal('spVLong');
+        const qty = numVal('spVQty');
+        if (!(shortK > 0) || !(longK > 0) || !(qty > 0)) {
+            showToast('warning',
+                'Both strikes and a positive quantity are required.');
+            return null;
+        }
+        return [
+            { symbol, call_put: right, strike: shortK, expiry,
+              action: 'SELL_OPEN', quantity: qty },
+            { symbol, call_put: right, strike: longK, expiry,
+              action: 'BUY_OPEN', quantity: qty },
+        ];
+    }
+    // Iron condor: short put + long put + short call + long call.
+    const sp = numVal('spCShortPut');
+    const lp = numVal('spCLongPut');
+    const sc = numVal('spCShortCall');
+    const lc = numVal('spCLongCall');
+    const qty = numVal('spCQty');
+    if (!(sp > 0) || !(lp > 0) || !(sc > 0) || !(lc > 0) || !(qty > 0)) {
+        showToast('warning',
+            'All four strikes and a positive quantity are required.');
+        return null;
+    }
+    return [
+        { symbol, call_put: 'PUT', strike: sp, expiry,
+          action: 'SELL_OPEN', quantity: qty },
+        { symbol, call_put: 'PUT', strike: lp, expiry,
+          action: 'BUY_OPEN', quantity: qty },
+        { symbol, call_put: 'CALL', strike: sc, expiry,
+          action: 'SELL_OPEN', quantity: qty },
+        { symbol, call_put: 'CALL', strike: lc, expiry,
+          action: 'BUY_OPEN', quantity: qty },
+    ];
+}
+
+/** Render the preview summary and the order_ref state. */
+function renderPreviewResult(preview) {
+    const el = document.getElementById('previewResult');
+    if (!el) return;
+    const ids = (preview && preview.previewIds) || [];
+    let text;
+    try {
+        text = JSON.stringify(preview || {}, null, 2);
+    } catch (_) {
+        text = String(preview);
+    }
+    el.innerHTML =
+        '<div class="preview-ok"><i class="bi bi-check-circle-fill" ' +
+        'aria-hidden="true"></i> Previewed — review the estimate, then ' +
+        'Place.</div>' +
+        `<dl class="token-times"><dt>Preview IDs</dt>` +
+        `<dd class="num">${escapeHTML(ids.join(', ') || '—')}</dd></dl>` +
+        `<pre class="note-data-json">${escapeHTML(text)}</pre>`;
+}
+
+function clearPreviewResult() {
+    const el = document.getElementById('previewResult');
+    if (el) el.innerHTML = '';
+}
+
+/** A fresh preview enables Place; voiding it (any edit) disables Place. */
+function setOrderRef(ref) {
+    currentOrderRef = ref || null;
+    syncOrderTicketGate();
+}
+
+/** Single source of truth for Place-button enablement + the locked state. */
+function syncOrderTicketGate() {
+    const form = document.getElementById('orderTicketForm');
+    const locked = document.getElementById('ticketDisconnected');
+    const placeBtn = document.getElementById('btnPlace');
+    const killNote = document.getElementById('ticketKillNote');
+    if (!form || !locked || !placeBtn) return;
+
+    const ready = isConnected() && accountsLoaded && !!selectedAccountKey;
+    form.classList.toggle('d-none', !ready);
+    locked.classList.toggle('d-none', ready);
+
+    const engaged = killSwitchEngaged();
+    if (killNote) killNote.classList.toggle('d-none', !engaged);
+
+    // Place requires a fresh preview AND no kill switch.
+    const canPlace = ready && !!currentOrderRef && !engaged;
+    placeBtn.disabled = !canPlace;
+    placeBtn.title = engaged
+        ? 'Kill switch engaged — order placement is blocked.'
+        : (currentOrderRef ? 'Place the previewed order.'
+            : 'Preview an order first.');
+
+    const previewBtn = document.getElementById('btnPreview');
+    if (previewBtn) previewBtn.disabled = !ready || engaged;
+}
+
+/** ANY ticket edit voids the current preview (a stale preview is never
+    placeable — mirrors the verifier-input / scheduler-input protection). */
+function voidPreviewOnEdit() {
+    if (currentOrderRef !== null) {
+        currentOrderRef = null;
+        clearPreviewResult();
+    }
+    syncOrderTicketGate();
+}
+
+async function previewOrder() {
+    const body = buildPreviewBody();
+    if (!body) return;
+    const restore = btnLoading(document.getElementById('btnPreview'));
+    try {
+        const data = await fetchJSON('/api/live/order/preview', {
+            method: 'POST', body: JSON.stringify(body),
+        });
+        renderPreviewResult(data.preview || {});
+        setOrderRef(data.order_ref);
+        showToast('success', 'Order previewed — review, then Place.');
+        loadAudit(); // preview is audit-logged
+    } catch (_) {
+        setOrderRef(null);
+        // toasted by fetchJSON (covers 409 kill-switch, 401, 422)
+    } finally {
+        restore();
+    }
+}
+
+function openPlaceModal() {
+    if (!currentOrderRef || killSwitchEngaged()) return;
+    const summary = document.getElementById('placeModalSummary');
+    if (summary) {
+        const preview = document.getElementById('previewResult');
+        summary.textContent = preview
+            ? preview.textContent.slice(0, 2000) : '';
+    }
+    bootstrap.Modal.getOrCreateInstance(
+        document.getElementById('placeConfirmModal')).show();
+}
+
+async function confirmPlaceOrder() {
+    if (!currentOrderRef) return;
+    const ref = currentOrderRef;
+    const restore = btnLoading(document.getElementById('placeModalConfirm'));
+    try {
+        const data = await fetchJSON('/api/live/order/place', {
+            method: 'POST', body: JSON.stringify({ order_ref: ref }),
+        });
+        bootstrap.Modal.getOrCreateInstance(
+            document.getElementById('placeConfirmModal')).hide();
+        const order = data.order || {};
+        showToast('success',
+            `Order placed — id ${order.orderId ?? '(pending)'}.`);
+        // The ref is single-use and now consumed: void it locally too.
+        setOrderRef(null);
+        clearPreviewResult();
+        refreshWorkingOrders();
+        loadAudit();
+        if (selectedAccountKey) loadAccountDetail(selectedAccountKey);
+    } catch (err) {
+        // Kill switch / circuit breaker (409), reauthorize (401), reject
+        // (422) all toasted by fetchJSON. Keep the order UN-placed; the ref
+        // is consumed server-side on success only, but a 404 (expired) or a
+        // place failure means the operator must re-preview.
+        if (err.status === 404 || err.status === 409) {
+            bootstrap.Modal.getOrCreateInstance(
+                document.getElementById('placeConfirmModal')).hide();
+            setOrderRef(null);
+        }
+        restore();
+    }
+}
+
+/* ==========================================================================
    Scheduler (market-hours evaluate_once loop via /api/live/scheduler)
 
    Render rules:
@@ -894,6 +1454,7 @@ async function stopScheduler() {
    ========================================================================== */
 
 async function refreshStatus() {
+    const wasConnected = isConnected();
     let data;
     try {
         data = await fetchJSON('/api/live/status', { silent: true });
@@ -905,6 +1466,9 @@ async function refreshStatus() {
         renderConnectionUnavailable(
             (err.body && (err.body.reason || err.body.error)) || err.message);
         renderKillSwitch(null);
+        accountsLoaded = false;
+        renderAccountBody('expired');
+        syncOrderTicketGate();
         return;
     }
     liveStatus = data;
@@ -914,6 +1478,18 @@ async function refreshStatus() {
     renderConnection(data.auth || {});
     renderKillSwitch(data.kill_switch);
     if (data.reconciliation) renderReconciliation(data.reconciliation);
+
+    // Drive the account panel + order-ticket gate from the connection state.
+    // Load accounts once on (re)connect; the poll never rebuilds operator
+    // inputs, only flips the kill-switch-driven Place gate.
+    const nowConnected = isConnected();
+    if (nowConnected && (!wasConnected || !accountsLoaded)) {
+        loadAccounts();
+    } else if (!nowConnected && wasConnected) {
+        accountsLoaded = false;
+        renderAccountBody('expired');
+    }
+    syncOrderTicketGate();
 }
 
 /* ==========================================================================
@@ -945,6 +1521,58 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const btnReconcile = document.getElementById('btnReconcile');
     if (btnReconcile) btnReconcile.addEventListener('click', runReconcile);
+
+    // Account selection: load that account's balances + positions.
+    const accountSelect = document.getElementById('accountSelect');
+    if (accountSelect) {
+        accountSelect.addEventListener('change', () => {
+            selectedAccountKey = accountSelect.value || null;
+            updateTicketAccountLabel(knownAccounts);
+            loadAccountDetail(selectedAccountKey);
+            // Switching accounts voids any standing preview (it was built
+            // for the old account_id_key).
+            voidPreviewOnEdit();
+        });
+    }
+
+    // Quotes.
+    const btnQuotes = document.getElementById('btnQuotes');
+    if (btnQuotes) btnQuotes.addEventListener('click', lookupQuotes);
+    const quoteInput = document.getElementById('quoteSymbols');
+    if (quoteInput) {
+        quoteInput.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter') { ev.preventDefault(); lookupQuotes(); }
+        });
+    }
+
+    // Order ticket.
+    const ticketKindSel = document.getElementById('ticketKind');
+    if (ticketKindSel) {
+        ticketKindSel.addEventListener('change', () => {
+            renderTicketPanes();
+            voidPreviewOnEdit();
+        });
+    }
+    const spPreset = document.getElementById('spPreset');
+    if (spPreset) {
+        spPreset.addEventListener('change', () => {
+            renderTicketPanes();
+            voidPreviewOnEdit();
+        });
+    }
+    // EVERY ticket field voids the standing preview on edit.
+    document.querySelectorAll('.ticket-input').forEach((el) => {
+        const ev = el.tagName === 'SELECT' ? 'change' : 'input';
+        el.addEventListener(ev, voidPreviewOnEdit);
+    });
+    const btnPreview = document.getElementById('btnPreview');
+    if (btnPreview) btnPreview.addEventListener('click', previewOrder);
+    const btnPlace = document.getElementById('btnPlace');
+    if (btnPlace) btnPlace.addEventListener('click', openPlaceModal);
+    const placeConfirm = document.getElementById('placeModalConfirm');
+    if (placeConfirm) placeConfirm.addEventListener('click', confirmPlaceOrder);
+    renderTicketPanes();
+    syncOrderTicketGate();
 
     const btnSchedStart = document.getElementById('btnSchedStart');
     if (btnSchedStart) btnSchedStart.addEventListener('click', startScheduler);

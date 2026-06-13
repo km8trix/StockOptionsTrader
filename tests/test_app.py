@@ -59,6 +59,9 @@ def _isolate_live_singletons(monkeypatch, tmp_path):
     monkeypatch.setattr(api_live, '_kill_switch', None)
     monkeypatch.setattr(api_live, '_audit_log', None)
     monkeypatch.setattr(api_live, '_scheduler', None)
+    monkeypatch.setattr(api_live, '_client', None)
+    monkeypatch.setattr(api_live, '_client_auth_manager', None)
+    api_live._ORDER_REF_CACHE.clear()
 
 
 @pytest.fixture()
@@ -2677,6 +2680,483 @@ class TestLiveTraderConstruction:
         assert response.get_json() == {
             'error': 'Live trading unavailable', 'reason': sentinel}
         assert 't-live-noaudit' not in api_trading.active_traders
+
+
+# ==================== LIVE TRADING: ACCOUNTS / QUOTES / ORDER TICKET ===========
+# R1-R6 routes over a MOCKED EtradeClient injected into api_live.get_client.
+# NO network, NO real OAuth. The fake records its calls so place_order's
+# single-call / same-cached-request guarantees can be asserted.
+
+#: A raw account number that must NEVER appear whole in any response.
+RAW_ACCOUNT_NUMBER = '83056214'
+
+
+class FakeTradeClient:
+    """EtradeClient-shaped fake for the accounts/quotes/order-ticket routes."""
+
+    def __init__(self):
+        self.preview_calls = []
+        self.place_calls = []
+        self.accounts = [{
+            'accountId': RAW_ACCOUNT_NUMBER,
+            'accountIdKey': 'KEY-ABC',
+            'accountType': 'MARGIN',
+            'accountDesc': 'Individual Brokerage',
+            'accountStatus': 'ACTIVE',
+        }]
+
+    def list_accounts(self):
+        return list(self.accounts)
+
+    def get_balances(self, account_id_key):
+        return {
+            'accountId': RAW_ACCOUNT_NUMBER,
+            'accountIdKey': account_id_key,
+            'Computed': {
+                'netAccountValue': 125000.50,
+                'cashAvailableForInvestment': 40000.0,
+                'RealTimeValues': {'accountId': RAW_ACCOUNT_NUMBER},
+            },
+        }
+
+    def get_portfolio(self, account_id_key):
+        return [{
+            'symbol': 'SPY', 'quantity': 10, 'marketValue': 4500.0,
+            'totalGain': 250.0, 'accountId': RAW_ACCOUNT_NUMBER,
+        }]
+
+    def get_quotes(self, symbols):
+        return {s: {'bid': 1.0, 'ask': 1.1, 'last': 1.05} for s in symbols}
+
+    def preview_order(self, account_id_key, order_request):
+        self.preview_calls.append((account_id_key, order_request))
+        return {
+            'PreviewIds': [{'previewId': 555}],
+            'Order': [{'estimatedTotalAmount': -101.25,
+                       'estimatedCommission': 0.0}],
+        }
+
+    def place_order(self, account_id_key, order_request, preview_ids):
+        self.place_calls.append((account_id_key, order_request, preview_ids))
+        return {'order_id': 'ORD-LIVE-1',
+                'response': {'OrderIds': [{'orderId': 'ORD-LIVE-1',
+                                           'status': 'OPEN'}]}}
+
+
+@pytest.fixture()
+def patch_trade(monkeypatch):
+    """Inject a connected FakeAuthManager + FakeTradeClient into api_live."""
+    import gui.routes.api_live as api_live
+
+    fakes = {
+        'auth': FakeAuthManager(state='connected'),
+        'kill': FakeKillSwitch(),
+        'audit': FakeAuditLog(),
+        'client': FakeTradeClient(),
+    }
+    monkeypatch.setattr(api_live, 'get_auth_manager', lambda: fakes['auth'])
+    monkeypatch.setattr(api_live, 'get_kill_switch', lambda: fakes['kill'])
+    monkeypatch.setattr(api_live, 'get_audit_log', lambda: fakes['audit'])
+    monkeypatch.setattr(api_live, 'get_client', lambda: fakes['client'])
+    return fakes
+
+
+def _no_raw_account_number(blob: str):
+    assert RAW_ACCOUNT_NUMBER not in blob, \
+        'raw account number leaked into the response'
+
+
+class TestLiveAccountRoutes:
+    """R1/R2/R3 GET routes: shape + masking + 409/401 guards."""
+
+    def test_accounts_shape_and_masking(self, client, patch_trade):
+        response = client.get('/api/live/accounts')
+        assert response.status_code == 200
+        body = response.get_json()
+        _no_raw_account_number(response.get_data(as_text=True))
+        assert len(body['accounts']) == 1
+        acct = body['accounts'][0]
+        assert acct['accountIdKey'] == 'KEY-ABC'
+        assert acct['accountType'] == 'MARGIN'
+        assert acct['accountDesc'] == 'Individual Brokerage'
+        assert acct['accountStatus'] == 'ACTIVE'
+        assert acct['accountId_masked'] == '••••6214'
+        assert 'accountId' not in acct
+
+    def test_balances_shape_and_deep_masking(self, client, patch_trade):
+        response = client.get('/api/live/accounts/KEY-ABC/balances')
+        assert response.status_code == 200
+        text = response.get_data(as_text=True)
+        _no_raw_account_number(text)
+        balances = response.get_json()['balances']
+        # Useful computed fields survive.
+        assert balances['Computed']['netAccountValue'] == 125000.50
+        assert balances['Computed']['cashAvailableForInvestment'] == 40000.0
+        # Account number masked at EVERY depth.
+        assert balances['accountId_masked'] == '••••6214'
+        assert 'accountId' not in balances
+        assert balances['Computed']['RealTimeValues']['accountId_masked'] \
+            == '••••6214'
+
+    def test_portfolio_shape_and_masking(self, client, patch_trade):
+        response = client.get('/api/live/accounts/KEY-ABC/portfolio')
+        assert response.status_code == 200
+        _no_raw_account_number(response.get_data(as_text=True))
+        positions = response.get_json()['positions']
+        assert positions[0]['symbol'] == 'SPY'
+        assert positions[0]['quantity'] == 10
+        assert positions[0]['marketValue'] == 4500.0
+        assert 'accountId' not in positions[0]
+        assert positions[0]['accountId_masked'] == '••••6214'
+
+    @pytest.mark.parametrize('path', [
+        '/api/live/accounts',
+        '/api/live/accounts/KEY-ABC/balances',
+        '/api/live/accounts/KEY-ABC/portfolio',
+        '/api/live/quotes?symbols=SPY',
+    ])
+    def test_not_connected_is_409_with_state(self, client, monkeypatch, path):
+        import gui.routes.api_live as api_live
+
+        monkeypatch.setattr(api_live, 'get_auth_manager',
+                            lambda: FakeAuthManager(state='disconnected'))
+        monkeypatch.setattr(api_live, 'get_client',
+                            lambda: FakeTradeClient())
+        response = client.get(path)
+        assert response.status_code == 409
+        body = response.get_json()
+        assert body['error'] == 'not connected'
+        assert body['state'] == 'disconnected'
+
+    @pytest.mark.parametrize('path', [
+        '/api/live/accounts',
+        '/api/live/accounts/KEY-ABC/balances',
+        '/api/live/accounts/KEY-ABC/portfolio',
+        '/api/live/quotes?symbols=SPY',
+    ])
+    def test_auth_expired_is_401(self, client, patch_trade, path):
+        import gui.routes.api_live as api_live
+
+        def boom(*_a, **_k):
+            raise api_live.EtradeAuthExpired('token expired')
+
+        clt = patch_trade['client']
+        clt.list_accounts = boom
+        clt.get_balances = boom
+        clt.get_portfolio = boom
+        clt.get_quotes = boom
+
+        response = client.get(path)
+        assert response.status_code == 401
+        assert response.get_json() == {'error': 'reauthorize'}
+
+
+class TestLiveQuotes:
+    """R4: /quotes shape, de-dupe, and the 25-symbol cap."""
+
+    def test_quotes_round_trip(self, client, patch_trade):
+        response = client.get('/api/live/quotes?symbols=SPY,AAPL')
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['requested'] == ['SPY', 'AAPL']
+        assert body['quotes']['SPY'] == {'bid': 1.0, 'ask': 1.1, 'last': 1.05}
+
+    def test_quotes_requires_symbols(self, client, patch_trade):
+        response = client.get('/api/live/quotes?symbols=')
+        assert response.status_code == 400
+
+    def test_quotes_cap_at_25(self, client, patch_trade):
+        symbols = ','.join(f'SYM{i}' for i in range(26))
+        response = client.get(f'/api/live/quotes?symbols={symbols}')
+        assert response.status_code == 400
+        assert 'max' in response.get_json()['error'].lower()
+
+
+class TestLiveOrderTicket:
+    """R5/R6: preview caches an order_ref; place is single-use and places
+    exactly the cached request; kill switch / rejection / auth mapping."""
+
+    EQUITY = {'account_id_key': 'KEY-ABC', 'kind': 'equity',
+              'symbol': 'SPY', 'side': 'BUY', 'quantity': 1,
+              'limit_price': 101.25}
+
+    def test_preview_returns_order_ref_and_caches(self, client, patch_trade):
+        import gui.routes.api_live as api_live
+
+        response = client.post('/api/live/order/preview', json=self.EQUITY)
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['preview']['previewIds'] == [555]
+        ref = body['order_ref']
+        assert ref and isinstance(ref, str)
+        assert ref in api_live._ORDER_REF_CACHE
+        # The client previewed exactly the built request.
+        assert patch_trade['client'].preview_calls[0][0] == 'KEY-ABC'
+
+    def test_place_uses_cached_request_exactly_once(self, client, patch_trade):
+        preview = client.post('/api/live/order/preview',
+                              json=self.EQUITY).get_json()
+        ref = preview['order_ref']
+        built = patch_trade['client'].preview_calls[0][1]
+
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': ref})
+        assert response.status_code == 200
+        assert response.get_json()['order'] == {
+            'orderId': 'ORD-LIVE-1', 'status': 'OPEN'}
+
+        calls = patch_trade['client'].place_calls
+        assert len(calls) == 1
+        # Placed with the SAME account + SAME cached request + the preview's
+        # previewIds — not anything the client posted to /place.
+        assert calls[0][0] == 'KEY-ABC'
+        assert calls[0][1] is built
+        assert calls[0][2] == [{'previewId': 555}]
+
+    def test_order_ref_is_single_use(self, client, patch_trade):
+        ref = client.post('/api/live/order/preview',
+                          json=self.EQUITY).get_json()['order_ref']
+        first = client.post('/api/live/order/place', json={'order_ref': ref})
+        assert first.status_code == 200
+        second = client.post('/api/live/order/place', json={'order_ref': ref})
+        assert second.status_code == 404
+        # Only the first place reached the client.
+        assert len(patch_trade['client'].place_calls) == 1
+
+    def test_place_unknown_ref_is_404(self, client, patch_trade):
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': 'nope-nope'})
+        assert response.status_code == 404
+        assert patch_trade['client'].place_calls == []
+
+    def test_place_cannot_post_arbitrary_payload(self, client, patch_trade):
+        """No order_ref -> 400; an order_request body is ignored (place only
+        ever works from a cached, previewed ref)."""
+        response = client.post('/api/live/order/place',
+                               json={'order_request': {'evil': True}})
+        assert response.status_code == 400
+        assert patch_trade['client'].place_calls == []
+
+    def test_kill_switch_blocks_place_with_409(self, client, patch_trade):
+        import gui.routes.api_live as api_live
+
+        ref = client.post('/api/live/order/preview',
+                          json=self.EQUITY).get_json()['order_ref']
+
+        def engaged(*_a, **_k):
+            raise api_live.KillSwitchEngaged(
+                'Kill switch engaged — new orders are blocked')
+
+        patch_trade['client'].place_order = engaged
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': ref})
+        assert response.status_code == 409
+        assert response.get_json()['error'] == 'kill switch engaged'
+
+    def test_circuit_breaker_labeled_in_409(self, client, patch_trade):
+        import gui.routes.api_live as api_live
+
+        ref = client.post('/api/live/order/preview',
+                          json=self.EQUITY).get_json()['order_ref']
+
+        def breaker(*_a, **_k):
+            raise api_live.KillSwitchEngaged(
+                'Daily-loss circuit breaker tripped — new orders are blocked')
+
+        patch_trade['client'].place_order = breaker
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': ref})
+        assert response.status_code == 409
+        assert response.get_json()['error'] == 'circuit breaker'
+
+    def test_kill_switch_blocks_preview_with_409(self, client, patch_trade):
+        import gui.routes.api_live as api_live
+
+        def engaged(*_a, **_k):
+            raise api_live.KillSwitchEngaged('Kill switch engaged')
+
+        patch_trade['client'].preview_order = engaged
+        response = client.post('/api/live/order/preview', json=self.EQUITY)
+        assert response.status_code == 409
+        assert response.get_json()['error'] == 'kill switch engaged'
+
+    def test_order_rejected_is_422_with_reason(self, client, patch_trade):
+        import gui.routes.api_live as api_live
+
+        ref = client.post('/api/live/order/preview',
+                          json=self.EQUITY).get_json()['order_ref']
+
+        def reject(*_a, **_k):
+            raise api_live.EtradeOrderRejected('Insufficient buying power')
+
+        patch_trade['client'].place_order = reject
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': ref})
+        assert response.status_code == 422
+        body = response.get_json()
+        assert body['error'] == 'order rejected'
+        assert body['reason'] == 'Insufficient buying power'
+
+    def test_place_auth_expired_is_401(self, client, patch_trade):
+        import gui.routes.api_live as api_live
+
+        ref = client.post('/api/live/order/preview',
+                          json=self.EQUITY).get_json()['order_ref']
+
+        def expired(*_a, **_k):
+            raise api_live.EtradeAuthExpired('expired')
+
+        patch_trade['client'].place_order = expired
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': ref})
+        assert response.status_code == 401
+        assert response.get_json() == {'error': 'reauthorize'}
+
+    def test_unknown_kind_is_400(self, client, patch_trade):
+        response = client.post('/api/live/order/preview', json={
+            'account_id_key': 'KEY-ABC', 'kind': 'futures', 'symbol': 'ES'})
+        assert response.status_code == 400
+        assert patch_trade['client'].preview_calls == []
+
+    @pytest.mark.parametrize('body', [
+        {'account_id_key': 'KEY-ABC', 'kind': 'equity', 'side': 'BUY',
+         'quantity': 1},                                    # no symbol
+        {'account_id_key': 'KEY-ABC', 'kind': 'equity', 'symbol': 'SPY',
+         'side': 'HOLD', 'quantity': 1},                    # bad side
+        {'account_id_key': 'KEY-ABC', 'kind': 'equity', 'symbol': 'SPY',
+         'side': 'BUY', 'quantity': 0},                     # non-positive qty
+        {'kind': 'equity', 'symbol': 'SPY', 'side': 'BUY',
+         'quantity': 1},                                    # no account
+    ])
+    def test_missing_required_fields_is_400(self, client, patch_trade, body):
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert patch_trade['client'].preview_calls == []
+
+    @pytest.mark.parametrize('bad', ['inf', '-inf', 'Infinity', 'nan', 'NaN'])
+    def test_non_finite_quantity_is_400_not_500(self, client, patch_trade,
+                                                bad):
+        """A non-finite string quantity must be a clean 400 — never a route
+        500. float('inf') parses, but int(float('inf')) raises OverflowError
+        and int(float('nan')) raises ValueError; _to_int rejects both up
+        front so the request never reaches the broker preview."""
+        body = {'account_id_key': 'KEY-ABC', 'kind': 'equity',
+                'symbol': 'SPY', 'side': 'BUY', 'quantity': bad}
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert response.get_json()['error'] == \
+            "'quantity' must be a positive integer"
+        assert patch_trade['client'].preview_calls == []
+
+    @pytest.mark.parametrize('bad', ['nan', 'NaN', 'inf', '-inf', 'Infinity'])
+    def test_non_finite_option_strike_is_400_not_sent(self, client,
+                                                      patch_trade, bad):
+        """NaN/Inf must NOT slip past the strike positivity guard: every
+        comparison with NaN is False, so without the finite check a
+        strike='nan' would build a real OPTN order carrying a non-JSON
+        NaN token and reach the broker preview. It must 400 and never be
+        sent."""
+        body = {'account_id_key': 'KEY-ABC', 'kind': 'option',
+                'symbol': 'SPY', 'call_put': 'CALL', 'strike': bad,
+                'expiry': '2026-07-17', 'action': 'BUY_OPEN', 'quantity': 1}
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert response.get_json()['error'] == \
+            "'strike' must be a positive number"
+        assert patch_trade['client'].preview_calls == []
+
+    @pytest.mark.parametrize('value', ['nan', 'inf', '-inf'])
+    def test_non_finite_limit_price_dropped_to_market(self, client,
+                                                      patch_trade, value):
+        """A non-finite limit_price is treated as absent (-> MARKET order),
+        never carried into the built order as a NaN/Inf limitPrice."""
+        body = {'account_id_key': 'KEY-ABC', 'kind': 'equity',
+                'symbol': 'SPY', 'side': 'BUY', 'quantity': 1,
+                'limit_price': value}
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 200
+        built = patch_trade['client'].preview_calls[0][1]
+        order = built['Order'][0]
+        assert order['priceType'] == 'MARKET'
+        assert 'limitPrice' not in order
+
+    def test_finite_limit_price_survives(self, client, patch_trade):
+        """Sanity: a real limit price still produces a LIMIT order."""
+        body = {'account_id_key': 'KEY-ABC', 'kind': 'equity',
+                'symbol': 'SPY', 'side': 'BUY', 'quantity': 1,
+                'limit_price': '99.50'}
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 200
+        order = patch_trade['client'].preview_calls[0][1]['Order'][0]
+        assert order['priceType'] == 'LIMIT'
+        assert order['limitPrice'] == 99.50
+
+    def test_non_finite_spread_net_price_is_400_not_sent(self, client,
+                                                         patch_trade):
+        """spread net_price='nan' must 400 (non-zero guard) and never be
+        built into a SPREADS order carrying a NaN netPrice."""
+        body = {
+            'account_id_key': 'KEY-ABC', 'kind': 'spread', 'net_price': 'nan',
+            'legs': [
+                {'symbol': 'SPY', 'call_put': 'PUT', 'strike': 450,
+                 'expiry': '2026-07-17', 'action': 'SELL_OPEN', 'quantity': 1},
+                {'symbol': 'SPY', 'call_put': 'PUT', 'strike': 445,
+                 'expiry': '2026-07-17', 'action': 'BUY_OPEN', 'quantity': 1},
+            ],
+        }
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert patch_trade['client'].preview_calls == []
+
+    def test_spread_vertical_round_trip(self, client, patch_trade):
+        body = {
+            'account_id_key': 'KEY-ABC', 'kind': 'spread', 'net_price': 1.25,
+            'legs': [
+                {'symbol': 'SPY', 'call_put': 'PUT', 'strike': 450,
+                 'expiry': '2026-07-17', 'action': 'SELL_OPEN', 'quantity': 1},
+                {'symbol': 'SPY', 'call_put': 'PUT', 'strike': 445,
+                 'expiry': '2026-07-17', 'action': 'BUY_OPEN', 'quantity': 1},
+            ],
+        }
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 200
+        assert response.get_json()['preview']['previewIds'] == [555]
+        built = patch_trade['client'].preview_calls[0][1]
+        assert built['orderType'] == 'SPREADS'
+
+    def test_spread_rejects_single_leg(self, client, patch_trade):
+        body = {
+            'account_id_key': 'KEY-ABC', 'kind': 'spread', 'net_price': 1.0,
+            'legs': [{'symbol': 'SPY', 'call_put': 'PUT', 'strike': 450,
+                      'expiry': '2026-07-17', 'action': 'SELL_OPEN',
+                      'quantity': 1}],
+        }
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert patch_trade['client'].preview_calls == []
+
+    def test_order_routes_503_when_client_unavailable(self, client,
+                                                      monkeypatch):
+        import gui.routes.api_live as api_live
+
+        sentinel = 'ImportError: synthetic etrade_client import failure'
+        monkeypatch.setattr(api_live, 'EtradeClient', None)
+        monkeypatch.setattr(api_live, 'CLIENT_IMPORT_ERROR', sentinel)
+
+        response = client.get('/api/live/accounts')
+        assert response.status_code == 503
+        assert response.get_json()['reason'] == sentinel
+
+    def test_live_page_ships_order_ticket_containers(self, client):
+        html = client.get('/live').get_data(as_text=True)
+        for marker in (
+            'id="accountCard"', 'id="accountSelect"', 'id="accountBody"',
+            'id="quoteCard"', 'id="quoteSymbols"', 'id="quoteBody"',
+            'id="orderTicketCard"', 'id="orderTicketForm"', 'id="ticketKind"',
+            'id="paneEquity"', 'id="paneOption"', 'id="paneSpread"',
+            'id="btnPreview"', 'id="btnPlace"', 'id="placeConfirmModal"',
+        ):
+            assert marker in html, f'/live missing {marker}'
 
 
 class TestLauncherEnvHygiene:

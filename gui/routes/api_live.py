@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 import logging
+import math
 import os
 import threading
 
@@ -111,6 +112,53 @@ except Exception as e:  # noqa: BLE001
         'Failed to import LiveScheduler — the scheduler is unavailable: %s',
         SCHEDULER_IMPORT_ERROR,
     )
+
+# The trading client + its typed exceptions and order-request builders.
+# A single guarded import block: if any of these is missing the whole
+# trade surface (accounts/quotes/order ticket) answers 503-with-reason,
+# exactly like the surfaces above.
+CLIENT_IMPORT_ERROR: str | None
+try:
+    from brokers.etrade_client import (
+        EtradeClient,
+        EtradeApiError,
+        EtradeOrderRejected,
+        EtradeRateLimited,
+        EtradeUnavailable,
+        build_equity_order,
+        build_option_order,
+        build_spread_order,
+    )
+    from brokers.etrade_auth import EtradeAuthExpired
+    from utils.kill_switch import KillSwitchEngaged
+    CLIENT_IMPORT_ERROR = None
+except Exception as e:  # noqa: BLE001
+    EtradeClient = None
+    build_equity_order = build_option_order = build_spread_order = None
+    CLIENT_IMPORT_ERROR = f'{type(e).__name__}: {e}'
+    logger.error(
+        'Failed to import EtradeClient — live trading routes are '
+        'unavailable: %s', CLIENT_IMPORT_ERROR,
+    )
+
+    class EtradeApiError(Exception):
+        """Placeholder so except-clauses stay valid while the client
+        surface is absent (never raised through this fallback)."""
+
+    class EtradeOrderRejected(EtradeApiError):
+        pass
+
+    class EtradeRateLimited(EtradeApiError):
+        pass
+
+    class EtradeUnavailable(EtradeApiError):
+        pass
+
+    class EtradeAuthExpired(Exception):
+        pass
+
+    class KillSwitchEngaged(Exception):
+        pass
 
 live_bp = Blueprint('live', __name__, url_prefix='/api/live')
 
@@ -198,6 +246,52 @@ def auth_unavailable_reason() -> str:
     """Reason string for 503s when the auth surface is unusable."""
     return (ETRADE_AUTH_IMPORT_ERROR or _auth_construct_error
             or 'EtradeAuthManager construction failed')
+
+
+# Cached EtradeClient, plus the auth-manager identity it was built over.
+# The client binds to ONE auth manager (its signing session + base URL);
+# if the auth manager is ever replaced (e.g. a reconnect rebuilds it),
+# the cached client is stale and must be rebuilt over the new manager.
+_client = None
+_client_auth_manager = None
+
+
+def get_client():
+    """Shared EtradeClient over the live auth manager + kill switch + audit,
+    or None when the client surface or the auth manager is unavailable.
+
+    The client is cached and reused, but rebuilt whenever the underlying
+    auth manager identity changes (a reconnect) so it never signs with a
+    dead session. The kill switch is wired in so preview/place raise
+    KillSwitchEngaged FIRST — the route layer never bypasses it.
+    """
+    global _client, _client_auth_manager
+    if EtradeClient is None:
+        return None
+    manager = get_auth_manager()
+    if manager is None:
+        return None
+    with _singleton_lock:
+        if _client is None or _client_auth_manager is not manager:
+            try:
+                _client = EtradeClient(
+                    manager,
+                    kill_switch=get_kill_switch(),
+                    audit=get_audit_log(),
+                )
+                _client_auth_manager = manager
+            except Exception:
+                logger.error('EtradeClient construction failed', exc_info=True)
+                _client = None
+                _client_auth_manager = None
+                return None
+    return _client
+
+
+def client_unavailable_reason() -> str:
+    """Reason string for 503s when the trading-client surface is unusable."""
+    return (CLIENT_IMPORT_ERROR or auth_unavailable_reason()
+            or 'EtradeClient construction failed')
 
 
 # The process-wide LiveScheduler. Deliberately NOT auto-constructed: a
@@ -305,6 +399,100 @@ def _int_arg(name: str, default: int, lo: int, hi: int):
     if not lo <= value <= hi:
         return None
     return value
+
+
+# ==================== ACCOUNT-NUMBER REDACTION ====================
+# accountIdKey is the opaque, non-sensitive handle E*TRADE wants on every
+# subsequent call — safe to expose. The raw account NUMBER (accountId) is
+# sensitive and is NEVER returned whole: it surfaces only as a last-4 mask.
+
+_ACCOUNT_NUMBER_FIELDS = ('accountId', 'accountNumber', 'acctNumber')
+
+
+def _mask_account_number(value) -> str | None:
+    """Last-4 mask for an account number ('••••1234'), or None for empties."""
+    if value is None:
+        return None
+    digits = ''.join(ch for ch in str(value) if ch.isalnum())
+    if not digits:
+        return None
+    return '••••' + digits[-4:]
+
+
+def _redact_account_numbers(obj):
+    """Recursively drop every raw account-number field from a balances /
+    portfolio payload, replacing each with a '<field>_masked' last-4.
+
+    Defensive by construction: E*TRADE sprinkles accountId into nested
+    balance/position blocks, so a shallow scrub could leak one. accountIdKey
+    is deliberately left untouched (it is the safe handle).
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for key, val in obj.items():
+            if key in _ACCOUNT_NUMBER_FIELDS:
+                out[f'{key}_masked'] = _mask_account_number(val)
+            else:
+                out[key] = _redact_account_numbers(val)
+        return out
+    if isinstance(obj, list):
+        return [_redact_account_numbers(item) for item in obj]
+    return obj
+
+
+# ==================== ORDER-REF CACHE (preview -> place handshake) ====================
+# A previewed order_request is cached server-side, keyed by an opaque
+# order_ref handed back to the client. PLACE works ONLY from a cached ref:
+# the client can never post an arbitrary order payload to place. Refs are
+# single-use (consumed on a successful place), TTL-expired, and the cache
+# is size-capped (oldest evicted) so it cannot grow without bound.
+
+import time as _time  # noqa: E402  (local alias; client uses its own time)
+import secrets  # noqa: E402
+
+_ORDER_REF_TTL_S = 300          # 5 minutes
+_ORDER_REF_CACHE_MAX = 256      # cap distinct in-flight previews
+_ORDER_REF_CACHE: dict = {}     # order_ref -> {request, preview_ids, account_id_key, created}
+
+
+def _prune_order_refs(now: float | None = None) -> None:
+    """Drop expired refs and, if still over cap, the oldest ones. Caller
+    holds _singleton_lock."""
+    now = _time.time() if now is None else now
+    expired = [ref for ref, rec in _ORDER_REF_CACHE.items()
+               if now - rec['created'] > _ORDER_REF_TTL_S]
+    for ref in expired:
+        _ORDER_REF_CACHE.pop(ref, None)
+    if len(_ORDER_REF_CACHE) > _ORDER_REF_CACHE_MAX:
+        # Oldest-first eviction down to the cap.
+        for ref, _rec in sorted(_ORDER_REF_CACHE.items(),
+                                key=lambda kv: kv[1]['created']):
+            if len(_ORDER_REF_CACHE) <= _ORDER_REF_CACHE_MAX:
+                break
+            _ORDER_REF_CACHE.pop(ref, None)
+
+
+def _cache_order_ref(account_id_key: str, order_request: dict,
+                     preview_ids: list) -> str:
+    """Cache a previewed order_request and return its opaque order_ref."""
+    ref = secrets.token_urlsafe(18)
+    with _singleton_lock:
+        _prune_order_refs()
+        _ORDER_REF_CACHE[ref] = {
+            'request': order_request,
+            'preview_ids': preview_ids,
+            'account_id_key': account_id_key,
+            'created': _time.time(),
+        }
+    return ref
+
+
+def _consume_order_ref(ref: str):
+    """Pop a non-expired cached order_ref (single-use), or None if missing
+    or expired. Caller resolves None into a 404."""
+    with _singleton_lock:
+        _prune_order_refs()
+        return _ORDER_REF_CACHE.pop(ref, None)
 
 
 # ==================== STATUS ====================
@@ -637,3 +825,393 @@ def scheduler_action():
     except Exception:
         logger.error('Scheduler %s failed', action, exc_info=True)
         return jsonify({'error': f'Scheduler {action} failed'}), 500
+
+
+# ==================== LIVE TRADING (accounts / quotes / order ticket) ====================
+# Every route below requires a CONNECTED auth state. The flow is:
+#   1. _require_client()  -> 503 when the client surface is unavailable.
+#   2. connected state    -> 409 {'error':'not connected','state':<state>}.
+#   3. typed exceptions on the call are mapped by _client_error_response:
+#        EtradeAuthExpired   -> 401 {'error':'reauthorize'}
+#        KillSwitchEngaged   -> 409 {'error':'kill switch engaged'|'circuit breaker'}
+#        EtradeOrderRejected -> 422 {'error':..., 'reason':...}
+#        EtradeRateLimited   -> 503 (typed reason)
+#        EtradeUnavailable   -> 503 (typed reason)
+#        EtradeApiError      -> 502 (typed reason)
+# Tracebacks and secrets NEVER leak: only the typed reason strings (which
+# the client builds from E*TRADE's own Error.message) reach the client.
+
+#: Max symbols per /quotes request (E*TRADE multi-quote practical cap).
+QUOTE_SYMBOL_CAP = 25
+
+
+def _require_client():
+    """(client, None) when ready; (None, error_response) otherwise.
+
+    Resolves the 503 (surface unavailable) and 409 (not connected) guards
+    in one place so each route stays a thin happy-path.
+    """
+    if EtradeClient is None:
+        return None, _unavailable('Live trading', client_unavailable_reason())
+    manager = get_auth_manager()
+    if manager is None:
+        return None, _unavailable('Live trading', client_unavailable_reason())
+    try:
+        state = (manager.status() or {}).get('state')
+    except Exception:
+        logger.error('Failed to read auth state for live trade route',
+                     exc_info=True)
+        return None, (jsonify({'error': 'Failed to read auth state'}), 500)
+    if state != 'connected':
+        return None, (jsonify({'error': 'not connected', 'state': state}), 409)
+    client = get_client()
+    if client is None:
+        return None, _unavailable('Live trading', client_unavailable_reason())
+    return client, None
+
+
+def _client_error_response(exc: Exception):
+    """Map a typed client exception to its (json, status). Returns None when
+    the exception is not one we translate (caller raises/500s)."""
+    if isinstance(exc, EtradeAuthExpired):
+        return jsonify({'error': 'reauthorize'}), 401
+    if isinstance(exc, KillSwitchEngaged):
+        reason = str(exc)
+        label = ('circuit breaker' if 'circuit breaker' in reason.lower()
+                 else 'kill switch engaged')
+        return jsonify({'error': label, 'reason': reason}), 409
+    if isinstance(exc, EtradeOrderRejected):
+        return jsonify({'error': 'order rejected', 'reason': str(exc)}), 422
+    if isinstance(exc, EtradeRateLimited):
+        return jsonify({'error': 'rate limited', 'reason': str(exc)}), 503
+    if isinstance(exc, EtradeUnavailable):
+        return jsonify({'error': 'E*TRADE unavailable',
+                        'reason': str(exc)}), 503
+    if isinstance(exc, EtradeApiError):
+        return jsonify({'error': 'E*TRADE API error', 'reason': str(exc)}), 502
+    return None
+
+
+# -------------------- R1: accounts --------------------
+
+@live_bp.route('/accounts', methods=['GET'])
+def live_accounts():
+    """List E*TRADE accounts (account numbers masked to last-4)."""
+    client, err = _require_client()
+    if err is not None:
+        return err
+    try:
+        raw = client.list_accounts()
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
+        logger.error('Failed to list accounts', exc_info=True)
+        return jsonify({'error': 'Failed to list accounts'}), 500
+    accounts = [{
+        'accountIdKey': acct.get('accountIdKey'),
+        'accountType': acct.get('accountType'),
+        'accountDesc': acct.get('accountDesc'),
+        'accountStatus': acct.get('accountStatus'),
+        'accountId_masked': _mask_account_number(acct.get('accountId')),
+    } for acct in (raw or [])]
+    return jsonify({'accounts': accounts})
+
+
+# -------------------- R2: balances --------------------
+
+@live_bp.route('/accounts/<id_key>/balances', methods=['GET'])
+def live_balances(id_key):
+    """Account balances, with every account-number field masked."""
+    client, err = _require_client()
+    if err is not None:
+        return err
+    try:
+        balances = client.get_balances(id_key)
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
+        logger.error('Failed to read balances', exc_info=True)
+        return jsonify({'error': 'Failed to read balances'}), 500
+    return jsonify({'balances': _redact_account_numbers(balances or {})})
+
+
+# -------------------- R3: portfolio --------------------
+
+@live_bp.route('/accounts/<id_key>/portfolio', methods=['GET'])
+def live_portfolio(id_key):
+    """Account positions, with every account-number field masked."""
+    client, err = _require_client()
+    if err is not None:
+        return err
+    try:
+        positions = client.get_portfolio(id_key)
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
+        logger.error('Failed to read portfolio', exc_info=True)
+        return jsonify({'error': 'Failed to read portfolio'}), 500
+    return jsonify({'positions': _redact_account_numbers(positions or [])})
+
+
+# -------------------- R4: quotes --------------------
+
+@live_bp.route('/quotes', methods=['GET'])
+def live_quotes():
+    """Multi-symbol quotes (bid/ask/last). Capped at QUOTE_SYMBOL_CAP;
+    over-cap requests are a 400 (the UI never sends more)."""
+    client, err = _require_client()
+    if err is not None:
+        return err
+    raw = (request.args.get('symbols') or '').strip()
+    requested = [s.strip().upper() for s in raw.split(',') if s.strip()]
+    # De-dupe while preserving order.
+    seen: dict = {}
+    for sym in requested:
+        seen.setdefault(sym, None)
+    requested = list(seen.keys())
+    if not requested:
+        return jsonify({'error': "'symbols' is required (comma-separated)"}), 400
+    if len(requested) > QUOTE_SYMBOL_CAP:
+        return jsonify({'error': f'Too many symbols (max '
+                                 f'{QUOTE_SYMBOL_CAP})'}), 400
+    try:
+        quotes = client.get_quotes(requested)
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
+        logger.error('Failed to read quotes', exc_info=True)
+        return jsonify({'error': 'Failed to read quotes'}), 500
+    return jsonify({'quotes': quotes or {}, 'requested': requested})
+
+
+# -------------------- R5/R6: order ticket --------------------
+
+def _to_float(value):
+    """float(value) or None — never raises. Rejects non-finite values
+    (NaN/Inf): NaN would slip past every ``<= 0`` / ``== 0`` route guard
+    (all NaN comparisons are False) and Inf is never a valid price/strike,
+    so a non-finite input is treated as absent (-> None)."""
+    if value is None or value == '':
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def _to_int(value):
+    """int(value) or None — never raises; rejects floats with a fraction.
+
+    Non-finite inputs are rejected up front: float('inf'/'nan') parses, but
+    ``int(float('inf'))`` raises OverflowError and ``int(float('nan'))``
+    raises ValueError — so the finite check keeps this contract truthful.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    if f != int(f):
+        return None
+    return int(f)
+
+
+def _build_order_request(kind: str, params: dict):
+    """(order_request, None) on success, or (None, error_message).
+
+    Validates the kind-specific required fields and delegates to the
+    matching builder. Builder ValueErrors (bad action/strike count/zero
+    net) become the error message — never a 500.
+    """
+    try:
+        if kind == 'equity':
+            symbol = str(params.get('symbol') or '').strip().upper()
+            side = str(params.get('side') or '').strip().upper()
+            quantity = _to_int(params.get('quantity'))
+            limit = _to_float(params.get('limit_price'))
+            if not symbol:
+                return None, "'symbol' is required"
+            if side not in ('BUY', 'SELL'):
+                return None, "'side' must be BUY or SELL"
+            if quantity is None or quantity <= 0:
+                return None, "'quantity' must be a positive integer"
+            return build_equity_order(symbol, side, quantity,
+                                      limit_price=limit), None
+
+        if kind == 'option':
+            symbol = str(params.get('symbol') or '').strip().upper()
+            call_put = str(params.get('call_put') or '').strip().upper()
+            strike = _to_float(params.get('strike'))
+            expiry = str(params.get('expiry') or '').strip()
+            action = str(params.get('action') or '').strip().upper()
+            quantity = _to_int(params.get('quantity'))
+            limit = _to_float(params.get('limit_price'))
+            if not symbol:
+                return None, "'symbol' is required"
+            if call_put not in ('CALL', 'PUT'):
+                return None, "'call_put' must be CALL or PUT"
+            if strike is None or strike <= 0:
+                return None, "'strike' must be a positive number"
+            if not expiry:
+                return None, "'expiry' is required (YYYY-MM-DD)"
+            if quantity is None or quantity <= 0:
+                return None, "'quantity' must be a positive integer"
+            return build_option_order(symbol, call_put, strike, expiry,
+                                      action, quantity,
+                                      limit_price=limit), None
+
+        if kind == 'spread':
+            legs_in = params.get('legs')
+            net_price = _to_float(params.get('net_price'))
+            if not isinstance(legs_in, list) or len(legs_in) < 2:
+                return None, "'legs' must be a list of at least 2 legs"
+            if net_price is None or net_price == 0:
+                return None, ("'net_price' must be a non-zero number "
+                              '(+credit / -debit)')
+            legs = []
+            for i, leg in enumerate(legs_in):
+                if not isinstance(leg, dict):
+                    return None, f'leg {i} must be an object'
+                sym = str(leg.get('symbol') or '').strip().upper()
+                cp = str(leg.get('call_put') or '').strip().upper()
+                strike = _to_float(leg.get('strike'))
+                expiry = str(leg.get('expiry') or '').strip()
+                action = str(leg.get('action') or '').strip().upper()
+                qty = _to_int(leg.get('quantity'))
+                if not sym:
+                    return None, f'leg {i}: symbol is required'
+                if cp not in ('CALL', 'PUT'):
+                    return None, f'leg {i}: call_put must be CALL or PUT'
+                if strike is None or strike <= 0:
+                    return None, f'leg {i}: strike must be a positive number'
+                if not expiry:
+                    return None, f'leg {i}: expiry is required (YYYY-MM-DD)'
+                if qty is None or qty <= 0:
+                    return None, f'leg {i}: quantity must be a positive integer'
+                legs.append({'symbol': sym, 'call_put': cp, 'strike': strike,
+                             'expiry': expiry, 'action': action,
+                             'quantity': qty})
+            return build_spread_order(legs, net_price), None
+
+        return None, f'unknown kind {kind!r}'
+    except ValueError as e:
+        return None, str(e)
+
+
+def _preview_summary(preview: dict) -> dict:
+    """Pull the operator-facing numbers out of a PreviewOrderResponse:
+    previewIds plus any estimated cost / margin fields E*TRADE returns.
+    Robust to missing blocks — sandbox previews vary."""
+    preview_ids = [p.get('previewId') for p in preview.get('PreviewIds', [])
+                   if isinstance(p, dict) and p.get('previewId') is not None]
+    summary = {'previewIds': preview_ids}
+    # E*TRADE puts estimates in Order[].{estimatedTotalAmount,
+    # estimatedCommission, ...} and a top-level marginLevelCd /
+    # marginBuyingPower depending on the order type. Pass through whatever
+    # is present without assuming a fixed shape.
+    orders = preview.get('Order') or []
+    if orders and isinstance(orders[0], dict):
+        first = orders[0]
+        for key in ('estimatedTotalAmount', 'estimatedCommission',
+                    'netPrice', 'netbid', 'netask'):
+            if first.get(key) is not None:
+                summary[key] = first[key]
+    for key in ('marginLevelCd', 'dstFlag', 'placedTime',
+                'PreviewIds', 'totalOrderValue', 'totalCommission'):
+        if key == 'PreviewIds':
+            continue
+        if preview.get(key) is not None:
+            summary[key] = preview[key]
+    return summary
+
+
+@live_bp.route('/order/preview', methods=['POST'])
+def live_order_preview():
+    """Build + preview an order, caching the built request behind an opaque
+    order_ref. PLACE only ever works from a cached, previewed ref."""
+    client, err = _require_client()
+    if err is not None:
+        return err
+    data = request.get_json(silent=True) or {}
+    account_id_key = str(data.get('account_id_key') or '').strip()
+    kind = str(data.get('kind') or '').strip()
+    if not account_id_key:
+        return jsonify({'error': "'account_id_key' is required"}), 400
+    if kind not in ('equity', 'option', 'spread'):
+        return jsonify({'error': "'kind' must be 'equity', 'option' or "
+                                 "'spread'"}), 400
+
+    order_request, build_err = _build_order_request(kind, data)
+    if build_err is not None:
+        return jsonify({'error': build_err}), 400
+
+    try:
+        preview = client.preview_order(account_id_key, order_request)
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
+        logger.error('Order preview failed', exc_info=True)
+        return jsonify({'error': 'Order preview failed'}), 500
+
+    preview_ids = preview.get('PreviewIds', []) if isinstance(preview, dict) \
+        else []
+    order_ref = _cache_order_ref(account_id_key, order_request, preview_ids)
+    return jsonify({
+        'preview': _preview_summary(preview if isinstance(preview, dict)
+                                    else {}),
+        'order_ref': order_ref,
+    })
+
+
+@live_bp.route('/order/place', methods=['POST'])
+def live_order_place():
+    """Place a previously-previewed order, addressed ONLY by order_ref.
+
+    Looks up the cached previewed request (404 if missing/expired), places
+    it, and consumes the ref on success (single-use). The cached request is
+    consumed BEFORE the place call so a successful placement can never be
+    replayed; a failed place re-caches nothing (the operator re-previews).
+    """
+    client, err = _require_client()
+    if err is not None:
+        return err
+    data = request.get_json(silent=True) or {}
+    order_ref = str(data.get('order_ref') or '').strip()
+    if not order_ref:
+        return jsonify({'error': "'order_ref' is required"}), 400
+
+    record = _consume_order_ref(order_ref)
+    if record is None:
+        return jsonify({'error': 'order_ref not found or expired'}), 404
+
+    account_id_key = record['account_id_key']
+    order_request = record['request']
+    preview_ids = record['preview_ids']
+    try:
+        result = client.place_order(account_id_key, order_request,
+                                    preview_ids)
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
+        logger.error('Order placement failed', exc_info=True)
+        return jsonify({'error': 'Order placement failed'}), 500
+
+    order_id = result.get('order_id') if isinstance(result, dict) else None
+    placed = result.get('response', {}) if isinstance(result, dict) else {}
+    status = None
+    if isinstance(placed, dict):
+        order_ids = placed.get('OrderIds') or []
+        if order_ids and isinstance(order_ids[0], dict):
+            status = order_ids[0].get('status')
+        status = status or placed.get('status')
+    return jsonify({'order': {'orderId': order_id, 'status': status}})
