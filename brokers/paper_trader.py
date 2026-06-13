@@ -22,9 +22,12 @@ logger = logging.getLogger(__name__)
 class PaperTrader(ExecutionBroker):
     """Simulated trading with real market data"""
 
-    def __init__(self, initial_capital: float = 100000):
+    def __init__(self, initial_capital: float = 100000,
+                 price_sanity_threshold: Optional[float] = None):
         self.portfolio = PortfolioManager(initial_capital)
         self.market_data = MarketDataHandler()
+        # Opt-in fat-finger guard (None disables); see ExecutionBroker.
+        self.price_sanity_threshold = price_sanity_threshold
         self.pending_orders: List[Order] = []
         self.order_id_counter = 0
         # Date of the close that served each symbol's last price quote.
@@ -35,10 +38,16 @@ class PaperTrader(ExecutionBroker):
         # (double fill, then ValueError on the second remove). RLock, not
         # Lock, because get_portfolio_status() calls process_orders().
         self._lock = threading.RLock()
+        # Filled orders kept queryable by order_status() so a PatientExecutor
+        # driving the paper broker can poll/bank fills exactly like live (paper
+        # fills all-or-nothing, so a filled order reports its full quantity).
+        # Keyed by order_id; bounded by the orders placed this session.
+        self.filled_orders: Dict[str, Order] = {}
 
     def place_order(self, asset: Asset, order_type: OrderType, quantity: int,
                    limit_price: Optional[float]) -> str:
         """Place a new order"""
+        self._check_price_sanity(asset.symbol, limit_price)
         with self._lock:
             self.order_id_counter += 1
             order_id = f"ORD-{self.order_id_counter:06d}"
@@ -60,8 +69,20 @@ class PaperTrader(ExecutionBroker):
 
         Returns True when the order was found and removed from the pending
         queue (its status is set to CANCELLED), False otherwise.
+
+        Processes pending fills FIRST: a fill that just became marketable is
+        captured (the order moves to filled_orders) before the cancel, so a
+        fill racing the cancel is never silently dropped — an already-filled
+        order is then no longer cancellable and returns False, mirroring live
+        cancel-vs-fill behavior.
+
+        Like get_portfolio_status(), this runs process_orders() under the
+        RLock, so the lock is held across the price fetch — an intentional,
+        pre-existing pattern (paper-only; cancel latency gains one quote
+        round-trip in exchange for never losing a racing fill).
         """
         with self._lock:
+            self.process_orders()
             for order in self.pending_orders:
                 if order.order_id == order_id:
                     order.status = OrderStatus.CANCELLED
@@ -72,6 +93,29 @@ class PaperTrader(ExecutionBroker):
                     return True
         logger.warning("cancel_order: no pending order with id %s", order_id)
         return False
+
+    def order_status(self, order_id: str) -> Optional[Dict]:
+        """Status of an order for PatientExecutor fill polling.
+
+        Returns {'status', 'filled_quantity', 'avg_fill_price'}:
+        'OPEN' with filled_quantity 0 while pending, 'FILLED' with the full
+        quantity and fill price once executed — or None if the order id is
+        unknown. This is the same contract LiveEtradeBroker.order_status()
+        satisfies, so a PatientExecutor can drive paper rehearsal exactly as
+        it drives the live broker (closing a paper/live parity gap).
+        """
+        with self._lock:
+            for order in self.pending_orders:
+                if order.order_id == order_id:
+                    return {"status": "OPEN",
+                            "filled_quantity": order.filled_quantity,
+                            "avg_fill_price": order.filled_price}
+            filled = self.filled_orders.get(order_id)
+            if filled is not None:
+                return {"status": "FILLED",
+                        "filled_quantity": filled.filled_quantity,
+                        "avg_fill_price": filled.filled_price}
+        return None
 
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Get the most recent close for a symbol.
@@ -140,6 +184,12 @@ class PaperTrader(ExecutionBroker):
 
                 if filled:
                     self._execute_order(order, current_price)
+                    # Record the fill on the order and keep it queryable via
+                    # order_status() (paper fills fully or not at all).
+                    order.filled_quantity = order.quantity
+                    order.filled_price = current_price
+                    order.status = OrderStatus.FILLED
+                    self.filled_orders[order.order_id] = order
                     self.pending_orders.remove(order)
     
     def _execute_order(self, order: Order, execution_price: float):

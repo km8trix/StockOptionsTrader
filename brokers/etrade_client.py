@@ -506,8 +506,18 @@ class EtradeClient:
             response = self._send("post", path, payload, order_endpoint=True)
             placed = response.get("PlaceOrderResponse", {})
             order_ids = placed.get("OrderIds", [])
+            if not order_ids:
+                # A 200 with no OrderIds means the order was NOT accepted (or
+                # the response is malformed) — a successful place always carries
+                # them. Returning order_id=None lets the caller stringify it to
+                # "None", which then poisons cancel_order and the audit trail
+                # (a ghost order working at the broker while the session thinks
+                # it was never placed). Fail loudly so the operator decides.
+                raise EtradeOrderRejected(
+                    "E*TRADE place response carried no OrderIds — the order was "
+                    "not accepted (or the response was malformed)")
             return {
-                "order_id": order_ids[0].get("orderId") if order_ids else None,
+                "order_id": order_ids[0].get("orderId"),
                 "response": placed,
             }
 

@@ -60,9 +60,8 @@ the kill switch always reports 'killed'; edge decay always reports
 'edge_decayed' (the report's fills list says what was banked); only the
 deadline distinguishes 'partial' (some fills) from 'timeout' (none).
 
-Broker protocol (duck-typed; LiveEtradeBroker complies in full —
-PaperTrader lacks order_status, so paper rehearsal goes through
-LiveTradingSession's direct place_order path instead of this engine):
+Broker protocol (duck-typed; both LiveEtradeBroker and PaperTrader comply
+in full, so paper rehearsal can drive this engine exactly like live):
     place_order(asset, OrderType, quantity, limit_price) -> order_id
     place_structure(legs, net_price, contracts)          -> order_id
         (only needed when working multi-leg packages)

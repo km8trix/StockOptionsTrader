@@ -268,6 +268,27 @@ class TestOrderFlow:
         events = [e["event_type"] for e in audit.entries(ascending=True)]
         assert events == ["order_previewed", "order_placed"]
 
+    def test_empty_order_ids_raises_rejected(self, harness):
+        # Phase 1: a 200 place response carrying no OrderIds must RAISE, not
+        # return a None order_id that stringifies to "None" and poisons later
+        # cancels / the audit trail (a ghost order at the broker).
+        client, transport, _ = harness
+        transport.route("post", "orders/preview.json", FakeResponse(
+            200, {"PreviewOrderResponse": {"PreviewIds": [{"previewId": 9}]}}))
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {"OrderIds": []}}))
+        with pytest.raises(EtradeOrderRejected, match="OrderIds"):
+            client.submit_order(ACCOUNT, build_equity_order("AAPL", "BUY", 10))
+
+    def test_missing_order_ids_key_raises_rejected(self, harness):
+        client, transport, _ = harness
+        transport.route("post", "orders/preview.json", FakeResponse(
+            200, {"PreviewOrderResponse": {"PreviewIds": [{"previewId": 9}]}}))
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {}}))
+        with pytest.raises(EtradeOrderRejected, match="OrderIds"):
+            client.submit_order(ACCOUNT, build_equity_order("AAPL", "BUY", 10))
+
 
 # ----------------------------------------------------------------------
 # THE IDEMPOTENCY STATE MACHINE
@@ -505,6 +526,39 @@ class TestLiveEtradeBroker:
         sent = transport.calls[-1]["json"]["PlaceOrderRequest"]
         assert sent["orderType"] == "EQ"
         assert sent["PreviewIds"] == [{"previewId": 3}]
+
+    def test_kill_switch_blocks_place_order_and_structure(self, tmp_path):
+        # Phase 1 INTEGRATION: an engaged kill switch blocks BOTH order-entry
+        # points on LiveEtradeBroker (place_order + place_structure) before any
+        # order HTTP call. Pins the safety contract end-to-end through the
+        # broker wrapper, not just the client unit.
+        from brokers.live_trader import LiveEtradeBroker
+        from core.models import Asset, AssetType, OrderType
+        from utils.kill_switch import KillSwitch, KillSwitchEngaged
+        db_path = str(tmp_path / "ks.db")
+        audit = AuditLog(db_path, env="sandbox")
+        kill_switch = KillSwitch(db_path, audit=audit)
+        transport = ScriptedTransport()
+        client = EtradeClient(FakeAuth(transport, db_path),
+                              kill_switch=kill_switch, audit=audit,
+                              sleep_fn=lambda _s: None)
+        broker = LiveEtradeBroker(client, ACCOUNT)
+        kill_switch.engage("test halt", actor="ops")
+
+        with pytest.raises(KillSwitchEngaged):
+            broker.place_order(Asset("AAPL", AssetType.STOCK),
+                               OrderType.BUY, 10, 190.0)
+        legs = [
+            {"asset": Asset("SPY", AssetType.PUT, 440.0, "2026-07-17"),
+             "action": "SHORT"},
+            {"asset": Asset("SPY", AssetType.PUT, 430.0, "2026-07-17"),
+             "action": "BUY"},
+        ]
+        with pytest.raises(KillSwitchEngaged):
+            broker.place_structure(legs, net_price=1.15, contracts=2)
+        # No order endpoint was ever hit (gated before any HTTP call).
+        assert not any("orders/place" in c["url"] or "orders/preview" in c["url"]
+                       for c in transport.calls)
 
     def test_place_structure_maps_desk_legs(self, harness):
         from core.models import Asset, AssetType

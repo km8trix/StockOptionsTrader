@@ -1763,6 +1763,34 @@ class TestPaperPendingOrders:
         assert client.post(
             '/api/trader/nope-x/order/ORD-000001/cancel').status_code == 404
 
+    # Phase 1: robust order-input validation (no silent truncation/bad price).
+    def test_order_rejects_fractional_quantity(self, client):
+        self._create_trader(client, 'val-frac')
+        r = client.post('/api/trader/val-frac/order', json={
+            'symbol': 'AAPL', 'action': 'BUY', 'quantity': 1.9, 'price': 100.0})
+        assert r.status_code == 400
+        assert 'integer' in r.get_json()['error'].lower()
+
+    def test_order_rejects_zero_quantity(self, client):
+        self._create_trader(client, 'val-zero')
+        r = client.post('/api/trader/val-zero/order', json={
+            'symbol': 'AAPL', 'action': 'BUY', 'quantity': 0, 'price': 100.0})
+        assert r.status_code == 400
+
+    def test_order_rejects_negative_price(self, client):
+        self._create_trader(client, 'val-neg')
+        r = client.post('/api/trader/val-neg/order', json={
+            'symbol': 'MSFT', 'action': 'SELL', 'quantity': 5, 'price': -50.0})
+        assert r.status_code == 400
+        assert 'non-negative' in r.get_json()['error'].lower()
+
+    def test_order_rejects_empty_symbol(self, client):
+        self._create_trader(client, 'val-sym')
+        r = client.post('/api/trader/val-sym/order', json={
+            'symbol': '   ', 'action': 'BUY', 'quantity': 5, 'price': 100.0})
+        assert r.status_code == 400
+        assert 'symbol' in r.get_json()['error'].lower()
+
 
 # ==================== LIVE TRADING (Phase 9, contract C20) ====================
 # The backend C16-C19 surfaces (brokers/etrade_auth, utils/kill_switch,

@@ -329,3 +329,70 @@ class TestConcurrency:
         assert len(set(order_ids)) == self.N_THREADS, (
             f"duplicate order ids minted: {sorted(order_ids)}")
         assert len(trader.pending_orders) == self.N_THREADS
+
+
+class TestOrderStatusParity:
+    """Phase 1: order_status() gives paper the same fill-polling contract as
+    LiveEtradeBroker, so a PatientExecutor can drive paper rehearsal."""
+
+    def test_pending_order_reports_open(self, trader):
+        oid = trader.place_order(_stock(), OrderType.BUY, 10, limit_price=90.0)
+        status = trader.order_status(oid)
+        assert status == {"status": "OPEN", "filled_quantity": 0,
+                          "avg_fill_price": None}
+
+    def test_filled_order_reports_full_quantity_and_price(self, trader):
+        oid = trader.place_order(_stock(), OrderType.BUY, 10, limit_price=None)
+        trader.process_orders()  # market order fills at CURRENT_PRICE
+        status = trader.order_status(oid)
+        assert status["status"] == "FILLED"
+        assert status["filled_quantity"] == 10
+        assert status["avg_fill_price"] == pytest.approx(CURRENT_PRICE)
+
+    def test_unknown_order_is_none(self, trader):
+        assert trader.order_status("ORD-999999") is None
+
+
+class TestCancelProcessesFillsFirst:
+    """Phase 1: cancel_order() processes pending fills FIRST, so a fill racing
+    the cancel is captured (and an already-filled order is uncancellable)."""
+
+    def test_cancel_of_marketable_order_captures_the_fill(self, trader):
+        # A market order is immediately marketable; cancel must fill it first
+        # (recording the position) and then report it un-cancellable.
+        oid = trader.place_order(_stock(), OrderType.BUY, 10, limit_price=None)
+        result = trader.cancel_order(oid)
+        assert result is False                      # already filled, not cancelled
+        pos = trader.portfolio.get_position(_stock())
+        assert pos is not None and pos.quantity == 10   # the fill was preserved
+        assert trader.order_status(oid)["status"] == "FILLED"
+
+    def test_cancel_of_resting_limit_still_cancels(self, trader):
+        oid = trader.place_order(_stock(), OrderType.BUY, 10, limit_price=90.0)
+        assert trader.cancel_order(oid) is True     # never marketable -> cancelled
+        assert trader.portfolio.get_position(_stock()) is None
+
+
+class TestPriceSanityGuard:
+    """Phase 1: opt-in fat-finger guard — warn-only, disabled by default."""
+
+    def test_warns_on_fat_finger_when_enabled(self, monkeypatch, caplog):
+        monkeypatch.setattr(PaperTrader, "get_current_price",
+                            lambda self, symbol: 100.0)
+        t = PaperTrader(price_sanity_threshold=0.5)
+        with caplog.at_level(logging.WARNING, logger="brokers.base"):
+            t.place_order(_stock(), OrderType.BUY, 1, limit_price=0.01)
+        assert any("fat-finger" in r.message for r in caplog.records)
+
+    def test_disabled_by_default(self, trader, caplog):
+        with caplog.at_level(logging.WARNING, logger="brokers.base"):
+            trader.place_order(_stock(), OrderType.BUY, 1, limit_price=0.01)
+        assert not any("fat-finger" in r.message for r in caplog.records)
+
+    def test_within_threshold_no_warning(self, monkeypatch, caplog):
+        monkeypatch.setattr(PaperTrader, "get_current_price",
+                            lambda self, symbol: 100.0)
+        t = PaperTrader(price_sanity_threshold=0.5)
+        with caplog.at_level(logging.WARNING, logger="brokers.base"):
+            t.place_order(_stock(), OrderType.BUY, 1, limit_price=99.0)
+        assert not any("fat-finger" in r.message for r in caplog.records)

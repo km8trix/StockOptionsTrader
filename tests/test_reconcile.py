@@ -36,6 +36,30 @@ class TestReconcile:
         # checked_at is a parseable ISO timestamp.
         datetime.fromisoformat(result["checked_at"])
 
+    def test_option_assignment_is_caught_by_share_and_cash_checks(self):
+        # Phase 1: an overnight short-put ASSIGNMENT — the broker now shows the
+        # option gone, 100 new shares of the underlying, and ~$44k less cash,
+        # while the local book still believes it holds the short put with the
+        # old cash. The dangerous divergence DOES surface (engaging the
+        # kill-switch safety net) through the existing union + cash checks — no
+        # special known-positions machinery is needed.
+        broker = FakeBroker(
+            [{"symbol": "SPY", "quantity": 100}],   # assigned shares appear
+            cash=56_000.0)                          # ~$44k assignment cost out
+        result = reconcile({OPT_KEY: -1}, 100_000.0, broker)
+        assert result["ok"] is False
+        kinds = {(m["kind"], m["symbol"]) for m in result["mismatches"]}
+        assert ("position", "SPY") in kinds         # new shares vs local 0
+        assert ("position", OPT_KEY) in kinds       # local short put vs broker 0
+        assert ("cash", None) in kinds              # the cash delta
+
+    def test_both_books_agree_position_gone_stays_clean(self):
+        # A worthless expiry zeroes a position in BOTH books with no share/cash
+        # effect — intentionally NOT a mismatch (flagging it would false-halt
+        # trading on every routine expiry).
+        broker = FakeBroker([], cash=100_000.0)
+        assert reconcile({}, 100_000.0, broker)["ok"] is True
+
     def test_position_quantity_drift(self):
         broker = FakeBroker([{"symbol": "AAPL", "quantity": 90}], 0.0)
         result = reconcile({"AAPL": 100}, 0.0, broker)

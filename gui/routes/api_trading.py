@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from flask import Blueprint, request, jsonify
 import logging
+import math
 import os
 import threading
 
@@ -125,13 +126,29 @@ def place_order(trader_id):
             return jsonify({'error': f'Trader {trader_id} not found'}), 404
             
         data = request.get_json(silent=True) or {}
-        symbol = data.get('symbol', '').upper()
+        symbol = str(data.get('symbol') or '').strip().upper()
         action = data.get('action', 'BUY').upper()
-        quantity = int(data.get('quantity', 0))
-        price = float(data.get('price', 0))
-        
-        if not symbol or quantity <= 0:
-            return jsonify({'error': 'Invalid parameters'}), 400
+
+        # Robust parsing (mirrors api_live's _to_int/_to_float): reject a
+        # fractional quantity instead of silently truncating int(1.9)->1, and
+        # reject a negative or non-finite (NaN/Inf) price instead of routing it.
+        try:
+            qty_raw = float(data.get('quantity', 0))
+        except (TypeError, ValueError):
+            return jsonify({'error': "'quantity' must be a positive integer"}), 400
+        if not math.isfinite(qty_raw) or qty_raw != int(qty_raw) or qty_raw <= 0:
+            return jsonify({'error': "'quantity' must be a positive integer"}), 400
+        quantity = int(qty_raw)
+
+        try:
+            price = float(data.get('price', 0))
+        except (TypeError, ValueError):
+            return jsonify({'error': "'price' must be a non-negative number"}), 400
+        if not math.isfinite(price) or price < 0:
+            return jsonify({'error': "'price' must be a finite, non-negative number"}), 400
+
+        if not symbol:
+            return jsonify({'error': "'symbol' is required"}), 400
             
         trader = active_traders[trader_id]
         asset = Asset(symbol, AssetType.STOCK)

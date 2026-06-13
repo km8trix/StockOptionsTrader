@@ -97,7 +97,8 @@ class LiveEtradeBroker(ExecutionBroker):
                  account_id_key: str,
                  kill_switch: Optional[KillSwitch] = None,
                  audit: Optional[AuditLog] = None,
-                 circuit_breaker=_AUTO):
+                 circuit_breaker=_AUTO,
+                 price_sanity_threshold: Optional[float] = None):
         if isinstance(auth, EtradeClient) or hasattr(auth, "preview_order"):
             self.client: EtradeClient = auth  # prebuilt (or fake) client
             # Surface the client's own gate (if any) for the session.
@@ -115,6 +116,8 @@ class LiveEtradeBroker(ExecutionBroker):
             # this very client (read-only GETs are never gated).
             self.client.circuit_breaker = circuit_breaker
         self.account_id_key = account_id_key
+        # Opt-in fat-finger guard (None disables); see ExecutionBroker.
+        self.price_sanity_threshold = price_sanity_threshold
 
     def _build_daily_loss_gate(self, kill_switch: KillSwitch,
                                audit: Optional[AuditLog]) -> DailyLossGate:
@@ -140,6 +143,7 @@ class LiveEtradeBroker(ExecutionBroker):
         closes it (SELL_CLOSE). Short option exposure is only ever opened
         as part of a defined-risk structure via place_structure().
         """
+        self._check_price_sanity(asset.symbol, limit_price)
         action = "BUY" if order_type == OrderType.BUY else "SELL"
         if asset.asset_type is AssetType.STOCK:
             request = build_equity_order(asset.symbol, action, quantity,

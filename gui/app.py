@@ -55,7 +55,13 @@ def create_app(config: dict | None = None) -> Flask:
 
     app = Flask(__name__, template_folder='templates', static_folder='static')
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-insecure-change-me')
-    CORS(app)
+    # Restrict CORS to localhost (and any explicitly configured origins). A
+    # bare CORS(app) allows ALL origins, which on a money-moving order API is a
+    # CSRF-equivalent exposure. Phase 4 Docker can widen this via CORS_ORIGINS.
+    cors_origins = [o.strip() for o in os.environ.get(
+        'CORS_ORIGINS',
+        'http://localhost:5001,http://127.0.0.1:5001').split(',') if o.strip()]
+    CORS(app, resources={r"/*": {"origins": cors_origins}})
 
     @app.context_processor
     def inject_app_version():

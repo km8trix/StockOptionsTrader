@@ -9,14 +9,48 @@ brokers.live_trader.LiveEtradeBroker.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, Optional
 
 from core.models import Asset, OrderType
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionBroker(ABC):
     """Abstract interface that every execution venue must implement."""
+
+    #: Optional fractional distance from the current price beyond which a
+    #: limit price is flagged as a likely fat-finger (e.g. 0.5 = 50%). None
+    #: disables the check; concrete brokers expose it via their constructor.
+    price_sanity_threshold: Optional[float] = None
+
+    def _check_price_sanity(self, symbol: str,
+                            limit_price: Optional[float]) -> None:
+        """Warn when a limit price is implausibly far from the current price.
+
+        Opt-in and WARN-ONLY: does nothing unless price_sanity_threshold is
+        set, and never blocks the order (a legitimately far-from-market limit
+        must still place). It exists to surface obvious fat-fingers — a 0.01
+        limit on a $200 name, or a 10x typo — in the logs rather than silently
+        routing them to the broker.
+        """
+        threshold = self.price_sanity_threshold
+        if threshold is None or limit_price is None:
+            return
+        try:
+            current = self.get_current_price(symbol)
+        except Exception:  # noqa: BLE001 - a sanity check must never break place
+            return
+        if current is None or current <= 0:
+            return
+        distance = abs(limit_price - current) / current
+        if distance > threshold:
+            logger.warning(
+                "Limit price %.4f for %s is %.1f%% away from current %.4f "
+                "(threshold %.0f%%) — possible fat-finger",
+                limit_price, symbol, distance * 100, current, threshold * 100)
 
     @abstractmethod
     def place_order(self, asset: Asset, order_type: OrderType, quantity: int,

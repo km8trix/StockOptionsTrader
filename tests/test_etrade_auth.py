@@ -184,6 +184,22 @@ class TestRenewal:
         assert status["renewed_at"] == clock.now.isoformat()
         assert ("GET", RENEW_TOKEN_URL) in factory.request_log
 
+    def test_renew_invalidates_cached_session(self, sandbox_env, tmp_path):
+        # After renew() the cached signing session must be dropped so the next
+        # get_session() rebuilds it with the renewed token; otherwise the stale
+        # pre-renewal session keeps being handed out and 401s once the old idle
+        # window lapses.
+        clock = Clock(datetime(2026, 6, 12, 14, 0, tzinfo=UTC))
+        manager, _ = make_manager(tmp_path, clock)
+        connect(manager)
+        before = manager.get_session()            # caches _session
+        assert manager._session is not None
+        clock.now = datetime(2026, 6, 12, 16, 0, tzinfo=UTC)
+        assert manager.renew() is True
+        assert manager._session is None           # cache invalidated
+        after = manager.get_session()             # rebuilt fresh
+        assert after is not before
+
     def test_renew_with_no_token_returns_false(self, sandbox_env, tmp_path):
         manager, _ = make_manager(tmp_path)
         assert manager.renew() is False

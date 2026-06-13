@@ -431,6 +431,12 @@ class EtradeAuthManager:
             self.audit.append("auth_manager", "auth_renewed",
                               {"env": self.env})
             logger.info("E*TRADE token renewed at %s", renewed_at)
+            # Invalidate the cached signing session so get_session() rebuilds it
+            # with the renewed token. Without this the client keeps handing out
+            # the pre-renewal session and 401s once the old idle window lapses —
+            # connect() and disconnect() already null _session for the same
+            # reason.
+            self._session = None
             return True
         if response.status_code == 401 and "oauth_problem" in response.text:
             self._expire_row(row, "oauth_problem on renew")
