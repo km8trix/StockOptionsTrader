@@ -89,8 +89,19 @@ class LiveTradingSession:
                  auth_manager=None,
                  reconcile_fn: Optional[Callable] = None,
                  circuit_breaker=_AUTO,
-                 clock: Optional[Callable[[], datetime]] = None):
+                 clock: Optional[Callable[[], datetime]] = None,
+                 orchestrator=None):
+        # Fund mode: a FundOrchestrator drives N desks on the shared
+        # portfolio. It exposes the read surface the session needs
+        # (key/capital_allocation/set_clock) and a step() that returns the
+        # netted, account-risk-approved intents. Provide exactly ONE of
+        # desk= or orchestrator=.
+        if (desk is None) == (orchestrator is None):
+            raise ValueError(
+                "Provide exactly one of desk= or orchestrator= to "
+                "LiveTradingSession")
         self.desk = desk
+        self.orchestrator = orchestrator
         self.broker = broker
         self.portfolio = portfolio
         self.data_fn = data_fn
@@ -106,6 +117,13 @@ class LiveTradingSession:
         self.circuit_breaker = circuit_breaker
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.last_reconciliation: Optional[Dict] = None
+
+    @property
+    def _driver(self):
+        """The desk or orchestrator driving this session. Both expose
+        key/capital_allocation/set_clock, so the session reads whichever is
+        set off this one accessor."""
+        return self.desk if self.desk is not None else self.orchestrator
 
     # ------------------------------------------------------------------
     def evaluate_once(self) -> Dict:
@@ -135,21 +153,49 @@ class LiveTradingSession:
             return halted_by_breaker
 
         self.audit.append("live_session", "session_evaluate",
-                          {"desk": self.desk.key,
+                          {"desk": self._driver.key,
                            "timestamp": now.isoformat()})
-        all_data = self.data_fn()
-        self.desk.set_clock(now)
-        intents = self.desk.generate_intents(all_data, now, self.portfolio)
-        for intent in intents:
-            self.audit.append("live_session", "desk_intent", {
-                "symbol": intent.asset.symbol,
-                "action": intent.action,
-                "size_fraction": intent.size_fraction,
-                "quantity": intent.quantity,
-                "reason": intent.reason,
+        # Intent generation + risk is FAIL-CLOSED: a raise here (data fetch,
+        # a desk's generate_intents, the orchestrator's net/apply_risk/
+        # aggregator, or apply_risk) must NOT escape as a bare exception
+        # leaving the audit trail open at session_evaluate — it becomes a
+        # clean, audited session_halted, same as the execution-phase rails.
+        # (Fund mode widens this surface to N desks + netting + aggregator;
+        # the guard hardens both modes identically.)
+        try:
+            all_data = self.data_fn()
+            self._driver.set_clock(now)
+            if self.orchestrator is not None:
+                # The orchestrator fans out to its desks, nets, and runs the
+                # one account-wide apply_risk (+ aggregator) internally;
+                # step() returns the already-approved intents. The netting/
+                # conflict decisions are captured in orchestrator.notes.
+                intents = self.orchestrator.step(all_data, now, self.portfolio)
+                approved = intents
+            else:
+                intents = self.desk.generate_intents(all_data, now,
+                                                     self.portfolio)
+            for intent in intents:
+                self.audit.append("live_session", "desk_intent", {
+                    "symbol": intent.asset.symbol,
+                    "action": intent.action,
+                    "size_fraction": intent.size_fraction,
+                    "quantity": intent.quantity,
+                    "reason": intent.reason,
+                })
+            if self.orchestrator is None:
+                approved = self.desk.apply_risk(intents, self.portfolio,
+                                                all_data, now)
+        except Exception as e:  # noqa: BLE001 - audited halt, never a crash
+            self.audit.append("live_session", "session_halted", {
+                "reason": "intent_generation_error",
+                "error": str(e),
+                "error_type": type(e).__name__,
             })
-        approved = self.desk.apply_risk(intents, self.portfolio, all_data,
-                                        now)
+            logger.error("Session halted: intent generation/risk raised "
+                         "%s: %s", type(e).__name__, e)
+            return {"status": "halted", "reason": "intent_generation_error",
+                    "timestamp": now.isoformat(), "reports": []}
 
         reports: List[Dict] = []
         halted = False
@@ -298,8 +344,12 @@ class LiveTradingSession:
         price = self.broker.get_current_price(intent.asset.symbol)
         if price is None or price <= 0:
             return None
+        # In fund mode the driver is the orchestrator (capital_allocation
+        # 1.0) and intent.size_fraction is already account-absolute, so this
+        # is portfolio_value * size_fraction — no double-scaling. Single-desk
+        # mode uses the desk's own allocation, unchanged.
         dollars = (self.portfolio.get_portfolio_value()
-                   * self.desk.capital_allocation * intent.size_fraction)
+                   * self._driver.capital_allocation * intent.size_fraction)
         return int(dollars // (price * intent.asset.multiplier))
 
     # ------------------------------------------------------------------

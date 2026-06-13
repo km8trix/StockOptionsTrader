@@ -8,6 +8,10 @@ import pytest
 
 from core.models import Asset, AssetType, OrderType
 from desks.base import DeskIntent
+from desks.orchestrator import FundOrchestrator
+from tests.test_fund_orchestrator import ScriptedDesk
+from tests.test_fund_orchestrator import intent as fund_intent
+from tests.test_fund_orchestrator import stock as fund_stock
 from utils.audit import AuditLog
 from utils.kill_switch import KillSwitch
 from utils.live_session import LiveTradingSession
@@ -83,6 +87,93 @@ def make_session(desk, broker, executor, audit, switch, **kwargs):
         desk=desk, broker=broker, portfolio=FakePortfolio(),
         data_fn=lambda: {"SPY": None}, executor=executor, audit=audit,
         kill_switch=switch, **kwargs)
+
+
+class TestOrchestratorMode:
+    """Fund mode: a FundOrchestrator drives the live session in place of one
+    desk — the exactly-one-of guard, and netted/account-approved intents reach
+    the executor through the same path (single-desk path is unchanged)."""
+
+    def test_exactly_one_of_desk_or_orchestrator_required(self, rails):
+        audit, switch = rails
+        orch = FundOrchestrator([ScriptedDesk('s', 1.0)])
+        with pytest.raises(ValueError, match='exactly one'):
+            LiveTradingSession(desk=FakeDesk([]), broker=FakeBroker(),
+                               portfolio=FakePortfolio(),
+                               data_fn=lambda: {}, orchestrator=orch)
+        with pytest.raises(ValueError, match='exactly one'):
+            LiveTradingSession(desk=None, broker=FakeBroker(),
+                               portfolio=FakePortfolio(),
+                               data_fn=lambda: {})
+
+    def test_fund_mode_executes_netted_intents(self, rails):
+        audit, switch = rails
+        # The orchestrator runs the REAL Desk.apply_risk (daily-loss circuit
+        # reads portfolio_history), so use a real PortfolioManager here.
+        from portfolio.manager import PortfolioManager
+        orch = FundOrchestrator([ScriptedDesk(
+            's', 1.0, intents=[fund_intent(fund_stock('SPY'), 'BUY', 0.1)])])
+        executor = FakeExecutor()
+        session = LiveTradingSession(
+            desk=None, broker=FakeBroker(), portfolio=PortfolioManager(1e5),
+            data_fn=lambda: {'SPY': None}, executor=executor, audit=audit,
+            kill_switch=switch, orchestrator=orch)
+        result = session.evaluate_once()
+        assert result['status'] == 'ok'
+        assert result['approved'] == 1
+        assert len(executor.calls) == 1
+        side, asset, qty = executor.calls[0]
+        assert side == 'BUY' and asset.symbol == 'SPY' and qty > 0
+
+
+class TestIntentGenerationFailClosed:
+    """A raise during intent generation/risk (data fetch, a desk's
+    generate_intents, the orchestrator's net/apply_risk/aggregator) becomes a
+    clean AUDITED session_halted — never a bare exception out of
+    evaluate_once leaving the audit trail open."""
+
+    def test_fund_mode_desk_error_halts_cleanly(self, rails):
+        audit, switch = rails
+        from portfolio.manager import PortfolioManager
+
+        class Boom(ScriptedDesk):
+            def generate_intents(self, all_data, date, portfolio):
+                raise RuntimeError("desk boom")
+
+        orch = FundOrchestrator([Boom('boom', 1.0)])
+        executor = FakeExecutor()
+        session = LiveTradingSession(
+            desk=None, broker=FakeBroker(), portfolio=PortfolioManager(1e5),
+            data_fn=lambda: {'SPY': None}, executor=executor, audit=audit,
+            kill_switch=switch, orchestrator=orch)
+        result = session.evaluate_once()  # must NOT raise
+        assert result["status"] == "halted"
+        assert result["reason"] == "intent_generation_error"
+        assert executor.calls == []  # nothing executed
+
+    def test_desk_mode_generate_error_halts_cleanly(self, rails):
+        audit, switch = rails
+
+        class BoomDesk:
+            key = "boom"
+            capital_allocation = 1.0
+
+            def set_clock(self, now):
+                pass
+
+            def generate_intents(self, all_data, date, portfolio):
+                raise RuntimeError("desk boom")
+
+            def apply_risk(self, intents, portfolio, all_data, date):
+                return intents
+
+        executor = FakeExecutor()
+        session = make_session(BoomDesk(), FakeBroker(), executor, audit,
+                               switch)
+        result = session.evaluate_once()
+        assert result["status"] == "halted"
+        assert result["reason"] == "intent_generation_error"
+        assert executor.calls == []
 
 
 class TestIntentFlow:
