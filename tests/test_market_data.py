@@ -106,3 +106,49 @@ def test_ensure_ssl_certs_respects_existing(monkeypatch):
     monkeypatch.setenv('SSL_CERT_FILE', '/custom/ca.pem')
     MarketDataHandler._ensure_ssl_certs()
     assert os.environ['SSL_CERT_FILE'] == '/custom/ca.pem'
+
+
+def test_index_symbol_detection():
+    h = MarketDataHandler(cache=False)
+    assert h._index_symbol('SPX') == 'SPX'
+    assert h._index_symbol('^GSPC') == 'SPX'   # ^-prefix + alias
+    assert h._index_symbol('spx') == 'SPX'     # case-insensitive
+    assert h._index_symbol('COMP') == 'IXIC'   # alias -> Nasdaq Composite
+    assert h._index_symbol('VIX') == 'VIX'
+    assert h._index_symbol('AAPL') is None      # equity
+    assert h._index_symbol('SPY') is None       # ETF, not an index
+    assert h._index_symbol('') is None
+
+
+def test_index_symbol_routes_to_index_endpoint(monkeypatch):
+    """Index tickers must hit obb.index.price.historical (yfinance), and
+    equities the equity endpoint — never the other way around."""
+    import datetime as dt
+    from types import SimpleNamespace
+    calls = []
+
+    def make_price(kind):
+        def historical(symbol, start_date, end_date, provider):
+            calls.append((kind, symbol, provider))
+            item = SimpleNamespace(date=dt.date(2024, 1, 2), open=100.0,
+                                   high=101.0, low=99.0, close=100.5,
+                                   volume=1000.0)
+            return SimpleNamespace(results=[item])
+        return SimpleNamespace(historical=historical)
+
+    fake_obb = SimpleNamespace(
+        index=SimpleNamespace(price=make_price('index')),
+        equity=SimpleNamespace(price=make_price('equity')),
+    )
+    h = MarketDataHandler(cache=False)
+    monkeypatch.setattr(h, '_get_openbb', lambda: fake_obb)
+
+    df = h.fetch_stock_data('SPX', '2024-01-01', '2024-02-01')
+    assert not df.empty
+    assert ('index', 'SPX', 'yfinance') in calls
+    assert all(kind == 'index' for (kind, _s, _p) in calls)
+
+    calls.clear()
+    h.fetch_stock_data('AAPL', '2024-01-01', '2024-02-01')
+    assert all(kind == 'equity' for (kind, _s, _p) in calls)
+    assert any(s == 'AAPL' for (_k, s, _p) in calls)

@@ -31,6 +31,21 @@ class MarketDataHandler:
         ('intrinio', 'intrinio_api_key', 'INTRINIO_API_KEY'),
     )
 
+    # Index tickers route to OpenBB's index.price.historical (yfinance only —
+    # indices are not equities and Tiingo carries none). Keys are matched
+    # case-insensitively with an optional leading '^'; values are the symbol
+    # OpenBB's index endpoint expects. NOTE: an index is not directly
+    # tradeable — backtesting one simulates trading the level (analysis use).
+    _INDEX_SYMBOLS = {
+        'SPX': 'SPX', 'GSPC': 'SPX',        # S&P 500
+        'NDX': 'NDX',                        # Nasdaq 100
+        'IXIC': 'IXIC', 'COMP': 'IXIC',      # Nasdaq Composite
+        'DJI': 'DJI',                        # Dow Jones Industrial Average
+        'RUT': 'RUT',                        # Russell 2000
+        'VIX': 'VIX',                        # CBOE Volatility Index
+        'NYA': 'NYA',                        # NYSE Composite
+    }
+
     def __init__(self, cache: Union[OHLCVCache, bool, None] = None):
         """
         Args:
@@ -77,6 +92,15 @@ class MarketDataHandler:
         keyed = [name for (name, _attr, env) in self._KEYED_PROVIDERS
                  if os.environ.get(env)]
         return keyed + ['yfinance']
+
+    def _index_symbol(self, symbol: str) -> Optional[str]:
+        """Return the OpenBB index-endpoint symbol for a known index ticker
+        (case-insensitive, optional leading '^'), or None for an equity/ETF.
+        Used to route indices to obb.index.price.historical."""
+        if not symbol:
+            return None
+        key = symbol.strip().lstrip('^').upper()
+        return self._INDEX_SYMBOLS.get(key)
 
     def _apply_credentials(self, obb) -> None:
         """Push any configured provider keys from the environment into OpenBB's
@@ -165,14 +189,25 @@ class MarketDataHandler:
             used_provider = None
             obb = self._get_openbb()
 
-            # Try multiple ODP providers
-            for provider in self.providers if obb is not None else []:
+            # Index symbols (SPX, ^GSPC, NDX, ...) are not equities and are
+            # absent from Tiingo — route them to OpenBB's index endpoint via
+            # yfinance. Equities/ETFs use the normal keyed-provider chain.
+            index_symbol = self._index_symbol(symbol)
+            if index_symbol is not None:
+                attempts = [('yfinance', 'index', index_symbol)]
+            else:
+                attempts = [(p, 'equity', symbol) for p in self.providers]
+
+            for provider, kind, fetch_symbol in (
+                    attempts if obb is not None else []):
                 try:
-                    result = obb.equity.price.historical(
-                        symbol=symbol,
+                    endpoint = (obb.index.price.historical if kind == 'index'
+                                else obb.equity.price.historical)
+                    result = endpoint(
+                        symbol=fetch_symbol,
                         start_date=start_date,
                         end_date=end_date,
-                        provider=provider
+                        provider=provider,
                     )
 
                     if result is None or not hasattr(result, 'results'):
@@ -196,8 +231,8 @@ class MarketDataHandler:
                         data = pd.DataFrame(data_list)
                         used_provider = provider
                         logger.info(
-                            "Fetched %s from OpenBB ODP provider %s (%d rows)",
-                            symbol, provider, len(data_list)
+                            "Fetched %s from OpenBB %s provider %s (%d rows)",
+                            symbol, kind, provider, len(data_list)
                         )
                         break
                     failures.append({'provider': provider,
