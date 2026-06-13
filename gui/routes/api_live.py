@@ -736,14 +736,44 @@ def working_orders():
 
 @live_bp.route('/orders/<order_id>/cancel', methods=['POST'])
 def cancel_working_order(order_id):
-    """Cancel one working order on the live broker (cancel stays allowed
-    even while the kill switch is engaged — C17 blocks placement only)."""
+    """Cancel one order. The source depends on whether account_id_key is given:
+      - GUI-placed order (account_id_key present): cancelled via the shared
+        EtradeClient — the SAME client that previewed/placed it. This is the
+        order-ticket cancel path; without it, GUI-placed orders had no
+        cancel route (the broker fallback below never sees them).
+      - patient-executor working order (no account_id_key): cancelled via
+        the live broker session, as before.
+    Cancel stays allowed even while the kill switch is engaged (C17 blocks
+    placement only; the client cancel path skips the pre-trade checks)."""
+    data = request.get_json(silent=True) or {}
+    account_id_key = str(data.get('account_id_key')
+                         or request.args.get('account_id_key') or '').strip()
+
+    if account_id_key:
+        client, err = _require_client()
+        if err is not None:
+            return err
+        try:
+            cancelled = client.cancel_order(account_id_key, order_id)
+        except Exception as exc:  # noqa: BLE001
+            mapped = _client_error_response(exc)
+            if mapped is not None:
+                return mapped
+            logger.error('Failed to cancel order %s via client', order_id,
+                         exc_info=True)
+            return jsonify({'error': 'Failed to cancel order'}), 500
+        if cancelled:
+            return jsonify({'message': 'Order cancelled', 'order_id': order_id})
+        return jsonify({'error': f'Order {order_id} not found'}), 404
+
+    # No account_id_key: a patient-executor working order on the live broker.
     broker = _find_live_broker()
     if broker is None:
         return jsonify({
             'error': 'No live broker session',
-            'detail': 'There is no live session whose orders could be '
-                      'cancelled.',
+            'detail': 'Pass account_id_key to cancel a GUI-placed order, or '
+                      'start a live session to cancel patient-executor '
+                      'working orders.',
         }), 409
     try:
         if broker.cancel_order(order_id):

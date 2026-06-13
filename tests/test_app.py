@@ -2697,6 +2697,9 @@ class FakeTradeClient:
     def __init__(self):
         self.preview_calls = []
         self.place_calls = []
+        self.cancel_calls = []
+        self.cancel_result = True
+        self.cancel_exc = None
         self.accounts = [{
             'accountId': RAW_ACCOUNT_NUMBER,
             'accountIdKey': 'KEY-ABC',
@@ -2741,6 +2744,12 @@ class FakeTradeClient:
         return {'order_id': 'ORD-LIVE-1',
                 'response': {'OrderIds': [{'orderId': 'ORD-LIVE-1',
                                            'status': 'OPEN'}]}}
+
+    def cancel_order(self, account_id_key, order_id):
+        self.cancel_calls.append((account_id_key, order_id))
+        if self.cancel_exc is not None:
+            raise self.cancel_exc
+        return self.cancel_result
 
 
 @pytest.fixture()
@@ -3232,3 +3241,58 @@ class TestGetClientNoDeadlock:
         assert not worker.is_alive(), (
             'get_client() deadlocked on the singleton lock')
         assert result.get('client') is not None
+
+
+class TestCancelOrderRouting:
+    """The cancel route has two sources: a GUI-placed order (account_id_key
+    given) cancels via the shared client; a patient-executor working order
+    (no account_id_key) falls back to the live broker. Regression for the
+    gap where GUI-placed orders had no working cancel path."""
+
+    def test_cancel_with_account_key_uses_client(self, client, patch_trade,
+                                                 monkeypatch):
+        import gui.routes.api_live as api_live
+        # The broker path must NOT be taken when an account key is supplied.
+        monkeypatch.setattr(api_live, '_find_live_broker',
+                            lambda: (_ for _ in ()).throw(
+                                AssertionError('broker path used')))
+        resp = client.post('/api/live/orders/ORD-LIVE-1/cancel',
+                           json={'account_id_key': 'KEY-ABC'})
+        assert resp.status_code == 200
+        assert patch_trade['client'].cancel_calls == [('KEY-ABC', 'ORD-LIVE-1')]
+
+    def test_cancel_with_account_key_not_found(self, client, patch_trade):
+        patch_trade['client'].cancel_result = False
+        resp = client.post('/api/live/orders/ORD-X/cancel',
+                           json={'account_id_key': 'KEY-ABC'})
+        assert resp.status_code == 404
+
+    def test_cancel_with_account_key_maps_client_error(self, client,
+                                                       patch_trade):
+        from brokers.etrade_client import EtradeApiError
+        patch_trade['client'].cancel_exc = EtradeApiError('upstream boom')
+        resp = client.post('/api/live/orders/ORD-LIVE-1/cancel',
+                           json={'account_id_key': 'KEY-ABC'})
+        # _client_error_response maps EtradeApiError -> 502 (not a 500 leak).
+        assert resp.status_code == 502
+
+    def test_cancel_without_account_key_falls_back_to_broker(self, client,
+                                                            patch_trade,
+                                                            monkeypatch):
+        import gui.routes.api_live as api_live
+
+        class _Broker:
+            def __init__(self):
+                self.calls = []
+
+            def cancel_order(self, order_id):
+                self.calls.append(order_id)
+                return True
+
+        broker = _Broker()
+        monkeypatch.setattr(api_live, '_find_live_broker', lambda: broker)
+        resp = client.post('/api/live/orders/WORK-1/cancel', json={})
+        assert resp.status_code == 200
+        assert broker.calls == ['WORK-1']
+        # The client cancel path was NOT used.
+        assert patch_trade['client'].cancel_calls == []

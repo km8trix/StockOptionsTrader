@@ -519,18 +519,69 @@ async function refreshWorkingOrders() {
     }
 }
 
-async function cancelWorkingOrder(orderId, btn) {
-    if (!window.confirm(`Cancel working order ${orderId}?`)) return;
+async function cancelWorkingOrder(orderId, btn, accountKey) {
+    if (!window.confirm(`Cancel order ${orderId}?`)) return;
     const restore = btnLoading(btn);
+    // A GUI-placed order is cancelled through the shared client by passing
+    // its account_id_key; a patient-executor working order omits it and the
+    // route falls back to the live broker session.
+    const body = accountKey ? JSON.stringify({ account_id_key: accountKey })
+        : undefined;
     try {
         await fetchJSON(
             `/api/live/orders/${encodeURIComponent(orderId)}/cancel`,
-            { method: 'POST' });
+            { method: 'POST', body });
         showToast('info', `Order ${orderId} cancelled.`);
+        if (accountKey) removePlacedOrder(orderId);
         refreshWorkingOrders();
         loadAudit();
     } catch (_) {
         restore();
+    }
+}
+
+// --- GUI-placed orders this session (cancellable via the shared client) ---
+const _placedOrders = [];   // [{ orderId, accountKey }]
+
+function recordPlacedOrder(orderId, accountKey) {
+    if (orderId === undefined || orderId === null || !accountKey) return;
+    if (!_placedOrders.some((o) => String(o.orderId) === String(orderId))) {
+        _placedOrders.push({ orderId, accountKey });
+    }
+    renderPlacedOrders();
+}
+
+function removePlacedOrder(orderId) {
+    const i = _placedOrders.findIndex(
+        (o) => String(o.orderId) === String(orderId));
+    if (i !== -1) _placedOrders.splice(i, 1);
+    renderPlacedOrders();
+}
+
+function renderPlacedOrders() {
+    const wrap = document.getElementById('placedOrdersWrap');
+    const list = document.getElementById('placedOrdersList');
+    if (!wrap || !list) return;
+    list.replaceChildren();
+    if (_placedOrders.length === 0) {
+        wrap.classList.add('d-none');
+        return;
+    }
+    wrap.classList.remove('d-none');
+    for (const { orderId, accountKey } of _placedOrders) {
+        const li = document.createElement('li');
+        li.className = 'placed-orders-item';
+        const label = document.createElement('span');
+        label.className = 'num';
+        label.textContent = `Order ${orderId}`;   // textContent: no injection
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm btn-outline-danger';
+        btn.textContent = 'Cancel';
+        btn.addEventListener('click',
+            () => cancelWorkingOrder(orderId, btn, accountKey));
+        li.append(label, btn);
+        list.append(li);
     }
 }
 
@@ -1252,6 +1303,11 @@ async function confirmPlaceOrder() {
         const order = data.order || {};
         showToast('success',
             `Order placed — id ${order.orderId ?? '(pending)'}.`);
+        // Track it so it can be cancelled (via the shared client) from the
+        // ticket — GUI-placed orders are not patient-executor working orders.
+        if (order.orderId !== undefined && order.orderId !== null) {
+            recordPlacedOrder(order.orderId, selectedAccountKey);
+        }
         // The ref is single-use and now consumed: void it locally too.
         setOrderRef(null);
         clearPreviewResult();

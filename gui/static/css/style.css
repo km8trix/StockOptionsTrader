@@ -1242,3 +1242,11 @@ th.sortable .sort-arrow {
     font-weight: 600;
     color: var(--gain);
 }
+
+/* Placed-this-session orders (GUI order ticket; cancellable via the client). */
+.placed-orders { border-top: 1px solid var(--border, #30363d); padding-top: 0.5rem; }
+.placed-orders-head { font-size: 0.75rem; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--text-muted, #8b949e); margin-bottom: 0.4rem; }
+.placed-orders-list { list-style: none; margin: 0; padding: 0; }
+.placed-orders-item { display: flex; align-items: center;
+    justify-content: space-between; gap: 0.5rem; padding: 0.25rem 0; }
