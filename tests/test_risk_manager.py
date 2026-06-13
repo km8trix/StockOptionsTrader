@@ -264,6 +264,17 @@ class TestCheckCorrelation:
         assert rm.check_correlation({'A': [0.01, 0.02], 'B': [0.01, 0.02]}) is True
         assert any('correlation' in u for u in rm.unevaluated)
 
+    def test_zero_variance_series_recorded_unevaluated(self):
+        # A flat (zero-variance) return series makes every np.corrcoef pair
+        # NaN; the cap cannot be evaluated and must be RECORDED, not silently
+        # passed (regression for the all-NaN-pairs silent-pass).
+        rm = RiskManager(max_correlation=0.8)
+        flat = [0.0, 0.0, 0.0, 0.0, 0.0]
+        vary = [0.01, -0.02, 0.03, -0.01, 0.02]
+        assert rm.check_correlation({'A': flat, 'B': vary}) is True
+        assert rm.violations == []
+        assert any('correlation' in u for u in rm.unevaluated)
+
 
 class TestCheckPortfolioSectorConcentration:
     def test_over_concentration_violates(self):

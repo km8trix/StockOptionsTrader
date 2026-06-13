@@ -438,3 +438,35 @@ class TestEngineFundWithOptions:
         # And the desk tracked the structures it opened inside the fund.
         assert js.tracker.to_report()
         assert report['desk']['key'] == 'fund'
+
+
+class TestRiskAggregatorIntegration:
+    """The account-level overlay (PortfolioRiskAggregator) plugged into the
+    orchestrator runs AFTER the unified apply_risk and drops book-wide
+    breaches the per-name gate cannot see."""
+
+    def test_aggregator_blocks_overgross_open_and_notes_it(self):
+        from portfolio.risk_aggregator import PortfolioRiskAggregator
+        # 0.10x account gross cap = 10k on a 100k account. Two desks each open
+        # a different name at 0.5*0.2 = 0.10 account-absolute (10k each):
+        # apply_risk passes both (each == the 10% per-name cap), but the
+        # aggregator admits only the first 10k and blocks the second.
+        agg = PortfolioRiskAggregator(max_gross_leverage=0.10)
+        orch = FundOrchestrator([
+            ScriptedDesk('a', 0.5, intents=[intent(stock('AAA'), 'BUY', 0.2)]),
+            ScriptedDesk('b', 0.5, intents=[intent(stock('BBB'), 'BUY', 0.2)]),
+        ], risk_aggregator=agg)
+        approved = step_once(orch)
+        opens = [i for i in approved if i.action == 'BUY']
+        assert len(opens) == 1  # one 10k open fits the 10k gross cap
+        assert any('aggregator blocked' in n.message.lower()
+                   for n in orch.notes)
+
+    def test_no_aggregator_leaves_both_opens(self):
+        # Same setup, no aggregator -> both opens survive (apply_risk only).
+        orch = FundOrchestrator([
+            ScriptedDesk('a', 0.5, intents=[intent(stock('AAA'), 'BUY', 0.2)]),
+            ScriptedDesk('b', 0.5, intents=[intent(stock('BBB'), 'BUY', 0.2)]),
+        ])
+        approved = step_once(orch)
+        assert len([i for i in approved if i.action == 'BUY']) == 2

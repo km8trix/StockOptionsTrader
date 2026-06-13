@@ -257,7 +257,16 @@ class RiskManager:
                     worst_abs = abs(c)
                     worst = (symbols[i], symbols[j], float(c))
 
-        if worst is not None and worst_abs > self.max_correlation:
+        if worst is None:
+            # Every pair was NaN — e.g. a zero-variance (flat/halted) series
+            # makes np.corrcoef NaN, and those pairs are skipped above. The
+            # cap could NOT be evaluated; record it rather than silently pass
+            # (mirrors the ragged/short path that records unevaluated too).
+            self.unevaluated.append(
+                'correlation: all pairs NaN (zero-variance/constant series)')
+            return True
+
+        if worst_abs > self.max_correlation:
             a, b, c = worst
             self.violations.append(
                 f"Correlation {abs(c):.2f} between {a} and {b} exceeds "

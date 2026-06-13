@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 import pandas as pd
 
@@ -63,6 +63,9 @@ from core.models import Asset, AssetType
 from desks.base import Desk, DeskIntent, TraderNote
 from portfolio.manager import PortfolioManager
 from portfolio.risk_manager import RiskManager
+
+if TYPE_CHECKING:  # annotation only
+    from portfolio.risk_aggregator import PortfolioRiskAggregator
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +117,8 @@ class FundOrchestrator:
     """
 
     def __init__(self, desks: List[Desk],
-                 risk_manager: Optional[RiskManager] = None):
+                 risk_manager: Optional[RiskManager] = None,
+                 risk_aggregator: Optional['PortfolioRiskAggregator'] = None):
         if not desks:
             raise ValueError("FundOrchestrator requires at least one desk")
         keys = [desk.key for desk in desks]
@@ -137,6 +141,9 @@ class FundOrchestrator:
 
         self._account = _AccountDesk(risk_manager=risk_manager)
         self.risk_manager = self._account.risk_manager
+        # Optional account-level overlay (gross leverage / correlation /
+        # sector) run AFTER the unified apply_risk; None -> not enforced.
+        self.risk_aggregator = risk_aggregator
         #: Conflict notes the orchestrator itself raises (kept separate from
         #: the account desk's risk notes and the sub-desks' own notes).
         self._own_notes: List[TraderNote] = []
@@ -198,7 +205,23 @@ class FundOrchestrator:
 
         netted = self._net_intents(tagged)
         self._account.set_clock(date)
-        return self._account.apply_risk(netted, portfolio, all_data, date)
+        approved = self._account.apply_risk(netted, portfolio, all_data, date)
+
+        # Account-level overlay (gross leverage / correlation / sector) on the
+        # netted, risk-approved batch. Blocked opens are dropped + noted; this
+        # catches book-wide breaches the per-name apply_risk cannot (e.g. many
+        # in-limit names summing past the gross cap).
+        if self.risk_aggregator is not None:
+            approved, blocked = self.risk_aggregator.check(
+                approved, portfolio, all_data, date)
+            for intent, reason in blocked:
+                self._note(
+                    'risk',
+                    f"Account risk aggregator blocked {intent.action} "
+                    f"{intent.asset.symbol}: {reason}",
+                    symbol=intent.asset.symbol, action=intent.action,
+                    reason=reason)
+        return approved
 
     # ------------------------------------------------------------------
     # Netting
