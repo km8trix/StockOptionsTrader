@@ -5,6 +5,7 @@ Market Data Handler - Fetches and manages price data using OpenBB ODP
 from __future__ import annotations
 
 import logging
+import os
 
 import pandas as pd
 import numpy as np
@@ -19,6 +20,17 @@ logger = logging.getLogger(__name__)
 class MarketDataHandler:
     """Fetches and manages market data using OpenBB Open Data Platform (ODP)"""
 
+    # Keyed equity-historical providers in preference order: (provider name,
+    # OpenBB credential attribute, environment variable). Each is used ONLY
+    # when its key is configured, and tried BEFORE the free yfinance fallback
+    # so a paid key actually serves the data (higher rate limit, better
+    # reliability) instead of yfinance.
+    _KEYED_PROVIDERS = (
+        ('fmp', 'fmp_api_key', 'FMP_API_KEY'),
+        ('tiingo', 'tiingo_token', 'TIINGO_TOKEN'),
+        ('intrinio', 'intrinio_api_key', 'INTRINIO_API_KEY'),
+    )
+
     def __init__(self, cache: Union[OHLCVCache, bool, None] = None):
         """
         Args:
@@ -29,20 +41,14 @@ class MarketDataHandler:
         """
         self.stock_data: Dict[str, pd.DataFrame] = {}
         self.cache: Dict[str, pd.DataFrame] = {}
-        # OpenBB providers for equity.price.historical, tried in order.
-        # yfinance is FREE and needs no API key (the working default in a
-        # stock install). fmp / intrinio / tiingo are valid too but require
-        # credentials, so they only succeed once those keys are configured.
-        # NOTE: cboe/tmx/polygon/alpha_vantage/tradier are NOT valid
-        # equity-historical providers in the installed OpenBB build (they
-        # raise "Input should be 'fmp', 'intrinio', 'tiingo' or 'yfinance'")
-        # and were the reason backtests returned "No data available".
-        self.providers = [
-            'yfinance',
-            'fmp',
-            'intrinio',
-            'tiingo',
-        ]
+        # Provider order for equity.price.historical: any keyed provider whose
+        # credential is configured comes first (reliable, higher rate limit),
+        # then free keyless yfinance as the always-available fallback. Keyed
+        # providers without a key are omitted (they would only fail with a
+        # missing-credential error and add log noise). NOTE:
+        # cboe/tmx/polygon/alpha_vantage/tradier are NOT valid equity-
+        # historical providers in the installed OpenBB build.
+        self.providers = self._resolve_providers()
         self._sqlite_cache: Optional[OHLCVCache] = (
             cache if isinstance(cache, OHLCVCache) else None
         )
@@ -64,10 +70,34 @@ class MarketDataHandler:
                 return None
         return self._sqlite_cache
 
+    def _resolve_providers(self) -> list:
+        """Keyed providers (with a configured credential) first, then the free
+        yfinance fallback. Recomputed from os.environ so a key added to .env
+        takes effect on the next handler construction."""
+        keyed = [name for (name, _attr, env) in self._KEYED_PROVIDERS
+                 if os.environ.get(env)]
+        return keyed + ['yfinance']
+
+    def _apply_credentials(self, obb) -> None:
+        """Push any configured provider keys from the environment into OpenBB's
+        runtime credentials, so a key in .env is used without also editing
+        OpenBB's user_settings.json. Best-effort: a failure to set one key
+        never blocks the free yfinance path."""
+        for name, attr, env in self._KEYED_PROVIDERS:
+            value = os.environ.get(env)
+            if not value:
+                continue
+            try:
+                setattr(obb.user.credentials, attr, value)
+            except Exception as e:  # noqa: BLE001 — credential plumbing is best-effort
+                logger.warning("Could not apply %s credential to OpenBB: %s",
+                               name, e)
+
     def _get_openbb(self):
         """Import OpenBB only when it is needed; initialization can touch user-level files."""
         try:
             from openbb import obb
+            self._apply_credentials(obb)
             return obb
         except Exception as e:
             logger.warning("OpenBB unavailable: %s", e)

@@ -51,15 +51,39 @@ def test_atr_valid_at_bar_14(make_ohlcv):
     assert result['atr'].iloc[13] == pytest.approx(result['tr'].iloc[:14].mean())
 
 
-def test_provider_list_is_valid_for_equity_historical():
-    """Regression: backtests returned 'No data available' because the
-    provider list held names the installed OpenBB rejects for
-    equity.price.historical. The free, keyless 'yfinance' provider must be
-    present (and first), and the known-invalid names must be gone."""
+_KEYED_ENV = ('FMP_API_KEY', 'TIINGO_TOKEN', 'INTRINIO_API_KEY')
+
+
+def test_provider_list_falls_back_to_yfinance_with_no_keys(monkeypatch):
+    """Regression: backtests returned 'No data available' because the provider
+    list held names the installed OpenBB rejects for equity.price.historical.
+    With no credentials configured, the only provider is free keyless
+    yfinance, and the known-invalid names are gone."""
+    for env in _KEYED_ENV:
+        monkeypatch.delenv(env, raising=False)
     providers = MarketDataHandler().providers
-    assert 'yfinance' in providers, 'free keyless provider must be present'
-    assert providers[0] == 'yfinance', 'free provider should be tried first'
+    assert providers == ['yfinance']
     invalid = {'cboe', 'tmx', 'polygon', 'alpha_vantage', 'tradier'}
-    assert not (invalid & set(providers)), (
-        f'invalid equity-historical providers still listed: '
-        f'{invalid & set(providers)}')
+    assert not (invalid & set(providers))
+
+
+def test_configured_key_is_tried_before_yfinance(monkeypatch):
+    """A configured keyed provider must come BEFORE yfinance, so a paid key
+    actually serves the data (higher rate limit / reliability) rather than
+    yfinance staying primary."""
+    for env in _KEYED_ENV:
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setenv('FMP_API_KEY', 'test-key')
+    providers = MarketDataHandler().providers
+    assert providers == ['fmp', 'yfinance']
+
+
+def test_multiple_keys_keep_preference_order_then_yfinance(monkeypatch):
+    for env in _KEYED_ENV:
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setenv('TIINGO_TOKEN', 't')
+    monkeypatch.setenv('INTRINIO_API_KEY', 'i')
+    providers = MarketDataHandler().providers
+    # Preference order (fmp, tiingo, intrinio) filtered to configured keys,
+    # then yfinance — fmp absent because its key is unset.
+    assert providers == ['tiingo', 'intrinio', 'yfinance']
