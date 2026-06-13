@@ -3191,3 +3191,44 @@ class TestLauncherEnvHygiene:
 
         assert 'kwargs' in captured, 'launcher never called app.run()'
         assert captured['kwargs'].get('load_dotenv') is False
+
+
+class TestGetClientNoDeadlock:
+    """Regression for the singleton-lock self-deadlock: get_client() holds
+    _singleton_lock while calling get_kill_switch()/get_audit_log(), which
+    re-acquire it. With a plain Lock this hangs forever on the first real
+    call; the mocked route tests never caught it because they patch
+    get_client() wholesale. This exercises the REAL accessor.
+    """
+
+    def test_real_get_client_builds_without_deadlock(self, monkeypatch,
+                                                     tmp_path):
+        import threading
+        import gui.routes.api_live as api_live
+
+        if api_live.EtradeClient is None:
+            pytest.skip('EtradeClient unavailable')
+
+        # Isolate from the developer's real DB and reset the singletons.
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'dl.db'))
+        monkeypatch.setenv('ETRADE_ENV', 'sandbox')
+        monkeypatch.setenv('ETRADE_SANDBOX_CONSUMER_KEY', 'dl-key')
+        monkeypatch.setenv('ETRADE_SANDBOX_CONSUMER_SECRET', 'dl-secret')
+        for attr in ('_auth_manager', '_kill_switch', '_audit_log',
+                     '_client', '_client_auth_manager'):
+            monkeypatch.setattr(api_live, attr, None)
+
+        # The lock must be reentrant for the nested accessors to work.
+        assert type(api_live._singleton_lock).__name__ == 'RLock'
+
+        result = {}
+
+        def _build():
+            result['client'] = api_live.get_client()  # offline construction
+
+        worker = threading.Thread(target=_build)
+        worker.start()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive(), (
+            'get_client() deadlocked on the singleton lock')
+        assert result.get('client') is not None

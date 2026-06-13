@@ -167,7 +167,10 @@ live_bp = Blueprint('live', __name__, url_prefix='/api/live')
 # switch and audit log share the trading SQLite file (TRADING_DB_PATH,
 # same resolution as gui.globals.get_db) so state survives restarts.
 
-_singleton_lock = threading.Lock()
+# RLock (not Lock): get_client() holds this while calling get_kill_switch()
+# and get_audit_log(), which re-acquire it to lazily build their own
+# singletons — a plain Lock self-deadlocks on that first nested call.
+_singleton_lock = threading.RLock()
 _auth_manager = None
 _kill_switch = None
 _audit_log = None
