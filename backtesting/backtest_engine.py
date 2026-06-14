@@ -50,6 +50,7 @@ OPTIONS IN DESK MODE (Phase 8 — SYNTHETIC PRICING, see desks/options_pricing):
 from __future__ import annotations
 
 import logging
+import math
 
 import pandas as pd
 import numpy as np
@@ -85,6 +86,11 @@ MAX_PENDING_DAYS = 5
 #: Minimum absolute half-spread haircut per option fill ($/share).
 MIN_OPTION_HAIRCUT = 0.05
 
+#: Cap on the realistic-fill market-impact fraction (Step 6). Bounds a huge
+#: (uncapped close) order so the impacted fill price can never reach/cross zero
+#: — mirrors the options cost model flooring its traded price at 0.0.
+_MAX_IMPACT_FRACTION = 0.5
+
 
 class BacktestEngine:
     """Simulates trading strategies on historical data"""
@@ -97,7 +103,11 @@ class BacktestEngine:
                  per_contract_commission: float = 0.65,
                  orchestrator: Optional['FundOrchestrator'] = None,
                  reweighter: Optional['DynamicReweighter'] = None,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None,
+                 enable_realistic_fills: bool = False,
+                 impact_coef: float = 0.1,
+                 participation_cap: float = 0.1,
+                 adv_window: int = 20):
         if sum(driver is not None
                for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
@@ -133,6 +143,18 @@ class BacktestEngine:
         # Options cost model (module docstring); option assets only.
         self.spread_pct = spread_pct
         self.per_contract_commission = per_contract_commission
+        # Realistic execution (Phase 3 Step 6) — OPT-IN, default OFF so every
+        # existing backtest and the greeks golden stay BYTE-IDENTICAL. When on:
+        # square-root ADV market impact (impact_coef*sqrt(filled/ADV)) is added
+        # to slippage on STOCK fills, and an order is capped at
+        # participation_cap*ADV per day with the remainder re-queued to fill
+        # over subsequent days (accumulating into the position). ADV is the
+        # trailing adv_window-day mean of volume STRICTLY BEFORE the fill date
+        # (no lookahead). Options are unaffected (synthetic, no contract volume).
+        self.enable_realistic_fills = enable_realistic_fills
+        self.impact_coef = impact_coef
+        self.participation_cap = participation_cap
+        self.adv_window = adv_window
         self.market_data = MarketDataHandler()
         self.trades_log: List[Dict] = []
         self.signals_log: List[Dict] = []
@@ -284,11 +306,11 @@ class BacktestEngine:
 
                     if signal in ('BUY', 'SELL'):
                         # A new intent for an asset replaces an older pending one.
-                        self.pending_intents[asset] = {
+                        self._queue_pending_intent(asset, {
                             'signal': signal,
                             'signal_date': date,
                             'days_waiting': 0,
-                        }
+                        })
 
             # --- PHASE 4: RECORD SNAPSHOT ---
             self.portfolio.record_snapshot(date)
@@ -349,7 +371,7 @@ class BacktestEngine:
 
         for intent in approved:
             # A new intent for an asset replaces an older pending one.
-            self.pending_intents[intent.asset] = {
+            self._queue_pending_intent(intent.asset, {
                 'signal': intent.action,
                 'signal_date': date,
                 'days_waiting': 0,
@@ -357,7 +379,7 @@ class BacktestEngine:
                 # Absolute size override (contracts/shares); None defers
                 # to size_fraction dollar sizing at fill time.
                 'quantity': intent.quantity,
-            }
+            })
 
     def _run_orchestrator_step(self, all_data: Dict[str, pd.DataFrame],
                                date) -> None:
@@ -388,13 +410,90 @@ class BacktestEngine:
         approved = self.orchestrator.step(enriched, date, self.portfolio)
         for intent in approved:
             # A new intent for an asset replaces an older pending one.
-            self.pending_intents[intent.asset] = {
+            self._queue_pending_intent(intent.asset, {
                 'signal': intent.action,
                 'signal_date': date,
                 'days_waiting': 0,
                 'size_fraction': intent.size_fraction,
                 'quantity': intent.quantity,
-            }
+            })
+
+    # ------------------------------------------------------------------
+    # Realistic execution (Step 6, opt-in) — STOCK fills only
+    # ------------------------------------------------------------------
+    def _average_daily_volume(self, data: Optional[pd.DataFrame],
+                              date) -> Optional[float]:
+        """Trailing adv_window-day mean of volume STRICTLY BEFORE `date`.
+
+        No lookahead: the fill is at today's open, before today's volume is
+        known, so today's bar is excluded. Returns None when volume is
+        unavailable or non-positive (the caller then applies no impact/cap).
+        """
+        if data is None or 'volume' not in getattr(data, 'columns', []):
+            return None
+        prior = data[data.index < pd.Timestamp(date)].sort_index()
+        if prior.empty:
+            return None
+        vols = prior['volume'].tail(self.adv_window).dropna()
+        if vols.empty:
+            return None
+        adv = float(vols.mean())
+        return adv if adv > 0 else None
+
+    def _impact_fraction(self, quantity: int,
+                         adv: Optional[float]) -> float:
+        """Square-root market impact (Almgren) as an adverse price fraction:
+        ``impact_coef * sqrt(quantity / ADV)``. 0.0 when ADV is unknown or
+        non-positive, or quantity <= 0."""
+        if not adv or adv <= 0 or quantity <= 0:
+            return 0.0
+        return min(_MAX_IMPACT_FRACTION,
+                   self.impact_coef * math.sqrt(quantity / adv))
+
+    def _capped_fill_quantity(self, desired: int,
+                              adv: Optional[float]):
+        """Participation cap: at most ``participation_cap * ADV`` units fill
+        today. Returns ``(filled, remainder)``; no cap (remainder 0) when ADV
+        is unknown or the cap is not binding."""
+        if not adv or adv <= 0:
+            return desired, 0
+        # Floor the cap at 1 share: int(participation_cap*ADV) rounds to 0 for
+        # very thin names — exactly where the cap matters MOST — so without the
+        # floor the whole order would dump uncapped. Thin names trickle instead.
+        cap = max(1, int(self.participation_cap * adv))
+        if desired <= cap:
+            return desired, 0
+        return cap, desired - cap
+
+    def _requeue_remainder(self, intent: Dict, remainder: int) -> Optional[Dict]:
+        """Build a follow-on intent for the un-filled remainder (cap-and-requeue),
+        or None when nothing remains. The remainder is an ABSOLUTE share count
+        and carries 'accumulate' so its next-day fill adds to the position
+        opened today rather than opening a fresh one. Returns None unless
+        realistic fills are enabled."""
+        if remainder <= 0 or not self.enable_realistic_fills:
+            return None
+        follow = dict(intent)
+        follow['quantity'] = remainder
+        follow['accumulate'] = True
+        follow['days_waiting'] = 0
+        return follow
+
+    def _queue_pending_intent(self, asset, intent: Dict) -> None:
+        """Queue a new pending intent for ``asset``, replacing any older one.
+
+        Surfaces the realistic-fills edge where a fresh signal supersedes an
+        in-flight cap-and-requeue remainder: the unfilled shares are abandoned,
+        so warn instead of dropping them silently. Off-path no intent ever
+        carries 'accumulate', so this is a plain assignment (byte-identical).
+        """
+        prior = self.pending_intents.get(asset)
+        if prior is not None and prior.get('accumulate'):
+            logger.warning(
+                "Abandoning %s unfilled shares of %s: a new %s signal "
+                "supersedes the in-flight partial fill",
+                prior.get('quantity'), asset.symbol, intent.get('signal'))
+        self.pending_intents[asset] = intent
 
     def _fill_pending_intents(self, all_data: Dict[str, pd.DataFrame],
                               date, position_size: float) -> None:
@@ -444,10 +543,20 @@ class BacktestEngine:
 
             if is_option:
                 self._fill_option_intent(asset, intent, float(fill_base), date)
+                del self.pending_intents[asset]
             else:
-                self._fill_intent(asset, intent, float(fill_base), date,
-                                  position_size)
-            del self.pending_intents[asset]
+                adv = (self._average_daily_volume(data, date)
+                       if self.enable_realistic_fills else None)
+                remainder = self._fill_intent(asset, intent, float(fill_base),
+                                              date, position_size, adv=adv)
+                # Cap-and-requeue: a partial stock fill returns a follow-on
+                # intent for the remainder (same asset) to fill on later days;
+                # otherwise the intent is consumed. With realistic fills off,
+                # _fill_intent always returns None -> identical to before.
+                if remainder is not None:
+                    self.pending_intents[asset] = remainder
+                else:
+                    del self.pending_intents[asset]
 
     # ------------------------------------------------------------------
     # Options: cost model, fills, MTM, expiry settlement (desk mode)
@@ -646,8 +755,27 @@ class BacktestEngine:
                 "Expiry settlement: %s %d %s at intrinsic %.4f on %s",
                 action, abs(quantity), str(asset), intrinsic, date)
 
+    def _accumulate_position(self, position: Position, add_quantity: int,
+                             fill_price: float) -> None:
+        """Add to an existing same-direction position (cap-and-requeue
+        remainder), updating the size-weighted average entry price.
+
+        add_quantity is POSITIVE for a long add, NEGATIVE for a short add; the
+        position's sign is preserved. Only ever called under realistic fills.
+        """
+        old_qty = position.quantity
+        new_qty = old_qty + add_quantity
+        if new_qty == 0:
+            return
+        position.avg_entry_price = (
+            (old_qty * position.avg_entry_price + add_quantity * fill_price)
+            / new_qty)
+        position.quantity = new_qty
+        position.current_price = fill_price
+
     def _fill_intent(self, asset: Asset, intent: Dict, base_price: float,
-                     fill_date, position_size: float) -> None:
+                     fill_date, position_size: float,
+                     adv: Optional[float] = None) -> Optional[Dict]:
         """Fill a queued intent at base_price (today's open) with slippage.
 
         Slippage is always adverse: buys (BUY, COVER) fill at
@@ -666,9 +794,22 @@ class BacktestEngine:
         quantity (Trade.pnl = qty * (exit - entry) is sign-correct). Gated on
         self._desk_mode, so a fund's netted-SHORT residual and account-level
         COVER fill the same way a single desk's do.
+
+        REALISTIC FILLS (Step 6, opt-in via enable_realistic_fills; ``adv`` is
+        the trailing volume passed by the caller): adds square-root ADV market
+        impact to slippage and caps the filled size at participation_cap*ADV,
+        re-queuing the remainder. Returns a follow-on intent dict for that
+        remainder (to fill on later days, accumulating into the position) or
+        None when the intent is fully consumed. With realistic fills OFF this
+        always returns None and every fill is byte-identical to before.
+
+        NOTE: dollar-sized orders (strategy mode) compute the share count against
+        the PRE-impact price, so an uncapped realistic fill can exceed the dollar
+        budget by up to the impact fraction (bounded by the cash guard).
         """
         signal = intent['signal']
         slippage = self.slippage_bps / 10000.0
+        realistic = self.enable_realistic_fills
         if self.orchestrator is not None and 'size_fraction' in intent:
             # Orchestrator intents are already account-absolute fractions.
             position_size = intent['size_fraction']
@@ -678,24 +819,50 @@ class BacktestEngine:
         if base_price <= 0:
             logger.warning("Skipping %s fill for %s on %s: non-positive price %s",
                            signal, asset.symbol, fill_date, base_price)
-            return
+            return None
 
         existing_pos = self.portfolio.get_position(asset)
 
-        if signal == 'BUY' and (not existing_pos or existing_pos.quantity == 0):
-            fill_price = base_price * (1 + slippage)
+        # A re-queued remainder ('accumulate') whose position is gone (closed or
+        # flipped between fills) cannot top up anything — drop it deterministically
+        # rather than silently re-opening a fresh position or falling through.
+        if realistic and intent.get('accumulate'):
+            same_direction = existing_pos is not None and (
+                (signal == 'BUY' and existing_pos.quantity > 0)
+                or (signal == 'SHORT' and existing_pos.quantity < 0))
+            if not same_direction:
+                logger.warning(
+                    "Dropping orphaned %s remainder for %s on %s: the position "
+                    "it was accumulating into is gone", signal, asset.symbol,
+                    fill_date)
+                return None
+
+        if signal == 'BUY' and (
+                (not existing_pos or existing_pos.quantity == 0)
+                or (realistic and intent.get('accumulate')
+                    and existing_pos and existing_pos.quantity > 0)):
+            base_fill = base_price * (1 + slippage)
             portfolio_value = self.portfolio.get_portfolio_value()
             trade_value = portfolio_value * position_size
-            # Desk intents may carry an absolute share count (Phase 8);
-            # it overrides the dollar sizing. Strategy mode never sets it.
-            quantity = intent.get('quantity') or int(trade_value / fill_price)
+            # Desk intents may carry an absolute share count (Phase 8); it
+            # overrides the dollar sizing. Strategy mode never sets it. A
+            # re-queued remainder (realistic fills) also carries it.
+            desired = intent.get('quantity') or int(trade_value / base_fill)
 
-            if quantity == 0:
+            if desired == 0:
                 logger.warning(
                     "Dropping BUY intent for %s on %s: position sizes to 0 "
                     "shares (trade value %.2f at fill price %.4f)",
-                    asset.symbol, fill_date, trade_value, fill_price)
-                return
+                    asset.symbol, fill_date, trade_value, base_fill)
+                return None
+
+            if realistic:
+                quantity, remainder = self._capped_fill_quantity(desired, adv)
+                fill_price = base_price * (
+                    1 + slippage + self._impact_fraction(quantity, adv))
+            else:
+                quantity, remainder = desired, 0
+                fill_price = base_fill
 
             cost = quantity * fill_price * (1 + self.commission)
             if self.portfolio.cash < cost:
@@ -703,17 +870,16 @@ class BacktestEngine:
                     "Dropping BUY intent for %s on %s: insufficient cash "
                     "(needed %.2f, available %.2f)",
                     asset.symbol, fill_date, cost, self.portfolio.cash)
-                return
+                return None
 
             self.portfolio.cash -= cost
-            position = Position(
-                asset=asset,
-                quantity=quantity,
-                avg_entry_price=fill_price,
-                current_price=fill_price,
-                timestamp=fill_date
-            )
-            self.portfolio.add_position(position)
+            if existing_pos and existing_pos.quantity > 0:
+                # Accumulate the re-queued remainder into the existing long.
+                self._accumulate_position(existing_pos, quantity, fill_price)
+            else:
+                self.portfolio.add_position(Position(
+                    asset=asset, quantity=quantity, avg_entry_price=fill_price,
+                    current_price=fill_price, timestamp=fill_date))
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset), 'action': 'BUY',
@@ -722,10 +888,16 @@ class BacktestEngine:
             logger.info("BUY %d %s @ %.4f on %s (signal %s)",
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
+            return self._requeue_remainder(intent, remainder)
 
         elif signal == 'SELL' and existing_pos and existing_pos.quantity > 0:
-            fill_price = base_price * (1 - slippage)
             quantity = existing_pos.quantity
+            # Closes are not size-capped (a full exit), but pay market impact.
+            if realistic:
+                fill_price = base_price * (
+                    1 - slippage - self._impact_fraction(quantity, adv))
+            else:
+                fill_price = base_price * (1 - slippage)
             proceeds = quantity * fill_price * (1 - self.commission)
             self.portfolio.cash += proceeds
             self.portfolio.close_position(
@@ -742,31 +914,40 @@ class BacktestEngine:
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
 
-        elif signal == 'SHORT' and self._desk_mode \
-                and (not existing_pos or existing_pos.quantity == 0):
+        elif signal == 'SHORT' and self._desk_mode and (
+                (not existing_pos or existing_pos.quantity == 0)
+                or (realistic and intent.get('accumulate')
+                    and existing_pos and existing_pos.quantity < 0)):
             # A short is a SELL: adverse slippage means a LOWER fill.
-            fill_price = base_price * (1 - slippage)
+            base_fill = base_price * (1 - slippage)
             portfolio_value = self.portfolio.get_portfolio_value()
             trade_value = portfolio_value * position_size
-            quantity = intent.get('quantity') or int(trade_value / fill_price)
+            desired = intent.get('quantity') or int(trade_value / base_fill)
 
-            if quantity == 0:
+            if desired == 0:
                 logger.warning(
                     "Dropping SHORT intent for %s on %s: position sizes to 0 "
                     "shares (trade value %.2f at fill price %.4f)",
-                    asset.symbol, fill_date, trade_value, fill_price)
-                return
+                    asset.symbol, fill_date, trade_value, base_fill)
+                return None
+
+            if realistic:
+                quantity, remainder = self._capped_fill_quantity(desired, adv)
+                fill_price = base_price * (
+                    1 - slippage - self._impact_fraction(quantity, adv))
+            else:
+                quantity, remainder = desired, 0
+                fill_price = base_fill
 
             proceeds = quantity * fill_price * (1 - self.commission)
             self.portfolio.cash += proceeds
-            position = Position(
-                asset=asset,
-                quantity=-quantity,
-                avg_entry_price=fill_price,
-                current_price=fill_price,
-                timestamp=fill_date
-            )
-            self.portfolio.add_position(position)
+            if existing_pos and existing_pos.quantity < 0:
+                # Accumulate the re-queued remainder into the existing short.
+                self._accumulate_position(existing_pos, -quantity, fill_price)
+            else:
+                self.portfolio.add_position(Position(
+                    asset=asset, quantity=-quantity, avg_entry_price=fill_price,
+                    current_price=fill_price, timestamp=fill_date))
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset), 'action': 'SHORT',
@@ -776,12 +957,18 @@ class BacktestEngine:
             logger.info("SHORT %d %s @ %.4f on %s (signal %s)",
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
+            return self._requeue_remainder(intent, remainder)
 
         elif signal == 'COVER' and self._desk_mode \
                 and existing_pos and existing_pos.quantity < 0:
             # A cover is a BUY: adverse slippage means a HIGHER fill.
-            fill_price = base_price * (1 + slippage)
             quantity = existing_pos.quantity  # negative
+            # Closes are not size-capped (a full exit), but pay market impact.
+            if realistic:
+                fill_price = base_price * (
+                    1 + slippage + self._impact_fraction(abs(quantity), adv))
+            else:
+                fill_price = base_price * (1 + slippage)
             cost = abs(quantity) * fill_price * (1 + self.commission)
             # Closes always execute — even if cash dips negative the desk
             # must be able to exit a losing short (margin is not modeled).
@@ -799,6 +986,11 @@ class BacktestEngine:
             logger.info("COVER %d %s @ %.4f on %s (signal %s)",
                         abs(quantity), asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
+
+        # No matching branch (e.g. a BUY when already long without accumulate,
+        # or a close with no position) -> consume the intent. Realistic-fill
+        # remainders are the only thing re-queued (returned above).
+        return None
 
     def _build_benchmark(self, benchmark_symbol: str, start_date: str,
                          end_date: str) -> Optional[Dict]:

@@ -205,6 +205,12 @@ function applyMode() {
     // Position size drives strategy/desk sizing only; a fund's desks size
     // themselves and the reweighter sets capital, so hide it in fund mode.
     document.getElementById('positionSizeField').classList.toggle('d-none', mode === 'fund');
+    // Realistic fills are strategy/desk only (fund mode does not thread the
+    // flag), so hide the checkbox in fund mode rather than leave an inert one.
+    const realisticField = document.getElementById('realisticFillsField');
+    if (realisticField) {
+        realisticField.classList.toggle('d-none', mode === 'fund');
+    }
 }
 
 /** Populate #btDesk with READY desks; returns them (empty array on error). */
@@ -434,6 +440,12 @@ async function onRun(event) {
         delete payload.position_size; // the fund path sizes via desks + reweighter
     } else {
         payload.strategy = document.getElementById('btStrategy').value;
+    }
+    // Opt-in realistic fills (Step 6): strategy/desk modes only (the fund path
+    // does not expose it yet).
+    if (currentMode() !== 'fund') {
+        const realistic = document.getElementById('realisticFills');
+        if (realistic) payload.realistic_fills = realistic.checked;
     }
 
     restoreRunBtn = btnLoading(document.getElementById('runBtn'));

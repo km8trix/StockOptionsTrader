@@ -1227,7 +1227,8 @@ class TestDeskModeBacktest:
             def __init__(self, strategy=None, desk=None,
                          initial_capital=100000, **kwargs):
                 seen['ctor'] = {'strategy': strategy, 'desk': desk,
-                                'initial_capital': initial_capital}
+                                'initial_capital': initial_capital,
+                                'kwargs': kwargs}
                 # _fetch_info getattr-guards a missing provenance method.
                 self.market_data = None
 
@@ -1278,6 +1279,27 @@ class TestDeskModeBacktest:
         # greeks_series keys on a non-janestreet desk.
         assert result.get('structures') in (None, [])
         assert result.get('greeks_series') in (None, [])
+
+    def test_realistic_fills_threads_to_engine(self, client, patch_desk_stack):
+        # Step 6: default off; explicit true reaches the engine constructor.
+        r1 = client.post('/api/backtest/run', json=self.PAYLOAD)
+        _wait_for_job(client, r1.get_json()['job_id'])
+        assert patch_desk_stack['ctor']['kwargs'].get(
+            'enable_realistic_fills') is False
+
+        r2 = client.post('/api/backtest/run',
+                         json={**self.PAYLOAD, 'realistic_fills': True})
+        _wait_for_job(client, r2.get_json()['job_id'])
+        assert patch_desk_stack['ctor']['kwargs'].get(
+            'enable_realistic_fills') is True
+
+    def test_non_boolean_realistic_fills_rejected(self, client,
+                                                  patch_desk_stack):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'realistic_fills': 'yes'})
+        assert response.status_code == 400
+        assert 'realistic_fills' in response.get_json()['error']
 
     def test_desk_run_saved_with_desk_prefixed_strategy(
             self, client, patch_desk_stack):

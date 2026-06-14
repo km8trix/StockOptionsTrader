@@ -9,6 +9,8 @@ never at day T's close.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -503,3 +505,192 @@ class TestDrawdownSeries:
             pytest.approx(engine.portfolio.get_max_drawdown())
         assert min(point['drawdown_pct'] for point in series) == \
             pytest.approx(report['summary']['max_drawdown'])
+
+
+def _vol_frame(dates, opens, volume):
+    """OHLCV frame: scalar or per-date opens, constant volume."""
+    n = len(dates)
+    op = [float(opens)] * n if not isinstance(opens, (list, tuple)) else \
+        [float(o) for o in opens]
+    return pd.DataFrame({
+        'open': op, 'high': [o * 1.01 for o in op],
+        'low': [o * 0.99 for o in op], 'close': op,
+        'volume': [float(volume)] * n,
+    }, index=dates)
+
+
+class TestRealisticFills:
+    """Phase 3 Step 6 (opt-in): ADV market impact + cap-and-requeue partial
+    fills. Default OFF is byte-identical (covered by the rest of this file +
+    the greeks golden); these exercise the ON path directly."""
+
+    def _engine(self, **kw):
+        from strategies.base import MomentumStrategy
+        return BacktestEngine(MomentumStrategy(), initial_capital=10_000_000.0,
+                              commission=COMMISSION, **kw)
+
+    def _asset(self):
+        from core.models import Asset, AssetType
+        return Asset('AAA', AssetType.STOCK)
+
+    def test_realistic_buy_caps_impacts_and_requeues(self):
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 10000)
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True, impact_coef=0.1,
+                              participation_cap=0.1, adv_window=5)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[4], 'days_waiting': 0,
+            'quantity': 5000}
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        # ADV = 10000 (5 prior days), cap = 1000, impact = 0.1*sqrt(1000/10000).
+        impact = 0.1 * math.sqrt(1000 / 10000.0)
+        expected_price = 100.0 * (1 + DEFAULT_SLIPPAGE_BPS / 10000.0 + impact)
+        assert len(engine.trades_log) == 1
+        trade = engine.trades_log[0]
+        assert trade['quantity'] == 1000  # capped, not 5000
+        assert trade['price'] == pytest.approx(expected_price)
+        assert engine.portfolio.get_position(asset).quantity == 1000
+        # Remainder re-queued to fill on later days.
+        requeued = engine.pending_intents[asset]
+        assert requeued['quantity'] == 4000
+        assert requeued['accumulate'] is True
+
+    def test_requeued_remainder_accumulates_into_position(self):
+        dates = pd.bdate_range('2023-01-02', periods=8)
+        # Different opens on the two fill days so the average entry is non-trivial.
+        frame = _vol_frame(dates, [100.0] * 6 + [110.0, 110.0], 10000)
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True, impact_coef=0.1,
+                              participation_cap=0.1, adv_window=5)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[5], 'days_waiting': 0,
+            'quantity': 5000}
+
+        engine._fill_pending_intents({'AAA': frame}, dates[6],
+                                     position_size=0.1)
+        p1 = engine.trades_log[0]['price']
+        assert engine.portfolio.get_position(asset).quantity == 1000
+
+        # Next day the re-queued 4000 fills another 1000 and accumulates.
+        engine._fill_pending_intents({'AAA': frame}, dates[7],
+                                     position_size=0.1)
+        p2 = engine.trades_log[1]['price']
+        pos = engine.portfolio.get_position(asset)
+        assert pos.quantity == 2000
+        assert pos.avg_entry_price == pytest.approx((1000 * p1 + 1000 * p2)
+                                                    / 2000)
+        assert engine.pending_intents[asset]['quantity'] == 3000
+
+    def test_flag_off_fills_fully_no_cap(self):
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 10000)
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=False)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[4], 'days_waiting': 0,
+            'quantity': 5000}
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        trade = engine.trades_log[0]
+        assert trade['quantity'] == 5000  # no cap when off
+        assert trade['price'] == pytest.approx(
+            100.0 * (1 + DEFAULT_SLIPPAGE_BPS / 10000.0))  # no impact
+        assert asset not in engine.pending_intents  # nothing re-queued
+
+    def test_thin_adv_cap_floors_at_one_share(self):
+        # Review fix (HIGH): int(participation_cap*ADV) rounds to 0 for thin
+        # names; the cap is floored at 1 so the order trickles, never dumps.
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 5)  # ADV = 5 shares
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True, impact_coef=0.1,
+                              participation_cap=0.1, adv_window=5)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[4], 'days_waiting': 0,
+            'quantity': 5000}
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+        assert engine.trades_log[0]['quantity'] == 1  # floored, not 5000
+        assert engine.pending_intents[asset]['quantity'] == 4999
+
+    def test_new_signal_clobbering_remainder_warns(self, caplog):
+        # Review fix (HIGH): a fresh signal that supersedes an in-flight
+        # remainder must surface the abandoned shares, not drop them silently.
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': None, 'days_waiting': 0,
+            'quantity': 4000, 'accumulate': True}
+        with caplog.at_level('WARNING'):
+            engine._queue_pending_intent(asset, {
+                'signal': 'SELL', 'signal_date': None, 'days_waiting': 0})
+        assert engine.pending_intents[asset]['signal'] == 'SELL'
+        assert any('Abandoning' in r.message for r in caplog.records)
+
+    def test_orphaned_accumulate_remainder_dropped(self):
+        # Review fix (MEDIUM): an accumulate remainder whose position is gone
+        # (flat/flipped) is dropped deterministically, not re-opened/silently lost.
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 10000)
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True)
+        # accumulate remainder but NO existing position (it was closed).
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[4], 'days_waiting': 0,
+            'quantity': 1000, 'accumulate': True}
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+        assert engine.trades_log == []  # not re-opened
+        assert engine.portfolio.get_position(asset) is None
+        assert asset not in engine.pending_intents  # consumed, not re-queued
+
+    def test_impact_clamped_keeps_fill_price_positive(self):
+        # Review fix (MEDIUM): a huge (uncapped) close into thin ADV must not
+        # produce a negative fill price; impact is clamped (mirrors options 0.0).
+        from core.models import Position
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 100)  # ADV = 100
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True, impact_coef=0.1,
+                              participation_cap=0.1, adv_window=5)
+        engine.portfolio.add_position(Position(
+            asset=asset, quantity=1_000_000, avg_entry_price=90.0,
+            current_price=100.0, timestamp=dates[0]))
+        engine.pending_intents[asset] = {
+            'signal': 'SELL', 'signal_date': dates[4], 'days_waiting': 0}
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+        # Uncapped impact would be 0.1*sqrt(1e6/100)=10; clamped to 0.5.
+        expected = 100.0 * (1 - DEFAULT_SLIPPAGE_BPS / 10000.0 - 0.5)
+        trade = engine.trades_log[0]
+        assert trade['price'] > 0
+        assert trade['price'] == pytest.approx(expected)
+
+    def test_realistic_sell_pays_impact_no_cap(self):
+        from core.models import Position
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 10000)
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True, impact_coef=0.1,
+                              participation_cap=0.1, adv_window=5)
+        engine.portfolio.add_position(Position(
+            asset=asset, quantity=500, avg_entry_price=90.0,
+            current_price=100.0, timestamp=dates[0]))
+        engine.pending_intents[asset] = {
+            'signal': 'SELL', 'signal_date': dates[4], 'days_waiting': 0}
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        # Full exit (no cap on closes) but pays slippage + impact on 500 shares.
+        impact = 0.1 * math.sqrt(500 / 10000.0)
+        expected_price = 100.0 * (1 - DEFAULT_SLIPPAGE_BPS / 10000.0 - impact)
+        trade = engine.trades_log[0]
+        assert trade['action'] == 'SELL'
+        assert trade['quantity'] == 500
+        assert trade['price'] == pytest.approx(expected_price)
+        assert engine.portfolio.get_position(asset) is None
+        assert asset not in engine.pending_intents

@@ -142,6 +142,17 @@ def _parse_seed(data):
     return seed, None
 
 
+def _parse_realistic_fills(data):
+    """Opt-in realistic execution flag (Phase 3 Step 6). Returns (bool, None),
+    or (False, error) when present but not a real boolean. Default False keeps
+    the vanilla cost model (and byte-identical reports). Applies to strategy and
+    desk modes; fund mode does not expose it yet."""
+    value = data.get('realistic_fills', False)
+    if not isinstance(value, bool):
+        return False, 'realistic_fills must be a boolean'
+    return value, None
+
+
 def _date_str(value):
     """'YYYY-MM-DD' for datetimes/Timestamps; str fallback for anything else."""
     if hasattr(value, 'strftime'):
@@ -291,17 +302,19 @@ def _execute_engine_job(backtester, symbols, start_date, end_date,
 
 def _run_backtest_job(symbols, strategy_name, start_date, end_date,
                       initial_capital, position_size, name, seed=None,
-                      progress=None):
+                      enable_realistic_fills=False, progress=None):
     """JobManager job body: run the engine and return a JSON-safe report.
 
     The JobManager injects ``progress`` (callable taking float 0-100); it is
     wired straight into BacktestEngine.run's progress_callback. ``seed`` (if
-    given) pins the engine's RNG for reproducibility. Raising here marks the
-    job 'error' with the exception message.
+    given) pins the engine's RNG for reproducibility. ``enable_realistic_fills``
+    (Step 6, default False) turns on ADV market impact + cap-and-requeue partial
+    fills. Raising here marks the job 'error' with the exception message.
     """
     strategy_instance = STRATEGIES[strategy_name]()
-    backtester = BacktestEngine(strategy_instance,
-                                initial_capital=initial_capital, seed=seed)
+    backtester = BacktestEngine(
+        strategy_instance, initial_capital=initial_capital, seed=seed,
+        enable_realistic_fills=enable_realistic_fills)
     return _execute_engine_job(backtester, symbols, start_date, end_date,
                                initial_capital, position_size, name,
                                strategy_name, progress, seed=seed)
@@ -309,7 +322,7 @@ def _run_backtest_job(symbols, strategy_name, start_date, end_date,
 
 def _run_desk_backtest_job(symbols, desk, desk_key, start_date, end_date,
                            initial_capital, position_size, name, seed=None,
-                           progress=None):
+                           enable_realistic_fills=False, progress=None):
     """JobManager job body (desk mode): engine built per contract C2.
 
     The report comes back with the additive desk keys (contract C3:
@@ -319,8 +332,9 @@ def _run_desk_backtest_job(symbols, desk, desk_key, start_date, end_date,
     stay distinguishable in the history/compare/export UIs (additive: the
     column still holds a plain string). ``seed`` (if given) pins the engine RNG.
     """
-    backtester = BacktestEngine(desk=desk, initial_capital=initial_capital,
-                                seed=seed)
+    backtester = BacktestEngine(
+        desk=desk, initial_capital=initial_capital, seed=seed,
+        enable_realistic_fills=enable_realistic_fills)
     return _execute_engine_job(backtester, symbols, start_date, end_date,
                                initial_capital, position_size, name,
                                f'desk:{desk_key}', progress, seed=seed)
@@ -490,12 +504,16 @@ def run_backtest_async():
     if seed_err:
         return jsonify({'error': seed_err}), 400
 
+    realistic, realistic_err = _parse_realistic_fills(data)
+    if realistic_err:
+        return jsonify({'error': realistic_err}), 400
+
     if desk is not None:
         name = (data.get('name') or '').strip() or \
             f"desk:{desk_key} {','.join(symbols)}"
         job_id = get_job_manager().submit(
             _run_desk_backtest_job, symbols, desk, desk_key, start_date,
-            end_date, initial_capital, position_size, name, seed)
+            end_date, initial_capital, position_size, name, seed, realistic)
         logger.info('Desk backtest job %s submitted (desk:%s on %s)', job_id,
                     desk_key, symbols)
         return jsonify({'job_id': job_id}), 202
@@ -505,7 +523,7 @@ def run_backtest_async():
 
     job_id = get_job_manager().submit(
         _run_backtest_job, symbols, strategy_name, start_date, end_date,
-        initial_capital, position_size, name, seed)
+        initial_capital, position_size, name, seed, realistic)
     logger.info('Backtest job %s submitted (%s on %s)', job_id,
                 strategy_name, symbols)
     return jsonify({'job_id': job_id}), 202
@@ -546,9 +564,14 @@ def run_backtest():
         if seed_err:
             return jsonify({'error': seed_err}), 400
 
+        realistic, realistic_err = _parse_realistic_fills(data)
+        if realistic_err:
+            return jsonify({'error': realistic_err}), 400
+
         strategy_instance = STRATEGIES[strategy_name]()
-        backtester = BacktestEngine(strategy_instance,
-                                    initial_capital=initial_capital, seed=seed)
+        backtester = BacktestEngine(
+            strategy_instance, initial_capital=initial_capital, seed=seed,
+            enable_realistic_fills=realistic)
 
         results = backtester.run(symbols, start_date, end_date, position_size)
 
