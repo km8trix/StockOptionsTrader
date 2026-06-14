@@ -53,6 +53,22 @@ from utils.kill_switch import KillSwitch
 logger = logging.getLogger(__name__)
 
 
+def _filled_quantity(report: Dict) -> Optional[int]:
+    """Actual filled size from the executor report's fills, or None.
+
+    A partial fill banks fewer units than the intended quantity, so the parity
+    harness needs the realized size (not the intent size) to scale drift and
+    commission. The PatientExecutor reports per-fill {qty, price}; the paper
+    path carries no fills, so this returns None there (the harness then falls
+    back to the recorded intended quantity).
+    """
+    fills = report.get("fills") if isinstance(report, dict) else None
+    if not fills:
+        return None
+    total = sum(f.get("qty", 0) for f in fills if isinstance(f, dict))
+    return total or None
+
+
 class LiveTradingSession:
     """Wires a Desk to a broker through the safety rails.
 
@@ -328,6 +344,17 @@ class LiveTradingSession:
             "status": report.get("status"),
             "avg_fill": report.get("avg_fill"),
             "shortfall_per_unit": report.get("shortfall_per_unit"),
+            # Parity fields (Step 5, additive): let the read-only parity harness
+            # replay this fill through the backtest cost model EXACTLY, without
+            # recovering the reference price or guessing the asset class.
+            # arrival_mid/commission come from the executor report (commission
+            # is None today — the broker does not surface it yet; the field is a
+            # forward-compatible hook). asset_type/quantity are known here.
+            "arrival_mid": report.get("arrival_mid"),
+            "asset_type": intent.asset.asset_type.value,
+            "quantity": quantity,
+            "filled_quantity": _filled_quantity(report),
+            "commission": report.get("commission"),
         }
         if report.get("status") == "error":
             report_payload["error"] = report.get("error")

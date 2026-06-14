@@ -765,6 +765,7 @@ async function runReconcile() {
         }
         refreshStatus();  // kill switch / status may have flipped
         loadAudit();
+        loadParity();  // reconciliation follows trading — refresh fill parity
     } catch (_) {
         // toasted by fetchJSON (covers 409 no-live-session and 503s)
     } finally {
@@ -1552,6 +1553,89 @@ async function refreshStatus() {
    Bootstrap
    ========================================================================== */
 
+// ==================== EXECUTION PARITY (Phase 3 Step 5) ====================
+
+function fmtParityNum(value, digits) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '—';
+    }
+    return Number(value).toFixed(digits);
+}
+
+async function loadParity() {
+    const summary = document.getElementById('paritySummary');
+    const table = document.getElementById('parityTable');
+    const body = document.getElementById('parityBody');
+    const empty = document.getElementById('parityEmpty');
+    if (!summary || !body || !table || !empty) return;
+
+    let data;
+    try {
+        data = await fetchJSON('/api/live/parity', { silent: true });
+    } catch (err) {
+        table.classList.add('d-none');
+        body.innerHTML = '';
+        summary.textContent = '';
+        empty.innerHTML = emptyStateHTML('bi-rulers', 'Parity unavailable',
+            err.message || 'The audit backend has not been configured.');
+        return;
+    }
+    renderParity(data);
+}
+
+function renderParity(data) {
+    const summary = document.getElementById('paritySummary');
+    const table = document.getElementById('parityTable');
+    const body = document.getElementById('parityBody');
+    const empty = document.getElementById('parityEmpty');
+
+    const fills = Array.isArray(data.fills) ? data.fills : [];
+    if (fills.length === 0) {
+        table.classList.add('d-none');
+        body.innerHTML = '';
+        summary.textContent = '';
+        empty.innerHTML = emptyStateHTML('bi-rulers', 'No live fills yet',
+            'Execution parity appears once the live session has recorded ' +
+            'filled orders in the audit log.');
+        return;
+    }
+
+    empty.innerHTML = '';
+    table.classList.remove('d-none');
+    body.innerHTML = fills.map((f) => {
+        const driftClass = Number(f.slippage_drift) > 0 ? 'pnl-neg' : 'pnl-pos';
+        const recovered = f.arrival_mid_recovered
+            ? ' <span class="text-muted" title="arrival mid recovered from'
+              + ' shortfall (legacy row)">~</span>'
+            : '';
+        return '<tr>' +
+            `<td class="num">${escapeHTML(String(f.seq ?? '—'))}</td>` +
+            `<td>${escapeHTML(f.symbol ?? '—')}</td>` +
+            `<td>${escapeHTML(f.action ?? '—')}</td>` +
+            `<td>${escapeHTML(f.asset_type ?? '—')}</td>` +
+            `<td class="num">${f.quantity ?? '—'}</td>` +
+            `<td class="num">${fmtParityNum(f.arrival_mid, 2)}${recovered}</td>` +
+            `<td class="num">${fmtParityNum(f.realized_shortfall, 4)}</td>` +
+            `<td class="num">${fmtParityNum(f.expected_shortfall, 4)}</td>` +
+            `<td class="num ${driftClass}">` +
+            `${fmtParityNum(f.slippage_drift, 4)}</td>` +
+            `<td class="num ${driftClass}">` +
+            `${fmtParityNum(f.slippage_drift_total, 2)}</td>` +
+            '</tr>';
+    }).join('');
+
+    const s = data.summary || {};
+    const commNote = data.commission_available
+        ? `actual commission $${fmtParityNum(s.total_actual_commission, 2)}`
+        : 'actual commission N/A (broker does not surface it yet)';
+    summary.textContent =
+        `${data.n_fills} fill${data.n_fills === 1 ? '' : 's'} ` +
+        `(${data.n_skipped} skipped) · total slippage drift ` +
+        `$${fmtParityNum(s.total_slippage_drift, 2)} · ` +
+        `modeled commission $${fmtParityNum(s.total_modeled_commission, 2)} · ` +
+        `${commNote}. Drift > 0 = live worse than the model.`;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     // Initial paint + the page's poll. Status, working orders and the
     // scheduler refresh every LIVE_POLL_MS; the audit log loads once and
@@ -1560,6 +1644,7 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshWorkingOrders();
     refreshScheduler();
     loadAudit();
+    loadParity();
     setInterval(refreshStatus, LIVE_POLL_MS);
     setInterval(refreshWorkingOrders, LIVE_POLL_MS);
     setInterval(refreshScheduler, LIVE_POLL_MS);

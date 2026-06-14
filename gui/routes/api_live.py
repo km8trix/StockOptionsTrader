@@ -101,6 +101,18 @@ except Exception as e:  # noqa: BLE001
         RECONCILE_IMPORT_ERROR,
     )
 
+PARITY_IMPORT_ERROR: str | None
+try:
+    from backtesting.parity_harness import parity_report
+    PARITY_IMPORT_ERROR = None
+except Exception as e:  # noqa: BLE001
+    parity_report = None
+    PARITY_IMPORT_ERROR = f'{type(e).__name__}: {e}'
+    logger.error(
+        'Failed to import parity_harness — parity is unavailable: %s',
+        PARITY_IMPORT_ERROR,
+    )
+
 SCHEDULER_IMPORT_ERROR: str | None
 try:
     from utils.scheduler import LiveScheduler
@@ -661,6 +673,33 @@ def audit_entries():
     except Exception:
         logger.error('Failed to read audit log', exc_info=True)
         return jsonify({'error': 'Failed to read audit log'}), 500
+
+
+# ==================== EXECUTION PARITY (Phase 3 Step 5) ====================
+
+@live_bp.route('/parity', methods=['GET'])
+def execution_parity():
+    """Read-only live-vs-backtest execution parity over audited fills.
+
+    Replays the audit log's execution_report rows through the backtest cost
+    model and reports slippage/spread drift (+ modeled commission). Pure read:
+    no orders, no broker calls, no audit writes.
+    """
+    if parity_report is None:
+        return _unavailable('Execution parity', PARITY_IMPORT_ERROR)
+    log = get_audit_log()
+    if log is None:
+        return _unavailable('Audit log', AUDIT_IMPORT_ERROR)
+
+    limit = _int_arg('limit', default=10_000, lo=1, hi=100_000)
+    if limit is None:
+        return jsonify(
+            {'error': "'limit' must be an integer between 1 and 100000"}), 400
+    try:
+        return jsonify(parity_report(log, limit=limit))
+    except Exception:
+        logger.error('Failed to compute execution parity', exc_info=True)
+        return jsonify({'error': 'Failed to compute execution parity'}), 500
 
 
 # ==================== RECONCILIATION (C19) ====================

@@ -354,6 +354,38 @@ class TestExecutionErrorHalts:
         assert report_row["payload"]["error_type"] == "ConnectionError"
 
 
+class TestExecutionReportEnrichment:
+    """Step 5: execution_report rows additionally record arrival_mid,
+    asset_type and quantity so the parity harness can replay them exactly.
+    Additive — the existing keys and the hash chain are unaffected."""
+
+    def test_report_payload_carries_parity_fields(self, rails):
+        audit, switch = rails
+
+        class MidExecutor:
+            def execute(self, side, instrument, quantity, **kwargs):
+                return {"status": "filled", "avg_fill": 100.10,
+                        "arrival_mid": 100.0, "shortfall_per_unit": 0.10,
+                        "fills": [{"qty": 10, "price": 100.10}]}
+
+        desk = FakeDesk([DeskIntent(SPY, "BUY", 0.05, "x", quantity=10)])
+        session = make_session(desk, FakeBroker(), MidExecutor(), audit, switch)
+        session.evaluate_once()
+
+        reports = audit.entries(event_type="execution_report")
+        assert reports, "expected an execution_report row"
+        payload = reports[0]["payload"]
+        assert payload["arrival_mid"] == pytest.approx(100.0)
+        assert payload["asset_type"] == "stock"
+        assert payload["quantity"] == 10
+        assert payload["filled_quantity"] == 10  # actual filled size
+        assert payload["commission"] is None  # broker does not surface it yet
+        # Legacy keys still present; additive fields do not break the chain.
+        assert payload["avg_fill"] == pytest.approx(100.10)
+        assert payload["shortfall_per_unit"] == pytest.approx(0.10)
+        assert audit.verify_chain()["ok"] is True
+
+
 class FakeGate:
     """Zero-arg daily-loss gate double: scripted results (last sticky);
     exceptions in the queue are raised."""

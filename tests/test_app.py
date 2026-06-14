@@ -2505,6 +2505,60 @@ class TestLiveAuditEndpoint:
             'error': 'Audit log unavailable', 'reason': sentinel}
 
 
+class TestLiveParityEndpoint:
+    """GET /api/live/parity (Phase 3 Step 5) — read-only execution parity."""
+
+    class _ParityAudit:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def entries(self, limit=100, offset=0, event_type=None,
+                    ascending=False):
+            return [r for r in self._rows
+                    if event_type is None or r['event_type'] == event_type]
+
+    def _audit(self):
+        return self._ParityAudit([
+            {'seq': 1, 'ts': 't', 'env': 'sandbox', 'actor': 'live_session',
+             'event_type': 'execution_report',
+             'payload': {'symbol': 'AAA', 'action': 'BUY', 'status': 'filled',
+                         'avg_fill': 100.10, 'shortfall_per_unit': 0.10,
+                         'arrival_mid': 100.0, 'asset_type': 'stock',
+                         'quantity': 100, 'commission': None}},
+        ])
+
+    def test_parity_report_returned(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'get_audit_log', lambda: self._audit())
+        body = client.get('/api/live/parity').get_json()
+        assert body['n_fills'] == 1
+        fill = body['fills'][0]
+        assert fill['slippage_drift'] == pytest.approx(0.05)
+        assert fill['slippage_drift_total'] == pytest.approx(5.0)
+        assert body['commission_available'] is False
+
+    def test_bad_limit_is_400(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'get_audit_log', lambda: self._audit())
+        response = client.get('/api/live/parity?limit=0')
+        assert response.status_code == 400
+
+    def test_503_when_parity_unavailable(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'parity_report', None)
+        monkeypatch.setattr(api_live, 'PARITY_IMPORT_ERROR', 'ImportError: x')
+        response = client.get('/api/live/parity')
+        assert response.status_code == 503
+        assert response.get_json()['reason'] == 'ImportError: x'
+
+    def test_503_when_audit_unavailable(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'get_audit_log', lambda: None)
+        monkeypatch.setattr(api_live, 'AUDIT_IMPORT_ERROR', 'ImportError: y')
+        response = client.get('/api/live/parity')
+        assert response.status_code == 503
+
+
 class TestLiveReconcileEndpoint:
     """POST /api/live/reconcile (contract C19/C20)."""
 

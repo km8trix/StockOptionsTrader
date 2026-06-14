@@ -514,6 +514,39 @@
             </div>
         </div>
     </div>
+
+    <!-- ============ EXECUTION PARITY (Phase 3 Step 5) ============ -->
+    <div class="col-12">
+        <div class="card" id="parityCard">
+            <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <span><i class="bi bi-rulers" aria-hidden="true"></i> Execution parity</span>
+                <span class="card-header-hint" id="parityHint">live fills vs backtest cost model</span>
+            </div>
+            <div class="card-body">
+                <div id="paritySummary" class="small text-muted mb-2">Loading…</div>
+                <div class="table-responsive">
+                    <table class="table table-sm d-none" id="parityTable">
+                        <thead>
+                            <tr>
+                                <th class="num">Seq</th>
+                                <th>Symbol</th>
+                                <th>Action</th>
+                                <th>Type</th>
+                                <th class="num">Qty</th>
+                                <th class="num">Arrival</th>
+                                <th class="num">Realized</th>
+                                <th class="num">Expected</th>
+                                <th class="num">Drift/unit</th>
+                                <th class="num">Drift $</th>
+                            </tr>
+                        </thead>
+                        <tbody id="parityBody"></tbody>
+                    </table>
+                </div>
+                <div id="parityEmpty"></div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- Kill-switch confirm modal: confirmation is required in BOTH directions;
