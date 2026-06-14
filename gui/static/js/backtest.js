@@ -516,6 +516,7 @@ function renderResults(report) {
     renderPendingSignals(report.pending_signals || []);
     renderEquityChart(report);
     renderDrawdownChart(report.drawdown_series || []);
+    renderOosFolds(report);
     renderReweightChart(report);
     renderGreeksChart(report);
     renderPodAllocation(report);
@@ -1201,6 +1202,83 @@ function deskLabel(key) {
 }
 
 /** Contract-shaped reweight_log entries; [] when absent/empty/foreign. */
+/**
+ * Per-fold OOS significance (Phase 3 Step 4). Paints report.oos_folds as a
+ * table — one row per walk-forward fold with its one-sided t-stat, p-value and
+ * Bonferroni/BH verdicts — plus a summary line carrying the honest "heuristic,
+ * not FWER" caveat. Hidden entirely for strategy/legacy runs (no key); shows an
+ * N/A note in fund mode (netted multi-desk book). Mirrors the conditional
+ * card-toggle pattern used by renderReweightChart.
+ */
+function renderOosFolds(report) {
+    const card = document.getElementById('oosFoldsCard');
+    const body = document.getElementById('oosFoldsBody');
+    const caption = document.getElementById('oosFoldsCaption');
+    const summary = document.getElementById('oosFoldsSummary');
+    const data = report && report.oos_folds;
+    if (!data || typeof data !== 'object') {
+        card.classList.add('d-none');
+        body.innerHTML = '';
+        return;
+    }
+    card.classList.remove('d-none');
+
+    if (data.available === false) {
+        caption.textContent = '(fund mode)';
+        body.innerHTML = '';
+        summary.textContent = 'Not available for a fund: ' +
+            (data.reason || 'per-fold OOS significance requires a single desk.');
+        return;
+    }
+
+    const folds = Array.isArray(data.folds) ? data.folds : [];
+    const alphaPct = Number.isFinite(Number(data.alpha))
+        ? `${(Number(data.alpha) * 100).toFixed(0)}%` : '5%';
+    caption.textContent = `(one-sided t-test · α=${alphaPct})`;
+
+    if (folds.length === 0) {
+        body.innerHTML =
+            '<tr><td colspan="8" class="text-muted">No walk-forward folds.</td></tr>';
+    } else {
+        body.innerHTML = folds.map((f) => {
+            const window = f.oos_end
+                ? `${escapeHTML(f.oos_start)} → ${escapeHTML(f.oos_end)}`
+                : `${escapeHTML(f.oos_start)} → end`;
+            const mean = (f.mean_return === null || f.mean_return === undefined)
+                ? '—' : `${(Number(f.mean_return) * 100).toFixed(3)}%`;
+            const tstat = (f.tstat === null || f.tstat === undefined)
+                ? '—' : Number(f.tstat).toFixed(2);
+            const pval = (f.pvalue === null || f.pvalue === undefined)
+                ? '—' : Number(f.pvalue).toFixed(4);
+            return '<tr>' +
+                `<td class="num">${escapeHTML(f.fit_date)}</td>` +
+                `<td class="num">${window}</td>` +
+                `<td class="text-end num">${Number(f.n_returns) || 0}</td>` +
+                `<td class="text-end num">${mean}</td>` +
+                `<td class="text-end num">${tstat}</td>` +
+                `<td class="text-end num">${pval}</td>` +
+                `<td>${oosBadge(f.significant_bonferroni)}</td>` +
+                `<td>${oosBadge(f.significant_bh)}</td>` +
+                '</tr>';
+        }).join('');
+    }
+
+    const m = Number(data.n_testable_folds) || 0;
+    const bonfAlpha = (data.bonferroni_alpha === null ||
+                       data.bonferroni_alpha === undefined)
+        ? '—' : Number(data.bonferroni_alpha).toFixed(4);
+    summary.textContent =
+        `${data.n_significant_bh || 0}/${m} folds significant (BH), ` +
+        `${data.n_significant_bonferroni || 0}/${m} (Bonferroni, α/m=${bonfAlpha}). ` +
+        `${data.caveat || ''}`;
+}
+
+function oosBadge(flag) {
+    return flag
+        ? '<span class="badge bg-success">✓</span>'
+        : '<span class="badge bg-secondary">·</span>';
+}
+
 function reweightLog(report) {
     return Array.isArray(report.reweight_log)
         ? report.reweight_log.filter(

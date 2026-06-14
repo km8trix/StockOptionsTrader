@@ -8,9 +8,12 @@ import math
 import numpy as np
 import pytest
 from scipy.stats import kurtosis, norm, skew
+from scipy.stats import t as student_t
 
-from analysis.research_stats import (deflated_sharpe_ratio,
-                                     expected_max_sharpe_z,
+from analysis.research_stats import (benjamini_hochberg, bonferroni_alpha,
+                                     deflated_sharpe_ratio,
+                                     expected_max_sharpe_z, fold_oos_pvalue,
+                                     fold_oos_tstat,
                                      probabilistic_sharpe_ratio)
 
 
@@ -94,3 +97,102 @@ class TestDeflatedSharpe:
     def test_in_unit_interval(self):
         dsr = deflated_sharpe_ratio(_normal_returns(seed=4), 25)
         assert dsr is not None and 0.0 <= dsr <= 1.0
+
+
+class TestFoldOOSTstat:
+    def test_matches_one_sample_t_identity(self):
+        # t = mean / (std_ddof1 / sqrt(N)) == sharpe * sqrt(N).
+        returns = [0.02, 0.015, 0.025, 0.018, 0.021]
+        arr = np.asarray(returns)
+        expected = arr.mean() / (arr.std(ddof=1) / math.sqrt(len(arr)))
+        assert fold_oos_tstat(returns) == pytest.approx(float(expected))
+
+    def test_positive_mean_positive_tstat(self):
+        assert fold_oos_tstat([0.02, 0.015, 0.025, 0.018]) > 0.0
+
+    def test_negative_mean_negative_tstat(self):
+        assert fold_oos_tstat([-0.02, -0.015, -0.025, -0.018]) < 0.0
+
+    def test_too_few_returns_is_none(self):
+        assert fold_oos_tstat([0.01]) is None
+        assert fold_oos_tstat([]) is None
+
+    def test_zero_variance_is_none(self):
+        # Degenerate std -> None (same guard as PSR/DSR), never a giant t.
+        assert fold_oos_tstat([0.01] * 6) is None
+
+    def test_non_finite_filtered(self):
+        clean = _normal_returns(mean=0.001, seed=11)
+        dirty = clean[:5] + [float('nan'), float('inf')] + clean[5:]
+        assert fold_oos_tstat(dirty) is not None
+
+
+class TestFoldOOSPvalue:
+    def test_matches_one_sided_upper_tail(self):
+        returns = _normal_returns(mean=0.0008, seed=13)
+        t_stat = fold_oos_tstat(returns)
+        n = len(returns)
+        expected = float(student_t.sf(t_stat, df=n - 1))
+        assert fold_oos_pvalue(returns) == pytest.approx(expected)
+
+    def test_strong_positive_mean_small_pvalue(self):
+        # Consistent positive returns -> significant one-sided edge.
+        assert fold_oos_pvalue([0.02, 0.018, 0.022, 0.019, 0.021]) < 0.05
+
+    def test_negative_mean_pvalue_above_half(self):
+        # One-sided (mean > 0): a losing fold is NOT significant (p > 0.5).
+        assert fold_oos_pvalue([-0.02, -0.018, -0.022, -0.019]) > 0.5
+
+    def test_in_unit_interval(self):
+        p = fold_oos_pvalue(_normal_returns(seed=14))
+        assert p is not None and 0.0 <= p <= 1.0
+
+    def test_too_few_returns_is_none(self):
+        assert fold_oos_pvalue([0.01]) is None
+        assert fold_oos_pvalue([0.01] * 6) is None  # zero variance
+
+
+class TestBonferroniAlpha:
+    def test_divides_alpha_by_m(self):
+        assert bonferroni_alpha(0.05, 5) == pytest.approx(0.01)
+        assert bonferroni_alpha(0.05, 1) == pytest.approx(0.05)
+
+    def test_non_positive_m_is_none(self):
+        assert bonferroni_alpha(0.05, 0) is None
+        assert bonferroni_alpha(0.05, -3) is None
+
+
+class TestBenjaminiHochberg:
+    def test_step_up_rejects_expected_set(self):
+        # m=3, alpha=0.05. thresholds k/m*alpha = [.01667, .03333, .05].
+        # sorted p [.01, .02, .5]: k=1 ok, k=2 ok, k=3 fail -> reject ranks 1,2.
+        result = benjamini_hochberg([0.5, 0.01, 0.02], alpha=0.05)
+        assert result['m'] == 3
+        assert result['bh_threshold'] == pytest.approx(0.02)
+        assert result['n_significant_bh'] == 2
+        # rejected_bh aligned to INPUT order [0.5, 0.01, 0.02].
+        assert result['rejected_bh'] == [False, True, True]
+        assert result['alpha'] == pytest.approx(0.05)
+
+    def test_none_entries_dropped_from_family(self):
+        # The None fold is not counted in m and never rejected.
+        result = benjamini_hochberg([0.01, None, 0.02, 0.5], alpha=0.05)
+        assert result['m'] == 3
+        assert result['bh_threshold'] == pytest.approx(0.02)
+        assert result['rejected_bh'] == [True, False, True, False]
+
+    def test_no_rejections_when_all_large(self):
+        result = benjamini_hochberg([0.4, 0.6, 0.9], alpha=0.05)
+        assert result['m'] == 3
+        assert result['bh_threshold'] is None
+        assert result['n_significant_bh'] == 0
+        assert result['rejected_bh'] == [False, False, False]
+
+    def test_empty_or_all_none_family(self):
+        result = benjamini_hochberg([None, None], alpha=0.05)
+        assert result['m'] == 0
+        assert result['bh_threshold'] is None
+        assert result['n_significant_bh'] == 0
+        assert result['rejected_bh'] == [False, False]
+        empty = benjamini_hochberg([], alpha=0.05)
+        assert empty['m'] == 0 and empty['rejected_bh'] == []

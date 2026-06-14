@@ -36,10 +36,11 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.stats import kurtosis, norm, skew
+from scipy.stats import t as student_t
 
 logger = logging.getLogger(__name__)
 
@@ -143,3 +144,105 @@ def deflated_sharpe_ratio(returns: Sequence[float],
     se_sharpe = math.sqrt(var_term / (n - 1))
     sr_star = se_sharpe * expected_max_sharpe_z(n_trials)
     return probabilistic_sharpe_ratio(returns, sr_star)
+
+
+# ----------------------------------------------------------------------------
+# Per-fold out-of-sample significance + multiple-testing correction (Step 4).
+#
+# A walk-forward backtest produces a sequence of refits; the realized account
+# returns between consecutive refits form per-"fold" OOS samples. These helpers
+# score each fold's OOS edge (one-sided t-test that the mean return > 0) and
+# correct the family of fold p-values for multiple testing (Bonferroni and
+# Benjamini-Hochberg). As with DSR's n_trials, overlapping train windows mean
+# the fold count over-states INDEPENDENT trials, so the correction is a
+# documented heuristic upper bound on multiple-testing severity, NOT exact
+# FWER/FDR control. The fold-significance layer and the DSR deflation are two
+# distinct lenses on the same over-counted breadth and must NOT be combined.
+# ----------------------------------------------------------------------------
+
+
+def fold_oos_tstat(returns: Sequence[float]) -> Optional[float]:
+    """One-sample t-statistic that the per-period mean OOS return is > 0.
+
+    ``t = mean / (std_ddof1 / sqrt(N)) = (per-period Sharpe) * sqrt(N)``. Reuses
+    :func:`_sharpe_components`, so it inherits the SAME ddof=1 sample-std
+    convention and the SAME ``<2``-finite / degenerate-std guard as PSR/DSR — a
+    near-constant or too-short fold returns None (never a meaningless,
+    astronomical t). The sign is informative: a losing fold yields a negative t.
+    """
+    comp = _sharpe_components(returns)
+    if comp is None:
+        return None
+    sharpe, n, _sk, _kt = comp
+    return float(sharpe * math.sqrt(n))
+
+
+def fold_oos_pvalue(returns: Sequence[float]) -> Optional[float]:
+    """One-sided p-value for H0: mean OOS return <= 0 vs H1: mean > 0.
+
+    Upper tail of :func:`fold_oos_tstat` under a Student-t(df=N-1) null, or None
+    when the t-stat is undefined. One-sided BY DESIGN: a fold with a large
+    NEGATIVE mean gets a p-value near 1 (correctly not a significant positive
+    edge), so a loss can never masquerade as a discovery.
+    """
+    comp = _sharpe_components(returns)
+    if comp is None:
+        return None
+    sharpe, n, _sk, _kt = comp
+    t_stat = sharpe * math.sqrt(n)
+    return float(student_t.sf(t_stat, df=n - 1))
+
+
+def bonferroni_alpha(alpha: float, m: int) -> Optional[float]:
+    """Bonferroni per-comparison significance threshold ``alpha / m`` for ``m``
+    simultaneous tests, or None when ``m < 1``.
+
+    Pure arithmetic: the family size ``m`` (the number of TESTABLE folds) is
+    supplied by the caller, so the "overlapping walk-forward windows over-count
+    independent trials" caveat lives at the call site, not here.
+    """
+    m = int(m)
+    if m < 1:
+        return None
+    return float(alpha) / m
+
+
+def benjamini_hochberg(pvalues: Sequence[Optional[float]],
+                       alpha: float = 0.05) -> Dict:
+    """Benjamini-Hochberg step-up FDR control over a family of p-values.
+
+    None / non-finite entries — folds whose t-stat was undefined — are DROPPED
+    from the family and never counted in ``m``, so an untestable fold neither
+    inflates nor relaxes the correction. Returns::
+
+        {'m': int,                  # number of finite p-values tested
+         'alpha': float,
+         'bh_threshold': float|None,# largest p_(k) with p_(k) <= (k/m)*alpha
+         'n_significant_bh': int,
+         'rejected_bh': list[bool]} # reject flags ALIGNED to the input order
+                                    # (None / dropped entries -> False)
+
+    Standard step-up: sort the ``m`` finite p-values ascending; find the largest
+    rank ``k`` with ``p_(k) <= (k/m)*alpha``; reject every hypothesis with
+    ``p <= p_(k)``. ``m == 0`` -> threshold None, no rejections.
+    """
+    flags = [False] * len(pvalues)
+    finite = [(i, float(p)) for i, p in enumerate(pvalues)
+              if p is not None and np.isfinite(p)]
+    m = len(finite)
+    if m == 0:
+        return {'m': 0, 'alpha': float(alpha), 'bh_threshold': None,
+                'n_significant_bh': 0, 'rejected_bh': flags}
+    ordered = sorted(finite, key=lambda ip: ip[1])
+    bh_threshold: Optional[float] = None
+    cutoff_rank = 0
+    for rank, (_idx, p) in enumerate(ordered, start=1):
+        if p <= (rank / m) * alpha:
+            bh_threshold = p
+            cutoff_rank = rank
+    # Step-up: reject the cutoff_rank smallest p-values (all p <= p_(k*)).
+    for rank, (idx, _p) in enumerate(ordered, start=1):
+        if rank <= cutoff_rank:
+            flags[idx] = True
+    return {'m': m, 'alpha': float(alpha), 'bh_threshold': bh_threshold,
+            'n_significant_bh': cutoff_rank, 'rejected_bh': flags}

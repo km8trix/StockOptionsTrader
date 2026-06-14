@@ -222,6 +222,37 @@
                 </div>
             </div>
 
+            <!-- Per-fold out-of-sample significance (Phase 3 Step 4): a
+                 one-sided t-test that each walk-forward fold's mean OOS return
+                 > 0, with Bonferroni + Benjamini-Hochberg multiple-testing
+                 correction. Painted by backtest.js only when the report carries
+                 report.oos_folds (single-desk runs); fund runs show an N/A
+                 note; absent for strategy/legacy runs. -->
+            <div class="card mb-2 d-none" id="oosFoldsCard">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>Per-fold OOS significance</span>
+                    <span class="provenance-caption" id="oosFoldsCaption"></span>
+                </div>
+                <div class="card-body p-2">
+                    <div id="oosFoldsSummary" class="small text-muted mb-2"></div>
+                    <div class="table-responsive">
+                        <table class="table table-sm mb-0">
+                            <thead><tr>
+                                <th>Fit date</th>
+                                <th>OOS window</th>
+                                <th class="text-end">n</th>
+                                <th class="text-end">mean</th>
+                                <th class="text-end">t-stat</th>
+                                <th class="text-end">p-value</th>
+                                <th>Bonf.</th>
+                                <th>BH</th>
+                            </tr></thead>
+                            <tbody id="oosFoldsBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
             <!-- Fund dynamic reweighter: desk capital weights over the
                  rebalance schedule (stacked area), with fallback markers on
                  rebalances that degenerated to equal weight. Painted by

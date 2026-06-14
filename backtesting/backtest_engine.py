@@ -61,6 +61,8 @@ from desks.base import Desk
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
 from strategies.base import Strategy
+from analysis.research_stats import (benjamini_hochberg, bonferroni_alpha,
+                                     fold_oos_pvalue, fold_oos_tstat)
 
 if TYPE_CHECKING:  # annotation only — avoids any import-order coupling
     from desks.orchestrator import FundOrchestrator
@@ -838,6 +840,93 @@ class BacktestEngine:
                            benchmark_symbol, start_date, end_date, e)
             return None
 
+    def _compute_oos_folds(self, desk, alpha: float = 0.05) -> Dict:
+        """Per-fold out-of-sample significance for a SINGLE-desk run.
+
+        Reconstructs OOS folds by slicing the realized account return stream at
+        the desk's distinct walk-forward fit dates: fold k spans
+        ``[fit_date_k, fit_date_{k+1})`` (the last fold is open-ended). Each
+        fold's returns are scored with a one-sided t-test that the mean OOS
+        return > 0 (fold_oos_tstat / fold_oos_pvalue), and the family of fold
+        p-values is corrected for multiple testing (Bonferroni + BH). Returns
+        with no active model (before the first fit) are excluded.
+
+        HONEST SCOPE: the sliced series is the BLENDED account return (T+1 fill
+        lag, netting, stops) over each window, NOT the isolated P&L of the model
+        refit at fit_date_k. Overlapping train windows over-count independent
+        trials, so the correction is a heuristic upper bound, NOT exact
+        FWER/FDR control. This layer is independent of the deflated-Sharpe
+        n_trials lens and must NOT be combined with it.
+
+        'folds' is [] when the desk has no fits.
+        """
+        fits = list(desk.walk_forward_fits)
+        # Distinct, sorted fit-date boundaries. Read the date via to_dict()
+        # (contract C3) — the SAME serialization the 'walk_forward' report key
+        # uses — so this works for both WalkForwardFit and the TaggedWalkForwardFit
+        # wrapper (which has no .fit_date attribute). to_dict()['fit_date'] is a
+        # 'YYYY-MM-DD' string; parse to a plain date to compare against the
+        # snapshot-derived fold dates.
+        boundaries = sorted({pd.Timestamp(fit.to_dict()['fit_date']).date()
+                             for fit in fits})
+        dated = self.portfolio.get_daily_returns_with_dates()
+
+        folds: List[Dict] = []
+        pvalues: List[Optional[float]] = []
+        for k, start in enumerate(boundaries):
+            end = boundaries[k + 1] if k + 1 < len(boundaries) else None
+            fold_returns = [r for (day, r) in dated
+                            if day >= start and (end is None or day < end)]
+            tstat = fold_oos_tstat(fold_returns)
+            pvalue = fold_oos_pvalue(fold_returns)
+            pvalues.append(pvalue)
+            folds.append({
+                'fit_date': start.strftime('%Y-%m-%d'),
+                'oos_start': start.strftime('%Y-%m-%d'),
+                'oos_end': end.strftime('%Y-%m-%d') if end is not None else None,
+                'n_returns': len(fold_returns),
+                'mean_return': (float(np.mean(fold_returns))
+                                if fold_returns else None),
+                'tstat': tstat,
+                'pvalue': pvalue,
+            })
+
+        bh = benjamini_hochberg(pvalues, alpha)
+        m = bh['m']
+        bonf_alpha = bonferroni_alpha(alpha, m)
+        n_significant_bonferroni = 0
+        for fold, pvalue, rejected_bh in zip(folds, pvalues, bh['rejected_bh']):
+            fold['significant_bh'] = rejected_bh
+            sig_bonf = (pvalue is not None and bonf_alpha is not None
+                        and pvalue <= bonf_alpha)
+            fold['significant_bonferroni'] = sig_bonf
+            if sig_bonf:
+                n_significant_bonferroni += 1
+
+        return {
+            'available': True,
+            'alpha': alpha,
+            'test': 'one-sided (mean OOS return > 0)',
+            'n_folds': len(folds),
+            'n_testable_folds': m,
+            'bonferroni_alpha': bonf_alpha,
+            'bh_threshold': bh['bh_threshold'],
+            'n_significant_bonferroni': n_significant_bonferroni,
+            'n_significant_bh': bh['n_significant_bh'],
+            'folds': folds,
+            'caveat': ('Account-level OOS folds sliced at distinct walk-forward '
+                       'fit dates: blended account returns (T+1 fill lag, '
+                       'netting, stops), not isolated per-model P&L. The first '
+                       'return in each fold is realized under the PRIOR model '
+                       'state (T+1 fill lag), so a boundary return reflects the '
+                       'prior model, not the refit at that boundary. Overlapping '
+                       'refit windows over-count independent trials, so '
+                       'Bonferroni/BH is a heuristic upper bound on '
+                       'multiple-testing severity, NOT exact FWER/FDR control. '
+                       'Independent of the deflated-Sharpe n_trials lens; do not '
+                       'combine.'),
+        }
+
     def _generate_report(self, benchmark_symbol: Optional[str] = None,
                          start_date: Optional[str] = None,
                          end_date: Optional[str] = None) -> Dict:
@@ -906,6 +995,33 @@ class BacktestEngine:
                                       for note in driver.notes]
             report['walk_forward'] = [fit.to_dict()
                                       for fit in driver.walk_forward_fits]
+            # Per-fold OOS significance + multiple-testing (Step 4). Coherent
+            # ONLY for a single desk: one controller -> one fold timeline. In a
+            # fund the desks refit on different cadences over a NETTED book, so
+            # folds are not attributable to any single model -> marked N/A.
+            if self.orchestrator is not None:
+                report['oos_folds'] = {
+                    'available': False,
+                    'reason': ('netted multi-desk fund book — per-fold OOS '
+                               'significance is not attributable to a single '
+                               'model'),
+                }
+            else:
+                # Defense-in-depth: this additive research-integrity feature
+                # runs BEFORE the golden-protected greeks_series/structures keys
+                # below, so it must never be able to abort the rest of the
+                # report. Degrade to the same N/A marker on any failure (the GUI
+                # already handles available=False), mirroring _build_benchmark.
+                try:
+                    report['oos_folds'] = self._compute_oos_folds(self.desk,
+                                                                  alpha=0.05)
+                except Exception as exc:  # noqa: BLE001 - defensive boundary
+                    logger.warning(
+                        "OOS fold computation failed; reporting N/A: %s", exc)
+                    report['oos_folds'] = {
+                        'available': False,
+                        'reason': f'computation failed: {exc}',
+                    }
             # Contract C5: desks with a regime model expose regime_series;
             # included only when non-empty (FoundationDesk stays unchanged).
             regime_series = getattr(driver, 'regime_series', None)

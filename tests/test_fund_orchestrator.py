@@ -407,6 +407,10 @@ class TestEngineEndToEnd:
         assert report['summary']['n_trials'] == 3
         assert 'psr' in report['summary']
         assert 'deflated_sharpe' in report['summary']
+        # Step 4: single-desk reports carry per-fold OOS significance, one fold
+        # per distinct fit date (3 here).
+        assert report['oos_folds']['available'] is True
+        assert report['oos_folds']['n_folds'] == 3
 
     def test_strategy_mode_n_trials_is_one(self, monkeypatch):
         from strategies.base import MomentumStrategy
@@ -419,6 +423,112 @@ class TestEngineEndToEnd:
         report = engine.run(['AAA'], '2022-01-01', '2022-12-31',
                             benchmark_symbol=None)
         assert report['summary']['n_trials'] == 1
+        # Step 4: strategy mode has no walk-forward folds -> key absent.
+        assert 'oos_folds' not in report
+
+    def test_oos_folds_partitions_and_corrects(self):
+        # Per-fold OOS significance, exercised directly on a crafted account
+        # curve so the partitioning + one-sided t-test + BH/Bonferroni math is
+        # deterministic and hand-verifiable.
+        from datetime import datetime as _dt
+        from desks.walk_forward import WalkForwardFit
+
+        # Two folds: boundaries at the distinct fit dates 01-10 and 01-20.
+        fits = [WalkForwardFit(fit_date=_dt(2022, 1, 10),
+                               train_start=_dt(2021, 1, 1),
+                               train_end=_dt(2022, 1, 9), n_samples=252),
+                WalkForwardFit(fit_date=_dt(2022, 1, 20),
+                               train_start=_dt(2021, 1, 10),
+                               train_end=_dt(2022, 1, 19), n_samples=252)]
+
+        class _FitDesk(ScriptedDesk):
+            @property
+            def walk_forward_fits(self):
+                return fits
+
+        desk = _FitDesk('solo', 1.0, intents=[])
+        engine = BacktestEngine(desk=desk, initial_capital=100_000.0)
+        # Pre-fit return (01-07, excluded), 4 tight positive returns in fold 1,
+        # a mixed/negative fold 2.
+        engine.portfolio.portfolio_history = [
+            {'timestamp': _dt(2022, 1, 5), 'portfolio_value': 100000.0},
+            {'timestamp': _dt(2022, 1, 7), 'portfolio_value': 100100.0},
+            {'timestamp': _dt(2022, 1, 10), 'portfolio_value': 101100.0},
+            {'timestamp': _dt(2022, 1, 12), 'portfolio_value': 102111.0},
+            {'timestamp': _dt(2022, 1, 15), 'portfolio_value': 103132.0},
+            {'timestamp': _dt(2022, 1, 18), 'portfolio_value': 104163.0},
+            {'timestamp': _dt(2022, 1, 20), 'portfolio_value': 103000.0},
+            {'timestamp': _dt(2022, 1, 22), 'portfolio_value': 103500.0},
+            {'timestamp': _dt(2022, 1, 25), 'portfolio_value': 102000.0},
+            {'timestamp': _dt(2022, 1, 28), 'portfolio_value': 102500.0},
+        ]
+        result = engine._compute_oos_folds(desk, alpha=0.05)
+
+        assert result['available'] is True
+        assert result['n_folds'] == 2
+        assert result['n_testable_folds'] == 2
+
+        fold1, fold2 = result['folds']
+        # Pre-fit 01-07 return is excluded -> fold 1 has exactly 4 OOS returns.
+        assert fold1['fit_date'] == '2022-01-10'
+        assert fold1['oos_start'] == '2022-01-10'
+        assert fold1['oos_end'] == '2022-01-20'
+        assert fold1['n_returns'] == 4
+        assert fold1['tstat'] > 0
+        assert fold1['pvalue'] < 0.05
+        assert fold1['significant_bh'] is True
+        assert fold1['significant_bonferroni'] is True
+        # Fold 2 mean < 0 -> one-sided p > 0.5, not a positive edge.
+        assert fold2['fit_date'] == '2022-01-20'
+        assert fold2['oos_end'] is None
+        assert fold2['pvalue'] > 0.5
+        assert fold2['significant_bh'] is False
+        assert fold2['significant_bonferroni'] is False
+
+        assert result['n_significant_bh'] == 1
+        assert result['n_significant_bonferroni'] == 1
+        assert result['bonferroni_alpha'] == pytest.approx(0.025)  # 0.05 / 2
+
+    def test_fund_mode_oos_folds_marked_unavailable(self, monkeypatch):
+        universe = {'AAA': flat_frame(), 'BBB': flat_frame()}
+
+        def fake_fetch(self, symbol, start, end):
+            return universe.get(symbol, pd.DataFrame())
+        monkeypatch.setattr(MarketDataHandler, 'fetch_stock_data', fake_fetch)
+
+        orch = FundOrchestrator([ScriptedDesk('asim', 0.5, intents=[]),
+                                 ScriptedDesk('bsim', 0.5, intents=[])])
+        engine = BacktestEngine(orchestrator=orch, initial_capital=100_000.0)
+        report = engine.run(['AAA', 'BBB'], '2022-01-01', '2022-12-31',
+                            benchmark_symbol=None)
+        # Fund mode: per-fold OOS significance is not attributable (netted book).
+        assert report['oos_folds']['available'] is False
+        assert 'netted' in report['oos_folds']['reason']
+
+    def test_oos_folds_failure_degrades_without_aborting_report(self, monkeypatch):
+        # Defense-in-depth: if the additive OOS-fold computation raises, it must
+        # NOT abort the rest of the report (greeks/summary/walk_forward); it
+        # degrades to an N/A marker like the benchmark does.
+        universe = {'AAA': flat_frame(n=8)}
+
+        def fake_fetch(self, symbol, start, end):
+            return universe.get(symbol, pd.DataFrame())
+        monkeypatch.setattr(MarketDataHandler, 'fetch_stock_data', fake_fetch)
+
+        desk = ScriptedDesk('solo', 1.0, intents=[])
+        engine = BacktestEngine(desk=desk, initial_capital=100_000.0)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError('synthetic fold failure')
+        monkeypatch.setattr(engine, '_compute_oos_folds', boom)
+
+        report = engine.run(['AAA'], '2022-01-01', '2022-12-31',
+                            benchmark_symbol=None)
+        assert report['oos_folds']['available'] is False
+        assert 'failed' in report['oos_folds']['reason']
+        # The pre-existing report survives the additive feature's failure.
+        assert 'summary' in report and 'walk_forward' in report
+        assert report['desk']['key'] == 'solo'
 
     def test_netted_short_opens_then_covers_in_fund(self, monkeypatch):
         # Regression for the fund-mode SHORT/COVER dead-code bug: a net-SHORT

@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, date
+from typing import Dict, List, Optional, Tuple
 from core.models import Asset, Position, Trade, Order, OrderType
 from analysis.research_stats import (deflated_sharpe_ratio,
                                      probabilistic_sharpe_ratio)
@@ -173,6 +173,29 @@ class PortfolioManager:
             if prev > 0:
                 returns.append(curr / prev - 1.0)
         return returns
+
+    def get_daily_returns_with_dates(self) -> List[Tuple[date, float]]:
+        """Per-period simple returns, each tagged with the DATE of the later
+        snapshot in the pair — the day the return realized.
+
+        The return VALUES are identical, one-for-one, to get_daily_returns()
+        (same 'previous value must be > 0' skip). Returns [] with fewer than 2
+        snapshots. Used to partition the account return stream into walk-forward
+        out-of-sample folds at fit-date boundaries (research integrity); the
+        date is taken from each snapshot's 'timestamp'.
+        """
+        if len(self.portfolio_history) < 2:
+            return []
+
+        out: List[Tuple[date, float]] = []
+        history = self.portfolio_history
+        for prev_snap, curr_snap in zip(history[:-1], history[1:]):
+            prev = prev_snap['portfolio_value']
+            if prev > 0:
+                ts = curr_snap['timestamp']
+                day = ts.date() if hasattr(ts, 'date') else pd.Timestamp(ts).date()
+                out.append((day, curr_snap['portfolio_value'] / prev - 1.0))
+        return out
 
     def get_sharpe_ratio(self, risk_free_rate: float = 0.02) -> float:
         """Annualized Sharpe ratio computed from DAILY portfolio returns.
