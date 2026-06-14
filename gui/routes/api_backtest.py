@@ -29,14 +29,18 @@ logger = logging.getLogger(__name__)
 # surface a loud 503 instead of an ImportError 500.
 DESK_REGISTRY_IMPORT_ERROR: str | None
 try:
-    from desks.registry import create_desk
+    from desks.registry import create_desk, create_fund_orchestrator
+    from backtesting.reweighting_fund import ReweightingFundBacktest
     DESK_REGISTRY_IMPORT_ERROR = None
-except Exception as e:  # noqa: BLE001 - any import failure disables desk mode
+except Exception as e:  # noqa: BLE001 - any import failure disables desk/fund mode
     create_desk = None
+    create_fund_orchestrator = None
+    ReweightingFundBacktest = None
     DESK_REGISTRY_IMPORT_ERROR = f'{type(e).__name__}: {e}'
     logger.error(
-        'Failed to import desks.registry — desk-mode backtests are '
-        'unavailable: %s', DESK_REGISTRY_IMPORT_ERROR,
+        'Failed to import desks.registry / backtesting.reweighting_fund — '
+        'desk- and fund-mode backtests are unavailable: %s',
+        DESK_REGISTRY_IMPORT_ERROR,
     )
 
 backtest_bp = Blueprint('backtest', __name__, url_prefix='/api')
@@ -85,6 +89,44 @@ def _parse_symbols(raw):
     if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
         return None
     return [s.strip().upper() for s in raw if s.strip()]
+
+
+def _parse_allocations(fund):
+    """Normalize a 'fund' payload to an ordered {desk_key: weight} dict.
+
+    Accepts either a list of desk keys (['foundation', 'renaissance'] -> equal
+    weight summing to 1.0) or a {key: weight} object (weights as numbers, used
+    as-is). Insertion order is preserved (the orchestrator's deterministic
+    netting depends on desk order). Returns (allocations, None) on success or
+    (None, error_message) so the caller can answer 400 instead of letting a
+    bad shape surface as a 500. Desk-key validity and the sum<=1.0 rule are
+    enforced downstream by create_fund_orchestrator.
+    """
+    if isinstance(fund, list):
+        keys = [k.strip().lower() for k in fund
+                if isinstance(k, str) and k.strip()]
+        if not keys:
+            return None, 'fund must list at least one desk key'
+        if len(set(keys)) != len(keys):
+            return None, 'fund desk keys must be unique'
+        weight = 1.0 / len(keys)
+        return {key: weight for key in keys}, None
+    if isinstance(fund, dict):
+        if not fund:
+            return None, 'fund must include at least one desk'
+        allocations = {}
+        for key, weight in fund.items():
+            if not isinstance(key, str) or not key.strip():
+                return None, 'fund desk keys must be non-empty strings'
+            try:
+                value = float(weight)
+            except (TypeError, ValueError):
+                return None, f"fund weight for '{key}' must be numeric"
+            if not value > 0:
+                return None, f"fund weight for '{key}' must be > 0"
+            allocations[key.strip().lower()] = value
+        return allocations, None
+    return None, 'fund must be a list of desk keys or a {key: weight} object'
 
 
 def _date_str(value):
@@ -259,6 +301,97 @@ def _run_desk_backtest_job(symbols, desk, desk_key, start_date, end_date,
                                f'desk:{desk_key}', progress)
 
 
+def _run_fund_backtest_job(symbols, allocations, rebalance_every, warmup,
+                           target_gross, start_date, end_date,
+                           initial_capital, name, progress=None):
+    """JobManager job body (fund mode): a multi-desk fund backtest with in-run
+    risk-parity reweighting (ReweightingFundBacktest — shadow solo books).
+
+    Runs each desk solo for its standalone curve, then the fund with a
+    DynamicReweighter. The report carries the additive ``orchestrator`` roster
+    and ``reweight_log`` (rebalance dates + weights + fallback flags), both
+    JSON-safe by construction, alongside the usual desk keys (the driver is the
+    'fund' orchestrator). The saved-history row stores the strategy as
+    ``fund:<k1>+<k2>`` so fund runs stay distinguishable in history/compare.
+    Reweighting has no single position_size, so none is persisted.
+    """
+    backtester = ReweightingFundBacktest(
+        allocations, initial_capital=initial_capital,
+        rebalance_every=rebalance_every, warmup=warmup,
+        target_gross=target_gross)
+    results = backtester.run(symbols, start_date, end_date,
+                             benchmark_symbol='SPY', progress_callback=progress)
+    if 'error' in results:
+        raise ValueError(results['error'])
+    report = _json_safe_report(results)
+    _save_report(name, symbols, start_date, end_date, initial_capital,
+                 f"fund:{'+'.join(allocations)}", None, report)
+    return report
+
+
+def _submit_fund_backtest(data, symbols):
+    """Validate a fund-mode payload and submit the job (helper for the route).
+
+    Returns a Flask (json, status) tuple. Fund mode is mutually exclusive with
+    'strategy'/'desk'; desk-key validity and the sum<=1.0 rule are checked
+    eagerly via create_fund_orchestrator so the user gets a 400 up front rather
+    than a failed background job.
+    """
+    if 'strategy' in data or 'desk' in data:
+        return jsonify({'error': "Provide only one of 'fund', 'desk', or "
+                                 "'strategy'"}), 400
+    if create_desk is None or ReweightingFundBacktest is None:
+        return jsonify({'error': 'Desk framework unavailable',
+                        'reason': DESK_REGISTRY_IMPORT_ERROR}), 503
+
+    allocations, err = _parse_allocations(data.get('fund'))
+    if err:
+        return jsonify({'error': err}), 400
+
+    start_date = data.get('start_date', '2023-01-01')
+    end_date = data.get('end_date', '2023-12-31')
+    if start_date >= end_date:
+        return jsonify({'error': 'start_date must be before end_date'}), 400
+
+    try:
+        initial_capital = float(data.get('initial_capital', 100000))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'initial_capital must be numeric'}), 400
+    if initial_capital <= 0:
+        return jsonify({'error': 'initial_capital must be positive'}), 400
+
+    try:
+        rebalance_every = int(data.get('rebalance_every', 21))
+        warmup = int(data.get('warmup', 0))
+        target_gross = float(data.get('target_gross', 1.0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'rebalance_every and warmup must be '
+                                 'integers; target_gross must be numeric'}), 400
+    if rebalance_every < 1:
+        return jsonify({'error': 'rebalance_every must be >= 1'}), 400
+    if warmup < 0:
+        return jsonify({'error': 'warmup must be >= 0'}), 400
+    if not 0 < target_gross <= 1.0:
+        return jsonify({'error': 'target_gross must be in (0, 1]'}), 400
+
+    # Eager validation: unknown desk keys and over-allocation (sum > 1.0)
+    # surface as a clean 400 here (contract C1 messages) instead of a failed
+    # job. Constructs throwaway desks — cheap; the heavy work is .run().
+    try:
+        create_fund_orchestrator(allocations)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    name = (data.get('name') or '').strip() or \
+        f"fund:{'+'.join(allocations)} {','.join(symbols)}"
+    job_id = get_job_manager().submit(
+        _run_fund_backtest_job, symbols, allocations, rebalance_every,
+        warmup, target_gross, start_date, end_date, initial_capital, name)
+    logger.info('Fund backtest job %s submitted (fund:%s on %s)', job_id,
+                '+'.join(allocations), symbols)
+    return jsonify({'job_id': job_id}), 202
+
+
 @backtest_bp.route('/backtest/run', methods=['POST'])
 def run_backtest_async():
     """Submit a backtest to the JobManager; returns {'job_id'} immediately.
@@ -277,6 +410,11 @@ def run_backtest_async():
                                  'or a list of strings'}), 400
     if not symbols:
         return jsonify({'error': 'No symbols provided'}), 400
+
+    # Fund mode (multi-desk + in-run risk-parity reweighting) is fully
+    # self-contained; the desk/strategy paths below stay unchanged.
+    if data.get('fund') is not None:
+        return _submit_fund_backtest(data, symbols)
 
     desk_key = data.get('desk')
     desk = None

@@ -25,6 +25,9 @@
                             <input type="radio" class="btn-check" name="btMode"
                                    id="modeDesk" value="desk">
                             <label class="btn btn-outline-secondary" for="modeDesk">Desk</label>
+                            <input type="radio" class="btn-check" name="btMode"
+                                   id="modeFund" value="fund">
+                            <label class="btn btn-outline-secondary" for="modeFund">Fund</label>
                         </div>
                     </div>
                     <div class="mb-3" id="strategyField">
@@ -36,6 +39,36 @@
                         <select class="form-select" id="btDesk"></select>
                         <div class="invalid-feedback">Pick a desk.</div>
                         <div class="provenance-caption mt-1" id="deskHint"></div>
+                    </div>
+                    <div class="mb-3 d-none" id="fundField">
+                        <span class="form-label d-block">Desks &amp; weights</span>
+                        <div id="fundDeskList" class="fund-desk-list"></div>
+                        <div class="invalid-feedback d-block d-none" id="fundDeskError"></div>
+                        <div class="provenance-caption mt-1">Weights are
+                            fractions of the account; checked desks must sum to
+                            &le; 1.0. Each desk is run solo for its standalone
+                            curve, then the fund reweights in-run by risk
+                            parity.</div>
+                        <div class="row g-2 mt-1">
+                            <div class="col-6">
+                                <label class="form-label" for="fundRebalance">Rebalance (days)</label>
+                                <input type="number" class="form-control num"
+                                       id="fundRebalance" value="21" min="1" step="1">
+                                <div class="invalid-feedback">&ge; 1.</div>
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label" for="fundWarmup">Warmup (days)</label>
+                                <input type="number" class="form-control num"
+                                       id="fundWarmup" value="0" min="0" step="1">
+                                <div class="invalid-feedback">&ge; 0.</div>
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label" for="fundTargetGross">Target gross (%)</label>
+                                <input type="number" class="form-control num"
+                                       id="fundTargetGross" value="100" min="1" max="100" step="1">
+                                <div class="invalid-feedback">1–100.</div>
+                            </div>
+                        </div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label" for="btSymbols">Symbols (comma-separated)</label>
@@ -60,7 +93,7 @@
                                value="100000" min="1" step="1000" required>
                         <div class="invalid-feedback">Capital must be positive.</div>
                     </div>
-                    <div class="mb-3">
+                    <div class="mb-3" id="positionSizeField">
                         <label class="form-label" for="btPositionSize">Position size (% of portfolio)</label>
                         <input type="number" class="form-control num" id="btPositionSize"
                                value="10" min="0.1" max="100" step="0.1" required>
@@ -175,6 +208,21 @@
                 <div class="card-header">Drawdown</div>
                 <div class="card-body p-2">
                     <div id="drawdownChart" style="min-height: 200px;"></div>
+                </div>
+            </div>
+
+            <!-- Fund dynamic reweighter: desk capital weights over the
+                 rebalance schedule (stacked area), with fallback markers on
+                 rebalances that degenerated to equal weight. Painted by
+                 backtest.js only when the report carries a non-empty
+                 reweight_log (fund-mode runs); absent for every other run. -->
+            <div class="card mb-2 d-none" id="reweightCard">
+                <div class="card-header">
+                    Desk capital allocation
+                    <span class="provenance-caption" id="reweightCaption">(risk-parity weights &middot; rebalanced in-run)</span>
+                </div>
+                <div class="card-body p-2">
+                    <div id="reweightChart" style="min-height: 260px;"></div>
                 </div>
             </div>
 

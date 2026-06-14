@@ -193,13 +193,18 @@ async function loadStrategies() {
    ========================================================================== */
 
 function currentMode() {
-    return document.getElementById('modeDesk').checked ? 'desk' : 'strategy';
+    const checked = document.querySelector('input[name="btMode"]:checked');
+    return checked ? checked.value : 'strategy';
 }
 
 function applyMode() {
-    const desk = currentMode() === 'desk';
-    document.getElementById('strategyField').classList.toggle('d-none', desk);
-    document.getElementById('deskField').classList.toggle('d-none', !desk);
+    const mode = currentMode();
+    document.getElementById('strategyField').classList.toggle('d-none', mode !== 'strategy');
+    document.getElementById('deskField').classList.toggle('d-none', mode !== 'desk');
+    document.getElementById('fundField').classList.toggle('d-none', mode !== 'fund');
+    // Position size drives strategy/desk sizing only; a fund's desks size
+    // themselves and the reweighter sets capital, so hide it in fund mode.
+    document.getElementById('positionSizeField').classList.toggle('d-none', mode === 'fund');
 }
 
 /** Populate #btDesk with READY desks; returns them (empty array on error). */
@@ -213,6 +218,7 @@ async function loadDesks() {
     } catch (_) {
         hint.textContent = 'Could not load desk list — reload the page.';
         document.getElementById('modeDesk').disabled = true;
+        document.getElementById('modeFund').disabled = true;
         return [];
     }
     desksByKey = {};
@@ -223,11 +229,79 @@ async function loadDesks() {
         opt.textContent = d.name;
         select.appendChild(opt);
     });
+    buildFundDeskList(ready);
     if (ready.length === 0) {
         hint.textContent = 'No desks are ready yet — they activate in later phases.';
         document.getElementById('modeDesk').disabled = true;
+        document.getElementById('modeFund').disabled = true;
     }
     return ready;
+}
+
+/** Render the fund desk checklist: one row per ready desk (checkbox + name +
+ *  percent-weight input), all checked at equal weight by default. Names and
+ *  keys reach the DOM only via textContent/dataset; accents pass ACCENT_RE
+ *  before any inline style. */
+function buildFundDeskList(ready) {
+    const list = document.getElementById('fundDeskList');
+    if (!list) return;
+    list.textContent = '';
+    if (ready.length === 0) return;
+    const equalPct = Math.floor(100 / ready.length);
+    ready.forEach((d) => {
+        const accent = ACCENT_RE.test(d.accent || '') ? d.accent : '';
+        const row = document.createElement('div');
+        row.className = 'fund-desk-row d-flex align-items-center gap-2 mb-1';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'form-check-input mt-0';
+        cb.checked = true;
+        cb.id = `fundDesk_${d.key}`;
+        cb.dataset.fundDesk = d.key;
+
+        const label = document.createElement('label');
+        label.className = 'form-check-label flex-grow-1 text-truncate';
+        label.htmlFor = cb.id;
+        label.textContent = d.name;
+        if (accent) {
+            label.style.borderLeft = `3px solid ${accent}`;
+            label.style.paddingLeft = '6px';
+        }
+
+        const weight = document.createElement('input');
+        weight.type = 'number';
+        weight.className = 'form-control form-control-sm num fund-weight';
+        weight.style.width = '5rem';
+        weight.min = '0';
+        weight.max = '100';
+        weight.step = '1';
+        weight.value = String(equalPct);
+        weight.dataset.fundWeight = d.key;
+        weight.setAttribute('aria-label', `${d.name} weight (%)`);
+
+        const pct = document.createElement('span');
+        pct.className = 'provenance-caption';
+        pct.textContent = '%';
+
+        row.append(cb, label, weight, pct);
+        list.appendChild(row);
+    });
+}
+
+/** {desk_key: fraction} for the CHECKED desks (percent inputs -> fractions). */
+function fundAllocations() {
+    const out = {};
+    document.querySelectorAll('#fundDeskList input[type="checkbox"]')
+        .forEach((cb) => {
+            if (!cb.checked) return;
+            const key = cb.dataset.fundDesk;
+            const wEl = document.querySelector(
+                `#fundDeskList input[data-fund-weight="${key}"]`);
+            const pct = Number(wEl && wEl.value);
+            out[key] = Number.isFinite(pct) ? pct / 100 : 0;
+        });
+    return out;
 }
 
 /** Wire the mode toggle and honor a /backtest?desk=<key> deep link. */
@@ -291,7 +365,50 @@ function validateForm() {
         ok = ok && deskOk;
     }
 
+    if (currentMode() === 'fund') {
+        ok = validateFundFields() && ok;
+    }
+
     return ok;
+}
+
+/** Fund-mode field validation: at least one checked desk, each weight > 0,
+ *  the checked weights sum to <= 100%, and valid reweight params. */
+function validateFundFields() {
+    const alloc = fundAllocations();
+    const keys = Object.keys(alloc);
+    const errEl = document.getElementById('fundDeskError');
+    let fundOk = true;
+
+    if (keys.length === 0) {
+        errEl.textContent = 'Pick at least one desk.';
+        fundOk = false;
+    } else if (keys.some((k) => !(alloc[k] > 0))) {
+        errEl.textContent = 'Each checked desk needs a weight greater than 0.';
+        fundOk = false;
+    } else {
+        const sum = keys.reduce((s, k) => s + alloc[k], 0);
+        if (sum > 1.0 + 1e-9) {
+            errEl.textContent =
+                `Weights sum to ${(sum * 100).toFixed(0)}% — must be ≤ 100%.`;
+            fundOk = false;
+        }
+    }
+    errEl.classList.toggle('d-none', fundOk);
+
+    const reb = Number(document.getElementById('fundRebalance').value);
+    const rebOk = Number.isInteger(reb) && reb >= 1;
+    document.getElementById('fundRebalance').classList.toggle('is-invalid', !rebOk);
+
+    const warm = Number(document.getElementById('fundWarmup').value);
+    const warmOk = Number.isInteger(warm) && warm >= 0;
+    document.getElementById('fundWarmup').classList.toggle('is-invalid', !warmOk);
+
+    const tg = Number(document.getElementById('fundTargetGross').value);
+    const tgOk = tg >= 1 && tg <= 100;
+    document.getElementById('fundTargetGross').classList.toggle('is-invalid', !tgOk);
+
+    return fundOk && rebOk && warmOk && tgOk;
 }
 
 async function onRun(event) {
@@ -306,9 +423,15 @@ async function onRun(event) {
         initial_capital: Number(document.getElementById('btCapital').value),
         position_size: Number(document.getElementById('btPositionSize').value) / 100,
     };
-    // Exactly one of strategy/desk crosses the wire (contract C2 mirrors it).
+    // Exactly one of strategy/desk/fund crosses the wire (the route mirrors it).
     if (currentMode() === 'desk') {
         payload.desk = document.getElementById('btDesk').value;
+    } else if (currentMode() === 'fund') {
+        payload.fund = fundAllocations();
+        payload.rebalance_every = Number(document.getElementById('fundRebalance').value);
+        payload.warmup = Number(document.getElementById('fundWarmup').value);
+        payload.target_gross = Number(document.getElementById('fundTargetGross').value) / 100;
+        delete payload.position_size; // the fund path sizes via desks + reweighter
     } else {
         payload.strategy = document.getElementById('btStrategy').value;
     }
@@ -393,6 +516,7 @@ function renderResults(report) {
     renderPendingSignals(report.pending_signals || []);
     renderEquityChart(report);
     renderDrawdownChart(report.drawdown_series || []);
+    renderReweightChart(report);
     renderGreeksChart(report);
     renderPodAllocation(report);
     renderStructures(report);
@@ -1025,6 +1149,116 @@ function renderGreeksChart(report) {
         line: { color: t.muted, width: 1, dash: 'dot' },
     }];
     Plotly.react(el, traces, layout, PLOT_CONFIG);
+}
+
+/* ==========================================================================
+   Fund dynamic reweighter: desk capital weights over the rebalance schedule.
+   report.reweight_log is [{date, day_number, weights:{desk:fraction},
+   fallback, degraded_desks}], one entry per rebalance (fund-mode runs only).
+   Rendered as a stacked-area of weights (x100) with dotted markers on
+   rebalances that degenerated to equal weight. Absent cleanly otherwise.
+   ========================================================================== */
+
+/** Color for a desk key: its registry accent when known, else a palette hue. */
+function deskColorFor(key) {
+    const meta = desksByKey[key];
+    if (meta && ACCENT_RE.test(meta.accent || '')) return meta.accent;
+    return podColorFor(key); // Map-backed palette fallback (hostile-key safe)
+}
+
+/** Display label for a desk key: its registry name, else underscores->spaces. */
+function deskLabel(key) {
+    const meta = desksByKey[key];
+    return (meta && meta.name) ? meta.name : String(key).replace(/_/g, ' ');
+}
+
+/** Contract-shaped reweight_log entries; [] when absent/empty/foreign. */
+function reweightLog(report) {
+    return Array.isArray(report.reweight_log)
+        ? report.reweight_log.filter(
+            (e) => e && typeof e.date === 'string' &&
+                   e.weights && typeof e.weights === 'object')
+        : [];
+}
+
+function renderReweightChart(report) {
+    const card = document.getElementById('reweightCard');
+    const el = document.getElementById('reweightChart');
+    const log = reweightLog(report);
+    if (log.length === 0) {
+        card.classList.add('d-none');
+        // Plotly.purge (not innerHTML='') so a later fund run can re-plot
+        // into the same div without stale internal state.
+        Plotly.purge(el);
+        return;
+    }
+    card.classList.remove('d-none');
+
+    // Desks in first-seen order across the log.
+    const keys = [];
+    log.forEach((e) => Object.keys(e.weights).forEach((k) => {
+        if (!keys.includes(k)) keys.push(k);
+    }));
+
+    const t = plotlyTheme();
+    const dates = log.map((e) => e.date);
+    const traces = keys.map((key) => {
+        const color = deskColorFor(key);
+        const label = escapeHTML(deskLabel(key));
+        return {
+            type: 'scatter', name: label, mode: 'lines',
+            x: dates,
+            y: log.map((e) => {
+                const w = Number(e.weights[key]);
+                return Number.isFinite(w) ? w * 100 : 0;
+            }),
+            stackgroup: 'desks',
+            line: { width: 0.75, color },
+            fillcolor: hexToRGBA(color, 0.45),
+            hovertemplate: `${label}: %{y:.1f}%<extra></extra>`,
+        };
+    });
+
+    const layout = baseLayout(t, 260);
+    layout.yaxis.title = { text: 'Weight (%)', font: { size: 10, color: t.muted } };
+    layout.yaxis.range = [0, 100];
+    addReweightFallbackMarkers(log, traces, layout);
+    Plotly.react(el, traces, layout, PLOT_CONFIG);
+
+    const fallbacks = log.filter((e) => e.fallback).length;
+    document.getElementById('reweightCaption').textContent =
+        `(${log.length} rebalance${log.length === 1 ? '' : 's'} · ` +
+        'risk-parity weights' +
+        (fallbacks > 0 ? ` · ${fallbacks} fell back to equal weight` : '') + ')';
+}
+
+/**
+ * Dotted vertical markers on the rebalances that fell back to equal weight
+ * (a desk's standalone curve was missing/flat/too short), plus one legend
+ * entry whose hover names the degenerate desks. Same anatomy as the
+ * walk-forward / pod-event markers.
+ */
+function addReweightFallbackMarkers(log, traces, layout) {
+    const fallbacks = log.filter((e) => e.fallback);
+    if (fallbacks.length === 0) return;
+    layout.shapes = (layout.shapes || []).concat(fallbacks.map((e) => ({
+        type: 'line', xref: 'x', yref: 'paper',
+        x0: e.date, x1: e.date, y0: 0, y1: 1,
+        line: { color: '#d29922', width: 1, dash: 'dot' },
+    })));
+    traces.push({
+        type: 'scatter', name: 'Equal-weight fallback', mode: 'markers',
+        x: fallbacks.map((e) => e.date),
+        y: fallbacks.map(() => 100),
+        marker: { symbol: 'line-ns-open', size: 9, color: '#d29922',
+                  line: { width: 1.5, color: '#d29922' } },
+        text: fallbacks.map((e) => {
+            const desks = Array.isArray(e.degraded_desks)
+                ? e.degraded_desks.map(deskLabel).join(', ') : '';
+            return `Equal-weight fallback${desks ? `: ${desks} degenerate` : ''}`;
+        }),
+        hovertemplate: '%{text}<extra></extra>',
+    });
 }
 
 /* ==========================================================================

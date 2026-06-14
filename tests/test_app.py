@@ -756,6 +756,199 @@ class TestAsyncBacktest:
         assert response.get_json() == {'error': 'Unknown job id'}
 
 
+def _fake_fund_report():
+    """Fund-engine-shaped report (the additive 'orchestrator' + 'reweight_log'
+    keys alongside the usual desk-mode shape), as ReweightingFundBacktest.run
+    returns before _json_safe_report normalizes dates."""
+    ts = pd.Timestamp('2023-03-01')
+    return {
+        'strategy': 'Fund Orchestrator',
+        'desk': {'key': 'fund', 'name': 'Fund Orchestrator'},
+        'summary': {
+            'initial_capital': 100000.0, 'current_value': 105000.0,
+            'cash': 5000.0, 'total_return': 5000.0, 'total_return_pct': 5.0,
+            'realized_pnl': 3000.0, 'unrealized_pnl': 2000.0,
+            'positions_count': 2, 'closed_trades': 6, 'win_rate': 66.7,
+            'max_drawdown': -4.0, 'sharpe_ratio': 1.1, 'sortino_ratio': 1.6,
+            'calmar_ratio': 0.9,
+        },
+        'benchmark': None,
+        'drawdown_series': [{'date': '2023-01-03', 'drawdown_pct': 0.0}],
+        'trades': [{
+            'date': ts, 'signal_date': ts - pd.Timedelta(days=1),
+            'symbol': 'AAA', 'action': 'BUY', 'quantity': 10,
+            'price': 100.0, 'value': 1000.0, 'instrument': 'AAA',
+        }],
+        'closed_trades': [],
+        'portfolio_history': [
+            {'timestamp': pd.Timestamp('2023-01-03'),
+             'portfolio_value': 100000.0, 'cash': 100000.0,
+             'positions_count': 0, 'unrealized_pnl': 0.0, 'realized_pnl': 0.0},
+        ],
+        'pending_signals': [],
+        'trader_notes': [],
+        'walk_forward': [],
+        'orchestrator': {
+            'desks': [
+                {'key': 'foundation', 'name': 'Foundation Desk',
+                 'capital_allocation': 0.6, 'notes_count': 0},
+                {'key': 'renaissance', 'name': 'Renaissance Desk',
+                 'capital_allocation': 0.4, 'notes_count': 0},
+            ],
+            'active_capital': 1.0, 'conflicts_resolved': 0,
+        },
+        'reweight_log': [
+            {'date': '2023-02-01', 'day_number': 21,
+             'weights': {'foundation': 0.6, 'renaissance': 0.4},
+             'fallback': False, 'degraded_desks': []},
+        ],
+    }
+
+
+class TestFundBacktest:
+    """POST /api/backtest/run fund mode (ReweightingFundBacktest)."""
+
+    FUND_PAYLOAD = {
+        'symbols': 'AAA,BBB',
+        'fund': {'foundation': 0.6, 'renaissance': 0.4},
+        'start_date': '2023-01-01',
+        'end_date': '2023-12-31',
+        'initial_capital': 100000,
+    }
+
+    @pytest.fixture()
+    def patch_fund_run(self, monkeypatch, tmp_path):
+        """Stub ReweightingFundBacktest.run and redirect the history DB. The
+        eager create_fund_orchestrator validation still runs against the REAL
+        registry (foundation/renaissance are ready), so payload validation is
+        exercised end to end; only the expensive .run is faked."""
+        import gui.globals as gui_globals
+        from gui.routes import api_backtest
+
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'fund-history.db'))
+        monkeypatch.setattr(gui_globals, '_db', None)
+
+        seen = {'progress_values': []}
+
+        def fake_run(self, symbols, start_date, end_date,
+                     benchmark_symbol='SPY', progress_callback=None):
+            seen['symbols'] = list(symbols)
+            seen['benchmark_symbol'] = benchmark_symbol
+            if progress_callback is not None:
+                progress_callback(55.0)
+                seen['progress_values'].append(55.0)
+            return _fake_fund_report()
+
+        monkeypatch.setattr(api_backtest.ReweightingFundBacktest, 'run',
+                            fake_run)
+        return seen
+
+    def test_run_returns_job_then_done_with_reweight_log(
+            self, client, patch_fund_run):
+        response = client.post('/api/backtest/run', json=self.FUND_PAYLOAD)
+        assert response.status_code == 202
+
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        assert job['progress'] == 100.0
+        assert patch_fund_run['symbols'] == ['AAA', 'BBB']
+        assert patch_fund_run['benchmark_symbol'] == 'SPY'
+
+        result = job['result']
+        assert result['desk']['key'] == 'fund'
+        assert result['orchestrator']['active_capital'] == 1.0
+        entry = result['reweight_log'][0]
+        assert entry['weights'] == {'foundation': 0.6, 'renaissance': 0.4}
+        assert entry['fallback'] is False
+        assert entry['degraded_desks'] == []
+        # Trade dates still normalize to ISO strings on the fund path.
+        assert result['trades'][0]['date'] == '2023-03-01'
+
+    def test_finished_fund_run_saved_as_fund_strategy(
+            self, client, patch_fund_run):
+        response = client.post('/api/backtest/run', json=self.FUND_PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        rows = client.get('/api/backtests').get_json()['backtests']
+        assert rows[0]['strategy'] == 'fund:foundation+renaissance'
+
+    def test_fund_accepts_list_payload_equal_weight(
+            self, client, patch_fund_run):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.FUND_PAYLOAD, 'fund': ['foundation', 'renaissance']})
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+
+    def test_fund_rejects_combo_with_strategy(self, client):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.FUND_PAYLOAD, 'strategy': 'momentum'})
+        assert response.status_code == 400
+        assert 'only one' in response.get_json()['error']
+
+    def test_fund_rejects_empty_allocations(self, client):
+        response = client.post(
+            '/api/backtest/run', json={**self.FUND_PAYLOAD, 'fund': {}})
+        assert response.status_code == 400
+
+    def test_fund_rejects_non_positive_weight(self, client):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.FUND_PAYLOAD, 'fund': {'foundation': 0}})
+        assert response.status_code == 400
+        assert 'must be > 0' in response.get_json()['error']
+
+    def test_fund_rejects_overallocation(self, client):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.FUND_PAYLOAD, 'fund': {'foundation': 0.6,
+                                                'citadel': 0.6}})
+        assert response.status_code == 400
+        assert 'must be <= 1.0' in response.get_json()['error']
+
+    def test_fund_rejects_unknown_desk(self, client):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.FUND_PAYLOAD, 'fund': {'warrenbuffett': 1.0}})
+        assert response.status_code == 400
+        assert 'Unknown desk' in response.get_json()['error']
+
+    @pytest.mark.parametrize('bad', [
+        {'rebalance_every': 0}, {'warmup': -1}, {'target_gross': 0},
+        {'target_gross': 1.5},
+    ])
+    def test_fund_rejects_bad_reweight_params(self, client, bad):
+        response = client.post(
+            '/api/backtest/run', json={**self.FUND_PAYLOAD, **bad})
+        assert response.status_code == 400
+
+    def test_fund_503_when_framework_unavailable(self, client, monkeypatch):
+        from gui.routes import api_backtest
+        sentinel = 'ImportError: synthetic desks import failure'
+        monkeypatch.setattr(api_backtest, 'create_desk', None)
+        monkeypatch.setattr(api_backtest, 'ReweightingFundBacktest', None)
+        monkeypatch.setattr(api_backtest, 'DESK_REGISTRY_IMPORT_ERROR',
+                            sentinel)
+        response = client.post('/api/backtest/run', json=self.FUND_PAYLOAD)
+        assert response.status_code == 503
+        assert response.get_json()['reason'] == sentinel
+
+    def test_parse_allocations_units(self):
+        from gui.routes.api_backtest import _parse_allocations
+
+        assert _parse_allocations(['Foundation', 'Renaissance']) == (
+            {'foundation': 0.5, 'renaissance': 0.5}, None)
+        assert _parse_allocations({'foundation': 0.6, 'citadel': 0.4}) == (
+            {'foundation': 0.6, 'citadel': 0.4}, None)
+        assert _parse_allocations({})[0] is None
+        assert _parse_allocations('nope')[0] is None
+        assert _parse_allocations(['a', 'a'])[0] is None
+        assert _parse_allocations({'foundation': 'x'})[0] is None
+        assert _parse_allocations({'foundation': -1})[0] is None
+
+
 # ==================== TRADING FLOOR DESKS (Phase 5) ====================
 
 # SHARED INTERFACE CONTRACT C1: desks.registry.list_desks() entries carry
