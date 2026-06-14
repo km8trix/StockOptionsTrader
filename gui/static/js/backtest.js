@@ -905,6 +905,34 @@ function renderMetrics(summary) {
     setMetric('mWinRate',
               summary.win_rate === null || summary.win_rate === undefined
                   ? '—' : `${Number(summary.win_rate).toFixed(1)}%`);
+    // Research integrity (Phase 3): PSR / deflated Sharpe are probabilities in
+    // [0,1] shown as percents; >50% leans real (green), <50% leans luck (red).
+    renderProbabilityMetric('mPSR', summary.psr);
+    renderProbabilityMetric('mDeflatedSharpe', summary.deflated_sharpe);
+    const trialsEl = document.getElementById('mDeflatedTrials');
+    const nTrials = Number(summary.n_trials);
+    if (Number.isFinite(nTrials) && nTrials > 0) {
+        trialsEl.textContent = `(${nTrials} trial${nTrials === 1 ? '' : 's'})`;
+        // Be honest in the UI: n_trials is a proxy, not a true independent count.
+        trialsEl.title = 'n_trials = walk-forward refit count — a conservative '
+            + 'proxy for multiple testing. Overlapping train windows (and, in a '
+            + 'fund, summing refits across desks) over-count independent trials, '
+            + 'so the deflated Sharpe errs low.';
+    } else {
+        trialsEl.textContent = '';
+        trialsEl.removeAttribute('title');
+    }
+}
+
+/** A probability metric (PSR/DSR): em dash when null, else NN.N% colored by
+ *  whether it clears the 50% line. */
+function renderProbabilityMetric(id, value) {
+    if (value === null || value === undefined) {
+        setMetric(id, '—');
+        return;
+    }
+    const p = Number(value);
+    setMetric(id, `${(p * 100).toFixed(1)}%`, p - 0.5);
 }
 
 function renderPendingSignals(pending) {
@@ -1885,6 +1913,17 @@ function compareCard(bt) {
         ['Calmar', fmtNum(summary.calmar_ratio, 2)],
         ['Max drawdown', maxDD === null || maxDD === undefined ? '—' : `${Number(maxDD).toFixed(2)}%`, maxDD],
         ['Win rate', winRate === null || winRate === undefined ? '—' : `${Number(winRate).toFixed(1)}%`],
+        // Research integrity (Phase 3): compare overfitting risk side by side.
+        ['PSR', summary.psr === null || summary.psr === undefined
+            ? '—' : `${(Number(summary.psr) * 100).toFixed(1)}%`,
+            summary.psr === null || summary.psr === undefined
+                ? undefined : Number(summary.psr) - 0.5],
+        ['Defl. Sharpe', summary.deflated_sharpe === null
+            || summary.deflated_sharpe === undefined
+            ? '—' : `${(Number(summary.deflated_sharpe) * 100).toFixed(1)}%`,
+            summary.deflated_sharpe === null
+                || summary.deflated_sharpe === undefined
+                ? undefined : Number(summary.deflated_sharpe) - 0.5],
     ];
     return (
         '<div class="col-md-6"><div class="card h-100">' +

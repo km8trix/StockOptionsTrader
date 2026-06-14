@@ -371,6 +371,55 @@ class TestEngineEndToEnd:
         assert 'orchestrator' not in report
         assert report['desk']['key'] == 'solo'
 
+    def test_desk_mode_n_trials_equals_walk_forward_count(self, monkeypatch):
+        # Phase 3: the engine deflates the Sharpe by the walk-forward refit
+        # count. Pre-load a desk with 3 fits and confirm summary.n_trials == 3.
+        from desks.walk_forward import WalkForwardFit
+        universe = {'AAA': flat_frame(n=8)}
+
+        def fake_fetch(self, symbol, start, end):
+            return universe.get(symbol, pd.DataFrame())
+        monkeypatch.setattr(MarketDataHandler, 'fetch_stock_data', fake_fetch)
+
+        fits = [
+            WalkForwardFit(fit_date=datetime(2022, 1, 3),
+                           train_start=datetime(2021, 1, 1),
+                           train_end=datetime(2022, 1, 2), n_samples=252),
+            WalkForwardFit(fit_date=datetime(2022, 2, 1),
+                           train_start=datetime(2021, 2, 1),
+                           train_end=datetime(2022, 1, 31), n_samples=252),
+            WalkForwardFit(fit_date=datetime(2022, 3, 1),
+                           train_start=datetime(2021, 3, 1),
+                           train_end=datetime(2022, 2, 28), n_samples=252),
+        ]
+
+        # walk_forward_fits is a read-only property (controllers override it),
+        # so subclass to expose a fixed set of fits.
+        class _FitDesk(ScriptedDesk):
+            @property
+            def walk_forward_fits(self):
+                return fits
+
+        desk = _FitDesk('solo', 1.0, intents=[])
+        engine = BacktestEngine(desk=desk, initial_capital=100_000.0)
+        report = engine.run(['AAA'], '2022-01-01', '2022-12-31',
+                            benchmark_symbol=None)
+        assert report['summary']['n_trials'] == 3
+        assert 'psr' in report['summary']
+        assert 'deflated_sharpe' in report['summary']
+
+    def test_strategy_mode_n_trials_is_one(self, monkeypatch):
+        from strategies.base import MomentumStrategy
+        universe = {'AAA': flat_frame(n=8)}
+
+        def fake_fetch(self, symbol, start, end):
+            return universe.get(symbol, pd.DataFrame())
+        monkeypatch.setattr(MarketDataHandler, 'fetch_stock_data', fake_fetch)
+        engine = BacktestEngine(MomentumStrategy(), initial_capital=100_000.0)
+        report = engine.run(['AAA'], '2022-01-01', '2022-12-31',
+                            benchmark_symbol=None)
+        assert report['summary']['n_trials'] == 1
+
     def test_netted_short_opens_then_covers_in_fund(self, monkeypatch):
         # Regression for the fund-mode SHORT/COVER dead-code bug: a net-SHORT
         # residual must OPEN a negative position, and a fund COVER must CLOSE

@@ -847,7 +847,16 @@ class BacktestEngine:
         same keys plus 'desk', 'trader_notes' and 'walk_forward'
         (contract C3); 'strategy' holds the desk name in that mode.
         """
-        summary = self.portfolio.get_summary()
+        # Deflate the Sharpe for multiple testing by the number of walk-forward
+        # refits (desk/fund mode). This is a conservative PROXY for the true
+        # multiple-testing breadth — overlapping train windows mean it over-
+        # counts independent trials, which biases the deflated Sharpe downward
+        # (the safe direction). Strategy mode has no refits -> n_trials=1 (no
+        # deflation, so deflated_sharpe == psr).
+        n_trials = 1
+        if self._desk_mode:
+            n_trials = max(1, len(self._driver.walk_forward_fits))
+        summary = self.portfolio.get_summary(n_trials=n_trials)
 
         benchmark = None
         if benchmark_symbol:

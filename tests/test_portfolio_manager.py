@@ -288,3 +288,38 @@ class TestSummary:
         assert summary['sharpe_ratio'] == pytest.approx(pm.get_sharpe_ratio())
         assert summary['sortino_ratio'] == pytest.approx(pm.get_sortino_ratio())
         assert summary['calmar_ratio'] == pytest.approx(pm.get_calmar_ratio())
+
+    def test_summary_has_research_integrity_keys(self):
+        # Phase 3: psr / deflated_sharpe / n_trials are additive.
+        pm = PortfolioManager(100000.0)
+        _seed_history(pm, HISTORY_VALUES)
+        summary = pm.get_summary()
+        assert {'psr', 'deflated_sharpe', 'n_trials'} <= summary.keys()
+        assert summary['n_trials'] == 1
+        assert summary['psr'] is None or 0.0 <= summary['psr'] <= 1.0
+        # n_trials == 1 -> no deflation, so DSR equals PSR exactly.
+        assert summary['deflated_sharpe'] == summary['psr']
+
+    def test_summary_n_trials_deflates_sharpe(self):
+        pm = PortfolioManager(100000.0)
+        # Positive-but-noisy curve: PSR is high yet < 1 and deflation bites,
+        # so the STRICT inequality below actually exercises the n_trials wiring
+        # (if n_trials were ignored both would equal PSR and the test fails).
+        rets = [0.01, -0.006, 0.012, -0.004, 0.008, -0.007] * 10
+        prices = [100000.0]
+        for r in rets:
+            prices.append(prices[-1] * (1.0 + r))
+        _seed_history(pm, prices)
+        base = pm.get_summary(n_trials=1)
+        deflated = pm.get_summary(n_trials=50)
+        assert deflated['n_trials'] == 50
+        assert base['psr'] is not None
+        assert deflated['deflated_sharpe'] is not None
+        assert deflated['deflated_sharpe'] < base['psr']
+
+    def test_summary_psr_none_when_history_too_short(self):
+        pm = PortfolioManager(100000.0)
+        _seed_history(pm, [100000.0, 100500.0])  # only one daily return
+        summary = pm.get_summary()
+        assert summary['psr'] is None
+        assert summary['deflated_sharpe'] is None

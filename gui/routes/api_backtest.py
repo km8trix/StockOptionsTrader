@@ -563,7 +563,10 @@ def run_backtest():
         # Run-level reproducibility provenance, parity with the async path.
         results['provenance'] = capture_run_provenance(seed)
 
-        return jsonify(results)
+        # Normalize dates + null any NaN summary metric, parity with the async
+        # path — without this a NaN Sharpe/Sortino/Calmar would make jsonify
+        # raise and the run would 500 with no diagnostic.
+        return jsonify(_json_safe_report(results))
     except Exception:
         logger.error('Backtest failed', exc_info=True)
         return jsonify({'error': 'Backtest failed'}), 500

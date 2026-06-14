@@ -9,6 +9,8 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, List, Optional
 from core.models import Asset, Position, Trade, Order, OrderType
+from analysis.research_stats import (deflated_sharpe_ratio,
+                                     probabilistic_sharpe_ratio)
 
 
 class PortfolioManager:
@@ -283,8 +285,25 @@ class PortfolioManager:
         }
         self.portfolio_history.append(snapshot)
     
-    def get_summary(self) -> Dict:
-        """Get portfolio summary"""
+    def get_summary(self, n_trials: int = 1,
+                    risk_free_rate: float = 0.02) -> Dict:
+        """Get portfolio summary.
+
+        ``n_trials`` (default 1) is the number of strategy trials / walk-forward
+        refits used to DEFLATE the Sharpe for multiple testing (the engine
+        passes the walk-forward fit count; 1 means no deflation, so
+        deflated_sharpe == psr). See analysis/research_stats for the PSR/DSR
+        conventions and caveats. The research-integrity keys are additive — they
+        only ADD to the prior summary shape.
+
+        PSR/DSR are computed on EXCESS daily returns (return - risk_free_rate /
+        252) with the SAME risk_free_rate used for the reported Sharpe, so
+        'psr' reads as P(true EXCESS Sharpe > 0) — consistent with the headline
+        Sharpe rather than a raw-return Sharpe.
+        """
+        returns = self.get_daily_returns()
+        excess_returns = [r - risk_free_rate / 252 for r in returns]
+        n_trials = max(1, int(n_trials))
         return {
             'initial_capital': self.initial_capital,
             'current_value': self.get_portfolio_value(),
@@ -297,7 +316,13 @@ class PortfolioManager:
             'closed_trades': len(self.closed_trades),
             'win_rate': self.get_win_rate(),
             'max_drawdown': self.get_max_drawdown(),
-            'sharpe_ratio': self.get_sharpe_ratio(),
-            'sortino_ratio': self.get_sortino_ratio(),
+            'sharpe_ratio': self.get_sharpe_ratio(risk_free_rate),
+            'sortino_ratio': self.get_sortino_ratio(risk_free_rate),
             'calmar_ratio': self.get_calmar_ratio(),
+            # Research integrity (Phase 3): PSR = P(true excess Sharpe > 0);
+            # deflated_sharpe = PSR vs the multiple-testing-inflated benchmark
+            # from n_trials. Both None when undefined (<2 returns / zero var).
+            'psr': probabilistic_sharpe_ratio(excess_returns, 0.0),
+            'deflated_sharpe': deflated_sharpe_ratio(excess_returns, n_trials),
+            'n_trials': n_trials,
         }
