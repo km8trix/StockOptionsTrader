@@ -10,7 +10,9 @@ from desks.base import Desk
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.janestreet import JaneStreetDesk
-from desks.registry import create_desk, list_desks
+from desks.orchestrator import FundOrchestrator
+from desks.registry import (create_desk, create_fund_orchestrator,
+                            list_desks)
 from desks.renaissance import RenaissanceDesk
 
 EXPECTED_KEYS = {'key', 'name', 'firm_inspiration', 'description', 'status',
@@ -118,3 +120,38 @@ class TestCreateDesk:
     def test_no_planned_desks_remain(self):
         # Phase 8 flipped the last planned desk; every entry is ready.
         assert all(entry['status'] == 'ready' for entry in list_desks())
+
+
+class TestCreateFundOrchestrator:
+    def test_builds_orchestrator_from_allocations(self):
+        orch = create_fund_orchestrator(
+            {'foundation': 0.5, 'renaissance': 0.5})
+        assert isinstance(orch, FundOrchestrator)
+        assert [d.key for d in orch.desks] == ['foundation', 'renaissance']
+        assert all(d.capital_allocation == 0.5 for d in orch.desks)
+        assert orch.active_capital == pytest.approx(1.0)
+
+    def test_preserves_allocation_order(self):
+        orch = create_fund_orchestrator(
+            {'renaissance': 0.3, 'foundation': 0.2, 'citadel': 0.1})
+        assert [d.key for d in orch.desks] == [
+            'renaissance', 'foundation', 'citadel']
+
+    def test_overallocation_raises(self):
+        with pytest.raises(ValueError, match='must be <= 1.0'):
+            create_fund_orchestrator({'foundation': 0.6, 'citadel': 0.6})
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match='at least one'):
+            create_fund_orchestrator({})
+
+    def test_unknown_desk_raises(self):
+        with pytest.raises(ValueError, match='Unknown desk'):
+            create_fund_orchestrator({'foundation': 0.5, 'nope': 0.5})
+
+    def test_risk_aggregator_is_wired(self):
+        from portfolio.risk_aggregator import PortfolioRiskAggregator
+        agg = PortfolioRiskAggregator()
+        orch = create_fund_orchestrator({'foundation': 1.0},
+                                        risk_aggregator=agg)
+        assert orch.risk_aggregator is agg

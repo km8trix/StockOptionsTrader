@@ -15,6 +15,7 @@ from desks.base import Desk
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.janestreet import JaneStreetDesk
+from desks.orchestrator import FundOrchestrator
 from desks.renaissance import RenaissanceDesk
 
 logger = logging.getLogger(__name__)
@@ -103,3 +104,24 @@ def create_desk(key: str, capital_allocation: float = 1.0) -> Desk:
     logger.info("Creating desk %s (capital_allocation=%.2f)",
                 key, capital_allocation)
     return spec['factory'](capital_allocation=capital_allocation)
+
+
+def create_fund_orchestrator(allocations: Dict[str, float],
+                             risk_aggregator=None) -> FundOrchestrator:
+    """Instantiate the named ready desks at the given capital_allocations and
+    wire them into a FundOrchestrator (convenience over create_desk + manual
+    construction).
+
+    ``allocations`` maps desk key -> capital_allocation; each desk is created
+    via create_desk (so unknown/planned keys raise the same informative
+    ValueErrors) and the FundOrchestrator validates the sum is <= 1.0. Pass an
+    optional PortfolioRiskAggregator as ``risk_aggregator`` for the
+    account-level overlay. Insertion order of ``allocations`` is preserved as
+    the desk order (which the orchestrator's deterministic netting relies on).
+    """
+    if not allocations:
+        raise ValueError(
+            "create_fund_orchestrator requires at least one desk allocation")
+    desks = [create_desk(key, allocation)
+             for key, allocation in allocations.items()]
+    return FundOrchestrator(desks, risk_aggregator=risk_aggregator)
