@@ -686,6 +686,30 @@ class TestAsyncBacktest:
         # Only the message crosses the wire — never a traceback.
         assert 'Traceback' not in str(job)
 
+    def test_run_records_provenance_with_seed(self, client, patch_engine_run):
+        response = client.post(
+            '/api/backtest/run', json={**self.PAYLOAD, 'seed': 99})
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        prov = job['result']['provenance']
+        assert set(prov) == {'git_sha', 'git_dirty', 'python_version',
+                             'dependency_versions', 'seed', 'captured_at'}
+        assert prov['seed'] == 99  # the pinned seed is recorded
+
+    def test_run_provenance_seed_none_when_unpinned(
+            self, client, patch_engine_run):
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['result']['provenance']['seed'] is None
+
+    @pytest.mark.parametrize('bad_seed', ['abc', 3.14, True, False])
+    def test_run_rejects_non_integer_seed(self, client, bad_seed):
+        # bool is an int subclass, so True/False must be rejected explicitly.
+        response = client.post(
+            '/api/backtest/run', json={**self.PAYLOAD, 'seed': bad_seed})
+        assert response.status_code == 400
+        assert 'seed' in response.get_json()['error']
+
     def test_run_rejects_missing_symbols(self, client):
         response = client.post(
             '/api/backtest/run', json={**self.PAYLOAD, 'symbols': '  '})
@@ -863,6 +887,14 @@ class TestFundBacktest:
         assert entry['degraded_desks'] == []
         # Trade dates still normalize to ISO strings on the fund path.
         assert result['trades'][0]['date'] == '2023-03-01'
+
+    def test_fund_run_records_provenance_with_seed(
+            self, client, patch_fund_run):
+        response = client.post(
+            '/api/backtest/run', json={**self.FUND_PAYLOAD, 'seed': 7})
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        assert job['result']['provenance']['seed'] == 7
 
     def test_finished_fund_run_saved_as_fund_strategy(
             self, client, patch_fund_run):

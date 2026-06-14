@@ -53,6 +53,7 @@ import logging
 
 import pandas as pd
 import numpy as np
+import threading
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from core.models import Asset, AssetType, Order, OrderType, OrderStatus, Position
@@ -66,6 +67,15 @@ if TYPE_CHECKING:  # annotation only — avoids any import-order coupling
     from desks.dynamic_reweighter import DynamicReweighter
 
 logger = logging.getLogger(__name__)
+
+#: Serializes SEEDED runs only. np.random.seed pins numpy's PROCESS-GLOBAL
+#: RNG, so two concurrently-running seeded backtests (JobManager uses daemon
+#: threads) would otherwise interleave draws and silently break each other's
+#: reproducibility. Held for the duration of a seeded run; unseeded runs (the
+#: default) never touch it and stay fully concurrent. True per-run isolation
+#: would need a np.random.Generator threaded through every RNG consumer — a
+#: larger refactor deferred beyond this step.
+_SEEDED_RUN_LOCK = threading.Lock()
 
 #: Trading days an intent may wait for a usable bar before being dropped.
 MAX_PENDING_DAYS = 5
@@ -84,7 +94,8 @@ class BacktestEngine:
                  spread_pct: float = 0.02,
                  per_contract_commission: float = 0.65,
                  orchestrator: Optional['FundOrchestrator'] = None,
-                 reweighter: Optional['DynamicReweighter'] = None):
+                 reweighter: Optional['DynamicReweighter'] = None,
+                 seed: Optional[int] = None):
         if sum(driver is not None
                for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
@@ -105,6 +116,15 @@ class BacktestEngine:
         # the snapshot to shift desk capital_allocation for the next window.
         # None -> a fund runs at its construction-time weights, unchanged.
         self.reweighter = reweighter
+        # Reproducibility (Phase 3): records the RNG seed; the actual
+        # np.random.seed() happens at the START of run() (under a lock), not
+        # here, so nothing consumed between construction and run() can leak into
+        # the simulation's RNG stream. Seeding pins numpy's LEGACY global RNG —
+        # it covers desks/strategies/models that draw from np.random.* (HMM
+        # init, ML estimators reading global state) but NOT components with
+        # their own np.random.Generator (e.g. SyntheticLOB's default_rng, which
+        # is independently seeded). None -> unpinned (prior behavior).
+        self.rng_seed = seed
         self.portfolio = PortfolioManager(initial_capital)
         self.commission = commission
         self.slippage_bps = slippage_bps
@@ -145,6 +165,25 @@ class BacktestEngine:
             position_size: float = 0.1,
             progress_callback: Optional[Callable[[float], None]] = None,
             benchmark_symbol: Optional[str] = 'SPY') -> Dict:
+        """Run the backtest, pinning numpy's global RNG when a seed was given.
+
+        Thin wrapper over _run_impl: when ``self.rng_seed`` is set, it seeds the
+        global RNG at the very start of the run AND holds _SEEDED_RUN_LOCK for
+        the whole run so a concurrent seeded run cannot interleave RNG draws.
+        Unseeded runs skip the lock entirely and stay fully concurrent.
+        """
+        if self.rng_seed is None:
+            return self._run_impl(symbols, start_date, end_date, position_size,
+                                  progress_callback, benchmark_symbol)
+        with _SEEDED_RUN_LOCK:
+            np.random.seed(self.rng_seed)
+            return self._run_impl(symbols, start_date, end_date, position_size,
+                                  progress_callback, benchmark_symbol)
+
+    def _run_impl(self, symbols: List[str], start_date: str, end_date: str,
+                  position_size: float = 0.1,
+                  progress_callback: Optional[Callable[[float], None]] = None,
+                  benchmark_symbol: Optional[str] = 'SPY') -> Dict:
         """Run backtest on given symbols.
 
         Each simulated trading day executes, in this order:

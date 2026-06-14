@@ -63,7 +63,7 @@ class ReweightingFundBacktest:
                  per_contract_commission: float = 0.65,
                  rebalance_every: int = 21, warmup: int = 0,
                  target_gross: float = 1.0,
-                 risk_aggregator=None,
+                 risk_aggregator=None, seed: Optional[int] = None,
                  solo_curve_provider: Optional[SoloCurveProvider] = None,
                  orchestrator_factory: Optional[OrchestratorFactory] = None):
         if not allocations:
@@ -81,6 +81,7 @@ class ReweightingFundBacktest:
         self.warmup = warmup
         self.target_gross = target_gross
         self.risk_aggregator = risk_aggregator
+        self.seed = seed
         self._solo_curve_provider = (solo_curve_provider
                                      or self._default_solo_curve)
         self._orchestrator_factory = (orchestrator_factory
@@ -121,7 +122,8 @@ class ReweightingFundBacktest:
             orchestrator=orchestrator, reweighter=reweighter,
             initial_capital=self.initial_capital, commission=self.commission,
             slippage_bps=self.slippage_bps, spread_pct=self.spread_pct,
-            per_contract_commission=self.per_contract_commission)
+            per_contract_commission=self.per_contract_commission,
+            seed=self.seed)
         # progress_callback covers only the fund pass (the N solo passes run
         # first); callers wanting whole-job progress should wrap accordingly.
         return engine.run(symbols, start_date, end_date,
@@ -146,7 +148,8 @@ class ReweightingFundBacktest:
             desk=desk, initial_capital=self.initial_capital,
             commission=self.commission, slippage_bps=self.slippage_bps,
             spread_pct=self.spread_pct,
-            per_contract_commission=self.per_contract_commission)
+            per_contract_commission=self.per_contract_commission,
+            seed=self.seed)
         report = engine.run(list(symbols), start_date, end_date,
                             benchmark_symbol=None)
         if 'error' in report:

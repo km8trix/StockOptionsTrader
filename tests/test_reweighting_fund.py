@@ -205,6 +205,31 @@ class TestCoordinatorInjected:
         # First boundary is warmup + rebalance_every = 35, then 50 over 60 days.
         assert [e['day_number'] for e in report['reweight_log']] == [35, 50]
 
+    def test_seed_threaded_into_engines(self, monkeypatch):
+        # seed reaches the BacktestEngine(s) the coordinator builds (here only
+        # the fund engine, since the injected solo provider bypasses the
+        # default solo-curve engines).
+        _patch_fetch(monkeypatch,
+                     {'AAA': flat_frame(n=N_DAYS), 'BBB': flat_frame(n=N_DAYS)})
+        captured = []
+        real_engine = rf_module.BacktestEngine
+
+        def spy(*args, **kwargs):
+            captured.append(kwargs.get('seed'))
+            return real_engine(*args, **kwargs)
+        monkeypatch.setattr(rf_module, 'BacktestEngine', spy)
+
+        def factory(allocations):
+            desks = [ScriptedDesk(k, v, risk_manager=wide_risk())
+                     for k, v in allocations.items()]
+            return FundOrchestrator(desks, risk_manager=wide_risk())
+
+        rfb = ReweightingFundBacktest(
+            {'asim': 0.5, 'bsim': 0.5}, rebalance_every=21, seed=7,
+            solo_curve_provider=lambda *a: LOW, orchestrator_factory=factory)
+        rfb.run(['AAA', 'BBB'], START, END, benchmark_symbol=None)
+        assert captured and all(s == 7 for s in captured)
+
     def test_target_gross_passed_through(self, monkeypatch):
         _patch_fetch(monkeypatch, {'AAA': flat_frame(n=N_DAYS)})
 

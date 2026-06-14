@@ -20,6 +20,7 @@ from strategies.advanced import (
     VolatilityBreakoutStrategy, CombinedStrategy, AdaptiveStrategy
 )
 from utils.jobs import get_job_manager
+from utils.provenance import capture_run_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,18 @@ def _parse_allocations(fund):
     return None, 'fund must be a list of desk keys or a {key: weight} object'
 
 
+def _parse_seed(data):
+    """Optional RNG seed for reproducibility. Returns (seed, None) with seed an
+    int or None, or (None, error) when the value is present but not a plain
+    integer. bool is rejected (it is an int subclass but a nonsense seed)."""
+    seed = data.get('seed')
+    if seed is None:
+        return None, None
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        return None, 'seed must be an integer'
+    return seed, None
+
+
 def _date_str(value):
     """'YYYY-MM-DD' for datetimes/Timestamps; str fallback for anything else."""
     if hasattr(value, 'strftime'):
@@ -235,6 +248,9 @@ def _save_report(name, symbols, start_date, end_date, initial_capital,
                 'portfolio_history': report.get('portfolio_history', []),
                 'drawdown_series': report.get('drawdown_series', []),
                 'benchmark': report.get('benchmark'),
+                # Run-level reproducibility provenance (git/deps/seed). Additive
+                # to the JSON results blob — no DB schema change.
+                'provenance': report.get('provenance'),
             },
         )
     except Exception:
@@ -244,11 +260,13 @@ def _save_report(name, symbols, start_date, end_date, initial_capital,
 
 def _execute_engine_job(backtester, symbols, start_date, end_date,
                         initial_capital, position_size, name, strategy_label,
-                        progress):
+                        progress, seed=None):
     """Shared job tail: run an engine, attach provenance, persist, return.
 
     ``strategy_label`` is what the saved-history row stores in its strategy
     column — the strategy key for legacy runs, ``desk:<key>`` for desk runs.
+    ``seed`` is the RNG seed the run was pinned to (recorded in provenance;
+    None when the run was not pinned).
     """
     results = backtester.run(symbols, start_date, end_date, position_size,
                              progress_callback=progress,
@@ -262,29 +280,35 @@ def _execute_engine_job(backtester, symbols, start_date, end_date,
         for symbol in symbols
     }
     report = _json_safe_report(results)
+    # Run-level reproducibility provenance, attached AFTER json-safing (it is
+    # already JSON-safe) so the saved results blob and the returned report both
+    # carry it. Additive — never present on pre-Phase-3 saved runs.
+    report['provenance'] = capture_run_provenance(seed)
     _save_report(name, symbols, start_date, end_date, initial_capital,
                  strategy_label, position_size, report)
     return report
 
 
 def _run_backtest_job(symbols, strategy_name, start_date, end_date,
-                      initial_capital, position_size, name, progress=None):
+                      initial_capital, position_size, name, seed=None,
+                      progress=None):
     """JobManager job body: run the engine and return a JSON-safe report.
 
     The JobManager injects ``progress`` (callable taking float 0-100); it is
-    wired straight into BacktestEngine.run's progress_callback. Raising here
-    marks the job 'error' with the exception message.
+    wired straight into BacktestEngine.run's progress_callback. ``seed`` (if
+    given) pins the engine's RNG for reproducibility. Raising here marks the
+    job 'error' with the exception message.
     """
     strategy_instance = STRATEGIES[strategy_name]()
     backtester = BacktestEngine(strategy_instance,
-                                initial_capital=initial_capital)
+                                initial_capital=initial_capital, seed=seed)
     return _execute_engine_job(backtester, symbols, start_date, end_date,
                                initial_capital, position_size, name,
-                               strategy_name, progress)
+                               strategy_name, progress, seed=seed)
 
 
 def _run_desk_backtest_job(symbols, desk, desk_key, start_date, end_date,
-                           initial_capital, position_size, name,
+                           initial_capital, position_size, name, seed=None,
                            progress=None):
     """JobManager job body (desk mode): engine built per contract C2.
 
@@ -293,17 +317,18 @@ def _run_desk_backtest_job(symbols, desk, desk_key, start_date, end_date,
     :func:`_json_safe_report` untouched — they are JSON-safe by contract.
     The saved-history row stores the strategy as ``desk:<key>`` so desk runs
     stay distinguishable in the history/compare/export UIs (additive: the
-    column still holds a plain string).
+    column still holds a plain string). ``seed`` (if given) pins the engine RNG.
     """
-    backtester = BacktestEngine(desk=desk, initial_capital=initial_capital)
+    backtester = BacktestEngine(desk=desk, initial_capital=initial_capital,
+                                seed=seed)
     return _execute_engine_job(backtester, symbols, start_date, end_date,
                                initial_capital, position_size, name,
-                               f'desk:{desk_key}', progress)
+                               f'desk:{desk_key}', progress, seed=seed)
 
 
 def _run_fund_backtest_job(symbols, allocations, rebalance_every, warmup,
                            target_gross, start_date, end_date,
-                           initial_capital, name, progress=None):
+                           initial_capital, name, seed=None, progress=None):
     """JobManager job body (fund mode): a multi-desk fund backtest with in-run
     risk-parity reweighting (ReweightingFundBacktest — shadow solo books).
 
@@ -318,12 +343,13 @@ def _run_fund_backtest_job(symbols, allocations, rebalance_every, warmup,
     backtester = ReweightingFundBacktest(
         allocations, initial_capital=initial_capital,
         rebalance_every=rebalance_every, warmup=warmup,
-        target_gross=target_gross)
+        target_gross=target_gross, seed=seed)
     results = backtester.run(symbols, start_date, end_date,
                              benchmark_symbol='SPY', progress_callback=progress)
     if 'error' in results:
         raise ValueError(results['error'])
     report = _json_safe_report(results)
+    report['provenance'] = capture_run_provenance(seed)
     _save_report(name, symbols, start_date, end_date, initial_capital,
                  f"fund:{'+'.join(allocations)}", None, report)
     return report
@@ -374,6 +400,10 @@ def _submit_fund_backtest(data, symbols):
     if not 0 < target_gross <= 1.0:
         return jsonify({'error': 'target_gross must be in (0, 1]'}), 400
 
+    seed, seed_err = _parse_seed(data)
+    if seed_err:
+        return jsonify({'error': seed_err}), 400
+
     # Eager validation: unknown desk keys and over-allocation (sum > 1.0)
     # surface as a clean 400 here (contract C1 messages) instead of a failed
     # job. Constructs throwaway desks — cheap; the heavy work is .run().
@@ -386,7 +416,8 @@ def _submit_fund_backtest(data, symbols):
         f"fund:{'+'.join(allocations)} {','.join(symbols)}"
     job_id = get_job_manager().submit(
         _run_fund_backtest_job, symbols, allocations, rebalance_every,
-        warmup, target_gross, start_date, end_date, initial_capital, name)
+        warmup, target_gross, start_date, end_date, initial_capital, name,
+        seed)
     logger.info('Fund backtest job %s submitted (fund:%s on %s)', job_id,
                 '+'.join(allocations), symbols)
     return jsonify({'job_id': job_id}), 202
@@ -455,12 +486,16 @@ def run_backtest_async():
     if not 0 < position_size <= 1:
         return jsonify({'error': 'position_size must be in (0, 1]'}), 400
 
+    seed, seed_err = _parse_seed(data)
+    if seed_err:
+        return jsonify({'error': seed_err}), 400
+
     if desk is not None:
         name = (data.get('name') or '').strip() or \
             f"desk:{desk_key} {','.join(symbols)}"
         job_id = get_job_manager().submit(
             _run_desk_backtest_job, symbols, desk, desk_key, start_date,
-            end_date, initial_capital, position_size, name)
+            end_date, initial_capital, position_size, name, seed)
         logger.info('Desk backtest job %s submitted (desk:%s on %s)', job_id,
                     desk_key, symbols)
         return jsonify({'job_id': job_id}), 202
@@ -470,7 +505,7 @@ def run_backtest_async():
 
     job_id = get_job_manager().submit(
         _run_backtest_job, symbols, strategy_name, start_date, end_date,
-        initial_capital, position_size, name)
+        initial_capital, position_size, name, seed)
     logger.info('Backtest job %s submitted (%s on %s)', job_id,
                 strategy_name, symbols)
     return jsonify({'job_id': job_id}), 202
@@ -506,12 +541,17 @@ def run_backtest():
         
         if strategy_name not in STRATEGIES:
             return jsonify({'error': f'Unknown strategy: {strategy_name}'}), 400
-            
+
+        seed, seed_err = _parse_seed(data)
+        if seed_err:
+            return jsonify({'error': seed_err}), 400
+
         strategy_instance = STRATEGIES[strategy_name]()
-        backtester = BacktestEngine(strategy_instance, initial_capital=initial_capital)
-        
+        backtester = BacktestEngine(strategy_instance,
+                                    initial_capital=initial_capital, seed=seed)
+
         results = backtester.run(symbols, start_date, end_date, position_size)
-        
+
         if 'error' in results:
             return jsonify({'error': results['error']}), 400
 
@@ -520,6 +560,8 @@ def run_backtest():
             symbol: _fetch_info(backtester.market_data, symbol)
             for symbol in symbols
         }
+        # Run-level reproducibility provenance, parity with the async path.
+        results['provenance'] = capture_run_provenance(seed)
 
         return jsonify(results)
     except Exception:
