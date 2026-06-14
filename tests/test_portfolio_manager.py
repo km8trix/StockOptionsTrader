@@ -30,9 +30,12 @@ def _seed_history(pm: PortfolioManager, values, start: str = '2023-01-02') -> No
         pm.portfolio_history.append({'timestamp': ts, 'portfolio_value': value})
 
 
-def _pop_std(xs) -> float:
+def _samp_std(xs) -> float:
+    """Sample standard deviation (ddof=1) — matches get_sharpe_ratio's
+    np.std(ddof=1) convention (Phase 3 research-integrity switch from the
+    population std / ddof=0)."""
     mean = sum(xs) / len(xs)
-    return math.sqrt(sum((x - mean) ** 2 for x in xs) / len(xs))
+    return math.sqrt(sum((x - mean) ** 2 for x in xs) / (len(xs) - 1))
 
 
 def _expected_daily_returns(values):
@@ -41,8 +44,9 @@ def _expected_daily_returns(values):
 
 def _target_downside_dev(excess) -> float:
     """Target semideviation about zero excess return (Sortino denominator):
-    sqrt(mean(min(x, 0)^2)) over ALL N excess returns."""
-    return math.sqrt(sum(min(x, 0.0) ** 2 for x in excess) / len(excess))
+    sqrt(sum(min(x, 0)^2) / (N-1)) — the SAMPLE (ddof=1) convention matching
+    get_sortino_ratio (Phase 3 switch from /N, ddof=0)."""
+    return math.sqrt(sum(min(x, 0.0) ** 2 for x in excess) / (len(excess) - 1))
 
 
 class TestPositionAccounting:
@@ -154,7 +158,7 @@ class TestSharpeRatio:
 
         returns = _expected_daily_returns(HISTORY_VALUES)
         excess = [r - DAILY_RF for r in returns]
-        expected = (sum(excess) / len(excess)) / _pop_std(excess) * math.sqrt(252)
+        expected = (sum(excess) / len(excess)) / _samp_std(excess) * math.sqrt(252)
 
         assert pm.get_sharpe_ratio(risk_free_rate=RISK_FREE) == pytest.approx(expected)
 

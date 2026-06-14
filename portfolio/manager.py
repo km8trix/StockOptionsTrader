@@ -178,15 +178,20 @@ class PortfolioManager:
         daily excess return = daily return - risk_free_rate / 252
         sharpe = mean(excess) / std(excess) * sqrt(252)
 
-        Uses the population standard deviation (np.std, ddof=0). Returns 0.0
-        when there are fewer than 2 daily returns or the std is zero.
+        Uses the SAMPLE standard deviation (np.std, ddof=1) — the conventional,
+        more conservative estimator for a Sharpe computed from a return SAMPLE
+        (this is what pandas .std() and most performance libraries use). This is
+        a Phase 3 research-integrity change; the prior convention was the
+        population std (ddof=0), which slightly understated the denominator and
+        so overstated the Sharpe. Returns 0.0 when there are fewer than 2 daily
+        returns or the std is zero.
         """
         returns = self.get_daily_returns()
         if len(returns) < 2:
             return 0.0
 
         excess_returns = np.array(returns) - (risk_free_rate / 252)
-        std_dev = np.std(excess_returns)
+        std_dev = np.std(excess_returns, ddof=1)
 
         # Prevent division by zero runtime crash
         if std_dev == 0:
@@ -199,13 +204,16 @@ class PortfolioManager:
 
         Numerator matches the Sharpe numerator (mean daily excess return).
         Denominator is the target downside deviation (target semideviation)
-        about a zero excess return, computed over ALL N daily returns:
+        about a zero excess return, summing squared downside excursions over
+        ALL N daily returns but normalized by N-1 (the SAMPLE convention,
+        ddof=1):
 
-            downside_dev = sqrt(mean(min(excess_returns, 0) ** 2))
+            downside_dev = sqrt(sum(min(excess_returns, 0) ** 2) / (N - 1))
 
-        This measures the magnitude of returns below the target — the
-        standard Sortino denominator — not the dispersion of the losing
-        subset about its own mean.
+        This measures the magnitude of returns below the target — the standard
+        Sortino denominator — not the dispersion of the losing subset about its
+        own mean. The N-1 normalization is the Phase 3 research-integrity change
+        matching the Sharpe ddof=1 switch (was /N, ddof=0, before).
 
         Convention: returns 0.0 when there are fewer than 2 daily returns or
         when the downside deviation is zero (no returns below the target;
@@ -216,7 +224,9 @@ class PortfolioManager:
             return 0.0
 
         excess_returns = np.array(returns) - (risk_free_rate / 252)
-        downside_dev = np.sqrt(np.mean(np.minimum(excess_returns, 0.0) ** 2))
+        downside_dev = np.sqrt(
+            np.sum(np.minimum(excess_returns, 0.0) ** 2)
+            / (len(excess_returns) - 1))
         if downside_dev == 0:
             return 0.0
 
