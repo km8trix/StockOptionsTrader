@@ -44,6 +44,18 @@ import logging
 import math
 import os
 import threading
+from datetime import datetime, timezone
+
+try:
+    from brokers.circuit_breaker import (DailyLossCircuitBreaker,
+                                         DailyLossGate, extract_account_value)
+except Exception:  # noqa: BLE001 - daily-loss gate is optional on the GUI client
+    DailyLossCircuitBreaker = DailyLossGate = extract_account_value = None
+
+try:
+    from utils.market_hours import MarketHours
+except Exception:  # noqa: BLE001 - market-hours guard is optional
+    MarketHours = None
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +290,9 @@ def get_client():
     The client is cached and reused, but rebuilt whenever the underlying
     auth manager identity changes (a reconnect) so it never signs with a
     dead session. The kill switch is wired in so preview/place raise
-    KillSwitchEngaged FIRST — the route layer never bypasses it.
+    KillSwitchEngaged FIRST — the route layer never bypasses it, and a
+    daily-loss gate is wired so the -2% rail PRE-blocks orders (not only
+    retroactively once a breach engages the kill switch).
     """
     global _client, _client_auth_manager
     if EtradeClient is None:
@@ -289,11 +303,13 @@ def get_client():
     with _singleton_lock:
         if _client is None or _client_auth_manager is not manager:
             try:
-                _client = EtradeClient(
+                client = EtradeClient(
                     manager,
                     kill_switch=get_kill_switch(),
                     audit=get_audit_log(),
                 )
+                _wire_daily_loss_gate(client)
+                _client = client
                 _client_auth_manager = manager
             except Exception:
                 logger.error('EtradeClient construction failed', exc_info=True)
@@ -301,6 +317,29 @@ def get_client():
                 _client_auth_manager = None
                 return None
     return _client
+
+
+def _wire_daily_loss_gate(client) -> None:
+    """Attach a -2% daily-loss gate to the shared GUI client so preview/place
+    are PRE-blocked by the rail (each call reads balances and engages the kill
+    switch on a breach), bound to the configured ETRADE_ACCOUNT_ID_KEY account.
+
+    No-op when the breaker import, the kill switch, or the account id is
+    unavailable — read-only GETs are never gated, and the rail FAILS CLOSED:
+    if value_fn raises (balances unreadable), the exception propagates and the
+    gated order is refused. Mirrors LiveEtradeBroker._build_daily_loss_gate.
+    """
+    if DailyLossGate is None:
+        return
+    kill_switch = get_kill_switch()
+    account_id_key = os.environ.get("ETRADE_ACCOUNT_ID_KEY")
+    if kill_switch is None or not account_id_key:
+        return
+    breaker = DailyLossCircuitBreaker(kill_switch, audit=get_audit_log())
+    client.circuit_breaker = DailyLossGate(
+        breaker,
+        value_fn=lambda: extract_account_value(
+            client.get_balances(account_id_key)))
 
 
 def client_unavailable_reason() -> str:
@@ -1205,6 +1244,34 @@ def _preview_summary(preview: dict) -> dict:
     return summary
 
 
+def _market_hours_block(data: dict):
+    """409 response when a PRODUCTION order must not transmit outside the NYSE
+    regular session, else None.
+
+    Sandbox is a test venue with no real market, so it is never blocked (live
+    rehearsal stays unimpeded). Override per request with allow_after_hours=true
+    for deliberate extended-hours orders.
+    """
+    if MarketHours is None or data.get('allow_after_hours') is True:
+        return None
+    manager = get_auth_manager()
+    env = getattr(manager, 'env', 'sandbox') if manager is not None \
+        else 'sandbox'
+    if env != 'production':
+        return None
+    try:
+        if MarketHours().is_market_open(datetime.now(timezone.utc)):
+            return None
+    except Exception:  # noqa: BLE001 - a calendar failure fails CLOSED (block)
+        logger.warning('Market-hours check failed; blocking order off-hours',
+                       exc_info=True)
+    return jsonify({
+        'error': 'market closed',
+        'detail': 'The NYSE regular session is closed. Pass '
+                  'allow_after_hours=true to override.',
+    }), 409
+
+
 @live_bp.route('/order/preview', methods=['POST'])
 def live_order_preview():
     """Build + preview an order, caching the built request behind an opaque
@@ -1217,9 +1284,24 @@ def live_order_preview():
     kind = str(data.get('kind') or '').strip()
     if not account_id_key:
         return jsonify({'error': "'account_id_key' is required"}), 400
+    # The daily-loss rail (get_client) monitors the configured
+    # ETRADE_ACCOUNT_ID_KEY account; refuse an order for any OTHER account so
+    # the rail and the order can never diverge. (No-op when it is unset — then
+    # no gate is wired anyway.) Place inherits this via the cached order_ref.
+    configured_account = os.environ.get("ETRADE_ACCOUNT_ID_KEY")
+    if configured_account and account_id_key != configured_account:
+        return jsonify({
+            'error': 'account mismatch',
+            'detail': 'Live orders must target the configured '
+                      'ETRADE_ACCOUNT_ID_KEY account — the one the daily-loss '
+                      'rail monitors.',
+        }), 409
     if kind not in ('equity', 'option', 'spread'):
         return jsonify({'error': "'kind' must be 'equity', 'option' or "
                                  "'spread'"}), 400
+    blocked = _market_hours_block(data)
+    if blocked is not None:
+        return blocked
 
     order_request, build_err = _build_order_request(kind, data)
     if build_err is not None:
@@ -1260,6 +1342,9 @@ def live_order_place():
     order_ref = str(data.get('order_ref') or '').strip()
     if not order_ref:
         return jsonify({'error': "'order_ref' is required"}), 400
+    blocked = _market_hours_block(data)
+    if blocked is not None:
+        return blocked
 
     record = _consume_order_ref(order_ref)
     if record is None:

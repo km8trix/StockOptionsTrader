@@ -527,6 +527,51 @@ class TestLiveEtradeBroker:
         assert sent["orderType"] == "EQ"
         assert sent["PreviewIds"] == [{"previewId": 3}]
 
+    def test_place_order_blocks_fat_finger_limit(self, harness):
+        # Gap 2: the live broker REFUSES a limit > 50% from the current price.
+        from brokers.live_trader import PriceSanityError
+        from core.models import Asset, AssetType, OrderType
+        broker, transport = self._broker(harness)
+        broker.get_current_price = lambda _s: 100.0  # current ~100
+        with pytest.raises(PriceSanityError):
+            broker.place_order(Asset("AAPL", AssetType.STOCK),
+                               OrderType.BUY, 1, 1000.0)  # 10x typo
+        # Refused before any order endpoint was hit.
+        assert not any("orders/" in c["url"] for c in transport.calls)
+
+    def test_place_structure_blocks_absurd_net_price(self, harness):
+        # Gap 2: structure net price beyond the defined-risk strike ceiling.
+        from brokers.live_trader import PriceSanityError
+        from core.models import Asset, AssetType
+        broker, transport = self._broker(harness)
+        legs = [
+            {"asset": Asset("SPY", AssetType.PUT, 440.0, "2026-07-17"),
+             "action": "SHORT"},
+            {"asset": Asset("SPY", AssetType.PUT, 430.0, "2026-07-17"),
+             "action": "BUY"},
+        ]
+        # net 5000 is a gross typo — blocked regardless of bound choice.
+        with pytest.raises(PriceSanityError):
+            broker.place_structure(legs, net_price=5000.0, contracts=1)
+        assert not any("orders/" in c["url"] for c in transport.calls)
+
+    def test_place_structure_blocks_realistic_magnitude_typo(self, harness):
+        # Gap 2 (review): a 430/440 spread (width 10, ceiling 15) priced 440.0
+        # instead of 4.40 is a 100x typo FAR BELOW any strike — the WIDTH
+        # ceiling catches it where a max-strike ceiling (660) would not.
+        from brokers.live_trader import PriceSanityError
+        from core.models import Asset, AssetType
+        broker, transport = self._broker(harness)
+        legs = [
+            {"asset": Asset("SPY", AssetType.PUT, 440.0, "2026-07-17"),
+             "action": "SHORT"},
+            {"asset": Asset("SPY", AssetType.PUT, 430.0, "2026-07-17"),
+             "action": "BUY"},
+        ]
+        with pytest.raises(PriceSanityError):
+            broker.place_structure(legs, net_price=440.0, contracts=1)
+        assert not any("orders/" in c["url"] for c in transport.calls)
+
     def test_kill_switch_blocks_place_order_and_structure(self, tmp_path):
         # Phase 1 INTEGRATION: an engaged kill switch blocks BOTH order-entry
         # points on LiveEtradeBroker (place_order + place_structure) before any
@@ -699,6 +744,67 @@ class TestDailyLossGate:
         assert gate()["breached"] is False
         assert gate()["breached"] is True   # same baseline, -2.1%
         assert switch.engaged() is True
+
+    def test_baseline_reused_across_restart(self, tmp_path):
+        """Gap 4: a mid-day process RESTART reuses the morning baseline from the
+        audit, not the drawn-down value — so a pre-restart drop still breaches."""
+        from datetime import datetime, timezone
+
+        from brokers.circuit_breaker import DailyLossGate
+
+        db_path = str(tmp_path / "restart.db")
+        audit = AuditLog(db_path, env="sandbox")
+        switch = KillSwitch(db_path, audit=audit)
+        when = datetime(2026, 1, 15, 18, 0, tzinfo=timezone.utc)  # 13:00 ET
+        clock = lambda: when  # noqa: E731
+
+        # Process 1: capture the morning baseline at 100k.
+        g1 = DailyLossGate(
+            DailyLossCircuitBreaker(switch, audit=audit, clock=clock),
+            value_fn=lambda: 100_000.0, clock=clock)
+        assert g1()["breached"] is False
+        assert g1.start_of_day_value == 100_000.0
+
+        # Process 2 (restart): account already down to 97k. A FRESH gate must
+        # reuse the 100k baseline -> -3% -> breach, not re-baseline to 97k.
+        g2 = DailyLossGate(
+            DailyLossCircuitBreaker(switch, audit=audit, clock=clock),
+            value_fn=lambda: 97_000.0, clock=clock)
+        result = g2()
+        assert result["start_of_day_value"] == 100_000.0  # reused, not 97k
+        assert result["breached"] is True
+        assert switch.engaged() is True
+        # No duplicate capture for the day.
+        caps = audit.entries(event_type="start_of_day_captured")
+        assert len(caps) == 1
+
+    def test_baseline_persistence_is_env_scoped(self, tmp_path):
+        """Gap 4 (review): a PRODUCTION gate must NOT reuse a SANDBOX baseline
+        captured the same day on the shared db — env isolation."""
+        from datetime import datetime, timezone
+
+        from brokers.circuit_breaker import DailyLossGate
+
+        db_path = str(tmp_path / "shared.db")
+        when = datetime(2026, 1, 15, 18, 0, tzinfo=timezone.utc)
+        clock = lambda: when  # noqa: E731
+
+        sb_audit = AuditLog(db_path, env="sandbox")
+        sb_switch = KillSwitch(db_path, audit=sb_audit)
+        DailyLossGate(DailyLossCircuitBreaker(sb_switch, audit=sb_audit,
+                                              clock=clock),
+                      value_fn=lambda: 100_000.0, clock=clock)()  # capture sb
+
+        # A production gate on the SAME db, same day: it must capture its OWN
+        # baseline (90k), not reuse the sandbox 100k.
+        prod_audit = AuditLog(db_path, env="production")
+        prod_switch = KillSwitch(db_path, audit=prod_audit)
+        prod_gate = DailyLossGate(
+            DailyLossCircuitBreaker(prod_switch, audit=prod_audit, clock=clock),
+            value_fn=lambda: 90_000.0, clock=clock)
+        result = prod_gate()
+        assert result["start_of_day_value"] == 90_000.0   # own, not 100k
+        assert result["breached"] is False                # 90k baseline == 90k
 
 
 # ----------------------------------------------------------------------

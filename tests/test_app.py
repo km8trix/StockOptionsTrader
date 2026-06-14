@@ -156,6 +156,91 @@ def test_live_trader_create_returns_503_when_broker_unavailable(client, monkeypa
     }
 
 
+def test_live_trader_create_503_without_account_id(client, monkeypatch):
+    """Gap 5: refuse a live broker when ETRADE_ACCOUNT_ID_KEY is unset rather
+    than route orders to account 'None'."""
+    import gui.routes.api_live as api_live
+    monkeypatch.setattr(api_live, 'get_auth_manager', lambda: object())
+    monkeypatch.setattr(api_live, 'get_kill_switch', lambda: object())
+    monkeypatch.setattr(api_live, 'get_audit_log', lambda: object())
+    monkeypatch.delenv('ETRADE_ACCOUNT_ID_KEY', raising=False)
+
+    response = client.post(
+        '/api/trader/create', json={'trader_id': 't-noacct', 'mode': 'live'})
+    assert response.status_code == 503
+    assert 'ETRADE_ACCOUNT_ID_KEY' in response.get_json()['reason']
+
+
+def test_wire_daily_loss_gate_attaches_breaker(monkeypatch, tmp_path):
+    """Gap 1: the GUI client gets a daily-loss gate when account id + kill
+    switch are available."""
+    import gui.routes.api_live as api_live
+    from brokers.circuit_breaker import DailyLossGate
+    from utils.audit import AuditLog
+    from utils.kill_switch import KillSwitch
+    db = str(tmp_path / 'g.db')
+    audit = AuditLog(db, env='sandbox')
+    monkeypatch.setattr(api_live, 'get_kill_switch',
+                        lambda: KillSwitch(db, audit=audit))
+    monkeypatch.setattr(api_live, 'get_audit_log', lambda: audit)
+    monkeypatch.setenv('ETRADE_ACCOUNT_ID_KEY', 'ACCT')
+
+    class FakeClient:
+        circuit_breaker = None
+
+        def get_balances(self, _a):
+            return 100_000.0
+
+    c = FakeClient()
+    api_live._wire_daily_loss_gate(c)
+    assert isinstance(c.circuit_breaker, DailyLossGate)
+
+
+def test_wire_daily_loss_gate_noop_without_account(monkeypatch, tmp_path):
+    """Gap 1: no gate (no crash) when the target account is not configured."""
+    import gui.routes.api_live as api_live
+    from utils.audit import AuditLog
+    from utils.kill_switch import KillSwitch
+    db = str(tmp_path / 'g.db')
+    audit = AuditLog(db, env='sandbox')
+    monkeypatch.setattr(api_live, 'get_kill_switch',
+                        lambda: KillSwitch(db, audit=audit))
+    monkeypatch.setattr(api_live, 'get_audit_log', lambda: audit)
+    monkeypatch.delenv('ETRADE_ACCOUNT_ID_KEY', raising=False)
+
+    class FakeClient:
+        circuit_breaker = None
+
+    c = FakeClient()
+    api_live._wire_daily_loss_gate(c)
+    assert c.circuit_breaker is None
+
+
+def test_market_hours_block_only_blocks_production_when_closed(app, monkeypatch):
+    """Gap 3: off-hours blocks PRODUCTION orders (override-able), never sandbox."""
+    import gui.routes.api_live as api_live
+
+    class FakeMH:
+        def is_market_open(self, _dt):
+            return False
+
+    monkeypatch.setattr(api_live, 'MarketHours', FakeMH)
+
+    class ProdMgr:
+        env = 'production'
+
+    class SbMgr:
+        env = 'sandbox'
+
+    with app.app_context():
+        monkeypatch.setattr(api_live, 'get_auth_manager', lambda: ProdMgr())
+        assert api_live._market_hours_block({}) is not None        # blocked
+        assert api_live._market_hours_block(
+            {'allow_after_hours': True}) is None                    # override
+        monkeypatch.setattr(api_live, 'get_auth_manager', lambda: SbMgr())
+        assert api_live._market_hours_block({}) is None            # sandbox ok
+
+
 # ==================== LAZY DATABASE SINGLETON (gui/globals.py) ====================
 
 
@@ -3230,6 +3315,16 @@ class TestLiveOrderTicket:
         assert ref in api_live._ORDER_REF_CACHE
         # The client previewed exactly the built request.
         assert patch_trade['client'].preview_calls[0][0] == 'KEY-ABC'
+
+    def test_preview_blocks_account_mismatch(self, client, patch_trade,
+                                             monkeypatch):
+        # Gap 1/4 review: when ETRADE_ACCOUNT_ID_KEY is set (the account the
+        # daily-loss rail monitors), an order for a DIFFERENT account is refused
+        # so the rail and the order can never diverge.
+        monkeypatch.setenv('ETRADE_ACCOUNT_ID_KEY', 'OTHER-ACCT')
+        response = client.post('/api/live/order/preview', json=self.EQUITY)
+        assert response.status_code == 409
+        assert 'account' in response.get_json()['error']
 
     def test_place_uses_cached_request_exactly_once(self, client, patch_trade):
         preview = client.post('/api/live/order/preview',

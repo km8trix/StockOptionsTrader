@@ -89,6 +89,21 @@ def make_session(desk, broker, executor, audit, switch, **kwargs):
         kill_switch=switch, **kwargs)
 
 
+def test_evaluate_once_skips_off_hours_when_enforced(rails):
+    """Gap 3: with enforce_market_hours, a manual evaluate_once outside the
+    NYSE session does not trade (the scheduler gates the autonomous loop, but a
+    direct call otherwise transmits)."""
+    from datetime import datetime, timezone
+    audit, switch = rails
+    desk = FakeDesk([])
+    saturday = datetime(2026, 6, 13, 15, 0, tzinfo=timezone.utc)  # weekend
+    session = make_session(desk, FakeBroker(), None, audit, switch,
+                           enforce_market_hours=True,
+                           clock=lambda: saturday)
+    result = session.evaluate_once()
+    assert result["status"] == "market_closed"
+
+
 class TestOrchestratorMode:
     """Fund mode: a FundOrchestrator drives the live session in place of one
     desk — the exactly-one-of guard, and netted/account-approved intents reach

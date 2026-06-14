@@ -184,6 +184,27 @@ class DailyLossGate:
         """Today's captured baseline (None before the first observation)."""
         return self._sod_value
 
+    def _persisted_baseline(self, date_iso: str) -> Optional[float]:
+        """The start-of-day baseline already captured for ``date_iso`` (this
+        env), recovered from the audit log so a mid-day process RESTART re-uses
+        the morning's baseline instead of re-baselining from an already
+        drawn-down value. Best-effort: any read failure returns None (the
+        caller then captures fresh, preserving prior in-memory behavior)."""
+        try:
+            rows = self.breaker.audit.entries(
+                event_type="start_of_day_captured", limit=500, ascending=False)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            return None
+        env = getattr(self.breaker.audit, "env", None)
+        for row in rows:
+            payload = row.get("payload", {}) or {}
+            if payload.get("date") == date_iso and (
+                    env is None or row.get("env") == env):
+                value = payload.get("value")
+                if value is not None:
+                    return float(value)
+        return None
+
     def __call__(self) -> Dict:
         """Evaluate the rail; returns breaker.check()'s result dict
         ({'breached': bool, ...} — the shape EtradeClient's pre-trade
@@ -192,13 +213,24 @@ class DailyLossGate:
         today_et = self._clock().astimezone(EASTERN).date()
         with self._lock:
             if self._sod_date != today_et or self._sod_value is None:
+                date_iso = today_et.isoformat()
+                # Restart-safe: reuse a baseline already captured today (in this
+                # env) rather than re-baselining from the current, possibly
+                # drawn-down, value. Only capture+audit when none exists yet.
+                persisted = self._persisted_baseline(date_iso)
+                if persisted is not None:
+                    self._sod_value = persisted
+                    logger.info(
+                        "Daily-loss baseline for %s reused from audit: %.2f",
+                        date_iso, persisted)
+                else:
+                    self._sod_value = current
+                    logger.info(
+                        "Daily-loss baseline captured for %s: %.2f",
+                        date_iso, current)
+                    self.breaker.audit.append(
+                        "circuit_breaker", "start_of_day_captured",
+                        {"date": date_iso, "value": current})
                 self._sod_date = today_et
-                self._sod_value = current
-                logger.info(
-                    "Daily-loss baseline captured for %s: %.2f",
-                    today_et.isoformat(), current)
-                self.breaker.audit.append(
-                    "circuit_breaker", "start_of_day_captured",
-                    {"date": today_et.isoformat(), "value": current})
             start_of_day = self._sod_value
         return self.breaker.check(current, start_of_day)

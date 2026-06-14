@@ -50,6 +50,11 @@ from core.models import OrderType
 from utils.audit import AuditLog
 from utils.kill_switch import KillSwitch
 
+try:
+    from utils.market_hours import MarketHours
+except Exception:  # noqa: BLE001 - market-hours guard is optional
+    MarketHours = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,7 +111,8 @@ class LiveTradingSession:
                  reconcile_fn: Optional[Callable] = None,
                  circuit_breaker=_AUTO,
                  clock: Optional[Callable[[], datetime]] = None,
-                 orchestrator=None):
+                 orchestrator=None,
+                 enforce_market_hours: bool = False):
         # Fund mode: a FundOrchestrator drives N desks on the shared
         # portfolio. It exposes the read surface the session needs
         # (key/capital_allocation/set_clock) and a step() that returns the
@@ -132,6 +138,11 @@ class LiveTradingSession:
             circuit_breaker = getattr(broker, "circuit_breaker", None)
         self.circuit_breaker = circuit_breaker
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # When True, evaluate_once() refuses to trade outside the NYSE regular
+        # session (a manual call off-hours otherwise transmits — the scheduler
+        # gates this for the autonomous loop, but a direct call does not).
+        # Default False keeps paper-parity and existing callers unchanged.
+        self.enforce_market_hours = enforce_market_hours
         self.last_reconciliation: Optional[Dict] = None
 
     @property
@@ -150,6 +161,14 @@ class LiveTradingSession:
                               {"reason": "kill_switch_engaged"})
             logger.warning("Session halted: kill switch engaged")
             return {"status": "halted", "reason": "kill_switch_engaged",
+                    "timestamp": now.isoformat(), "reports": []}
+
+        if (self.enforce_market_hours and MarketHours is not None
+                and not MarketHours().is_market_open(now)):
+            self.audit.append("live_session", "session_skipped",
+                              {"reason": "market_closed"})
+            logger.info("Session skipped: NYSE regular session is closed")
+            return {"status": "market_closed", "reason": "market_closed",
                     "timestamp": now.isoformat(), "reports": []}
 
         if self.auth_manager is not None:

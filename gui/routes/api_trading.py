@@ -94,9 +94,20 @@ def create_trader():
                     'reason': (AUDIT_IMPORT_ERROR
                                or 'AuditLog construction failed'),
                 }), 503
+            # Fail CLOSED on a missing target account: a live broker built with
+            # account_id_key=None would route every order to account 'None'
+            # (a typed E*TRADE rejection), not a real account — refuse it
+            # explicitly rather than rely on that downstream rejection.
+            account_id_key = os.getenv("ETRADE_ACCOUNT_ID_KEY")
+            if not account_id_key:
+                return jsonify({
+                    'error': 'Live trading unavailable',
+                    'reason': 'ETRADE_ACCOUNT_ID_KEY is not set — refusing to '
+                              'build a live broker without a target account',
+                }), 503
             trader = LiveEtradeBroker(
                 auth=auth_manager,
-                account_id_key=os.getenv("ETRADE_ACCOUNT_ID_KEY"),
+                account_id_key=account_id_key,
                 kill_switch=kill_switch,
                 audit=audit_log,
             )

@@ -39,6 +39,7 @@ factory; tests inject fakes and never touch the network.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime
 from typing import Dict, List, Optional, Union
 
@@ -57,6 +58,20 @@ logger = logging.getLogger(__name__)
 #: Sentinel: "auto-wire the daily-loss gate when a kill switch is given".
 #: Distinct from None, which disables the rail explicitly.
 _AUTO = object()
+
+#: Default fat-finger threshold for the LIVE broker: a limit price more than
+#: 50% from the current price (or a spread net price beyond the same fraction
+#: of its defined-risk strike ceiling) is REFUSED. Generous so a legitimately
+#: far-from-market limit still places; only egregious typos block. None on a
+#: LiveEtradeBroker disables the rail.
+DEFAULT_PRICE_SANITY_THRESHOLD = 0.5
+
+
+class PriceSanityError(ValueError):
+    """A limit / spread net price is implausibly far from the market — almost
+    certainly a fat-finger. Raised by the LIVE broker to BLOCK the order before
+    it reaches E*TRADE (the base ExecutionBroker._check_price_sanity stays
+    warn-only for paper)."""
 
 #: Desk structure-leg action -> E*TRADE orderAction, by lifecycle stage.
 #: Desk legs say SHORT (sell-to-open) / BUY (buy-to-open); closing flips.
@@ -98,7 +113,8 @@ class LiveEtradeBroker(ExecutionBroker):
                  kill_switch: Optional[KillSwitch] = None,
                  audit: Optional[AuditLog] = None,
                  circuit_breaker=_AUTO,
-                 price_sanity_threshold: Optional[float] = None):
+                 price_sanity_threshold: Optional[float] =
+                 DEFAULT_PRICE_SANITY_THRESHOLD):
         if isinstance(auth, EtradeClient) or hasattr(auth, "preview_order"):
             self.client: EtradeClient = auth  # prebuilt (or fake) client
             # Surface the client's own gate (if any) for the session.
@@ -116,7 +132,9 @@ class LiveEtradeBroker(ExecutionBroker):
             # this very client (read-only GETs are never gated).
             self.client.circuit_breaker = circuit_breaker
         self.account_id_key = account_id_key
-        # Opt-in fat-finger guard (None disables); see ExecutionBroker.
+        # BLOCKING fat-finger guard, default 50% (None disables). Refuses a
+        # single-instrument limit or a spread net price implausibly far from
+        # the market before it reaches E*TRADE.
         self.price_sanity_threshold = price_sanity_threshold
 
     def _build_daily_loss_gate(self, kill_switch: KillSwitch,
@@ -131,6 +149,62 @@ class LiveEtradeBroker(ExecutionBroker):
                 self.client.get_balances(self.account_id_key)))
 
     # ------------------------------------------------------------------
+    # Fat-finger guards (BLOCKING on the live path)
+    # ------------------------------------------------------------------
+    def _enforce_price_sanity(self, symbol: str,
+                              limit_price: Optional[float]) -> None:
+        """BLOCK a single-instrument order whose limit price is more than
+        price_sanity_threshold away from the current price. No-op when the
+        threshold or limit is None, or the current price is unavailable (the
+        base warn-only check still logs). Raises PriceSanityError to refuse."""
+        threshold = self.price_sanity_threshold
+        if threshold is None or limit_price is None:
+            return
+        try:
+            current = self.get_current_price(symbol)
+        except Exception:  # noqa: BLE001 - a sanity check must never crash place
+            return
+        if current is None or current <= 0:
+            return
+        distance = abs(limit_price - current) / current
+        if distance > threshold:
+            raise PriceSanityError(
+                f"Limit {limit_price:.4f} for {symbol} is {distance * 100:.1f}% "
+                f"from current {current:.4f} (threshold {threshold * 100:.0f}%)"
+                f" — refusing as a likely fat-finger")
+
+    def _enforce_structure_sanity(self, legs: List[Dict],
+                                  net_price: float) -> None:
+        """BLOCK a spread whose net price is non-finite or larger than the
+        package's defined-risk ceiling. Quote-free.
+
+        The legitimate per-share net of a defined-risk spread is bounded by the
+        STRIKE WIDTH (max - min strike), NOT the strike level — so the ceiling
+        is width*(1+threshold). A magnitude typo (e.g. 440.0 entered for 4.40
+        on a 430/440 spread) is then caught even though it is far below any
+        single strike. Single-strike packages (width 0, e.g. a straddle) have
+        no tight quote-free bound, so they fall back to a looser max-strike
+        ceiling that still catches gross 10x-100x typos without false-rejecting
+        a legitimate debit."""
+        threshold = self.price_sanity_threshold
+        if threshold is None:
+            return
+        if not math.isfinite(net_price):
+            raise PriceSanityError(f"Spread net price {net_price} is not finite")
+        strikes = [leg["asset"].strike_price for leg in legs
+                   if getattr(leg.get("asset"), "strike_price", None) is not None]
+        if not strikes:
+            return
+        width = max(strikes) - min(strikes)
+        basis = width if width > 0 else max(strikes)
+        ceiling = basis * (1.0 + threshold)
+        if abs(net_price) > ceiling:
+            raise PriceSanityError(
+                f"Spread net price {net_price:.4f} exceeds the {ceiling:.2f} "
+                f"defined-risk ceiling (strike width {width:.2f}, threshold "
+                f"{threshold * 100:.0f}%) — refusing as a likely fat-finger")
+
+    # ------------------------------------------------------------------
     # ExecutionBroker ABC
     # ------------------------------------------------------------------
     def place_order(self, asset: Asset, order_type: OrderType, quantity: int,
@@ -143,7 +217,7 @@ class LiveEtradeBroker(ExecutionBroker):
         closes it (SELL_CLOSE). Short option exposure is only ever opened
         as part of a defined-risk structure via place_structure().
         """
-        self._check_price_sanity(asset.symbol, limit_price)
+        self._enforce_price_sanity(asset.symbol, limit_price)
         action = "BUY" if order_type == OrderType.BUY else "SELL"
         if asset.asset_type is AssetType.STOCK:
             request = build_equity_order(asset.symbol, action, quantity,
@@ -175,6 +249,7 @@ class LiveEtradeBroker(ExecutionBroker):
             closing: False maps SHORT->SELL_OPEN / BUY->BUY_OPEN; True
                 flips to BUY_CLOSE / SELL_CLOSE to unwind.
         """
+        self._enforce_structure_sanity(legs, net_price)
         action_map = _CLOSE_ACTIONS if closing else _ENTRY_ACTIONS
         spread_legs = []
         for leg in legs:
