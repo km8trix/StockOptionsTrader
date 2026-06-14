@@ -57,6 +57,33 @@ class CrossDeskCapitalAllocator:
     # ------------------------------------------------------------------
     # Weighting
     # ------------------------------------------------------------------
+    @staticmethod
+    def degenerate_desks(returns_by_desk: Dict[str, Sequence[float]]
+                         ) -> Dict[str, str]:
+        """Map each desk whose returns cannot be inverse-vol weighted to the
+        reason it is degenerate ('<2 finite returns', 'degenerate vol ...', or
+        'unusable returns (...)'). An empty dict means risk parity is
+        well-defined for EVERY desk. This is the single definition of the
+        degeneracy rule — risk_parity_weights consults it before deciding to
+        fall back, and callers (e.g. DynamicReweighter) consult it to record
+        WHY a rebalance fell back to equal weight, instead of silently
+        emitting equal weights that look like a real risk-parity decision.
+        """
+        degenerate: Dict[str, str] = {}
+        for key, returns in returns_by_desk.items():
+            try:
+                arr = np.asarray(list(returns), dtype=float)
+                arr = arr[np.isfinite(arr)]
+                if arr.size < 2:
+                    degenerate[key] = '<2 finite returns'
+                    continue
+                vol = float(arr.std())
+                if not np.isfinite(vol) or vol <= 0.0:
+                    degenerate[key] = f'degenerate vol {vol:g}'
+            except Exception as exc:  # malformed / non-numeric series
+                degenerate[key] = f'unusable returns ({exc})'
+        return degenerate
+
     def risk_parity_weights(self,
                             returns_by_desk: Dict[str, Sequence[float]]
                             ) -> Dict[str, float]:
@@ -70,26 +97,25 @@ class CrossDeskCapitalAllocator:
         keys = list(returns_by_desk.keys())
         if not keys:
             return {}
-        try:
-            inv_vol: Dict[str, float] = {}
-            for key in keys:
-                arr = np.asarray(returns_by_desk[key], dtype=float)
-                arr = arr[np.isfinite(arr)]
-                if arr.size < 2:
-                    raise ValueError(f"desk '{key}': <2 finite returns")
-                vol = float(arr.std())
-                if not np.isfinite(vol) or vol <= 0.0:
-                    raise ValueError(f"desk '{key}': degenerate vol {vol}")
-                inv_vol[key] = 1.0 / vol
-            total = sum(inv_vol.values())
-            if not np.isfinite(total) or total <= 0.0:
-                raise ValueError("inverse-vol weights do not sum positive")
-            return {key: self.target_gross * inv_vol[key] / total
-                    for key in keys}
-        except Exception as exc:
+        degenerate = self.degenerate_desks(returns_by_desk)
+        if degenerate:
             logger.warning(
-                "Risk-parity allocation fell back to equal weight: %s", exc)
+                "Risk-parity allocation fell back to equal weight: %s",
+                degenerate)
             return self._equal_weight(keys)
+        inv_vol: Dict[str, float] = {}
+        for key in keys:
+            arr = np.asarray(list(returns_by_desk[key]), dtype=float)
+            arr = arr[np.isfinite(arr)]
+            inv_vol[key] = 1.0 / float(arr.std())
+        total = sum(inv_vol.values())
+        if not np.isfinite(total) or total <= 0.0:
+            logger.warning(
+                "Risk-parity inverse-vol weights do not sum positive (%s); "
+                "falling back to equal weight", total)
+            return self._equal_weight(keys)
+        return {key: self.target_gross * inv_vol[key] / total
+                for key in keys}
 
     def _equal_weight(self, keys: Sequence[str]) -> Dict[str, float]:
         keys = list(keys)

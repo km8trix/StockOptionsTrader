@@ -1,0 +1,162 @@
+"""
+Dynamic capital reweighter — in-run, walk-forward-honest risk parity.
+
+CrossDeskCapitalAllocator turns per-desk return series into risk-parity
+weights, but only at CONSTRUCTION time (run each desk solo, weight once, then
+build the fund). This module lifts that to a DYNAMIC, in-run rebalance using
+the shadow-solo-book design chosen for the fund: the caller precomputes each
+desk's STANDALONE equity curve (a single-desk backtest over the same window,
+run at full NAV so the curve is an undistorted measure of that desk's solo
+risk), and the reweighter slices those curves to the rebalance date, derives
+returns, risk-parity-weights them, and writes the weights into the LIVE fund
+desks' capital_allocation for the next window.
+
+WHY SHADOW-SOLO (not per-desk attribution on the unified book): the fund is one
+netted book with no per-desk P&L ledger; attributing realized pnl back to desks
+through blended entry prices, partial closes and the account-wide apply_risk is
+both treacherous AND produces a signal COUPLED across desks (a desk's measured
+return would depend on whatever netted against it). Each desk's solo curve is
+the clean, textbook risk-parity input and needs no attribution surgery.
+
+WALK-FORWARD HONESTY: on_day only ever reads curve points dated on/before the
+rebalance date, and a desk's solo curve is itself causal (the single-desk
+engine uses expanding-window indicators and the desk's own walk-forward
+fitting), so no future information can reach a weight. Weights are FRACTIONS of
+the account (they sum to the allocator's target_gross <= 1.0), so applying them
+never moves cash or breaks the equity curve — only the NEXT window's sizing
+changes.
+
+ADDITIVE: a fund run without a reweighter is unchanged; single-desk and
+strategy runs never touch this path.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+
+import pandas as pd
+
+from desks.capital_allocator import CrossDeskCapitalAllocator
+
+if TYPE_CHECKING:  # annotation only — avoids a runtime import cycle
+    from desks.base import Desk
+
+logger = logging.getLogger(__name__)
+
+#: Tolerance on the post-rebalance weight sum (<= 1.0) defence-in-depth check.
+_SUM_TOL = 1e-9
+
+
+class DynamicReweighter:
+    """Periodically reweights a fund's desks from their standalone curves.
+
+    Pre-load each desk's solo equity curve via set_curves, then call on_day
+    once per simulated trading day; on a rebalance boundary it sets each live
+    desk's capital_allocation in place and records the rebalance.
+    """
+
+    def __init__(self,
+                 allocator: Optional[CrossDeskCapitalAllocator] = None,
+                 rebalance_every: int = 21,
+                 warmup: int = 0):
+        if rebalance_every < 1:
+            raise ValueError(
+                f"rebalance_every must be >= 1; got {rebalance_every}")
+        if warmup < 0:
+            raise ValueError(f"warmup must be >= 0; got {warmup}")
+        self.allocator = allocator or CrossDeskCapitalAllocator()
+        self.rebalance_every = int(rebalance_every)
+        self.warmup = int(warmup)
+        self._curves: Dict[str, List[Tuple[pd.Timestamp, float]]] = {}
+        #: Append-only audit of every rebalance actually applied.
+        self.rebalance_log: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # Curve loading
+    # ------------------------------------------------------------------
+    def set_curves(self,
+                   curves: Dict[str, Sequence[Tuple[object, float]]]) -> None:
+        """Load each desk's standalone equity curve as (timestamp, value)
+        pairs. Stored sorted by timestamp with values coerced to float;
+        replaces any previously loaded curves. A desk with no curve here is
+        degenerate at rebalance time and triggers the allocator's WHOLE-FUND
+        equal-weight fallback (every desk shares equally, not just the missing
+        one); on_day records that in the rebalance log so it is not mistaken
+        for a genuine risk-parity result."""
+        stored: Dict[str, List[Tuple[pd.Timestamp, float]]] = {}
+        for key, pairs in curves.items():
+            seq = [(pd.Timestamp(ts), float(val)) for ts, val in pairs]
+            seq.sort(key=lambda pair: pair[0])
+            stored[key] = seq
+        self._curves = stored
+
+    # ------------------------------------------------------------------
+    # Schedule
+    # ------------------------------------------------------------------
+    def is_rebalance_day(self, day_number: int) -> bool:
+        """True on a rebalance boundary: strictly past the warmup, then every
+        ``rebalance_every`` trading days (day_number is 1-based)."""
+        if day_number <= self.warmup:
+            return False
+        return (day_number - self.warmup) % self.rebalance_every == 0
+
+    # ------------------------------------------------------------------
+    # Per-day hook
+    # ------------------------------------------------------------------
+    def on_day(self, desks: Sequence['Desk'], date,
+               day_number: int) -> Optional[Dict[str, float]]:
+        """Called once per simulated day. On a rebalance boundary, recompute
+        risk-parity weights from each desk's curve sliced to ``date`` and write
+        them into desk.capital_allocation, returning the weights. Returns None
+        on non-boundary days (a no-op)."""
+        if not self.is_rebalance_day(day_number):
+            return None
+        as_of = pd.Timestamp(date)
+        returns_by_desk: Dict[str, List[float]] = {}
+        for desk in desks:
+            points = self._curves.get(desk.key, [])
+            # Walk-forward honesty: only points observable on/before today.
+            values = [value for ts, value in points if ts <= as_of]
+            returns_by_desk[desk.key] = \
+                self.allocator.returns_from_equity(values)
+
+        # Record WHY (if at all) this rebalance is degenerate, so an
+        # equal-weight fallback is auditable rather than masquerading as a real
+        # risk-parity decision (a flat/missing/short solo curve forces the
+        # allocator's WHOLE-FUND equal-weight fallback).
+        degraded = self.allocator.degenerate_desks(returns_by_desk)
+        weights = self.allocator.risk_parity_weights(returns_by_desk)
+
+        # Defence-in-depth: the allocator scales weights to target_gross <= 1.0,
+        # so this is unreachable with the stock allocator — but the fund does
+        # NOT re-validate the sum after a mid-run write, so assert the contract
+        # loudly at the mutation site rather than over-deploying silently.
+        total = sum(weights.values())
+        if total > 1.0 + _SUM_TOL:
+            logger.error(
+                "Reweight on %s (day %d) produced weights summing to %.6f > 1.0"
+                " — over-leverage risk; check the allocator", as_of.date(),
+                day_number, total)
+
+        for desk in desks:
+            if desk.key in weights:
+                desk.capital_allocation = weights[desk.key]
+
+        self.rebalance_log.append({
+            'date': as_of,
+            'day_number': day_number,
+            'weights': dict(weights),
+            'fallback': bool(degraded),
+            'degraded_desks': sorted(degraded),
+        })
+        if degraded:
+            logger.warning(
+                "Fund reweight on %s (day %d) fell back to EQUAL WEIGHT; "
+                "degraded desks: %s", as_of.date(), day_number, degraded)
+        else:
+            logger.info("Fund reweight on %s (day %d): %s",
+                        as_of.date(), day_number,
+                        {key: round(weight, 4)
+                         for key, weight in weights.items()})
+        return weights

@@ -63,6 +63,7 @@ from strategies.base import Strategy
 
 if TYPE_CHECKING:  # annotation only — avoids any import-order coupling
     from desks.orchestrator import FundOrchestrator
+    from desks.dynamic_reweighter import DynamicReweighter
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +83,17 @@ class BacktestEngine:
                  desk: Optional[Desk] = None,
                  spread_pct: float = 0.02,
                  per_contract_commission: float = 0.65,
-                 orchestrator: Optional['FundOrchestrator'] = None):
+                 orchestrator: Optional['FundOrchestrator'] = None,
+                 reweighter: Optional['DynamicReweighter'] = None):
         if sum(driver is not None
                for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
                 "Provide exactly one of strategy=, desk= or orchestrator= "
                 "to BacktestEngine")
+        if reweighter is not None and orchestrator is None:
+            raise ValueError(
+                "reweighter= requires orchestrator= (dynamic reweighting only "
+                "applies to a fund of desks)")
         self.strategy = strategy
         self.desk = desk
         # Fund mode: an orchestrator drives N desks against the shared
@@ -95,6 +101,10 @@ class BacktestEngine:
         # (capital_allocation, price_option, notes, walk_forward_fits), so
         # the desk-mode fill/mark/settle/report paths work for it too.
         self.orchestrator = orchestrator
+        # Optional dynamic reweighter (fund mode): consulted once per day after
+        # the snapshot to shift desk capital_allocation for the next window.
+        # None -> a fund runs at its construction-time weights, unchanged.
+        self.reweighter = reweighter
         self.portfolio = PortfolioManager(initial_capital)
         self.commission = commission
         self.slippage_bps = slippage_bps
@@ -241,6 +251,19 @@ class BacktestEngine:
 
             # --- PHASE 4: RECORD SNAPSHOT ---
             self.portfolio.record_snapshot(date)
+
+            # --- FUND REWEIGHT (optional, fund mode): on a rebalance boundary
+            # shift each desk's capital_allocation from its standalone curve so
+            # the NEXT day's intent generation/sizing uses the new weights.
+            # Runs AFTER the snapshot so today's close is observable and no
+            # already-generated intent is retroactively resized. ---
+            if self.reweighter is not None:
+                weights = self.reweighter.on_day(
+                    self.orchestrator.desks, date, day_number)
+                if weights is not None:
+                    self.orchestrator.active_capital = sum(
+                        desk.capital_allocation
+                        for desk in self.orchestrator.desks)
 
             if progress_callback is not None:
                 if day_number == total_days:
@@ -867,5 +890,15 @@ class BacktestEngine:
                     'active_capital': self.orchestrator.active_capital,
                     'conflicts_resolved': self.orchestrator.conflicts_resolved,
                 }
+                # Dynamic reweighting audit (additive; only when a reweighter
+                # drove this fund). Non-reweighted fund reports are unchanged.
+                if self.reweighter is not None:
+                    report['reweight_log'] = [
+                        {'date': entry['date'].strftime('%Y-%m-%d'),
+                         'day_number': entry['day_number'],
+                         'weights': entry['weights'],
+                         'fallback': entry['fallback'],
+                         'degraded_desks': entry['degraded_desks']}
+                        for entry in self.reweighter.rebalance_log]
 
         return report
