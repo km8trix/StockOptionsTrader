@@ -66,7 +66,8 @@ logger = logging.getLogger(__name__)
 
 ETRADE_AUTH_IMPORT_ERROR: str | None
 try:
-    from brokers.etrade_auth import EtradeAuthManager, EtradeNotConfigured
+    from brokers.etrade_auth import (EtradeAuthError, EtradeAuthManager,
+                                      EtradeNotConfigured)
     ETRADE_AUTH_IMPORT_ERROR = None
 except Exception as e:  # noqa: BLE001 - any import failure disables the surface
     EtradeAuthManager = None
@@ -76,7 +77,11 @@ except Exception as e:  # noqa: BLE001 - any import failure disables the surface
         ETRADE_AUTH_IMPORT_ERROR,
     )
 
-    class EtradeNotConfigured(Exception):
+    class EtradeAuthError(Exception):
+        """Placeholder base so except-clauses stay valid while the backend
+        surface is absent (never raised through this fallback)."""
+
+    class EtradeNotConfigured(EtradeAuthError):
         """Placeholder so except-clauses stay valid while the backend
         surface is absent (never raised through this fallback)."""
 
@@ -763,6 +768,14 @@ def auth_start():
     except EtradeNotConfigured as e:
         return jsonify({'error': 'E*TRADE not configured',
                         'reason': str(e)}), 503
+    except EtradeAuthError as e:
+        # E*TRADE rejected the request_token call (e.g. bad / not-yet-approved
+        # production keys, or a key/secret mismatch). The message redacts the
+        # consumer key; surface it so the operator sees the actual oauth_problem
+        # instead of a blind 500.
+        logger.error('E*TRADE authorization failed: %s', e)
+        return jsonify({'error': 'Failed to start authorization',
+                        'reason': str(e)}), 502
     except Exception:
         logger.error('Failed to start E*TRADE authorization', exc_info=True)
         return jsonify({'error': 'Failed to start authorization'}), 500
@@ -783,6 +796,10 @@ def auth_verifier():
     except EtradeNotConfigured as e:
         return jsonify({'error': 'E*TRADE not configured',
                         'reason': str(e)}), 503
+    except EtradeAuthError as e:
+        logger.error('E*TRADE verifier exchange failed: %s', e)
+        return jsonify({'error': 'Failed to submit verifier code',
+                        'reason': str(e)}), 502
     except Exception:
         logger.error('Failed to submit verifier code', exc_info=True)
         return jsonify({'error': 'Failed to submit verifier code'}), 500
@@ -805,6 +822,10 @@ def auth_renew():
     except EtradeNotConfigured as e:
         return jsonify({'error': 'E*TRADE not configured',
                         'reason': str(e)}), 503
+    except EtradeAuthError as e:
+        logger.error('E*TRADE token renew failed: %s', e)
+        return jsonify({'error': 'Failed to renew token',
+                        'reason': str(e)}), 502
     except Exception:
         logger.error('Failed to renew E*TRADE token', exc_info=True)
         return jsonify({'error': 'Failed to renew token'}), 500

@@ -2530,6 +2530,53 @@ class TestLiveAuthFlow:
         assert response.get_json() == {
             'error': 'E*TRADE not configured', 'reason': 'consumer keys absent'}
 
+    def test_start_surfaces_etrade_auth_error_reason(self, client, patch_live):
+        """An EtradeAuthError (e.g. E*TRADE rejecting production keys at
+        request_token) surfaces as 502-WITH-REASON, not a blind 500."""
+        import gui.routes.api_live as api_live
+
+        def raising_start():
+            raise api_live.EtradeAuthError(
+                'request_token failed with HTTP 401: '
+                'oauth_problem=signature_invalid')
+
+        patch_live['auth'].start_auth = raising_start
+        response = client.post('/api/live/auth/start')
+
+        assert response.status_code == 502
+        body = response.get_json()
+        assert body['error'] == 'Failed to start authorization'
+        assert 'oauth_problem' in body['reason']
+
+    def test_verifier_surfaces_etrade_auth_error_reason(
+            self, client, patch_live):
+        import gui.routes.api_live as api_live
+
+        def raising_verifier(_code):
+            raise api_live.EtradeAuthError('access_token failed with HTTP 401')
+
+        patch_live['auth'].submit_verifier = raising_verifier
+        response = client.post('/api/live/auth/verifier', json={'code': 'X'})
+
+        assert response.status_code == 502
+        body = response.get_json()
+        assert body['error'] == 'Failed to submit verifier code'
+        assert 'access_token failed' in body['reason']
+
+    def test_renew_surfaces_etrade_auth_error_reason(self, client, patch_live):
+        import gui.routes.api_live as api_live
+
+        def raising_renew():
+            raise api_live.EtradeAuthError('renew failed with HTTP 401')
+
+        patch_live['auth'].renew = raising_renew
+        response = client.post('/api/live/auth/renew')
+
+        assert response.status_code == 502
+        body = response.get_json()
+        assert body['error'] == 'Failed to renew token'
+        assert 'renew failed' in body['reason']
+
     @pytest.mark.parametrize('path,method', [
         ('/api/live/auth/start', 'post'),
         ('/api/live/auth/verifier', 'post'),
