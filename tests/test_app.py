@@ -3157,6 +3157,119 @@ class TestKeepAliveAutoStart:
         api_live._stop_keepalive_best_effort()
 
 
+class FakeAuditEntries:
+    """Minimal AuditLog stand-in returning canned keepalive lifecycle seqs."""
+
+    def __init__(self, started_seq=None, stopped_seq=None):
+        self._started = started_seq
+        self._stopped = stopped_seq
+
+    def entries(self, limit=1, offset=0, event_type=None, ascending=False):
+        seq = None
+        if event_type == 'keepalive_started':
+            seq = self._started
+        elif event_type == 'keepalive_stopped':
+            seq = self._stopped
+        return [{'seq': seq}] if seq is not None else []
+
+
+class TestKeepAliveRestartRecovery:
+    """resume_keepalive_if_desired (Piece 3) — derive the prior intent from
+    the audit log and resume only a connected, operator-started loop."""
+
+    def test_desired_running_started_after_stopped(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'get_audit_log',
+                            lambda: FakeAuditEntries(started_seq=10,
+                                                     stopped_seq=5))
+        assert api_live._keepalive_desired_running() is True
+
+    def test_not_desired_stopped_after_started(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'get_audit_log',
+                            lambda: FakeAuditEntries(started_seq=5,
+                                                     stopped_seq=10))
+        assert api_live._keepalive_desired_running() is False
+
+    def test_not_desired_never_started(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'get_audit_log',
+                            lambda: FakeAuditEntries())
+        assert api_live._keepalive_desired_running() is False
+
+    def test_desired_started_with_no_stop(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'get_audit_log',
+                            lambda: FakeAuditEntries(started_seq=7))
+        assert api_live._keepalive_desired_running() is True
+
+    def test_resume_starts_when_desired_and_connected(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        open(api_live._live_db_path(), 'a').close()  # recovery reads an existing db
+        fake_ka = FakeKeepAlive()
+        api_live.set_keepalive_scheduler(fake_ka)
+        try:
+            monkeypatch.setattr(api_live, 'get_audit_log',
+                                lambda: FakeAuditEntries(started_seq=10))
+            monkeypatch.setattr(api_live, 'get_auth_manager',
+                                lambda: FakeAuthManager(state='connected'))
+            assert api_live.resume_keepalive_if_desired() is True
+            assert 'start' in fake_ka.calls
+        finally:
+            api_live.set_keepalive_scheduler(None)
+
+    def test_resume_noop_when_not_desired(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        open(api_live._live_db_path(), 'a').close()  # recovery reads an existing db
+        fake_ka = FakeKeepAlive()
+        api_live.set_keepalive_scheduler(fake_ka)
+        try:
+            monkeypatch.setattr(api_live, 'get_audit_log',
+                                lambda: FakeAuditEntries(started_seq=5,
+                                                         stopped_seq=10))
+            monkeypatch.setattr(api_live, 'get_auth_manager',
+                                lambda: FakeAuthManager(state='connected'))
+            assert api_live.resume_keepalive_if_desired() is False
+            assert fake_ka.calls == []
+        finally:
+            api_live.set_keepalive_scheduler(None)
+
+    def test_resume_noop_when_token_not_connected(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        open(api_live._live_db_path(), 'a').close()  # recovery reads an existing db
+        fake_ka = FakeKeepAlive()
+        api_live.set_keepalive_scheduler(fake_ka)
+        try:
+            monkeypatch.setattr(api_live, 'get_audit_log',
+                                lambda: FakeAuditEntries(started_seq=10))
+            monkeypatch.setattr(api_live, 'get_auth_manager',
+                                lambda: FakeAuthManager(state='expired'))
+            assert api_live.resume_keepalive_if_desired() is False
+            assert fake_ka.calls == []
+        finally:
+            api_live.set_keepalive_scheduler(None)
+
+    def test_create_app_invokes_restart_recovery(self, monkeypatch):
+        import gui.routes.api_live as api_live
+        from gui.app import create_app
+        called = []
+        monkeypatch.setattr(api_live, 'resume_keepalive_if_desired',
+                            lambda: called.append(True) or False)
+        create_app({'TESTING': True})
+        assert called == [True]
+
+    def test_resume_creates_no_db_when_no_persistent_db(
+            self, monkeypatch, tmp_path):
+        """With no TRADING_DB_PATH and no existing default db file, recovery
+        must be a no-op and must NOT create a db file (app construction stays
+        side-effect free in a fresh cwd)."""
+        import gui.routes.api_live as api_live
+        monkeypatch.delenv('TRADING_DB_PATH', raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert api_live.resume_keepalive_if_desired() is False
+        assert list(tmp_path.rglob('*.db')) == []
+
+
 class TestLiveTraderConstruction:
     """api_trading's live construction site now goes through the C16 auth
     manager (Phase 9) — the env-token constructor is gone."""

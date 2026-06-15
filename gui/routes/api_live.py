@@ -151,7 +151,7 @@ try:
 except Exception as e:  # noqa: BLE001
     TokenKeepAliveScheduler = None
     KEEPALIVE_INTERVAL_MIN = 1
-    KEEPALIVE_INTERVAL_MAX = 90
+    KEEPALIVE_INTERVAL_MAX = 60  # mirror the real constant if the import fails
     KEEPALIVE_IMPORT_ERROR = f'{type(e).__name__}: {e}'
     logger.error(
         'Failed to import TokenKeepAliveScheduler — keep-alive is '
@@ -474,6 +474,77 @@ def _stop_keepalive_best_effort() -> None:
     except Exception:  # noqa: BLE001 - never break disconnect
         logger.warning('Could not stop token keep-alive after disconnect',
                        exc_info=True)
+
+
+def _keepalive_desired_running() -> bool:
+    """Was keep-alive's LAST EXPLICIT intent 'start' (not 'stop')?
+
+    Derived from the persistent audit log so the intent survives a process
+    restart: compare the most-recent 'keepalive_started' vs 'keepalive_stopped'
+    sequence. A 'keepalive_paused' (token_expired / renew_failure_storm) is NOT
+    an explicit stop — it does not flip the intent (we just can't act on it
+    until the token reconnects, which the caller's connected-guard enforces).
+    """
+    audit = get_audit_log()
+    if audit is None:
+        return False
+    try:
+        started = audit.entries(limit=1, event_type='keepalive_started')
+        stopped = audit.entries(limit=1, event_type='keepalive_stopped')
+    except Exception:  # noqa: BLE001 - best-effort; absence means "not desired"
+        logger.warning('Could not read keep-alive intent from audit',
+                       exc_info=True)
+        return False
+    if not started:
+        return False
+    started_seq = started[0].get('seq')
+    stopped_seq = stopped[0].get('seq') if stopped else None
+    if started_seq is None:
+        return False
+    return stopped_seq is None or started_seq > stopped_seq
+
+
+def resume_keepalive_if_desired() -> bool:
+    """Restart recovery: after a process restart, resume the keep-alive loop
+    IFF its last explicit intent was 'start' AND the token is currently
+    connected (same ET day, still active in the DB). Returns True if it
+    (re)started the loop.
+
+    Conservative by construction: it can only ever resume a RENEW-ONLY loop
+    the operator had already started, for a token that is still live — it
+    never starts trading and never resurrects a dead token. Best-effort:
+    a failure here must never break app startup.
+    """
+    try:
+        # Never CREATE a db file just to look for a recovery intent: recovery
+        # reads PRIOR audit rows, so if the db file does not already exist
+        # there is nothing to recover. Guarding on existence (not just
+        # TRADING_DB_PATH) keeps app construction side-effect free even when a
+        # path is configured but no file has been written yet.
+        if not os.path.exists(_live_db_path()):
+            return False
+        if not _keepalive_desired_running():
+            return False
+        # The connected-guard binds recovery to THIS env's live token: even if
+        # the most-recent 'started' intent came from a different env sharing
+        # the db, we only ever resume the renew-only loop bound to the current
+        # auth manager, and only when its own token is connected — so a
+        # cross-env intent can at worst keep a token the operator is already
+        # holding warm. It can never trade or resurrect a dead token.
+        manager = get_auth_manager()
+        if manager is None or manager.status().get('state') != 'connected':
+            return False
+        scheduler = get_keepalive_scheduler()
+        if scheduler is None:
+            return False
+        resumed = scheduler.start()
+        if resumed:
+            logger.info('Keep-alive resumed after restart (token connected, '
+                        'last intent was start)')
+        return resumed
+    except Exception:  # noqa: BLE001 - never break app startup
+        logger.warning('Keep-alive restart-recovery failed', exc_info=True)
+        return False
 
 
 def kill_switch_engaged() -> bool:

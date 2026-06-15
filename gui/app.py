@@ -89,6 +89,19 @@ def create_app(config: dict | None = None) -> Flask:
     app.register_blueprint(floor_bp)
     app.register_blueprint(live_bp)
 
+    # Restart recovery: if the operator had the token keep-alive loop running
+    # (last explicit intent was 'start') and the E*TRADE token is still
+    # connected, resume the renew-only loop so a process restart does not
+    # silently let the session idle out. Best-effort and short-circuiting —
+    # a fresh process with no prior 'start' intent does nothing. It can only
+    # ever resume a renew-only loop for a live token; it never trades.
+    try:
+        from gui.routes.api_live import resume_keepalive_if_desired
+        resume_keepalive_if_desired()
+    except Exception:  # pragma: no cover - never block app startup
+        logger.warning('Keep-alive restart-recovery hook failed',
+                       exc_info=True)
+
     @app.context_processor
     def inject_kill_switch_banner():
         """Kill-switch banner state for base.html (Phase 9).

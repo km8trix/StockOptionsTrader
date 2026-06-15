@@ -1514,6 +1514,7 @@ async function stopScheduler() {
 let kaIntervalDirty = false;
 let lastKeepalive = null;     // last /api/live/keepalive payload (for the banner)
 let reauthNotified = false;   // de-dupe the browser notification per re-auth event
+let lastKaPausedReason = null; // de-dupe the renew-failure alert to transitions
 
 function paintKaState(kind, detail) {
     const state = document.getElementById('kaState');
@@ -1528,9 +1529,11 @@ function paintKaState(kind, detail) {
 }
 
 function renderKeepAlive(data) {
-    const running = !!(data && data.running === true);
-    const pausedReason = data ? data.paused_reason : null;
-    lastKeepalive = data || null;
+    if (!data) { renderKeepAliveUnavailable('Keep-alive status unavailable.'); return; }
+    const running = data.running === true;
+    const pausedReason = data.paused_reason;
+    lastKeepalive = data;
+    maybeAlertRenewStorm(pausedReason);
 
     if (running) {
         paintKaState('running',
@@ -1739,6 +1742,28 @@ function maybeNotifyReauth(needed) {
             new Notification('E*TRADE re-authentication needed', {
                 body: 'The daily token has expired. Reconnect to resume '
                     + 'live access.',
+            });
+        } catch (_) { /* notifications are best-effort */ }
+    }
+}
+
+/** Renew-failure alerting: when the keep-alive loop newly pauses for a
+    renew_failure_storm (repeated renew failures), surface it beyond the card
+    — a toast plus an opt-in browser notification — so the operator notices
+    the session is failing even if they are not watching the card. Fires only
+    on the TRANSITION into the storm (de-duped on paused_reason). */
+function maybeAlertRenewStorm(pausedReason) {
+    if (pausedReason === lastKaPausedReason) return;
+    lastKaPausedReason = pausedReason;
+    if (pausedReason !== 'renew_failure_storm') return;
+    showToast('error', 'Token keep-alive paused: repeated renew failures. '
+        + 'The E*TRADE session may be failing — check the connection.');
+    if (typeof Notification !== 'undefined'
+            && Notification.permission === 'granted') {
+        try {
+            new Notification('Token keep-alive paused', {
+                body: 'Repeated renew failures — the E*TRADE session may be '
+                    + 'failing.',
             });
         } catch (_) { /* notifications are best-effort */ }
     }
