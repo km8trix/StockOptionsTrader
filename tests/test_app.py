@@ -3933,6 +3933,37 @@ class TestLauncherEnvHygiene:
         assert captured['kwargs'].get('load_dotenv') is False
 
 
+class TestStartScript:
+    """start.sh is the explicit-operator-action launcher: it sources .env in
+    the operator's shell, then runs run_gui.py — WITHOUT weakening run_gui.py's
+    no-silent-load control (TestLauncherEnvHygiene)."""
+
+    def test_start_script_exists_and_is_executable(self):
+        import os
+        script = REPO_ROOT / 'start.sh'
+        assert script.is_file(), 'start.sh is missing'
+        assert os.access(str(script), os.X_OK), 'start.sh is not executable'
+
+    def test_start_script_sources_env_then_runs_launcher(self):
+        text = (REPO_ROOT / 'start.sh').read_text()
+        # set -a / set +a bracket the source so .env vars are EXPORTED.
+        assert 'set -a' in text and 'set +a' in text
+        assert 'source .env' in text
+        assert 'run_gui.py' in text
+
+    def test_start_script_is_valid_bash(self):
+        import subprocess
+        result = subprocess.run(
+            ['bash', '-n', str(REPO_ROOT / 'start.sh')],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    def test_wrapper_does_not_touch_launcher_security_control(self):
+        # The wrapper must NOT have changed run_gui.py's deliberate control.
+        text = (REPO_ROOT / 'run_gui.py').read_text()
+        assert 'load_dotenv=False' in text
+
+
 class TestGetClientNoDeadlock:
     """Regression for the singleton-lock self-deadlock: get_client() holds
     _singleton_lock while calling get_kill_switch()/get_audit_log(), which
