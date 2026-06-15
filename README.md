@@ -63,11 +63,19 @@ code, images, or compose files.
 | `SECRET_KEY` | insecure dev value | Flask session signing key; set a real one in production |
 | `TRADING_DB_PATH` | `trading_data.db` (image: `/data/trading_data.db`) | SQLite file used by the trade DB, OHLCV cache, and options/IV store |
 | `LOG_LEVEL` | `INFO` | Root logging level |
-| `ETRADE_CONSUMER_KEY` | — | E*TRADE OAuth consumer key |
-| `ETRADE_CONSUMER_SECRET` | — | E*TRADE OAuth consumer secret |
-| `ETRADE_ACCESS_TOKEN` | — | E*TRADE OAuth access token |
-| `ETRADE_ACCESS_SECRET` | — | E*TRADE OAuth access secret |
-| `ETRADE_ACCOUNT_ID_KEY` | — | E*TRADE account id key |
+| `ETRADE_ENV` | `sandbox` | `sandbox` or `production` — selects the host and which consumer-key pair is read |
+| `ETRADE_ALLOW_NETWORK` | unset | Must be `1` to allow **any** real E*TRADE network call (sandbox included) |
+| `ETRADE_PRODUCTION_ACK` | unset | Must equal `I_UNDERSTAND_LIVE_TRADING` to construct a **production** auth manager |
+| `ETRADE_SANDBOX_CONSUMER_KEY` / `_SECRET` | — | Sandbox OAuth consumer key/secret (used when `ETRADE_ENV=sandbox`) |
+| `ETRADE_PROD_CONSUMER_KEY` / `_SECRET` | — | Production OAuth consumer key/secret (used when `ETRADE_ENV=production`) |
+| `ETRADE_CONSUMER_KEY` / `_SECRET` | — | Generic fallback consumer key/secret (used only if the env-prefixed pair is unset) |
+| `ETRADE_ACCOUNT_ID_KEY` | — | E*TRADE account id key (anchors the daily-loss gate + account-match guard) |
+
+> **Live trading:** launch with **`./start.sh`** (it sources `.env`; the app
+> never auto-loads it). The OAuth **access token/secret are obtained via the
+> connect flow and stored in SQLite — they are not read from `.env`.** Full
+> walkthrough (sandbox → production, the gates, daily re-auth, troubleshooting)
+> is in **[docs/ETRADE_SETUP.md](docs/ETRADE_SETUP.md)**.
 
 Cache behaviour (OHLCV coverage/staleness, options chains, IV history) is
 keyed off `TRADING_DB_PATH`; there are no separate cache env knobs today.
