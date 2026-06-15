@@ -178,7 +178,11 @@ async function fetchJSON(url, opts = {}) {
     }
     if (!response.ok) {
         const msg = (data && data.error) || `Request failed (${response.status})`;
-        if (!silent) showToast('error', msg);
+        // Surface the server's `reason` (the 503-with-reason pattern) so the
+        // toast is self-explanatory instead of a dead-end generic error.
+        // These reasons carry config/diagnostic hints, never secrets.
+        const reason = data && data.reason;
+        if (!silent) showToast('error', reason ? `${msg} — ${reason}` : msg);
         const error = new Error(msg);
         error.status = response.status;
         error.body = data;
