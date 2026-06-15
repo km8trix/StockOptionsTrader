@@ -15,6 +15,28 @@
     <span id="envBadge" class="env-badge env-unknown ms-auto">CHECKING…</span>
 </div>
 
+<!-- Morning reconnect prompt. Hidden until live.js detects the daily token
+     needs re-auth (expired, or keep-alive paused for re-auth) — unmissable at
+     the top so the once-a-day re-authorization is a deliberate ritual, not a
+     surprise mid-session 401. "Enable alerts" opts into a browser
+     notification the next time re-auth becomes due. -->
+<div id="reconnectBanner" class="reconnect-banner d-none" role="alert">
+    <i class="bi bi-shield-lock-fill reconnect-icon" aria-hidden="true"></i>
+    <div class="reconnect-text">
+        <strong id="reconnectTitle">E*TRADE re-authentication needed</strong>
+        <span id="reconnectDetail">The daily token has expired — reconnect to
+            resume live access.</span>
+    </div>
+    <div class="reconnect-actions">
+        <button type="button" class="btn btn-light btn-sm" id="btnReconnectNow">
+            <i class="bi bi-plug-fill" aria-hidden="true"></i> Reconnect
+        </button>
+        <button type="button" class="btn btn-outline-light btn-sm" id="btnEnableAlerts">
+            <i class="bi bi-bell" aria-hidden="true"></i> Enable alerts
+        </button>
+    </div>
+</div>
+
 <div class="row g-3">
     <!-- ==================== CONNECTION ==================== -->
     <div class="col-lg-7">
@@ -465,6 +487,68 @@
                     are checked inside every evaluation — any halt pauses the
                     scheduler until it is manually started again. Both actions
                     require confirmation and are audit-logged.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== TOKEN KEEP-ALIVE ==================== -->
+    <!-- Renew-only loop that keeps the E*TRADE session warm through the day.
+         It NEVER trades. ALL dynamic fields are painted by live.js from GET
+         /api/live/keepalive, plus a token-expiry countdown derived from the
+         connection status. Starts automatically on connect; pauses at the
+         midnight-ET expiry until the operator reconnects. -->
+    <div class="col-12">
+        <div class="card" id="keepaliveCard">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-heart-pulse" aria-hidden="true"></i> Token keep-alive</span>
+                <span class="card-header-hint">renew-only · never trades · pauses at midnight ET</span>
+            </div>
+            <div class="card-body" aria-live="polite">
+                <div class="d-flex flex-wrap align-items-center gap-3 mb-2">
+                    <div id="kaState" class="ks-state ks-unknown">
+                        <i class="bi bi-question-circle" aria-hidden="true"></i>
+                        <span id="kaStateLabel">UNKNOWN</span>
+                    </div>
+                    <p id="kaStateDetail" class="ks-detail mb-0">
+                        Keep-alive state has not been read yet.
+                    </p>
+                </div>
+                <div class="ka-expiry mb-2" id="kaExpiryWrap">
+                    <span class="ka-expiry-label">
+                        <i class="bi bi-hourglass-split" aria-hidden="true"></i>
+                        Token expires (midnight ET) in
+                    </span>
+                    <span class="ka-expiry-value num" id="kaExpiry">—</span>
+                </div>
+                <dl class="sched-stats">
+                    <dt>Interval</dt><dd class="num" id="kaInterval">—</dd>
+                    <dt>Last renew</dt><dd class="num" id="kaLastRenew">—</dd>
+                    <dt>Next renew</dt><dd class="num" id="kaNextRun">—</dd>
+                    <dt>Renews today</dt><dd class="num" id="kaRenewsToday">—</dd>
+                    <dt>Consecutive failures</dt><dd class="num" id="kaFailures">—</dd>
+                </dl>
+                <div class="d-flex flex-wrap align-items-end gap-2">
+                    <div>
+                        <label class="form-label" for="kaIntervalInput">Interval (minutes)</label>
+                        <input type="number" class="form-control sched-interval-input"
+                               id="kaIntervalInput" min="1" max="60" step="1"
+                               inputmode="numeric" placeholder="15">
+                        <div class="invalid-feedback">Enter a whole number of minutes between 1 and 60.</div>
+                    </div>
+                    <button type="button" class="btn btn-primary" id="btnKaStart" disabled>
+                        <i class="bi bi-play-fill" aria-hidden="true"></i> Start keep-alive
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary" id="btnKaStop" disabled>
+                        <i class="bi bi-stop-fill" aria-hidden="true"></i> Stop
+                    </button>
+                </div>
+                <p class="ks-footnote mt-2">
+                    Calls renew() on the interval during NYSE hours to clear
+                    E*TRADE's ~2h idle timeout — it cannot place an order or
+                    bypass the midnight-ET re-auth. Starts automatically when
+                    you connect and pauses at the daily expiry until you
+                    reconnect.
                 </p>
             </div>
         </div>

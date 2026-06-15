@@ -1078,6 +1078,50 @@ th.sortable .sort-arrow {
 
 .kill-banner-link:hover { color: #fff; }
 
+/* Morning reconnect prompt (live.html): shown only when re-auth is due. */
+.reconnect-banner {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    background-color: var(--warn, #b8860b);
+    color: #fff;
+    border-radius: var(--radius, 6px);
+    padding: var(--sp-2) var(--sp-3);
+    margin-bottom: var(--sp-3);
+}
+
+.reconnect-icon { font-size: 20px; flex: 0 0 auto; }
+
+.reconnect-text { display: flex; flex-direction: column; line-height: 1.3; }
+.reconnect-text strong { font-size: 13px; }
+.reconnect-text span { font-size: 12px; opacity: 0.92; }
+
+.reconnect-actions {
+    margin-left: auto;
+    display: flex;
+    gap: var(--sp-2);
+    flex: 0 0 auto;
+}
+
+/* Token-expiry countdown (keep-alive card). */
+.ka-expiry {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+    font-size: 12px;
+}
+
+.ka-expiry-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.ka-expiry-value { font-size: 16px; font-weight: 700; }
+.ka-expiry-value.expiring { color: var(--loss); }
+.ka-expiry-value.expired { color: var(--loss); }
+
 /* Nav env/connection dot next to the Live link (painted by live.js only) */
 .nav-live-dot {
     display: inline-block;

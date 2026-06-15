@@ -3004,6 +3004,21 @@ class TestLiveSchedulerEndpoint:
         ):
             assert marker in html, f'/live missing {marker}'
 
+    def test_live_page_ships_keepalive_card_and_reconnect_banner(self, client):
+        html = client.get('/live').get_data(as_text=True)
+        for marker in (
+            # Keep-alive card (Piece 2)
+            'id="keepaliveCard"', 'id="kaState"', 'id="kaStateLabel"',
+            'id="kaStateDetail"', 'id="kaExpiry"', 'id="kaInterval"',
+            'id="kaLastRenew"', 'id="kaNextRun"', 'id="kaRenewsToday"',
+            'id="kaFailures"', 'id="kaIntervalInput"',
+            'id="btnKaStart"', 'id="btnKaStop"',
+            # Morning reconnect prompt
+            'id="reconnectBanner"', 'id="btnReconnectNow"',
+            'id="btnEnableAlerts"',
+        ):
+            assert marker in html, f'/live missing {marker}'
+
 
 class TestLiveKeepAliveEndpoint:
     """GET/POST /api/live/keepalive against a mocked keep-alive loop."""

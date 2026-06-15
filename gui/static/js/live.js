@@ -1507,6 +1507,266 @@ async function stopScheduler() {
 }
 
 /* ==========================================================================
+   Token keep-alive card + expiry countdown + morning reconnect prompt
+   (Piece 2). The keep-alive loop is renew-only and NEVER trades.
+   ========================================================================== */
+
+let kaIntervalDirty = false;
+let lastKeepalive = null;     // last /api/live/keepalive payload (for the banner)
+let reauthNotified = false;   // de-dupe the browser notification per re-auth event
+
+function paintKaState(kind, detail) {
+    const state = document.getElementById('kaState');
+    const label = document.getElementById('kaStateLabel');
+    const detailEl = document.getElementById('kaStateDetail');
+    if (!state || !label || !detailEl) return;
+    const [cls, icon, text] = SCHED_STATES[kind] || SCHED_STATES.unknown;
+    state.className = cls;
+    state.firstElementChild.className = icon;
+    label.textContent = text;
+    detailEl.textContent = detail;
+}
+
+function renderKeepAlive(data) {
+    const running = !!(data && data.running === true);
+    const pausedReason = data ? data.paused_reason : null;
+    lastKeepalive = data || null;
+
+    if (running) {
+        paintKaState('running',
+            'Renewing automatically during NYSE market hours — clears the ' +
+            "~2h idle timeout. It never trades.");
+    } else if (pausedReason === 'token_expired') {
+        paintKaState('paused',
+            'Paused: the daily token expired. Reconnect to resume keep-alive.');
+    } else if (pausedReason) {
+        paintKaState('paused',
+            `Paused: ${pausedReason}. Start again after resolving.`);
+    } else {
+        paintKaState('stopped',
+            'Not running. Connecting starts it automatically; you can also ' +
+            'start it here.');
+    }
+
+    const fields = {
+        kaInterval: Number.isFinite(Number(data.interval_minutes))
+            ? `${data.interval_minutes} min` : '—',
+        kaLastRenew: fmtTimestampText(data.last_renew),
+        kaNextRun: running ? fmtTimestampText(data.next_run_estimate) : '—',
+        kaRenewsToday: Number.isFinite(Number(data.renews_today))
+            ? String(data.renews_today) : '—',
+        kaFailures: Number.isFinite(Number(data.consecutive_failures))
+            ? String(data.consecutive_failures) : '—',
+    };
+    Object.entries(fields).forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    });
+
+    const btnStart = document.getElementById('btnKaStart');
+    const btnStop = document.getElementById('btnKaStop');
+    if (btnStart) btnStart.disabled = running;
+    if (btnStop) btnStop.disabled = !running;
+
+    const input = document.getElementById('kaIntervalInput');
+    if (input && data.interval_minutes != null) {
+        input.placeholder = String(data.interval_minutes);
+        if (!kaIntervalDirty && document.activeElement !== input) {
+            input.value = String(data.interval_minutes);
+        }
+    }
+    updateReconnectBanner();
+}
+
+function renderKeepAliveUnavailable(reason) {
+    paintKaState('unknown',
+        reason || 'The keep-alive backend has not been configured.');
+    lastKeepalive = null;
+    ['kaInterval', 'kaLastRenew', 'kaNextRun', 'kaRenewsToday', 'kaFailures']
+        .forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = '—';
+        });
+    const btnStart = document.getElementById('btnKaStart');
+    const btnStop = document.getElementById('btnKaStop');
+    if (btnStart) btnStart.disabled = true;
+    if (btnStop) btnStop.disabled = true;
+    updateReconnectBanner();
+}
+
+async function refreshKeepAlive() {
+    try {
+        const data = await fetchJSON('/api/live/keepalive', { silent: true });
+        renderKeepAlive(data);
+    } catch (err) {
+        renderKeepAliveUnavailable(
+            (err.body && (err.body.reason || err.body.error)) || err.message);
+    }
+}
+
+/** The interval to send with 'start': null = omit, undefined = invalid. */
+function kaIntervalToSend() {
+    const input = document.getElementById('kaIntervalInput');
+    if (!input) return null;
+    const raw = (input.value || '').trim();
+    if (!raw) { input.classList.remove('is-invalid'); return null; }
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > 60) {
+        input.classList.add('is-invalid');
+        return undefined;
+    }
+    input.classList.remove('is-invalid');
+    return n;
+}
+
+async function startKeepAlive() {
+    const interval = kaIntervalToSend();
+    if (interval === undefined) {
+        showToast('warning', 'Interval must be a whole number of minutes ' +
+            'between 1 and 60.');
+        return;
+    }
+    const body = { action: 'start' };
+    if (interval !== null) body.interval_minutes = interval;
+    const restore = btnLoading(document.getElementById('btnKaStart'));
+    try {
+        const data = await fetchJSON('/api/live/keepalive', {
+            method: 'POST', body: JSON.stringify(body),
+        });
+        showToast('success', 'Token keep-alive started.');
+        kaIntervalDirty = false;
+        renderKeepAlive(data);
+    } catch (_) {
+        // toasted by fetchJSON
+    } finally {
+        restore();
+    }
+}
+
+async function stopKeepAlive() {
+    const restore = btnLoading(document.getElementById('btnKaStop'));
+    try {
+        const data = await fetchJSON('/api/live/keepalive', {
+            method: 'POST', body: JSON.stringify({ action: 'stop' }),
+        });
+        showToast('info', 'Token keep-alive stopped.');
+        renderKeepAlive(data);
+    } catch (_) {
+        // toasted by fetchJSON
+    } finally {
+        restore();
+    }
+}
+
+/* -------------------- Token-expiry countdown -------------------- */
+
+/** Milliseconds until the next midnight in America/New_York — when the
+    E*TRADE token hard-expires. Computed from the ET wall clock so it is
+    DST-correct without any timezone library. */
+function msUntilMidnightET() {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York', hour12: false,
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    const parts = Object.fromEntries(
+        fmt.formatToParts(new Date()).map((p) => [p.type, p.value]));
+    let hh = Number(parts.hour);
+    if (hh === 24) hh = 0; // some engines emit '24' at midnight
+    const elapsed = hh * 3600 + Number(parts.minute) * 60 + Number(parts.second);
+    return (86400 - elapsed) * 1000;
+}
+
+function fmtCountdown(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return `${h}h ${String(m).padStart(2, '0')}m ${String(sec).padStart(2, '0')}s`;
+}
+
+/** Repaint the midnight-ET expiry countdown from the last known auth state
+    (driven by a 1s ticker, independent of the 10s status poll). */
+function tickExpiryCountdown() {
+    const el = document.getElementById('kaExpiry');
+    if (!el) return;
+    const auth = liveStatus && liveStatus.auth;
+    const state = auth && auth.state;
+    if (state === 'connected') {
+        const ms = msUntilMidnightET();
+        el.textContent = fmtCountdown(ms);
+        // Under 30 minutes: flag it (the morning re-auth is near).
+        el.className = 'ka-expiry-value num'
+            + (ms <= 30 * 60 * 1000 ? ' expiring' : '');
+    } else if (state === 'expired') {
+        el.textContent = 'EXPIRED — reconnect';
+        el.className = 'ka-expiry-value expired';
+    } else {
+        el.textContent = '—';
+        el.className = 'ka-expiry-value num';
+    }
+}
+
+/* -------------------- Morning reconnect prompt -------------------- */
+
+/** Re-auth is due when the token has expired, or the keep-alive loop paused
+    itself for the daily expiry. (A never-connected 'disconnected' state is
+    NOT a re-auth prompt — the connection card already handles first connect.) */
+function reauthNeeded() {
+    const auth = liveStatus && liveStatus.auth;
+    const expired = auth && auth.state === 'expired';
+    const kaPaused = lastKeepalive
+        && lastKeepalive.paused_reason === 'token_expired';
+    return !!(expired || kaPaused);
+}
+
+function updateReconnectBanner() {
+    const banner = document.getElementById('reconnectBanner');
+    if (!banner) return;
+    const needed = reauthNeeded();
+    banner.classList.toggle('d-none', !needed);
+    maybeNotifyReauth(needed);
+}
+
+/** Fire a browser notification once per re-auth event, only if the operator
+    opted in (granted permission via "Enable alerts"). Best-effort. */
+function maybeNotifyReauth(needed) {
+    if (!needed) { reauthNotified = false; return; }
+    if (reauthNotified) return;
+    reauthNotified = true;
+    if (typeof Notification !== 'undefined'
+            && Notification.permission === 'granted') {
+        try {
+            new Notification('E*TRADE re-authentication needed', {
+                body: 'The daily token has expired. Reconnect to resume '
+                    + 'live access.',
+            });
+        } catch (_) { /* notifications are best-effort */ }
+    }
+}
+
+function enableReauthAlerts() {
+    if (typeof Notification === 'undefined') {
+        showToast('warning', 'This browser does not support notifications.');
+        return;
+    }
+    Notification.requestPermission().then((perm) => {
+        if (perm === 'granted') {
+            showToast('success', 'Re-auth alerts enabled for this browser.');
+        } else {
+            showToast('info', 'Notifications not granted — the on-page '
+                + 'banner still appears.');
+        }
+    });
+}
+
+function reconnectNow() {
+    const card = document.getElementById('connectionBody');
+    if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const btn = document.getElementById('btnConnect');
+    if (btn) btn.click(); // the connection card renders Connect/Re-authenticate
+}
+
+/* ==========================================================================
    Status poll — the ONLY live-status poll in the app
    ========================================================================== */
 
@@ -1526,6 +1786,7 @@ async function refreshStatus() {
         accountsLoaded = false;
         renderAccountBody('expired');
         syncOrderTicketGate();
+        updateReconnectBanner();
         return;
     }
     liveStatus = data;
@@ -1547,6 +1808,7 @@ async function refreshStatus() {
         renderAccountBody('expired');
     }
     syncOrderTicketGate();
+    updateReconnectBanner();
 }
 
 /* ==========================================================================
@@ -1643,11 +1905,15 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshStatus();
     refreshWorkingOrders();
     refreshScheduler();
+    refreshKeepAlive();
+    tickExpiryCountdown();
     loadAudit();
     loadParity();
     setInterval(refreshStatus, LIVE_POLL_MS);
     setInterval(refreshWorkingOrders, LIVE_POLL_MS);
     setInterval(refreshScheduler, LIVE_POLL_MS);
+    setInterval(refreshKeepAlive, LIVE_POLL_MS);
+    setInterval(tickExpiryCountdown, 1000); // smooth 1s expiry countdown
 
     const ksBtn = document.getElementById('btnKillSwitch');
     if (ksBtn) ksBtn.addEventListener('click', openKillSwitchModal);
@@ -1727,6 +1993,25 @@ document.addEventListener('DOMContentLoaded', () => {
             schedIntervalDirty = true;
             schedInput.classList.remove('is-invalid');
         });
+    }
+
+    // Token keep-alive card + morning reconnect prompt (Piece 2).
+    const btnKaStart = document.getElementById('btnKaStart');
+    if (btnKaStart) btnKaStart.addEventListener('click', startKeepAlive);
+    const btnKaStop = document.getElementById('btnKaStop');
+    if (btnKaStop) btnKaStop.addEventListener('click', stopKeepAlive);
+    const kaInput = document.getElementById('kaIntervalInput');
+    if (kaInput) {
+        kaInput.addEventListener('input', () => {
+            kaIntervalDirty = true;
+            kaInput.classList.remove('is-invalid');
+        });
+    }
+    const btnReconnectNow = document.getElementById('btnReconnectNow');
+    if (btnReconnectNow) btnReconnectNow.addEventListener('click', reconnectNow);
+    const btnEnableAlerts = document.getElementById('btnEnableAlerts');
+    if (btnEnableAlerts) {
+        btnEnableAlerts.addEventListener('click', enableReauthAlerts);
     }
 
     const auditFilter = document.getElementById('auditEventType');
