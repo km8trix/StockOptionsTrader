@@ -36,6 +36,9 @@ Response shapes consumed by gui/static/js/live.js:
   GET  /api/live/scheduler   -> <LiveScheduler.status()> + interval_minutes
   POST /api/live/scheduler {action: 'start'|'stop', interval_minutes?}
         -> same shape as GET (503 until a scheduler is configured)
+  GET  /api/live/keepalive   -> <TokenKeepAliveScheduler.status()>
+  POST /api/live/keepalive {action: 'start'|'stop', interval_minutes?}
+        -> same shape as GET (renew-only loop; auto-starts on connect)
 """
 from __future__ import annotations
 
@@ -135,6 +138,24 @@ except Exception as e:  # noqa: BLE001
     logger.error(
         'Failed to import LiveScheduler — the scheduler is unavailable: %s',
         SCHEDULER_IMPORT_ERROR,
+    )
+
+KEEPALIVE_IMPORT_ERROR: str | None
+try:
+    from utils.token_keepalive import (
+        KEEPALIVE_INTERVAL_MAX,
+        KEEPALIVE_INTERVAL_MIN,
+        TokenKeepAliveScheduler,
+    )
+    KEEPALIVE_IMPORT_ERROR = None
+except Exception as e:  # noqa: BLE001
+    TokenKeepAliveScheduler = None
+    KEEPALIVE_INTERVAL_MIN = 1
+    KEEPALIVE_INTERVAL_MAX = 90
+    KEEPALIVE_IMPORT_ERROR = f'{type(e).__name__}: {e}'
+    logger.error(
+        'Failed to import TokenKeepAliveScheduler — keep-alive is '
+        'unavailable: %s', KEEPALIVE_IMPORT_ERROR,
     )
 
 # The trading client + its typed exceptions and order-request builders.
@@ -376,6 +397,85 @@ def scheduler_unavailable_reason() -> str:
                'session (which installs its scheduler) first.')
 
 
+# The process-wide token keep-alive loop. UNLIKE the trading scheduler
+# above, this one self-constructs lazily: it needs ONLY the shared auth
+# manager (no desk / broker / portfolio / data feed) and NEVER trades, so
+# "instantiate in prod" is safe to do on first use. It calls renew() on a
+# timer during market hours to clear E*TRADE's ~2h idle timeout — it cannot
+# place an order, resurrect a dead token, or bypass the midnight re-auth.
+_keepalive_scheduler = None
+
+
+def set_keepalive_scheduler(scheduler) -> None:
+    """Install (or clear, with None) the shared keep-alive scheduler.
+    Production builds it lazily via get_keepalive_scheduler(); tests use
+    this to inject a fake or reset between cases."""
+    global _keepalive_scheduler
+    with _singleton_lock:
+        _keepalive_scheduler = scheduler
+
+
+def get_keepalive_scheduler():
+    """Shared TokenKeepAliveScheduler over the live auth manager, built
+    lazily, or None when the surface/auth manager is unavailable.
+
+    Bound to the process-wide auth-manager singleton (which is constructed
+    once and never replaced), so a single long-lived keep-alive loop is
+    correct for the GUI process.
+    """
+    global _keepalive_scheduler
+    if TokenKeepAliveScheduler is None:
+        return None
+    if _keepalive_scheduler is None:
+        with _singleton_lock:
+            if _keepalive_scheduler is None:
+                # Resolve the manager INSIDE the lock so the binding and the
+                # double-checked construction are atomic (the lock is an
+                # RLock, so get_auth_manager()'s own acquire is fine).
+                manager = get_auth_manager()
+                if manager is None:
+                    return None
+                try:
+                    _keepalive_scheduler = TokenKeepAliveScheduler(
+                        manager, audit=get_audit_log())
+                except Exception:
+                    logger.error('TokenKeepAliveScheduler construction failed',
+                                 exc_info=True)
+                    return None
+    return _keepalive_scheduler
+
+
+def keepalive_unavailable_reason() -> str:
+    """Reason string for 503s when the keep-alive surface is unusable."""
+    return (KEEPALIVE_IMPORT_ERROR or auth_unavailable_reason()
+            or 'Token keep-alive is unavailable')
+
+
+def _start_keepalive_best_effort() -> None:
+    """Begin (or resume after a pause) the token keep-alive loop following a
+    successful connect. Best-effort and silent on failure — keeping the
+    session warm must NEVER break the connect flow."""
+    try:
+        scheduler = get_keepalive_scheduler()
+        if scheduler is not None:
+            scheduler.start()
+    except Exception:  # noqa: BLE001 - keep-alive must never break connect
+        logger.warning('Could not start token keep-alive after connect',
+                       exc_info=True)
+
+
+def _stop_keepalive_best_effort() -> None:
+    """Stop the keep-alive loop when the session is torn down (disconnect).
+    Best-effort and silent — never breaks the disconnect flow."""
+    try:
+        scheduler = get_keepalive_scheduler()
+        if scheduler is not None:
+            scheduler.stop()
+    except Exception:  # noqa: BLE001 - never break disconnect
+        logger.warning('Could not stop token keep-alive after disconnect',
+                       exc_info=True)
+
+
 def kill_switch_engaged() -> bool:
     """Best-effort engaged state for the base-template banner.
 
@@ -615,6 +715,10 @@ def auth_verifier():
     except Exception:
         logger.error('Failed to submit verifier code', exc_info=True)
         return jsonify({'error': 'Failed to submit verifier code'}), 500
+    # A successful connect starts the keep-alive loop so the freshly issued
+    # token stays warm through the trading day with no manual step (and
+    # clears any prior token_expired pause). Best-effort: never fails connect.
+    _start_keepalive_best_effort()
     return jsonify({'auth': status})
 
 
@@ -643,6 +747,8 @@ def auth_disconnect():
         return _unavailable('Live trading', auth_unavailable_reason())
     try:
         manager.disconnect()
+        # The session is gone — stop keeping a dead token warm.
+        _stop_keepalive_best_effort()
         return jsonify({'auth': manager.status()})
     except Exception:
         logger.error('Failed to disconnect E*TRADE session', exc_info=True)
@@ -936,6 +1042,62 @@ def scheduler_action():
     except Exception:
         logger.error('Scheduler %s failed', action, exc_info=True)
         return jsonify({'error': f'Scheduler {action} failed'}), 500
+
+
+# ==================== TOKEN KEEP-ALIVE ====================
+# A renew-only loop that keeps the E*TRADE OAuth session warm through the
+# trading day (clears the ~2h idle timeout). Self-constructs over the auth
+# manager, so — unlike /scheduler — it is available as soon as live auth
+# imports cleanly. It NEVER trades and cannot bypass the midnight re-auth.
+
+@live_bp.route('/keepalive', methods=['GET'])
+def keepalive_status():
+    """Token keep-alive loop state for the Live page."""
+    scheduler = get_keepalive_scheduler()
+    if scheduler is None:
+        return _unavailable('Keep-alive', keepalive_unavailable_reason())
+    try:
+        return jsonify(scheduler.status())
+    except Exception:
+        logger.error('Failed to read keep-alive status', exc_info=True)
+        return jsonify({'error': 'Failed to read keep-alive status'}), 500
+
+
+@live_bp.route('/keepalive', methods=['POST'])
+def keepalive_action():
+    """Start/stop the keep-alive loop ({action: 'start'|'stop',
+    interval_minutes?}). A 'start' also clears a pause (token_expired /
+    renew_failure_storm) once the operator has re-authed."""
+    scheduler = get_keepalive_scheduler()
+    if scheduler is None:
+        return _unavailable('Keep-alive', keepalive_unavailable_reason())
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if action not in ('start', 'stop'):
+        return jsonify({'error': "'action' must be 'start' or 'stop'"}), 400
+    interval = data.get('interval_minutes')
+    if interval is not None:
+        if action != 'start':
+            return jsonify({'error': "'interval_minutes' only applies to "
+                                     "action 'start'"}), 400
+        if (not isinstance(interval, int) or isinstance(interval, bool)
+                or not KEEPALIVE_INTERVAL_MIN <= interval
+                <= KEEPALIVE_INTERVAL_MAX):
+            return jsonify(
+                {'error': f"'interval_minutes' must be an integer between "
+                          f'{KEEPALIVE_INTERVAL_MIN} and '
+                          f'{KEEPALIVE_INTERVAL_MAX}'}), 400
+    try:
+        if action == 'start':
+            if interval is not None:
+                scheduler.interval_minutes = interval
+            scheduler.start()
+        else:
+            scheduler.stop()
+        return jsonify(scheduler.status())
+    except Exception:
+        logger.error('Keep-alive %s failed', action, exc_info=True)
+        return jsonify({'error': f'Keep-alive {action} failed'}), 500
 
 
 # ==================== LIVE TRADING (accounts / quotes / order ticket) ====================

@@ -59,6 +59,7 @@ def _isolate_live_singletons(monkeypatch, tmp_path):
     monkeypatch.setattr(api_live, '_kill_switch', None)
     monkeypatch.setattr(api_live, '_audit_log', None)
     monkeypatch.setattr(api_live, '_scheduler', None)
+    monkeypatch.setattr(api_live, '_keepalive_scheduler', None)
     monkeypatch.setattr(api_live, '_client', None)
     monkeypatch.setattr(api_live, '_client_auth_manager', None)
     api_live._ORDER_REF_CACHE.clear()
@@ -2249,6 +2250,43 @@ class FakeScheduler:
         return True
 
 
+class FakeKeepAlive:
+    """TokenKeepAliveScheduler-shaped fake: status() snapshot + recorded
+    start/stop actions (no real thread)."""
+
+    def __init__(self, running=False, paused_reason=None):
+        self.running = running
+        self.paused_reason = paused_reason
+        self.interval_minutes = 15
+        self.calls = []
+
+    def status(self):
+        return {
+            'running': self.running,
+            'last_renew': ('2026-06-12T10:00:00-04:00'
+                           if self.running else None),
+            'last_renew_ok': True if self.running else None,
+            'last_state': 'connected' if self.running else None,
+            'renews_today': 2 if self.running else 0,
+            'consecutive_failures': 0,
+            'next_run_estimate': ('2026-06-12T10:15:00-04:00'
+                                  if self.running else None),
+            'paused_reason': self.paused_reason,
+            'interval_minutes': self.interval_minutes,
+        }
+
+    def start(self):
+        self.calls.append('start')
+        self.running = True
+        self.paused_reason = None
+        return True
+
+    def stop(self):
+        self.calls.append('stop')
+        self.running = False
+        return True
+
+
 @pytest.fixture()
 def patch_live(monkeypatch):
     """Inject fake C16/C17/C18 surfaces into api_live; reset module state."""
@@ -2258,11 +2296,15 @@ def patch_live(monkeypatch):
         'auth': FakeAuthManager(),
         'kill': FakeKillSwitch(),
         'audit': FakeAuditLog(n=120),
+        'keepalive': FakeKeepAlive(),
     }
     monkeypatch.setattr(api_live, 'get_auth_manager', lambda: fakes['auth'])
     monkeypatch.setattr(api_live, 'get_kill_switch', lambda: fakes['kill'])
     monkeypatch.setattr(api_live, 'get_audit_log', lambda: fakes['audit'])
     monkeypatch.setattr(api_live, '_last_reconciliation', None)
+    # Install the keep-alive fake so the connect-time auto-start (and the
+    # /keepalive routes) drive it instead of spawning a real daemon thread.
+    monkeypatch.setattr(api_live, '_keepalive_scheduler', fakes['keepalive'])
     return fakes
 
 
@@ -2961,6 +3003,143 @@ class TestLiveSchedulerEndpoint:
             'id="btnSchedStart"', 'id="btnSchedStop"',
         ):
             assert marker in html, f'/live missing {marker}'
+
+
+class TestLiveKeepAliveEndpoint:
+    """GET/POST /api/live/keepalive against a mocked keep-alive loop."""
+
+    STATUS_KEYS = {'running', 'last_renew', 'last_renew_ok', 'last_state',
+                   'renews_today', 'consecutive_failures',
+                   'next_run_estimate', 'paused_reason', 'interval_minutes'}
+
+    def test_get_status_shape(self, client, patch_live):
+        response = client.get('/api/live/keepalive')
+        assert response.status_code == 200
+        body = response.get_json()
+        assert set(body) == self.STATUS_KEYS
+        assert body['running'] is False
+        assert body['interval_minutes'] == 15
+
+    def test_get_passes_paused_state_through(self, client, patch_live):
+        patch_live['keepalive'].paused_reason = 'token_expired'
+        body = client.get('/api/live/keepalive').get_json()
+        assert body['paused_reason'] == 'token_expired'
+
+    def test_start_calls_start_and_returns_running(self, client, patch_live):
+        response = client.post('/api/live/keepalive', json={'action': 'start'})
+        assert response.status_code == 200
+        assert response.get_json()['running'] is True
+        assert patch_live['keepalive'].calls == ['start']
+
+    def test_start_applies_interval(self, client, patch_live):
+        response = client.post('/api/live/keepalive', json={
+            'action': 'start', 'interval_minutes': 30})
+        assert response.status_code == 200
+        assert response.get_json()['interval_minutes'] == 30
+        assert patch_live['keepalive'].interval_minutes == 30
+
+    def test_stop_calls_stop(self, client, patch_live):
+        patch_live['keepalive'].running = True
+        response = client.post('/api/live/keepalive', json={'action': 'stop'})
+        assert response.status_code == 200
+        assert response.get_json()['running'] is False
+        assert patch_live['keepalive'].calls == ['stop']
+
+    @pytest.mark.parametrize('action', [None, '', 'pause', 'restart', 1])
+    def test_unknown_action_rejected(self, client, patch_live, action):
+        response = client.post('/api/live/keepalive', json={'action': action})
+        assert response.status_code == 400
+        assert patch_live['keepalive'].calls == []
+
+    @pytest.mark.parametrize('interval', [0, 91, 120, 241, -15, 2.5, '15', True])
+    def test_bad_interval_rejected(self, client, patch_live, interval):
+        """Keep-alive caps the interval at 90 min (under the 2h idle), so
+        91/120/241 are rejected even though /scheduler allows up to 240."""
+        response = client.post('/api/live/keepalive', json={
+            'action': 'start', 'interval_minutes': interval})
+        assert response.status_code == 400
+        assert 'interval_minutes' in response.get_json()['error']
+        assert patch_live['keepalive'].calls == []
+
+    def test_interval_with_stop_rejected(self, client, patch_live):
+        response = client.post('/api/live/keepalive', json={
+            'action': 'stop', 'interval_minutes': 30})
+        assert response.status_code == 400
+        assert patch_live['keepalive'].calls == []
+
+    def test_available_by_default_self_constructs(self, client):
+        """Unlike /scheduler, keep-alive self-constructs over the auth
+        manager (no desk/broker needed), so a fresh process answers 200
+        (stopped), not 503."""
+        response = client.get('/api/live/keepalive')
+        assert response.status_code == 200
+        assert response.get_json()['running'] is False
+
+    def test_503_when_surface_unavailable(self, client, monkeypatch):
+        import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, 'TokenKeepAliveScheduler', None)
+        monkeypatch.setattr(api_live, 'KEEPALIVE_IMPORT_ERROR',
+                            'ModuleNotFoundError: boom')
+        for response in (client.get('/api/live/keepalive'),
+                         client.post('/api/live/keepalive',
+                                     json={'action': 'start'})):
+            assert response.status_code == 503
+            assert response.get_json()['error'] == 'Keep-alive unavailable'
+
+    def test_set_keepalive_scheduler_installs_and_clears(self, client):
+        """The real setter pair: set_keepalive_scheduler installs a fake the
+        routes then read; clearing with None re-enables lazy construction."""
+        import gui.routes.api_live as api_live
+
+        fake = FakeKeepAlive(running=True)
+        api_live.set_keepalive_scheduler(fake)
+        try:
+            body = client.get('/api/live/keepalive').get_json()
+            assert body['running'] is True
+            assert api_live.get_keepalive_scheduler() is fake
+        finally:
+            api_live.set_keepalive_scheduler(None)
+
+
+class TestKeepAliveAutoStart:
+    """Connecting starts keep-alive; disconnecting stops it (best-effort)."""
+
+    def test_verifier_success_starts_keepalive(self, client, patch_live):
+        patch_live['auth'].start_auth()  # -> pending_verifier
+        response = client.post('/api/live/auth/verifier', json={'code': 'abc'})
+        assert response.status_code == 200
+        assert response.get_json()['auth']['state'] == 'connected'
+        assert 'start' in patch_live['keepalive'].calls
+
+    def test_disconnect_stops_keepalive(self, client, patch_live):
+        response = client.post('/api/live/auth/disconnect')
+        assert response.status_code == 200
+        assert 'stop' in patch_live['keepalive'].calls
+
+    def test_failed_connect_does_not_start_keepalive(
+            self, client, patch_live, monkeypatch):
+        def boom(_code):
+            raise RuntimeError('nope')
+        monkeypatch.setattr(patch_live['auth'], 'submit_verifier', boom)
+        response = client.post('/api/live/auth/verifier', json={'code': 'abc'})
+        assert response.status_code == 500
+        assert patch_live['keepalive'].calls == []
+
+    def test_best_effort_helpers_swallow_exceptions(self, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        class Boom:
+            def start(self):
+                raise RuntimeError('x')
+
+            def stop(self):
+                raise RuntimeError('x')
+
+        monkeypatch.setattr(api_live, 'get_keepalive_scheduler',
+                            lambda: Boom())
+        # Neither helper may propagate — connect/disconnect must never break.
+        api_live._start_keepalive_best_effort()
+        api_live._stop_keepalive_best_effort()
 
 
 class TestLiveTraderConstruction:
