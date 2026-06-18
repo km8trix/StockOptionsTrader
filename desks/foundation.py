@@ -41,6 +41,7 @@ class FoundationDesk(Desk):
     def __init__(self, capital_allocation: float = 1.0,
                  risk_manager: Optional[RiskManager] = None,
                  controller: Optional[WalkForwardController] = None,
+                 model_key: Optional[str] = None,
                  rsi_entry_low: float = 40.0,
                  rsi_entry_high: float = 70.0,
                  rsi_exit: float = 70.0,
@@ -59,8 +60,22 @@ class FoundationDesk(Desk):
         self.rsi_entry_high = rsi_entry_high
         self.rsi_exit = rsi_exit
         self.volume_confirmation_mult = volume_confirmation_mult
-        self._controller = (controller if controller is not None
-                            else WalkForwardController(GradientBoostingModel()))
+        # Controller precedence (documented contract):
+        #   1. an explicit ``controller`` wins, untouched (unchanged path);
+        #   2. else a ``model_key`` selects the model via the model
+        #      registry, wrapped in a default WalkForwardController;
+        #   3. else the historical default — GradientBoostingModel.
+        # ``model_key=None`` and no controller is therefore BYTE-IDENTICAL
+        # to the pre-existing behavior (same default model, same controller
+        # defaults). The model registry import is local so the default and
+        # explicit-controller paths never pull in optional model deps.
+        if controller is not None:
+            self._controller = controller
+        elif model_key is not None:
+            from desks.models import build_model
+            self._controller = WalkForwardController(build_model(model_key))
+        else:
+            self._controller = WalkForwardController(GradientBoostingModel())
 
     @property
     def walk_forward_fits(self) -> List[WalkForwardFit]:

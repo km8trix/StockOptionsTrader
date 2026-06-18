@@ -7,6 +7,7 @@ from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.janestreet import JaneStreetDesk
 from desks.ml_model import GradientBoostingModel
+from desks.models import available_models, build_model
 from desks.pairs import PairsCointegrationModel
 from desks.pods import MeanReversionPod, MomentumPod, Pod, StatArbPod
 from desks.regime import RegimeHMMModel
@@ -35,6 +36,8 @@ __all__ = [
     'WalkForwardController',
     'WalkForwardFit',
     'WalkForwardModel',
+    'available_models',
+    'build_model',
     'create_desk',
     'list_desks',
 ]

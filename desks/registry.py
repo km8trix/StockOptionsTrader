@@ -88,12 +88,21 @@ def list_desks() -> List[Dict]:
     ]
 
 
-def create_desk(key: str, capital_allocation: float = 1.0) -> Desk:
+def create_desk(key: str, capital_allocation: float = 1.0,
+                model_key: Optional[str] = None) -> Desk:
     """Instantiate a ready desk by key.
 
+    ``model_key`` selects the walk-forward model for desks that support
+    model selection (currently only ``'foundation'``). It is passed through
+    to the foundation factory; for any other desk a non-None ``model_key``
+    is rejected. ``model_key=None`` (the default) keeps every existing
+    caller — including ``create_fund_orchestrator`` — byte-identical.
+
     Raises:
-        ValueError: ``Unknown desk: <key>`` for unregistered keys, or
-            ``Desk '<key>' activates in Phase N`` for planned desks.
+        ValueError: ``Unknown desk: <key>`` for unregistered keys;
+            ``Desk '<key>' activates in Phase N`` for planned desks; or
+            ``Desk '<key>' does not support model selection`` when
+            ``model_key`` is given for a desk other than ``'foundation'``.
     """
     spec = _DESK_SPECS.get(key)
     if spec is None:
@@ -101,8 +110,14 @@ def create_desk(key: str, capital_allocation: float = 1.0) -> Desk:
     if spec['status'] != 'ready' or spec['factory'] is None:
         raise ValueError(
             f"Desk '{key}' activates in Phase {spec['activates_in_phase']}")
-    logger.info("Creating desk %s (capital_allocation=%.2f)",
-                key, capital_allocation)
+    logger.info("Creating desk %s (capital_allocation=%.2f, model_key=%s)",
+                key, capital_allocation, model_key)
+    if model_key is not None:
+        if key != 'foundation':
+            raise ValueError(
+                f"Desk '{key}' does not support model selection")
+        return spec['factory'](capital_allocation=capital_allocation,
+                               model_key=model_key)
     return spec['factory'](capital_allocation=capital_allocation)
 
 
