@@ -11,9 +11,10 @@ The default id ``'gbm'`` -> ``GradientBoostingModel`` is the CURRENT,
 golden behavior: ``FoundationDesk(model_key='gbm')`` is byte-identical to
 the historical default (and to ``model_key=None``).
 
-Imports are lazy: LightGBM is optional, so the heavier model module is only
-imported inside ``build_model``/``available_models``. Importing
-``desks.models`` (and therefore the registry) never requires lightgbm.
+Imports are lazy: LightGBM and torch are optional, so the heavier model
+modules are only imported inside ``build_model``/``available_models``.
+Importing ``desks.models`` (and therefore the registry) never requires
+lightgbm or torch.
 """
 
 from __future__ import annotations
@@ -43,6 +44,20 @@ _MODEL_SPECS: Dict[str, Dict[str, str]] = {
                         'and LightGBM via leakage-free out-of-fold base '
                         'predictions.'),
     },
+    'mlp': {
+        'name': 'Neural MLP',
+        'description': ('Feed-forward neural network on next-day direction '
+                        'using the extended technical-feature set; '
+                        'deterministic, train-window standardized. Requires '
+                        'the torch package.'),
+    },
+    'lstm': {
+        'name': 'Neural LSTM',
+        'description': ('LSTM sequence model over a 20-day lookback window '
+                        'of technical features, predicting next-day '
+                        'direction; deterministic, train-window '
+                        'standardized. Requires the torch package.'),
+    },
 }
 
 
@@ -63,7 +78,8 @@ def build_model(model_key: str) -> WalkForwardModel:
 
     Args:
         model_key: one of the ids from :func:`available_models`
-            (``'gbm'``, ``'lightgbm'``, ``'stacking'``).
+            (``'gbm'``, ``'lightgbm'``, ``'stacking'``, ``'mlp'``,
+            ``'lstm'``).
 
     Returns:
         A new, unfitted model instance.
@@ -71,8 +87,10 @@ def build_model(model_key: str) -> WalkForwardModel:
     Raises:
         ValueError: ``Unknown model: <key>`` for any unrecognized id.
         ImportError: when ``'lightgbm'`` is requested but the lightgbm
-            package is missing (surfaced by ``LightGBMModel``'s
-            constructor — a loud, early signal of a misconfigured install).
+            package is missing, or when ``'mlp'``/``'lstm'`` is requested
+            but the torch package is missing (surfaced by the respective
+            model constructor — a loud, early signal of a misconfigured
+            install).
     """
     if model_key == 'gbm':
         return GradientBoostingModel()
@@ -84,6 +102,14 @@ def build_model(model_key: str) -> WalkForwardModel:
     if model_key == 'stacking':
         from desks.models.boosting import StackingMetaModel
         return StackingMetaModel()
+    if model_key == 'mlp':
+        # Lazy import: keep torch optional for everyone who never asks for a
+        # neural model (the registry and default desk never require torch).
+        from desks.models.neural import MLPModel
+        return MLPModel()
+    if model_key == 'lstm':
+        from desks.models.neural import SequenceModel
+        return SequenceModel()
     raise ValueError(f"Unknown model: {model_key}")
 
 

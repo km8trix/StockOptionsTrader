@@ -29,10 +29,17 @@ dependencies = [
 dev = [
     "pytest==9.0.3",
 ]
-# Optional ML models ('lightgbm'/'stacking' walk-forward models). macOS
-# also needs the OpenMP runtime: `brew install libomp`.
+# Optional ML models ('lightgbm'/'stacking'/'mlp'/'lstm' walk-forward
+# models). macOS also needs the OpenMP runtime for lightgbm:
+# `brew install libomp`.
+#
+# torch lives ONLY in this extra (never in the base requirements.txt): the
+# CPU/MPS wheel is hundreds of MB, so keeping it optional keeps the Docker
+# image lean. The neural models ('mlp'/'lstm') import-guard torch and
+# degrade gracefully when it is absent, so the base install is unaffected.
 ai = [
     "lightgbm==4.6.0",
+    "torch==2.12.1",
 ]
 
 [tool.setuptools.packages.find]

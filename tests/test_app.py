@@ -4149,10 +4149,13 @@ class TestModelsEndpoint:
         body = response.get_json()
         assert set(body) == {'models'}
         models = body['models']
-        # Exactly the three Phase-A models, in order.
-        assert [m['id'] for m in models] == ['gbm', 'lightgbm', 'stacking']
+        # Exactly the five registry models, in order: the three Phase-A
+        # models followed by the two Phase-B neural models (mlp, lstm).
+        assert [m['id'] for m in models] == [
+            'gbm', 'lightgbm', 'stacking', 'mlp', 'lstm']
         assert [m['name'] for m in models] == [
-            'Gradient Boosting', 'LightGBM', 'Stacking Ensemble']
+            'Gradient Boosting', 'LightGBM', 'Stacking Ensemble',
+            'Neural MLP', 'Neural LSTM']
         for entry in models:
             assert set(entry) == MODEL_CONTRACT_KEYS
 
