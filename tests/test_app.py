@@ -4149,13 +4149,14 @@ class TestModelsEndpoint:
         body = response.get_json()
         assert set(body) == {'models'}
         models = body['models']
-        # Exactly the five registry models, in order: the three Phase-A
-        # models followed by the two Phase-B neural models (mlp, lstm).
+        # Exactly the six registry models, in order: the three Phase-A models,
+        # the two Phase-B neural models (mlp, lstm), then the Phase-D
+        # transparent factor model that powers the AQR desk.
         assert [m['id'] for m in models] == [
-            'gbm', 'lightgbm', 'stacking', 'mlp', 'lstm']
+            'gbm', 'lightgbm', 'stacking', 'mlp', 'lstm', 'factor']
         assert [m['name'] for m in models] == [
             'Gradient Boosting', 'LightGBM', 'Stacking Ensemble',
-            'Neural MLP', 'Neural LSTM']
+            'Neural MLP', 'Neural LSTM', 'Factor (AQR)']
         for entry in models:
             assert set(entry) == MODEL_CONTRACT_KEYS
 

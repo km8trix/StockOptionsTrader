@@ -40,7 +40,7 @@ class TestListDesks:
     def test_all_desks_present_with_plan_metadata(self):
         by_key = {entry['key']: entry for entry in list_desks()}
         assert set(by_key) == {'foundation', 'renaissance', 'citadel',
-                               'janestreet', 'twosigma'}
+                               'janestreet', 'twosigma', 'aqr'}
 
         assert by_key['foundation']['status'] == 'ready'
         assert by_key['foundation']['accent'] == '#4493f8'
@@ -66,6 +66,13 @@ class TestListDesks:
         assert by_key['twosigma']['activates_in_phase'] is None
         assert by_key['twosigma']['accent'] == '#3fb950'
         assert by_key['twosigma']['firm_inspiration'] == 'Two Sigma'
+
+        # Phase D: aqr is ready; the transparent classical-quant factor desk
+        # (reuses the shared cross-sectional book, distinct accent).
+        assert by_key['aqr']['status'] == 'ready'
+        assert by_key['aqr']['activates_in_phase'] is None
+        assert by_key['aqr']['accent'] == '#f0883e'
+        assert by_key['aqr']['firm_inspiration'] == 'AQR Capital Management'
 
 
 class TestCreateDesk:
