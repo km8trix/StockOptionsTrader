@@ -4267,14 +4267,48 @@ class TestDeskModelSelectionRoute:
         assert response.status_code == 400
         assert 'desk_model' in response.get_json()['error']
 
-    def test_desk_model_with_non_foundation_desk_returns_400(self, client):
-        """desk_model is only valid on the foundation desk."""
+    def test_valid_model_id_threads_through_on_twosigma(
+            self, client, patch_desk_stack):
+        """Phase C: desk='twosigma' is model-selectable, so a valid
+        desk_model submits (202) and threads through to create_desk."""
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk': 'twosigma', 'desk_model': 'mlp'})
+
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        assert patch_desk_stack['desk_key'] == 'twosigma'
+        assert patch_desk_stack['model_key'] == 'mlp'
+
+    def test_unknown_model_id_on_twosigma_returns_400(self, client):
+        """A bogus model id is rejected even on the twosigma desk."""
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk': 'twosigma', 'desk_model': 'bogus'})
+
+        assert response.status_code == 400
+        assert 'Unknown desk_model' in response.get_json()['error']
+
+    def test_desk_model_with_non_selectable_desk_returns_400(self, client):
+        """desk_model is only valid for the foundation or twosigma desk."""
         response = client.post(
             '/api/backtest/run',
             json={**self.PAYLOAD, 'desk': 'renaissance', 'desk_model': 'gbm'})
 
         assert response.status_code == 400
-        assert "desk == 'foundation'" in response.get_json()['error']
+        assert ('desk_model is only valid for the foundation or twosigma desk'
+                in response.get_json()['error'])
+
+    @pytest.mark.parametrize('desk', ['citadel', 'janestreet'])
+    def test_desk_model_with_other_desks_returns_400(self, client, desk):
+        """The remaining non-selectable desks also reject desk_model."""
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk': desk, 'desk_model': 'gbm'})
+
+        assert response.status_code == 400
+        assert 'twosigma desk' in response.get_json()['error']
 
     def test_desk_model_in_strategy_mode_returns_400(self, client):
         """desk_model with no desk (strategy mode) is rejected, not ignored."""
@@ -4284,7 +4318,8 @@ class TestDeskModelSelectionRoute:
             json={**payload, 'strategy': 'momentum', 'desk_model': 'gbm'})
 
         assert response.status_code == 400
-        assert "desk == 'foundation'" in response.get_json()['error']
+        assert ('desk_model is only valid for the foundation or twosigma desk'
+                in response.get_json()['error'])
 
     def test_foundation_without_desk_model_passes_none(
             self, client, patch_desk_stack):

@@ -17,6 +17,7 @@ from desks.foundation import FoundationDesk
 from desks.janestreet import JaneStreetDesk
 from desks.orchestrator import FundOrchestrator
 from desks.renaissance import RenaissanceDesk
+from desks.twosigma import TwoSigmaDesk
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,24 @@ _DESK_SPECS: Dict[str, Dict] = {
         'accent': '#d29922',
         'factory': JaneStreetDesk,
     },
+    'twosigma': {
+        'name': 'Two Sigma Desk',
+        'firm_inspiration': 'Two Sigma',
+        'description': ('Systematic cross-sectional long/short equity: a '
+                        'walk-forward ML model zoo (single stacking ensemble '
+                        'by default, optional multi-model committee) ranks the '
+                        'universe — long the top quantile, short the bottom, '
+                        'dollar-balanced.'),
+        'status': 'ready',
+        'activates_in_phase': None,
+        'accent': '#3fb950',
+        'factory': TwoSigmaDesk,
+    },
 }
+
+#: Desk keys that accept a ``model_key`` (walk-forward model selection). Other
+#: desks reject a non-None ``model_key`` with a clear ValueError.
+_MODEL_SELECTABLE_DESKS = frozenset({'foundation', 'twosigma'})
 
 
 def list_desks() -> List[Dict]:
@@ -93,16 +111,17 @@ def create_desk(key: str, capital_allocation: float = 1.0,
     """Instantiate a ready desk by key.
 
     ``model_key`` selects the walk-forward model for desks that support
-    model selection (currently only ``'foundation'``). It is passed through
-    to the foundation factory; for any other desk a non-None ``model_key``
-    is rejected. ``model_key=None`` (the default) keeps every existing
-    caller — including ``create_fund_orchestrator`` — byte-identical.
+    model selection (``'foundation'`` and ``'twosigma'`` — see
+    ``_MODEL_SELECTABLE_DESKS``). It is passed through to the desk factory;
+    for any other desk a non-None ``model_key`` is rejected.
+    ``model_key=None`` (the default) keeps every existing caller — including
+    ``create_fund_orchestrator`` — byte-identical.
 
     Raises:
         ValueError: ``Unknown desk: <key>`` for unregistered keys;
             ``Desk '<key>' activates in Phase N`` for planned desks; or
             ``Desk '<key>' does not support model selection`` when
-            ``model_key`` is given for a desk other than ``'foundation'``.
+            ``model_key`` is given for a desk that does not accept one.
     """
     spec = _DESK_SPECS.get(key)
     if spec is None:
@@ -113,7 +132,7 @@ def create_desk(key: str, capital_allocation: float = 1.0,
     logger.info("Creating desk %s (capital_allocation=%.2f, model_key=%s)",
                 key, capital_allocation, model_key)
     if model_key is not None:
-        if key != 'foundation':
+        if key not in _MODEL_SELECTABLE_DESKS:
             raise ValueError(
                 f"Desk '{key}' does not support model selection")
         return spec['factory'](capital_allocation=capital_allocation,

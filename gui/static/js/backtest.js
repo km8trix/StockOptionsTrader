@@ -29,9 +29,10 @@
 const SYMBOLS_RE = /^[A-Za-z][A-Za-z.\-]{0,9}$/;
 const POLL_MS = 1000;
 
-// The desk_model field on /api/backtest/run is FOUNDATION-DESK-ONLY (sending
-// it for any other desk -> 400), so the Model picker is gated on this key.
-const DESK_MODEL_DESK = 'foundation';
+// The desk_model field on /api/backtest/run is accepted only for the
+// model-selectable desks (foundation, twosigma); sending it for any other
+// desk -> 400, so the Model picker is gated on membership in this set.
+const MODEL_SELECTABLE_DESKS = new Set(['foundation', 'twosigma']);
 // The historical default model id; selecting it == omitting desk_model.
 const DEFAULT_DESK_MODEL = 'gbm';
 
@@ -195,10 +196,11 @@ async function loadStrategies() {
 }
 
 /* ==========================================================================
-   Foundation desk model picker (Phase A): /api/models -> #btDeskModel.
-   desk_model is FOUNDATION-DESK-ONLY on /api/backtest/run, so the picker is
-   shown only when the Foundation desk is the selected desk (see applyMode /
-   the #btDesk change handler) and only then does desk_model cross the wire.
+   Desk model picker (Phase A): /api/models -> #btDeskModel.
+   desk_model is accepted on /api/backtest/run only for the model-selectable
+   desks (foundation, twosigma), so the picker is shown only when one of those
+   desks is the selected desk (see applyMode / the #btDesk change handler) and
+   only then does desk_model cross the wire.
    ========================================================================== */
 
 /** Populate #btDeskModel from /api/models, default-selecting gbm. Each option
@@ -226,8 +228,9 @@ async function loadModels() {
         select.addEventListener('change', paintDeskModelHint);
         paintDeskModelHint();
     } catch (_) {
-        // The desk picker still gates on 'foundation'; a model-less picker just
-        // stays hidden and no desk_model is sent. The page keeps working.
+        // The desk picker still gates on the model-selectable desk set; a
+        // model-less picker just stays hidden and no desk_model is sent. The
+        // page keeps working.
         showToast('error', 'Could not load model list — reload the page');
     }
 }
@@ -241,12 +244,12 @@ function paintDeskModelHint() {
     hint.textContent = (opt && opt.dataset.description) || '';
 }
 
-/** True when the Model picker is live: desk mode AND the Foundation desk is
- *  the selected desk. This is the EXACT gate for both visibility and whether
- *  desk_model is included in the run payload. */
+/** True when the Model picker is live: desk mode AND the selected desk is one
+ *  of the model-selectable desks (foundation, twosigma). This is the EXACT
+ *  gate for both visibility and whether desk_model is in the run payload. */
 function deskModelActive() {
     return currentMode() === 'desk' &&
-        document.getElementById('btDesk').value === DESK_MODEL_DESK;
+        MODEL_SELECTABLE_DESKS.has(document.getElementById('btDesk').value);
 }
 
 /** Show/hide + enable/disable the Model picker per deskModelActive(). Disabling
@@ -284,8 +287,9 @@ function applyMode() {
     if (realisticField) {
         realisticField.classList.toggle('d-none', mode === 'fund');
     }
-    // The Model picker is foundation-desk-only; refresh it on every mode
-    // change (the #btDesk change handler covers desk-to-desk switches).
+    // The Model picker is limited to the model-selectable desks (foundation,
+    // twosigma); refresh it on every mode change (the #btDesk change handler
+    // covers desk-to-desk switches).
     applyDeskModelVisibility();
 }
 
@@ -391,7 +395,7 @@ async function initDeskMode() {
     document.querySelectorAll('input[name="btMode"]').forEach((radio) => {
         radio.addEventListener('change', applyMode);
     });
-    // Desk-to-desk switches must toggle the foundation-only Model picker too.
+    // Desk-to-desk switches must toggle the model-selectable Model picker too.
     document.getElementById('btDesk')
         .addEventListener('change', applyDeskModelVisibility);
     const ready = await loadDesks();
@@ -511,8 +515,9 @@ async function onRun(event) {
     // Exactly one of strategy/desk/fund crosses the wire (the route mirrors it).
     if (currentMode() === 'desk') {
         payload.desk = document.getElementById('btDesk').value;
-        // desk_model is foundation-desk-only: include it only when the picker
-        // is live (Foundation selected). Sending it for any other desk -> 400.
+        // desk_model is for model-selectable desks (foundation, twosigma)
+        // only: include it only when the picker is live. Sending it for any
+        // other desk -> 400.
         if (deskModelActive()) {
             payload.desk_model = document.getElementById('btDeskModel').value;
         }

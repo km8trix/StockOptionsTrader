@@ -11,9 +11,10 @@ from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.janestreet import JaneStreetDesk
 from desks.orchestrator import FundOrchestrator
-from desks.registry import (create_desk, create_fund_orchestrator,
-                            list_desks)
+from desks.registry import (_MODEL_SELECTABLE_DESKS, create_desk,
+                            create_fund_orchestrator, list_desks)
 from desks.renaissance import RenaissanceDesk
+from desks.twosigma import TwoSigmaDesk
 
 EXPECTED_KEYS = {'key', 'name', 'firm_inspiration', 'description', 'status',
                  'activates_in_phase', 'accent'}
@@ -36,10 +37,10 @@ class TestListDesks:
             else:
                 assert entry['activates_in_phase'] is None
 
-    def test_all_four_desks_present_with_plan_metadata(self):
+    def test_all_desks_present_with_plan_metadata(self):
         by_key = {entry['key']: entry for entry in list_desks()}
         assert set(by_key) == {'foundation', 'renaissance', 'citadel',
-                               'janestreet'}
+                               'janestreet', 'twosigma'}
 
         assert by_key['foundation']['status'] == 'ready'
         assert by_key['foundation']['accent'] == '#4493f8'
@@ -56,10 +57,15 @@ class TestListDesks:
         assert by_key['citadel']['accent'] == '#bc8cff'
 
         # Contract C15: janestreet is ready as of Phase 8; accent stays.
-        # All four desks are now live.
         assert by_key['janestreet']['status'] == 'ready'
         assert by_key['janestreet']['activates_in_phase'] is None
         assert by_key['janestreet']['accent'] == '#d29922'
+
+        # Phase C: twosigma is ready; systematic cross-sectional L/S desk.
+        assert by_key['twosigma']['status'] == 'ready'
+        assert by_key['twosigma']['activates_in_phase'] is None
+        assert by_key['twosigma']['accent'] == '#3fb950'
+        assert by_key['twosigma']['firm_inspiration'] == 'Two Sigma'
 
 
 class TestCreateDesk:
@@ -117,9 +123,62 @@ class TestCreateDesk:
         desk = create_desk('janestreet', capital_allocation=0.2)
         assert desk.capital_allocation == 0.2
 
+    def test_creates_twosigma_desk(self):
+        # Phase C: create_desk('twosigma') returns the desk.
+        desk = create_desk('twosigma')
+        assert isinstance(desk, TwoSigmaDesk)
+        assert isinstance(desk, Desk)
+        assert desk.key == 'twosigma'
+        assert desk.accent == '#3fb950'
+        assert desk.capital_allocation == 1.0
+
+    def test_twosigma_capital_allocation_is_passed_through(self):
+        desk = create_desk('twosigma', capital_allocation=0.35)
+        assert desk.capital_allocation == 0.35
+
+    def test_twosigma_model_key_threads_through(self):
+        # twosigma is model-selectable: model_key reaches the factory and
+        # selects the single controller (status reflects the chosen id).
+        desk = create_desk('twosigma', model_key='lightgbm')
+        assert isinstance(desk, TwoSigmaDesk)
+        assert desk.get_status()['models'] == ['lightgbm']
+
+    def test_foundation_model_key_threads_through(self):
+        # Companion check: the OTHER model-selectable desk still accepts a
+        # model_key (guards the _MODEL_SELECTABLE_DESKS set both ways).
+        desk = create_desk('foundation', model_key='gbm')
+        assert isinstance(desk, FoundationDesk)
+
+    def test_model_key_on_non_selectable_desk_raises(self):
+        # renaissance/citadel/janestreet do NOT support model selection.
+        for key in ('renaissance', 'citadel', 'janestreet'):
+            with pytest.raises(ValueError,
+                               match='does not support model selection'):
+                create_desk(key, model_key='gbm')
+
     def test_no_planned_desks_remain(self):
         # Phase 8 flipped the last planned desk; every entry is ready.
         assert all(entry['status'] == 'ready' for entry in list_desks())
+
+
+class TestModelSelectableDeskConsistency:
+    """The backtest route keeps a hand-maintained copy of the model-selectable
+    desk set (``gui.routes.api_backtest.MODEL_SELECTABLE_DESKS``) so the
+    desks package stays optional for the import. This pins the two copies as
+    set-equal so the route's copy can't silently drift from the registry's
+    source of truth (``desks.registry._MODEL_SELECTABLE_DESKS``)."""
+
+    def test_route_copy_matches_registry_source_of_truth(self):
+        from gui.routes.api_backtest import MODEL_SELECTABLE_DESKS
+        assert set(MODEL_SELECTABLE_DESKS) == set(_MODEL_SELECTABLE_DESKS)
+
+    def test_every_model_selectable_desk_actually_accepts_model_key(self):
+        # Both directions: each id in the set must really thread model_key
+        # through create_desk (a guard against an id being added to the set
+        # for a desk whose factory rejects model selection).
+        for key in _MODEL_SELECTABLE_DESKS:
+            desk = create_desk(key, model_key='gbm')
+            assert desk.key == key
 
 
 class TestCreateFundOrchestrator:

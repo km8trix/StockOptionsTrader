@@ -48,6 +48,11 @@ except Exception as e:  # noqa: BLE001 - any import failure disables desk/fund m
 
 backtest_bp = Blueprint('backtest', __name__, url_prefix='/api')
 
+# Desk keys that accept the optional walk-forward ``desk_model`` selector.
+# Mirrors desks.registry._MODEL_SELECTABLE_DESKS (kept local so a desks-package
+# import failure still disables desk mode cleanly without breaking this list).
+MODEL_SELECTABLE_DESKS = ('foundation', 'twosigma')
+
 # Unified strategy mapping
 STRATEGIES = {
     'momentum': MomentumStrategy,
@@ -160,7 +165,8 @@ def _parse_desk_model(data):
     with model_key a valid id or None, or (None, error) when present but
     invalid. Default (absent) -> None, which keeps desk runs byte-identical to
     the historical default model. Only meaningful in desk mode; the route
-    additionally restricts it to the 'foundation' desk. Valid ids are those
+    additionally restricts it to the model-selectable desks
+    (MODEL_SELECTABLE_DESKS: 'foundation', 'twosigma'). Valid ids are those
     from desks.models.available_models(); when the desk framework failed to
     import (available_models is None) any non-absent value is rejected so the
     request fails clearly rather than silently ignoring the field."""
@@ -514,11 +520,11 @@ def run_backtest_async():
             return jsonify({'error': 'Desk framework unavailable',
                             'reason': DESK_REGISTRY_IMPORT_ERROR}), 503
         desk_key = desk_key.strip().lower()
-        # desk_model is only meaningful for the foundation desk; reject it
-        # for any other desk with a clear 400 before construction.
-        if desk_model is not None and desk_key != 'foundation':
-            return jsonify({'error': "desk_model is only valid when "
-                                     "desk == 'foundation'"}), 400
+        # desk_model is only meaningful for the model-selectable desks; reject
+        # it for any other desk with a clear 400 before construction.
+        if desk_model is not None and desk_key not in MODEL_SELECTABLE_DESKS:
+            return jsonify({'error': "desk_model is only valid for the "
+                                     "foundation or twosigma desk"}), 400
         try:
             desk = create_desk(desk_key, model_key=desk_model)
         except ValueError as exc:
@@ -528,8 +534,8 @@ def run_backtest_async():
             return jsonify({'error': str(exc)}), 400
     else:
         if desk_model is not None:
-            return jsonify({'error': "desk_model is only valid when "
-                                     "desk == 'foundation'"}), 400
+            return jsonify({'error': "desk_model is only valid for the "
+                                     "foundation or twosigma desk"}), 400
         strategy_name = data.get('strategy', 'momentum').lower()
         if strategy_name not in STRATEGIES:
             return jsonify({'error': f'Unknown strategy: {strategy_name}'}), 400
