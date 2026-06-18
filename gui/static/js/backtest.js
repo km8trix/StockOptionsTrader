@@ -29,6 +29,12 @@
 const SYMBOLS_RE = /^[A-Za-z][A-Za-z.\-]{0,9}$/;
 const POLL_MS = 1000;
 
+// The desk_model field on /api/backtest/run is FOUNDATION-DESK-ONLY (sending
+// it for any other desk -> 400), so the Model picker is gated on this key.
+const DESK_MODEL_DESK = 'foundation';
+// The historical default model id; selecting it == omitting desk_model.
+const DEFAULT_DESK_MODEL = 'gbm';
+
 // Only a strict #rrggbb desk accent flows into inline styles.
 const ACCENT_RE = /^#[0-9a-fA-F]{6}$/;
 // Walk-forward refit markers: pod purple, same hue as the 'model' category.
@@ -189,6 +195,73 @@ async function loadStrategies() {
 }
 
 /* ==========================================================================
+   Foundation desk model picker (Phase A): /api/models -> #btDeskModel.
+   desk_model is FOUNDATION-DESK-ONLY on /api/backtest/run, so the picker is
+   shown only when the Foundation desk is the selected desk (see applyMode /
+   the #btDesk change handler) and only then does desk_model cross the wire.
+   ========================================================================== */
+
+/** Populate #btDeskModel from /api/models, default-selecting gbm. Each option
+ *  carries its description as a title tooltip; on the active option the
+ *  description also surfaces under the select (mirroring the desk hint). The
+ *  Model field is purely additive — failure leaves it empty + hidden, and a
+ *  hidden/empty picker simply never sends desk_model. */
+async function loadModels() {
+    const select = document.getElementById('btDeskModel');
+    if (!select) return;
+    try {
+        const data = await fetchJSON('/api/models', { silent: true });
+        (data.models || []).forEach((m) => {
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = m.name;
+            if (m.description) opt.title = m.description;
+            opt.dataset.description = m.description || '';
+            select.appendChild(opt);
+        });
+        // Default to the historical default model (byte-identical to omitting).
+        if (Array.from(select.options).some((o) => o.value === DEFAULT_DESK_MODEL)) {
+            select.value = DEFAULT_DESK_MODEL;
+        }
+        select.addEventListener('change', paintDeskModelHint);
+        paintDeskModelHint();
+    } catch (_) {
+        // The desk picker still gates on 'foundation'; a model-less picker just
+        // stays hidden and no desk_model is sent. The page keeps working.
+        showToast('error', 'Could not load model list — reload the page');
+    }
+}
+
+/** Show the selected model's description under the picker (desk-hint style). */
+function paintDeskModelHint() {
+    const select = document.getElementById('btDeskModel');
+    const hint = document.getElementById('deskModelHint');
+    if (!select || !hint) return;
+    const opt = select.selectedOptions[0];
+    hint.textContent = (opt && opt.dataset.description) || '';
+}
+
+/** True when the Model picker is live: desk mode AND the Foundation desk is
+ *  the selected desk. This is the EXACT gate for both visibility and whether
+ *  desk_model is included in the run payload. */
+function deskModelActive() {
+    return currentMode() === 'desk' &&
+        document.getElementById('btDesk').value === DESK_MODEL_DESK;
+}
+
+/** Show/hide + enable/disable the Model picker per deskModelActive(). Disabling
+ *  the hidden control keeps it out of the tab order and makes the intent
+ *  explicit; visibility is what gates the payload. */
+function applyDeskModelVisibility() {
+    const field = document.getElementById('deskModelField');
+    const select = document.getElementById('btDeskModel');
+    if (!field || !select) return;
+    const active = deskModelActive();
+    field.classList.toggle('d-none', !active);
+    select.disabled = !active;
+}
+
+/* ==========================================================================
    Desk mode (Phase 5): toggle, desk list, ?desk=<key> deep link
    ========================================================================== */
 
@@ -211,6 +284,9 @@ function applyMode() {
     if (realisticField) {
         realisticField.classList.toggle('d-none', mode === 'fund');
     }
+    // The Model picker is foundation-desk-only; refresh it on every mode
+    // change (the #btDesk change handler covers desk-to-desk switches).
+    applyDeskModelVisibility();
 }
 
 /** Populate #btDesk with READY desks; returns them (empty array on error). */
@@ -315,6 +391,9 @@ async function initDeskMode() {
     document.querySelectorAll('input[name="btMode"]').forEach((radio) => {
         radio.addEventListener('change', applyMode);
     });
+    // Desk-to-desk switches must toggle the foundation-only Model picker too.
+    document.getElementById('btDesk')
+        .addEventListener('change', applyDeskModelVisibility);
     const ready = await loadDesks();
     const deskParam = new URLSearchParams(window.location.search).get('desk');
     if (!deskParam) return;
@@ -432,6 +511,11 @@ async function onRun(event) {
     // Exactly one of strategy/desk/fund crosses the wire (the route mirrors it).
     if (currentMode() === 'desk') {
         payload.desk = document.getElementById('btDesk').value;
+        // desk_model is foundation-desk-only: include it only when the picker
+        // is live (Foundation selected). Sending it for any other desk -> 400.
+        if (deskModelActive()) {
+            payload.desk_model = document.getElementById('btDeskModel').value;
+        }
     } else if (currentMode() === 'fund') {
         payload.fund = fundAllocations();
         payload.rebalance_every = Number(document.getElementById('fundRebalance').value);
@@ -2090,6 +2174,7 @@ function paintInitialEmptyState() {
 document.addEventListener('DOMContentLoaded', () => {
     paintInitialEmptyState();
     loadStrategies();
+    loadModels();
     initDeskMode();
     loadSaved();
     initTradeSorting();

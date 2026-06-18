@@ -29,6 +29,11 @@ dependencies = [
 dev = [
     "pytest==9.0.3",
 ]
+# Optional ML models ('lightgbm'/'stacking' walk-forward models). macOS
+# also needs the OpenMP runtime: `brew install libomp`.
+ai = [
+    "lightgbm==4.6.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["core*", "data*", "brokers*", "portfolio*", "backtesting*", "strategies*", "desks*", "utils*", "gui*"]

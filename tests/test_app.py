@@ -1053,6 +1053,31 @@ class TestFundBacktest:
         assert response.status_code == 503
         assert response.get_json()['reason'] == sentinel
 
+    def test_fund_rejects_desk_model_with_400(self, client, patch_fund_run):
+        """L1: desk_model is a single-desk (foundation) selector with no
+        meaning in a multi-desk fund run. A fund payload carrying desk_model
+        is a clean 400 with the documented message, before any backtest
+        runs (the patch_fund_run stub proves .run is never reached)."""
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.FUND_PAYLOAD, 'desk_model': 'lightgbm'})
+        assert response.status_code == 400
+        assert response.get_json()['error'] == (
+            'desk_model is not valid in fund mode')
+        # Rejected before submission: the fund engine was never invoked.
+        assert 'symbols' not in patch_fund_run
+
+    def test_fund_without_desk_model_is_not_rejected_on_that_ground(
+            self, client, patch_fund_run):
+        """L1 (counterpart): an otherwise-valid fund payload WITHOUT
+        desk_model must NOT be rejected — it submits and runs (mocked)."""
+        response = client.post('/api/backtest/run', json=self.FUND_PAYLOAD)
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        # Not blocked on the desk_model ground: the run actually executed.
+        assert patch_fund_run['symbols'] == ['AAA', 'BBB']
+
     def test_parse_allocations_units(self):
         from gui.routes.api_backtest import _parse_allocations
 
@@ -1303,7 +1328,7 @@ class TestDeskModeBacktest:
         seen = {}
         desk_sentinel = object()
 
-        def fake_create_desk(key, capital_allocation=1.0):
+        def fake_create_desk(key, capital_allocation=1.0, model_key=None):
             seen['desk_key'] = key
             return desk_sentinel
 
@@ -1426,7 +1451,7 @@ class TestDeskModeBacktest:
             self, client, monkeypatch):
         from gui.routes import api_backtest
 
-        def raising_create_desk(key, capital_allocation=1.0):
+        def raising_create_desk(key, capital_allocation=1.0, model_key=None):
             raise ValueError(f'Unknown desk: {key}')
 
         monkeypatch.setattr(api_backtest, 'create_desk', raising_create_desk)
@@ -1441,7 +1466,7 @@ class TestDeskModeBacktest:
             self, client, monkeypatch):
         from gui.routes import api_backtest
 
-        def raising_create_desk(key, capital_allocation=1.0):
+        def raising_create_desk(key, capital_allocation=1.0, model_key=None):
             raise ValueError(f"Desk '{key}' activates in Phase 7")
 
         monkeypatch.setattr(api_backtest, 'create_desk', raising_create_desk)
@@ -1571,7 +1596,7 @@ class TestRenaissanceDeskModeBacktest:
 
         seen = {}
 
-        def fake_create_desk(key, capital_allocation=1.0):
+        def fake_create_desk(key, capital_allocation=1.0, model_key=None):
             seen['desk_key'] = key
             return object()
 
@@ -1724,7 +1749,7 @@ class TestCitadelDeskModeBacktest:
 
         seen = {}
 
-        def fake_create_desk(key, capital_allocation=1.0):
+        def fake_create_desk(key, capital_allocation=1.0, model_key=None):
             seen['desk_key'] = key
             return object()
 
@@ -1921,7 +1946,7 @@ class TestJaneStreetDeskModeBacktest:
 
         seen = {}
 
-        def fake_create_desk(key, capital_allocation=1.0):
+        def fake_create_desk(key, capital_allocation=1.0, model_key=None):
             seen['desk_key'] = key
             return object()
 
@@ -4105,3 +4130,177 @@ class TestCancelOrderRouting:
         assert broker.calls == ['WORK-1']
         # The client cancel path was NOT used.
         assert patch_trade['client'].cancel_calls == []
+
+
+# ==================== WALK-FORWARD MODEL SELECTION (Phase A) ====================
+
+# SHARED INTERFACE CONTRACT: GET /api/models entries carry exactly these keys
+# (the desks.models.available_models() shape the desk picker renders).
+MODEL_CONTRACT_KEYS = {'id', 'name', 'description'}
+
+
+class TestModelsEndpoint:
+    """GET /api/models proxies desks.models.available_models()."""
+
+    def test_returns_models_from_registry(self, client):
+        response = client.get('/api/models')
+
+        assert response.status_code == 200
+        body = response.get_json()
+        assert set(body) == {'models'}
+        models = body['models']
+        # Exactly the three Phase-A models, in order.
+        assert [m['id'] for m in models] == ['gbm', 'lightgbm', 'stacking']
+        assert [m['name'] for m in models] == [
+            'Gradient Boosting', 'LightGBM', 'Stacking Ensemble']
+        for entry in models:
+            assert set(entry) == MODEL_CONTRACT_KEYS
+
+    def test_returns_503_when_framework_unavailable(self, client, monkeypatch):
+        """Mirrors the desk/fund pattern: a failed desks import is a loud 503
+        so the frontend can disable the picker (never a 500)."""
+        from gui.routes import api_backtest
+
+        sentinel = 'ImportError: synthetic desks import failure'
+        monkeypatch.setattr(api_backtest, 'available_models', None)
+        monkeypatch.setattr(api_backtest, 'DESK_REGISTRY_IMPORT_ERROR',
+                            sentinel)
+
+        response = client.get('/api/models')
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            'error': 'Desk framework unavailable',
+            'reason': sentinel,
+        }
+
+
+class TestDeskModelSelectionRoute:
+    """POST /api/backtest/run desk_model validation (Phase A).
+
+    The async run is faked exactly like TestDeskModeBacktest, but the
+    create_desk stub here accepts the model_key keyword the route now
+    passes, so the desk_model threads through to construction.
+    """
+
+    PAYLOAD = {
+        'symbols': 'AAA',
+        'desk': 'foundation',
+        'start_date': '2023-01-01',
+        'end_date': '2023-12-31',
+        'initial_capital': 100000,
+        'position_size': 0.1,
+    }
+
+    @pytest.fixture()
+    def patch_desk_stack(self, monkeypatch, tmp_path):
+        """Stub create_desk (model_key-aware) + the engine; redirect the DB."""
+        import gui.globals as gui_globals
+        from gui.routes import api_backtest
+
+        monkeypatch.setenv('TRADING_DB_PATH', str(tmp_path / 'history.db'))
+        monkeypatch.setattr(gui_globals, '_db', None)
+
+        seen = {}
+        desk_sentinel = object()
+
+        def fake_create_desk(key, capital_allocation=1.0, model_key=None):
+            seen['desk_key'] = key
+            seen['model_key'] = model_key
+            return desk_sentinel
+
+        class FakeEngine:
+            def __init__(self, strategy=None, desk=None,
+                         initial_capital=100000, **kwargs):
+                self.market_data = None
+
+            def run(self, symbols, start_date, end_date, position_size,
+                    progress_callback=None, benchmark_symbol='SPY'):
+                if progress_callback is not None:
+                    progress_callback(50.0)
+                return _fake_desk_report()
+
+        monkeypatch.setattr(api_backtest, 'create_desk', fake_create_desk)
+        monkeypatch.setattr(api_backtest, 'BacktestEngine', FakeEngine)
+        return seen
+
+    def test_valid_model_id_threads_through_to_create_desk(
+            self, client, patch_desk_stack):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk_model': 'gbm'})
+
+        assert response.status_code == 202
+        job = _wait_for_job(client, response.get_json()['job_id'])
+        assert job['status'] == 'done'
+        # The model_key reached create_desk on the foundation desk.
+        assert patch_desk_stack['desk_key'] == 'foundation'
+        assert patch_desk_stack['model_key'] == 'gbm'
+
+    def test_model_id_is_lowercased_before_validation(
+            self, client, patch_desk_stack):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk_model': 'LightGBM'})
+
+        assert response.status_code == 202
+        _wait_for_job(client, response.get_json()['job_id'])
+        assert patch_desk_stack['model_key'] == 'lightgbm'
+
+    def test_unknown_model_id_returns_400(self, client):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk_model': 'bogus'})
+
+        assert response.status_code == 400
+        assert 'Unknown desk_model' in response.get_json()['error']
+
+    @pytest.mark.parametrize('bad_model', ['', '   ', 123, ['gbm'], {'x': 1}])
+    def test_blank_or_non_string_model_id_returns_400(self, client, bad_model):
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk_model': bad_model})
+
+        assert response.status_code == 400
+        assert 'desk_model' in response.get_json()['error']
+
+    def test_desk_model_with_non_foundation_desk_returns_400(self, client):
+        """desk_model is only valid on the foundation desk."""
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk': 'renaissance', 'desk_model': 'gbm'})
+
+        assert response.status_code == 400
+        assert "desk == 'foundation'" in response.get_json()['error']
+
+    def test_desk_model_in_strategy_mode_returns_400(self, client):
+        """desk_model with no desk (strategy mode) is rejected, not ignored."""
+        payload = {k: v for k, v in self.PAYLOAD.items() if k != 'desk'}
+        response = client.post(
+            '/api/backtest/run',
+            json={**payload, 'strategy': 'momentum', 'desk_model': 'gbm'})
+
+        assert response.status_code == 400
+        assert "desk == 'foundation'" in response.get_json()['error']
+
+    def test_foundation_without_desk_model_passes_none(
+            self, client, patch_desk_stack):
+        """Absent desk_model -> model_key=None (byte-identical default)."""
+        response = client.post('/api/backtest/run', json=self.PAYLOAD)
+        assert response.status_code == 202
+        _wait_for_job(client, response.get_json()['job_id'])
+        assert patch_desk_stack['model_key'] is None
+
+    def test_desk_model_unavailable_framework_returns_400(
+            self, client, monkeypatch):
+        """When the desks package failed to import, a present desk_model is a
+        clean 400 (available_models is None) rather than a silent ignore."""
+        from gui.routes import api_backtest
+
+        monkeypatch.setattr(api_backtest, 'available_models', None)
+        response = client.post(
+            '/api/backtest/run',
+            json={**self.PAYLOAD, 'desk_model': 'gbm'})
+
+        assert response.status_code == 400
+        assert 'Desk framework unavailable' in response.get_json()['error']

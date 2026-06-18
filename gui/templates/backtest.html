@@ -40,6 +40,17 @@
                         <div class="invalid-feedback">Pick a desk.</div>
                         <div class="provenance-caption mt-1" id="deskHint"></div>
                     </div>
+                    <!-- Foundation desk ML model picker: desk_model is a
+                         FOUNDATION-DESK-ONLY field on /api/backtest/run, so this
+                         shows only when the Foundation desk is the selected desk
+                         (hidden for other desks, strategy mode, and fund mode).
+                         Options come from /api/models; default = gbm (the
+                         historical default — byte-identical to omitting it). -->
+                    <div class="mb-3 d-none" id="deskModelField">
+                        <label class="form-label" for="btDeskModel">Model</label>
+                        <select class="form-select" id="btDeskModel"></select>
+                        <div class="provenance-caption mt-1" id="deskModelHint"></div>
+                    </div>
                     <div class="mb-3 d-none" id="fundField">
                         <span class="form-label d-block">Desks &amp; weights</span>
                         <div id="fundDeskList" class="fund-desk-list"></div>

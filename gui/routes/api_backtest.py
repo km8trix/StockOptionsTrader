@@ -31,11 +31,13 @@ logger = logging.getLogger(__name__)
 DESK_REGISTRY_IMPORT_ERROR: str | None
 try:
     from desks.registry import create_desk, create_fund_orchestrator
+    from desks.models import available_models
     from backtesting.reweighting_fund import ReweightingFundBacktest
     DESK_REGISTRY_IMPORT_ERROR = None
 except Exception as e:  # noqa: BLE001 - any import failure disables desk/fund mode
     create_desk = None
     create_fund_orchestrator = None
+    available_models = None
     ReweightingFundBacktest = None
     DESK_REGISTRY_IMPORT_ERROR = f'{type(e).__name__}: {e}'
     logger.error(
@@ -151,6 +153,30 @@ def _parse_realistic_fills(data):
     if not isinstance(value, bool):
         return False, 'realistic_fills must be a boolean'
     return value, None
+
+
+def _parse_desk_model(data):
+    """Opt-in walk-forward model selection (Phase A). Returns (model_key, None)
+    with model_key a valid id or None, or (None, error) when present but
+    invalid. Default (absent) -> None, which keeps desk runs byte-identical to
+    the historical default model. Only meaningful in desk mode; the route
+    additionally restricts it to the 'foundation' desk. Valid ids are those
+    from desks.models.available_models(); when the desk framework failed to
+    import (available_models is None) any non-absent value is rejected so the
+    request fails clearly rather than silently ignoring the field."""
+    value = data.get('desk_model')
+    if value is None:
+        return None, None
+    if not isinstance(value, str) or not value.strip():
+        return None, 'desk_model must be a non-empty model id'
+    if available_models is None:
+        return None, 'Desk framework unavailable'
+    model_key = value.strip().lower()
+    valid_ids = {m['id'] for m in available_models()}
+    if model_key not in valid_ids:
+        return None, (f"Unknown desk_model: {model_key} "
+                      f"(valid: {', '.join(sorted(valid_ids))})")
+    return model_key, None
 
 
 def _date_str(value):
@@ -459,7 +485,21 @@ def run_backtest_async():
     # Fund mode (multi-desk + in-run risk-parity reweighting) is fully
     # self-contained; the desk/strategy paths below stay unchanged.
     if data.get('fund') is not None:
+        # desk_model is a single-desk (foundation) selector; it has no
+        # meaning for a multi-desk fund run. Reject it explicitly with a
+        # 400, consistent with the strategy / non-foundation-desk modes
+        # below, instead of silently ignoring it.
+        if data.get('desk_model') is not None:
+            return jsonify(
+                {'error': "desk_model is not valid in fund mode"}), 400
         return _submit_fund_backtest(data, symbols)
+
+    # Optional walk-forward model selection (Phase A); only valid in desk
+    # mode on the foundation desk, enforced below. Parsed up front so a bad
+    # id is a clean 400 regardless of mode.
+    desk_model, desk_model_err = _parse_desk_model(data)
+    if desk_model_err:
+        return jsonify({'error': desk_model_err}), 400
 
     desk_key = data.get('desk')
     desk = None
@@ -474,13 +514,22 @@ def run_backtest_async():
             return jsonify({'error': 'Desk framework unavailable',
                             'reason': DESK_REGISTRY_IMPORT_ERROR}), 503
         desk_key = desk_key.strip().lower()
+        # desk_model is only meaningful for the foundation desk; reject it
+        # for any other desk with a clear 400 before construction.
+        if desk_model is not None and desk_key != 'foundation':
+            return jsonify({'error': "desk_model is only valid when "
+                                     "desk == 'foundation'"}), 400
         try:
-            desk = create_desk(desk_key)
+            desk = create_desk(desk_key, model_key=desk_model)
         except ValueError as exc:
-            # Contract C1 messages pass straight through: 'Unknown desk: ...'
-            # or "Desk '<key>' activates in Phase N".
+            # Contract C1 messages pass straight through: 'Unknown desk: ...',
+            # "Desk '<key>' activates in Phase N", or the model-selection
+            # rejection from the registry.
             return jsonify({'error': str(exc)}), 400
     else:
+        if desk_model is not None:
+            return jsonify({'error': "desk_model is only valid when "
+                                     "desk == 'foundation'"}), 400
         strategy_name = data.get('strategy', 'momentum').lower()
         if strategy_name not in STRATEGIES:
             return jsonify({'error': f'Unknown strategy: {strategy_name}'}), 400
@@ -605,6 +654,21 @@ def list_strategies():
             'description': strategy_class.__doc__ or 'No description available'
         })
     return jsonify({'strategies': strategies_list})
+
+@backtest_bp.route('/models', methods=['GET'])
+def list_models():
+    """Available walk-forward models for desk-mode model selection.
+
+    Returns ``{'models': [{'id','name','description'}, ...]}`` straight from
+    desks.models.available_models() — the single source of truth the desk
+    factory also uses. Surfaces the same 503 as desk mode when the desks
+    package failed to import (so the frontend can disable the picker), rather
+    than a 500.
+    """
+    if available_models is None:
+        return jsonify({'error': 'Desk framework unavailable',
+                        'reason': DESK_REGISTRY_IMPORT_ERROR}), 503
+    return jsonify({'models': available_models()})
 
 @backtest_bp.route('/backtests', methods=['GET'])
 def list_backtests():
