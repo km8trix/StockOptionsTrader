@@ -101,7 +101,7 @@ from core.models import Asset, AssetType
 from desks.base import Desk, DeskIntent
 from desks.options_pricing import (DEFAULT_RATE, EarningsCalendar,
                                    SyntheticIVModel, black_scholes_greeks,
-                                   black_scholes_price)
+                                   black_scholes_price, skew_adjusted_iv)
 from desks.options_pricing import price_option as _price_option
 from desks.regime import RegimeHMMModel
 from desks.renaissance import TaggedWalkForwardFit
@@ -160,7 +160,25 @@ class JaneStreetDesk(Desk):
                  profit_target_pct: float = 0.5,
                  stop_loss_mult: float = 2.0,
                  time_exit_dte: int = 21,
-                 rate: float = DEFAULT_RATE):
+                 rate: float = DEFAULT_RATE,
+                 # --- Phase E opt-in features (defaults reproduce the
+                 # current behavior EXACTLY; greeks golden byte-identical) ---
+                 #: Vol-surface skew slope on log-moneyness k=ln(K/spot):
+                 #: iv(k) = base_iv * (1 - slope*k), floored positive.
+                 #: None / 0.0 -> FLAT surface = current per-symbol IV on
+                 #: every leg (the byte-identical default). Positive ->
+                 #: equity skew (OTM puts richer, OTM calls cheaper).
+                 vol_skew_slope: Optional[float] = None,
+                 #: Drop earnings-window observations from the _iv_rank
+                 #: percentile so the VRP signal reflects the non-earnings
+                 #: vol regime. False (or no earnings_calendar) -> the rank
+                 #: is byte-identical to current.
+                 exclude_earnings_from_iv_rank: bool = False,
+                 #: Calendar days BEFORE a scheduled earnings date that
+                 #: count as the earnings window for the rank exclusion
+                 #: (inclusive of the earnings date itself). Only consulted
+                 #: when exclude_earnings_from_iv_rank is on.
+                 iv_rank_earnings_window_days: int = 5):
         super().__init__(
             key='janestreet',
             name='Jane Street Desk',
@@ -216,6 +234,9 @@ class JaneStreetDesk(Desk):
         self.stop_loss_mult = stop_loss_mult
         self.time_exit_dte = time_exit_dte
         self.rate = rate
+        self.vol_skew_slope = vol_skew_slope
+        self.exclude_earnings_from_iv_rank = exclude_earnings_from_iv_rank
+        self.iv_rank_earnings_window_days = iv_rank_earnings_window_days
 
         self._regime_controller = (
             regime_controller if regime_controller is not None
@@ -248,6 +269,14 @@ class JaneStreetDesk(Desk):
         #: symbol -> rolling synthetic IV observations (one per day with
         #: a computable IV; the IV-rank window slides over this)
         self._iv_history: Dict[str, List[float]] = {}
+        #: symbol -> PARALLEL list of bools, one per _iv_history entry:
+        #: True when that observation's date fell inside an earnings
+        #: window (computed AT observation time from the pre-announced
+        #: schedule — see _update_iv_series; NO lookahead). Consulted
+        #: only by _iv_rank when exclude_earnings_from_iv_rank is on; the
+        #: default rank reads _iv_history untouched, so it is
+        #: byte-identical to the pre-feature behavior.
+        self._iv_earnings_flags: Dict[str, List[bool]] = {}
         self._today_iv: Dict[str, float] = {}
         #: relative-value spread position (None when flat)
         self._rv_position: Optional[Dict] = None
@@ -311,6 +340,14 @@ class JaneStreetDesk(Desk):
                             if self._current_regime else None)
         status['book_weights'] = dict(self.book_weights)
         status['open_structures'] = len(self.tracker.live_ids())
+        # Phase E transparency: surface the opt-in features ONLY when
+        # enabled, so the default status dict is byte-identical to before.
+        if self.vol_skew_slope is not None:
+            status['vol_skew_slope'] = self.vol_skew_slope
+        if self.exclude_earnings_from_iv_rank:
+            status['exclude_earnings_from_iv_rank'] = True
+            status['iv_rank_earnings_window_days'] = \
+                self.iv_rank_earnings_window_days
         return status
 
     # ------------------------------------------------------------------
@@ -320,9 +357,41 @@ class JaneStreetDesk(Desk):
                      date, spot: float) -> Optional[float]:
         """Synthetic fair value the engine fills/marks against — the
         SAME SyntheticIVModel the books trade on, so the desk and the
-        fills can never disagree about the vol surface."""
-        return _price_option(asset, underlying_frame, date, spot,
-                             self.iv_model, rate=self.rate)
+        fills can never disagree about the vol surface.
+
+        VOL SURFACE (opt-in, vol_skew_slope): when enabled, the engine's
+        fills/marks use the per-STRIKE surface IV, the same skew the
+        desk's internal credit/greeks/marks apply — keeping the desk and
+        the fills on ONE surface. When disabled, this delegates to the
+        shared price_option with the flat model IV, byte-identical to the
+        pre-surface path. NO-LOOKAHEAD preserved: the base IV still slices
+        the frame to closes strictly before `date`; the skew is a pure
+        function of the caller-supplied spot and the leg strike.
+        """
+        if self.vol_skew_slope is None:
+            return _price_option(asset, underlying_frame, date, spot,
+                                 self.iv_model, rate=self.rate)
+        if asset.asset_type not in (AssetType.CALL, AssetType.PUT):
+            raise ValueError(
+                f"price_option needs an option asset, got {asset}")
+        if asset.strike_price is None or asset.expiration_date is None:
+            # Mirror the module price_option guard so both pricing paths
+            # reject a malformed option asset with the SAME clear ValueError
+            # (a None strike/expiry would otherwise surface as a vaguer
+            # TypeError/NaT here). Unreachable for real legs (always carry
+            # strike+expiry); defensive symmetry only.
+            raise ValueError(f"option asset missing strike/expiry: {asset}")
+        expiry = pd.Timestamp(asset.expiration_date).date()
+        t_years = (expiry - pd.Timestamp(date).date()).days / 365.0
+        if t_years <= 0:
+            return black_scholes_price(spot, asset.strike_price, 0.0, 0.0,
+                                       self.rate, asset.asset_type.value)
+        base_iv = self.iv_model.iv(asset.symbol, underlying_frame, date)
+        if base_iv is None:
+            return None
+        leg_iv = self._surface_iv(base_iv, spot, asset.strike_price, t_years)
+        return black_scholes_price(spot, asset.strike_price, t_years, leg_iv,
+                                   self.rate, asset.asset_type.value)
 
     # ------------------------------------------------------------------
     # One simulated day
@@ -373,7 +442,15 @@ class JaneStreetDesk(Desk):
                           date) -> None:
         """Append today's synthetic IV per symbol (closes strictly
         before today — the same number a fill at today's open would
-        price with)."""
+        price with).
+
+        Alongside each appended IV we record whether TODAY fell inside an
+        earnings window (computed here, at observation time, from the
+        pre-announced schedule via _in_earnings_window). The flag is
+        consulted only by _iv_rank under the opt-in exclusion; the IV
+        list itself is unchanged, so the default rank path is
+        byte-identical.
+        """
         self._today_iv = {}
         for symbol in sorted(all_data):
             frame = all_data[symbol]
@@ -384,17 +461,73 @@ class JaneStreetDesk(Desk):
                 continue
             self._today_iv[symbol] = iv
             self._iv_history.setdefault(symbol, []).append(iv)
+            self._iv_earnings_flags.setdefault(symbol, []).append(
+                self._in_earnings_window(symbol, date))
+
+    def _in_earnings_window(self, symbol: str, date) -> bool:
+        """True when `date` is within iv_rank_earnings_window_days
+        calendar days BEFORE the next scheduled earnings date for
+        `symbol` (inclusive of the earnings date itself).
+
+        NO-LOOKAHEAD: this uses next_earnings(symbol, date) — the
+        earnings schedule is known in advance, so judging an observation
+        against the NEXT pre-announced date as of that same observation
+        date introduces no future information. The flag is frozen when
+        the observation is appended and never recomputed retroactively
+        against a later-announced date. Returns False unless the
+        exclusion feature is enabled AND a calendar is present (so the
+        flag is always False on the default path).
+        """
+        if not self.exclude_earnings_from_iv_rank \
+                or self.earnings_calendar is None:
+            return False
+        current = pd.Timestamp(date).date()
+        earnings = self.earnings_calendar.next_earnings(symbol, current)
+        if earnings is None:
+            return False
+        days_to_e = (earnings - current).days
+        return 0 <= days_to_e <= self.iv_rank_earnings_window_days
 
     def _iv_rank(self, symbol: str) -> Optional[float]:
         """Percentile of today's IV within the trailing iv_rank_window
         observations (inclusive of today): 100 * fraction of window
         observations <= today's IV. None until iv_rank_min_obs
-        observations exist."""
+        observations exist.
+
+        EARNINGS EXCLUSION (opt-in, exclude_earnings_from_iv_rank): when
+        enabled, observations whose date fell inside an earnings window
+        (the parallel _iv_earnings_flags, frozen at observation time) are
+        DROPPED from the comparison set before the percentile is taken,
+        so an earnings IV run-up cannot inflate the VRP rank. Today's IV
+        stays the reference value even if today itself is flagged — the
+        question is "where does today's vol sit within the NON-earnings
+        regime". The min-obs gate also requires iv_rank_min_obs
+        non-earnings observations, so the rank never rests on a thin
+        post-exclusion sample. DEFAULT (feature off): the comparison set
+        is the raw trailing window, byte-identical to the prior behavior.
+        """
         history = self._iv_history.get(symbol, ())
         if len(history) < self.iv_rank_min_obs:
             return None
         window = history[-self.iv_rank_window:]
         today = window[-1]
+        if self.exclude_earnings_from_iv_rank:
+            flags = self._iv_earnings_flags.get(symbol, ())
+            window_flags = flags[-self.iv_rank_window:]
+            # The IV list and its earnings-flag list are appended in lockstep
+            # in _update_iv_series; fail LOUD rather than let zip() silently
+            # truncate (misaligning flags to values) if a future code path
+            # ever desyncs them.
+            if len(window_flags) != len(window):
+                raise RuntimeError(
+                    f"IV/earnings-flag desync for {symbol}: {len(window)} "
+                    f"IVs vs {len(window_flags)} flags")
+            comparison = [value for value, flagged
+                          in zip(window, window_flags) if not flagged]
+            if len(comparison) < self.iv_rank_min_obs:
+                return None
+            return 100.0 * sum(1 for value in comparison
+                               if value <= today) / len(comparison)
         return 100.0 * sum(1 for value in window if value <= today) / len(window)
 
     # ------------------------------------------------------------------
@@ -442,17 +575,39 @@ class JaneStreetDesk(Desk):
     def _leg_inputs(self, asset: Asset, all_data: Dict[str, pd.DataFrame],
                     date) -> Optional[Tuple[float, float, float]]:
         """(spot, iv, t_years) for an option leg at today's close, or
-        None when the underlying has no bar/IV today."""
+        None when the underlying has no bar/IV today.
+
+        VOL SURFACE (opt-in, vol_skew_slope): when enabled, the returned
+        iv is the per-STRIKE surface IV — the flat per-symbol base IV
+        tilted by the moneyness skew at THIS leg's strike (see
+        _surface_iv / skew_adjusted_iv). When disabled (slope None/0.0),
+        iv is the exact flat base IV, so every leg on a symbol shares one
+        IV and the pricing/greeks are byte-identical to the pre-surface
+        path. spot and strike are both same-day inputs -> no lookahead.
+        """
         frame = all_data.get(asset.symbol)
         if not self._has_bar_today(frame, date):
             return None
-        iv = self._today_iv.get(asset.symbol)
-        if iv is None:
+        base_iv = self._today_iv.get(asset.symbol)
+        if base_iv is None:
             return None
         spot = float(frame['close'].iloc[-1])
         expiry = pd.Timestamp(asset.expiration_date).date()
         t_years = (expiry - pd.Timestamp(date).date()).days / 365.0
+        iv = self._surface_iv(base_iv, spot, asset.strike_price, t_years)
         return spot, iv, t_years
+
+    def _surface_iv(self, base_iv: float, spot: float,
+                    strike: Optional[float], t_years: float) -> float:
+        """Per-strike surface IV via the deterministic moneyness skew, or
+        the flat base_iv when the surface is disabled. Centralizes the
+        opt-in switch so every pricing site (greeks, marks, entry sizing)
+        applies the SAME surface. vol_skew_slope None/0.0 -> base_iv
+        unchanged (byte-identical default)."""
+        if self.vol_skew_slope is None or strike is None:
+            return base_iv
+        return skew_adjusted_iv(base_iv, spot, strike, self.vol_skew_slope,
+                                t_years)
 
     def _leg_greeks(self, asset: Asset) -> Optional[Dict[str, float]]:
         """GreeksProvider for the portfolio aggregator (C12): this option
@@ -744,8 +899,11 @@ class JaneStreetDesk(Desk):
                                       else AssetType.CALL),
                           strike_price=spec['strike'],
                           expiration_date=expiry)
-            greeks = black_scholes_greeks(spot, spec['strike'], t_years, iv,
-                                          self.rate, spec['right'])
+            # Per-strike surface IV when the surface is on; the flat base
+            # `iv` (byte-identical) when it is off.
+            leg_iv = self._surface_iv(iv, spot, spec['strike'], t_years)
+            greeks = black_scholes_greeks(spot, spec['strike'], t_years,
+                                          leg_iv, self.rate, spec['right'])
             sign = 1.0 if spec['action'] == 'SHORT' else -1.0
             credit_pc += sign * greeks['price']
             vega_per_contract += -sign * greeks['vega'] * 100.0
@@ -837,6 +995,16 @@ class JaneStreetDesk(Desk):
 
             # --- vrp book: IV-rank trigger -------------------------------
             if self.book_weights['vrp'] <= 0:
+                continue
+            # When the IV-rank earnings exclusion is on, keep the VRP book OUT
+            # of the earnings window entirely: today's IV is itself
+            # earnings-bumped, so a high rank measured vs the calm
+            # (non-earnings) regime would otherwise sell premium INTO the
+            # pre-earnings run-up — that vol belongs to the earnings book.
+            # No-op on the default path (_in_earnings_window returns False
+            # when the exclusion feature is off or no calendar is present),
+            # so the greeks golden stays byte-identical.
+            if self._in_earnings_window(symbol, date):
                 continue
             iv_rank = self._iv_rank(symbol)
             if iv_rank is None or iv_rank <= self.iv_rank_entry:
