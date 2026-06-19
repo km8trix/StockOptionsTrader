@@ -119,6 +119,7 @@ import pandas as pd
 
 from core.models import Asset, AssetType
 from desks.base import Desk, DeskIntent, OPENING_ACTIONS
+from desks.factor_risk import FactorRiskModel
 from desks.pods import (MeanReversionPod, MomentumPod, Pod, POD_ACTIONS,
                         StatArbPod)
 from desks.renaissance import TaggedWalkForwardFit
@@ -261,7 +262,9 @@ class CitadelDesk(Desk):
                  weight_min: float = 0.10,
                  weight_max: float = 0.50,
                  vol_floor: float = 0.05,
-                 score_floor: float = 0.05):
+                 score_floor: float = 0.05,
+                 max_factor_exposure: Optional[float] = 0.25,
+                 factor_risk_model: Optional[FactorRiskModel] = None):
         super().__init__(
             key='citadel',
             name='Citadel Desk',
@@ -335,6 +338,37 @@ class CitadelDesk(Desk):
                           else CentralRiskBook(
                               capital_allocation=capital_allocation))
 
+        # --- Factor-neutrality band (the Phase E sharpening) ------------
+        # A FactorRiskModel measures the aggregate book's net loading on the
+        # common price factors (momentum/reversal/low_vol/risk_adj_mom,
+        # reused from the AQR factor set); the central risk book caps how
+        # directional the WHOLE book may get on any single factor so no pod
+        # (nor the pods jointly) can quietly load the desk on one common
+        # driver. ON by default (max_factor_exposure=0.25 of desk capital);
+        # set max_factor_exposure to None to recover the old, non-factor-
+        # gated behavior (the band gate then always passes). Registered ONCE
+        # here; _refresh_factor_loadings updates the loadings the gate reads
+        # each simulated day, so the check is leakage-free by construction.
+        if max_factor_exposure is not None and max_factor_exposure <= 0:
+            raise ValueError(
+                f"max_factor_exposure must be > 0 or None, got "
+                f"{max_factor_exposure}")
+        self.max_factor_exposure = max_factor_exposure
+        self.factor_risk_model = (factor_risk_model
+                                  if factor_risk_model is not None
+                                  else FactorRiskModel())
+        #: live per-symbol loadings the registered factor limit reads; the
+        #: desk refreshes this each day from the date-sliced all_data.
+        self._factor_loadings_ref: Dict[str, Dict] = {'loadings': {}}
+        #: latest aggregate book net factor exposure (transparency surface).
+        self._book_factor_exposure: Dict[str, float] = {}
+        if max_factor_exposure is not None:
+            self.risk_book.register_limit(
+                'factor_neutrality',
+                CentralRiskBook.factor_neutrality_limit(
+                    self.factor_risk_model, self._factor_loadings_ref,
+                    max_factor_exposure))
+
         # --- Pod accounting state ---------------------------------------
         self._statuses: Dict[str, str] = {key: 'active' for key in self._pods}
         self._navs: Dict[str, float] = {key: 1.0 for key in self._pods}
@@ -390,6 +424,14 @@ class CitadelDesk(Desk):
     def get_status(self) -> Dict:
         status = super().get_status()
         status['pods'] = self._pod_snapshot()
+        # AQR-style transparency: the operator sees the book's net factor
+        # exposures (fraction of desk capital) and the neutrality band in
+        # force. None band -> the gate is off; the field reports that.
+        status['factor_neutrality'] = {
+            'band': self.max_factor_exposure,
+            'book_factor_exposure': {
+                f: float(v) for f, v in self._book_factor_exposure.items()},
+        }
         return status
 
     def _pod_snapshot(self) -> Dict[str, Dict]:
@@ -431,6 +473,7 @@ class CitadelDesk(Desk):
         now in force."""
         self._advance_day(date)
         self._update_pod_navs(portfolio)
+        self._refresh_factor_loadings(all_data, date)
 
         tagged: List[Tuple[str, DeskIntent]] = []
         tagged.extend(self._reconcile_pods(portfolio))
@@ -439,6 +482,12 @@ class CitadelDesk(Desk):
         tagged.extend(self._collect_pod_intents(all_data, date, portfolio))
 
         approved = self._apply_risk_book(tagged, portfolio, all_data)
+        # Surface the held-book factor exposure EVERY day — even on
+        # intent-less days — so drift on already-held positions is visible:
+        # the gate is an accumulation backstop on new opens, not a realized
+        # cap, so the held book can drift as loadings rotate.
+        self._note_book_factor_exposure(
+            portfolio, self._latest_prices(all_data))
         self._record_pod_history(date)
         return approved
 
@@ -448,6 +497,55 @@ class CitadelDesk(Desk):
             self._day_index += 1
             self._days_since_realloc += 1
         self._last_seen_date = current
+
+    # ------------------------------------------------------------------
+    # Factor-neutrality: refresh the loadings the risk-book gate reads
+    # ------------------------------------------------------------------
+    def _refresh_factor_loadings(self, all_data: Dict[str, pd.DataFrame],
+                                 date) -> None:
+        """Recompute the day's per-symbol factor loadings and publish them
+        into the reference the registered factor limit reads.
+
+        Leakage-free: ``all_data`` is the engine's date-sliced panel
+        (index <= date) and FactorRiskModel.loadings re-slices defensively,
+        so loadings depend only on data on-or-before ``date``. Graceful: on
+        thin/empty data the model returns ``{}`` and the gate simply passes
+        (no false block). When the band is disabled this is a cheap no-op
+        (no gate reads the reference), so it is skipped to keep the old path
+        untouched."""
+        if self.max_factor_exposure is None:
+            return
+        try:
+            loadings = self.factor_risk_model.loadings(all_data, date)
+        except Exception as exc:  # noqa: BLE001 — never crash a run
+            logger.warning(
+                "Citadel: factor loadings failed (%s); factor gate passes "
+                "this day", exc)
+            loadings = {}
+        self._factor_loadings_ref['loadings'] = loadings
+
+    def _measure_book_factor_exposure(
+            self, portfolio: PortfolioManager,
+            prices: Dict[str, float]) -> Dict[str, float]:
+        """Aggregate book net factor exposure (fraction of desk capital).
+
+        Marks the held book at ``prices`` (latest closes) via the risk
+        book's own per-symbol netting, then dollar-weights each name by its
+        current factor loadings. Returns {} when the band is disabled or
+        there is no usable base/loadings (graceful)."""
+        if self.max_factor_exposure is None:
+            return {}
+        loadings = self._factor_loadings_ref.get('loadings') or {}
+        if not loadings:
+            return {}
+        desk_capital = (portfolio.get_portfolio_value()
+                        * self.capital_allocation)
+        if desk_capital <= 0:
+            return {}
+        per_symbol = self.risk_book.compute_exposures(
+            portfolio, prices)['per_symbol']
+        return self.factor_risk_model.book_exposure(
+            per_symbol, loadings, desk_capital)
 
     # ------------------------------------------------------------------
     # Pod accounting: daily P&L attribution and NAV indexing
@@ -928,6 +1026,18 @@ class CitadelDesk(Desk):
     # ------------------------------------------------------------------
     # Central risk book
     # ------------------------------------------------------------------
+    @staticmethod
+    def _latest_prices(all_data: Dict[str, pd.DataFrame]) -> Dict[str, float]:
+        """Latest-close mark per symbol (the risk book's preferred mark)."""
+        prices: Dict[str, float] = {}
+        for symbol, frame in all_data.items():
+            if frame is None or frame.empty or 'close' not in frame.columns:
+                continue
+            close = frame['close'].iloc[-1]
+            if pd.notna(close):
+                prices[symbol] = float(close)
+        return prices
+
     def _apply_risk_book(self, tagged: List[Tuple[str, DeskIntent]],
                          portfolio: PortfolioManager,
                          all_data: Dict[str, pd.DataFrame]
@@ -945,13 +1055,7 @@ class CitadelDesk(Desk):
                     intent.asset.symbol)
 
         ordered = sorted(tagged, key=sort_key)
-        prices: Dict[str, float] = {}
-        for symbol, frame in all_data.items():
-            if frame is None or frame.empty or 'close' not in frame.columns:
-                continue
-            close = frame['close'].iloc[-1]
-            if pd.notna(close):
-                prices[symbol] = float(close)
+        prices = self._latest_prices(all_data)
 
         pod_by_intent = {id(intent): pod_key for pod_key, intent in ordered}
         approved, blocked = self.risk_book.check(
@@ -971,6 +1075,41 @@ class CitadelDesk(Desk):
                         and state['entry_day'] == self._day_index:
                     del self._pod_positions[intent.asset]
         return approved
+
+    def _note_book_factor_exposure(self, portfolio: PortfolioManager,
+                                   prices: Dict[str, float]) -> None:
+        """Measure the aggregate book net factor exposure and surface it.
+
+        Stores the latest reading for get_status (the AQR-style operator
+        transparency: the book's net loading per factor, as a fraction of
+        desk capital) and emits one 'info' note per day (deliberately NOT
+        'allocation', to keep the C9 reallocation-note count exact — see the
+        inline comment below) when the book has a measurable factor exposure.
+        Called once per simulated day from generate_intents (NOT only on
+        intent days), so held-book drift is surfaced even when the pods are
+        quiet. Graceful/quiet when the band is disabled or there is no usable
+        exposure (no note, no churn on empty/thin days)."""
+        exposure = self._measure_book_factor_exposure(portfolio, prices)
+        self._book_factor_exposure = exposure
+        if not exposure:
+            return
+        if not any(v != 0.0 for v in exposure.values()):
+            return
+        worst_factor = max(exposure, key=lambda f: abs(exposure[f]))
+        summary = ", ".join(f"{f} {exposure[f]:+.2%}"
+                            for f in sorted(exposure))
+        # 'info' (not 'allocation'): kept clear of the C9 reallocation
+        # contract so counting 'allocation' notes stays exact; this is the
+        # AQR-style factor-exposure transparency note carrying
+        # data.factor_exposure + data.band.
+        self.note(
+            'info',
+            f"Book factor exposure (net, fraction of desk capital): "
+            f"{summary}; largest |{worst_factor}| "
+            f"{abs(exposure[worst_factor]):.2%} vs the "
+            f"+/-{self.max_factor_exposure:.2%} neutrality band",
+            factor_exposure={f: float(v) for f, v in exposure.items()},
+            band=self.max_factor_exposure, worst_factor=worst_factor)
 
     # ------------------------------------------------------------------
     # C8 history
