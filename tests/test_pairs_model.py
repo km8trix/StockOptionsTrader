@@ -79,8 +79,29 @@ class TestFit:
         log_b = np.log(universe['BBB']['close'].to_numpy())
         spread = log_a - pair['beta'] * log_b
         assert pair['spread_mean'] == pytest.approx(float(np.mean(spread)))
-        # Population std (ddof=0) by contract.
-        assert pair['spread_std'] == pytest.approx(float(np.std(spread)))
+        # Sample std (ddof=1) by contract (Phase 5 "pairs ddof + rolling
+        # mean": the unbiased estimator, matching the Phase 3 Sharpe/Sortino
+        # ddof=1 convention). The population std (ddof=0) is a smaller value
+        # by a sqrt(n/(n-1)) factor and must NOT match.
+        assert pair['spread_std'] == pytest.approx(float(np.std(spread, ddof=1)))
+        assert pair['spread_std'] != pytest.approx(float(np.std(spread, ddof=0)))
+
+    def test_spread_std_ddof_zero_recovers_population_std(self, universe):
+        # The ddof=1 change is opt-out: spread_std_ddof=0 reproduces the
+        # exact pre-Phase-E population std (and thus the old z denominator).
+        model = PairsCointegrationModel(spread_std_ddof=0)
+        model.fit(universe)
+        pair = model.pairs[0]
+        log_a = np.log(universe['AAA']['close'].to_numpy())
+        log_b = np.log(universe['BBB']['close'].to_numpy())
+        spread = log_a - pair['beta'] * log_b
+        assert pair['spread_std'] == pytest.approx(float(np.std(spread, ddof=0)))
+        assert pair['spread_std'] != pytest.approx(float(np.std(spread, ddof=1)))
+
+    def test_spread_std_ddof_validates(self):
+        for bad in (-1, 2, 5):
+            with pytest.raises(ValueError, match='spread_std_ddof'):
+                PairsCointegrationModel(spread_std_ddof=bad)
 
     def test_liquidity_cap_limits_the_scan(self, universe):
         # With only the 2 most liquid symbols (AAA, BBB by volume), the
@@ -96,6 +117,10 @@ class TestFit:
 
 class TestPredict:
     def test_z_score_hand_verified_at_a_known_date(self, universe, fitted):
+        # The default model (fitted fixture) carries z_mean_window=60, so
+        # predict() centers the z-score on the ROLLING mean of the last 60
+        # overlapping spread observations, NOT the static fit-window
+        # spread_mean.
         date = universe['AAA'].index[-1]
         result = fitted.predict(universe, date)
 
@@ -105,12 +130,71 @@ class TestPredict:
         assert set(quote) == {'a', 'b', 'beta', 'z'}
 
         pair = fitted.pairs[0]
+        log_a = np.log(universe['AAA']['close'])
+        log_b = np.log(universe['BBB']['close'])
+        spread_today = (float(log_a.iloc[-1])
+                        - pair['beta'] * float(log_b.iloc[-1]))
+
+        # Hand-compute the rolling center: the mean of the spread over the
+        # legs' last 60 overlapping dates.
+        common = log_a.index.intersection(log_b.index)
+        tail = common[-60:]
+        spread_window = (log_a.loc[tail].to_numpy()
+                         - pair['beta'] * log_b.loc[tail].to_numpy())
+        rolling_center = float(np.mean(spread_window))
+        expected_z = (spread_today - rolling_center) / pair['spread_std']
+        assert quote['z'] == pytest.approx(expected_z)
+        assert quote['beta'] == pytest.approx(pair['beta'])
+
+        # The static fit-window mean gives a DIFFERENT z, confirming the
+        # rolling-mean centering is actually in effect (not a no-op).
+        static_z = (spread_today - pair['spread_mean']) / pair['spread_std']
+        assert quote['z'] != pytest.approx(static_z)
+
+    def test_z_mean_window_none_recovers_static_mean(self, universe):
+        # RECOVERABILITY: z_mean_window=None centers on the static
+        # fit-window spread_mean — the exact pre-Phase-E z-score.
+        model = PairsCointegrationModel(z_mean_window=None)
+        model.fit(universe)
+        pair = model.pairs[0]
+        date = universe['AAA'].index[-1]
+        quote = model.predict(universe, date)['pairs'][0]
+
         spread_today = (np.log(float(universe['AAA']['close'].iloc[-1]))
                         - pair['beta']
                         * np.log(float(universe['BBB']['close'].iloc[-1])))
         expected_z = (spread_today - pair['spread_mean']) / pair['spread_std']
         assert quote['z'] == pytest.approx(expected_z)
-        assert quote['beta'] == pytest.approx(pair['beta'])
+
+    def test_rolling_z_is_leakage_free_and_deterministic(self, universe):
+        # NO-LOOKAHEAD: appending FUTURE rows then re-slicing to <= date
+        # must yield an identical z (the rolling mean reads only index<=date,
+        # exactly the date-sliced frames the controller passes). Also
+        # DETERMINISTIC: two predicts on the same input are byte-identical.
+        model = PairsCointegrationModel()
+        model.fit(universe)
+        date = universe['AAA'].index[-1]
+
+        sliced = {sym: df[df.index <= date] for sym, df in universe.items()}
+        z_baseline = model.predict(sliced, date)['pairs'][0]['z']
+        z_repeat = model.predict(sliced, date)['pairs'][0]['z']
+        assert z_repeat == z_baseline  # deterministic, byte-identical
+
+        # Append future bars (later dates) to every leg, then re-slice to
+        # the SAME date: future data must not change the z at `date`.
+        future_index = pd.bdate_range(
+            universe['AAA'].index[-1] + pd.Timedelta(days=1), periods=30)
+        extended = {}
+        for sym, df in universe.items():
+            future = _frame(
+                np.log(df['close'].to_numpy()[-1]) + np.cumsum(
+                    np.full(len(future_index), 0.05)),  # large upward drift
+                900_000.0, future_index)
+            extended[sym] = pd.concat([df, future])
+        re_sliced = {sym: df[df.index <= date]
+                     for sym, df in extended.items()}
+        z_after_future = model.predict(re_sliced, date)['pairs'][0]['z']
+        assert z_after_future == pytest.approx(z_baseline)
 
     def test_missing_leg_is_skipped(self, universe, fitted):
         date = universe['AAA'].index[-1]

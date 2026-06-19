@@ -11,6 +11,7 @@ C5 + C7 report shapes. Offline, seeded, deterministic.
 
 from __future__ import annotations
 
+import contextlib
 import json
 
 import numpy as np
@@ -31,6 +32,22 @@ from portfolio.risk_manager import RiskManager
 
 def stock(symbol: str) -> Asset:
     return Asset(symbol=symbol, asset_type=AssetType.STOCK)
+
+
+@contextlib.contextmanager
+def _patched_fetch(frames):
+    """Monkeypatch MarketDataHandler.fetch_stock_data to serve `frames`
+    (offline, deterministic) for the duration of the context."""
+    original = MarketDataHandler.fetch_stock_data
+
+    def fake_fetch(self, symbol, start_date, end_date):
+        return frames.get(symbol, pd.DataFrame())
+
+    MarketDataHandler.fetch_stock_data = fake_fetch
+    try:
+        yield
+    finally:
+        MarketDataHandler.fetch_stock_data = original
 
 
 def probs_for(state: str, p: float) -> dict:
@@ -71,6 +88,27 @@ class StubScoreModel(WalkForwardModel):
                 if symbol in data}
 
 
+class DateScoreModel(WalkForwardModel):
+    """Per-date stat-arb scores: scripted scores by date, falling back to
+    `default` for unscripted dates (restricted to present symbols). Lets a
+    test re-rank the universe between rebalances to exercise the rank-
+    stability band, minimum-hold period, and flip rules deterministically.
+    """
+
+    def __init__(self, schedule=None, default=None):
+        self.schedule = {pd.Timestamp(d): scores
+                         for d, scores in (schedule or {}).items()}
+        self.default = default or {}
+
+    def fit(self, train_data):
+        pass
+
+    def predict(self, data, date):
+        scores = self.schedule.get(pd.Timestamp(date), self.default)
+        return {symbol: score for symbol, score in scores.items()
+                if symbol in data}
+
+
 class StubPairsModel(WalkForwardModel):
     """Scripted pair quotes by date; exposes .pairs like the real model."""
 
@@ -99,6 +137,24 @@ def make_desk(regime_schedule=None, scores=None, pairs_schedule=None,
         pairs_controller=WalkForwardController(
             StubPairsModel(pairs_schedule, pairs=model_pairs),
             min_train_days=1, refit_every_days=pairs_refit_every),
+        **kwargs)
+
+
+def make_stat_arb_desk(score_model, stat_arb_refit_every=21, **kwargs):
+    """A desk wired with a custom (date-aware) stat-arb score model and no
+    regime/pairs activity, for the stat-arb turnover-control regressions.
+    New stat-arb params (band mult, min-hold, conviction) pass via kwargs."""
+    kwargs.setdefault('risk_manager', RiskManager(
+        max_position_size=1.0, max_daily_loss=0.99,
+        position_stop_loss=0.90))  # wide: book mechanics stay pure
+    return RenaissanceDesk(
+        regime_controller=WalkForwardController(
+            StubRegimeModel(None), min_train_days=1),
+        stat_arb_controller=WalkForwardController(
+            score_model, min_train_days=1,
+            refit_every_days=stat_arb_refit_every),
+        pairs_controller=WalkForwardController(
+            StubPairsModel(None, pairs=[]), min_train_days=1),
         **kwargs)
 
 
@@ -283,6 +339,54 @@ class TestMeanReversionBook:
         assert [i.action for i in intents] == ['SHORT']
         assert desk.notes[-1].data['z'] > 1.5
 
+    def _two_symbol_frames(self):
+        # Two LONG signals triggering the same day with different |z|:
+        # MRB's deeper drop (-5%) gives a larger |z| than MRA's (-2%).
+        win = (self.DROP_START, self.DROP_START + 3)
+        return {
+            'MRA': noisy_frame(n=90, seed=5, drop_window=win, drop=-0.02),
+            'MRB': noisy_frame(n=90, seed=5, drop_window=win, drop=-0.05),
+        }
+
+    def test_conviction_sizing_scales_by_z_excess(self):
+        # CONVICTION SIZING: the stronger |z|-excess signal (MRB) sizes
+        # larger than the weaker (MRA); the strongest sits at the per-entry
+        # cap and no entry exceeds it (book gross stays <= the old flat
+        # total). With 2 signals the cap is 0.4 * min(0.25, 1/4) = 0.1.
+        frames = self._two_symbol_frames()
+        dates = frames['MRA'].index
+        desk = make_desk(regime_schedule={
+            d: probs_for('mean_reverting', 0.90) for d in dates})
+        out = drive(desk, frames, dates[70:self.DROP_START + 1],
+                    PortfolioManager(100000.0))
+        intents = out[dates[self.DROP_START]]
+        sizes = {i.asset.symbol: i.size_fraction for i in intents}
+        zs = {n.data['symbol']: n.data['z'] for n in desk.notes
+              if n.data.get('book') == 'mean_reversion'
+              and n.data.get('symbol')}
+        assert abs(zs['MRB']) > abs(zs['MRA'])     # MRB the stronger signal
+        assert sizes['MRB'] > sizes['MRA']          # ... gets the larger size
+        per_entry_cap = 0.4 * min(0.25, 1.0 / max(4, len(intents)))
+        assert sizes['MRB'] == pytest.approx(per_entry_cap)  # strongest at cap
+        for size in sizes.values():
+            assert 0 < size <= per_entry_cap + 1e-12
+        assert sum(sizes.values()) <= len(intents) * per_entry_cap + 1e-12
+
+    def test_flat_sizing_recovers_old_per_entry_size(self):
+        # RECOVERABILITY: mr_size_by_conviction=False gives every entry the
+        # flat per-entry cap exactly, reproducing the pre-Phase-E sizing.
+        frames = self._two_symbol_frames()
+        dates = frames['MRA'].index
+        desk = make_desk(regime_schedule={
+            d: probs_for('mean_reverting', 0.90) for d in dates},
+            mr_size_by_conviction=False)
+        out = drive(desk, frames, dates[70:self.DROP_START + 1],
+                    PortfolioManager(100000.0))
+        intents = out[dates[self.DROP_START]]
+        per_entry_cap = 0.4 * min(0.25, 1.0 / max(4, len(intents)))
+        for intent in intents:
+            assert intent.size_fraction == pytest.approx(per_entry_cap)
+
     def test_exit_when_z_crosses_zero(self):
         # A +6% bounce 3 days after the trigger flips the 3d return
         # positive, so z crosses 0 at age 3 — before the age-5 exit.
@@ -403,14 +507,47 @@ class TestStatArbBook:
         assert sorted(i.asset.symbol for i in buys) == ['S00', 'S01']
         assert sorted(i.asset.symbol for i in shorts) == ['S08', 'S09']
 
-        # size = w_sa * min(0.25, 1/(2*top_n)) = 0.4 * 0.25 = 0.1.
+        # Conviction-sized by default (stat_arb_size_by_conviction=True):
+        # each leg is bounded by the per-leg cap and the book gross is
+        # bounded by the old flat total (n_entries * per_leg_cap).
+        per_leg_cap = 0.4 * min(0.25, 1.0 / (2 * top_n))  # 0.1
         for intent in intents:
-            assert intent.size_fraction == pytest.approx(0.4 * 0.25)
+            assert 0 < intent.size_fraction <= per_leg_cap + 1e-12
+        gross = sum(i.size_fraction for i in intents)
+        assert gross <= len(intents) * per_leg_cap + 1e-12
 
         book_notes = [n for n in desk.notes
                       if n.data.get('book') == 'stat_arb']
         assert {n.category for n in book_notes} == {'model', 'signal',
                                                     'allocation'}
+
+    def test_flat_sizing_recovers_old_per_leg_size(self):
+        # RECOVERABILITY: stat_arb_size_by_conviction=False reproduces the
+        # old flat per-leg size = w_sa * min(0.25, 1/(2*top_n)) = 0.1.
+        frames = self._universe()
+        dates = frames['S00'].index
+        desk = make_desk(scores=self._scores(),
+                         stat_arb_size_by_conviction=False)
+        out = drive(desk, frames, dates[:1], PortfolioManager(100000.0))
+        for intent in out[dates[0]]:
+            assert intent.size_fraction == pytest.approx(0.4 * 0.25)
+
+    def test_conviction_sizing_orders_legs_by_abs_score(self):
+        # CONVICTION SIZING: a higher-|score| leg gets a larger
+        # size_fraction than a lower-|score| leg on the same side. Scores
+        # S00..S09 are strictly monotone (0.9 .. -0.9), so |S00| > |S01|
+        # on the long side and |S09| > |S08| on the short side.
+        frames = self._universe()
+        dates = frames['S00'].index
+        desk = make_desk(scores=self._scores())  # conviction on by default
+        out = drive(desk, frames, dates[:1], PortfolioManager(100000.0))
+        sizes = {i.asset.symbol: i.size_fraction for i in out[dates[0]]}
+        # Long side: S00 (|0.9|) heavier than S01 (|0.7|).
+        assert sizes['S00'] > sizes['S01']
+        # Short side: S09 (|0.9|) heavier than S08 (|0.7|).
+        assert sizes['S09'] > sizes['S08']
+        # Equal |score| top legs (S00 long, S09 short both |0.9|) match.
+        assert sizes['S00'] == pytest.approx(sizes['S09'])
 
     def test_no_rebalance_off_mondays_without_refit(self):
         frames = self._universe()
@@ -429,6 +566,294 @@ class TestStatArbBook:
         out = drive(desk, frames, dates[:1], PortfolioManager(100000.0))
         # n=1 -> top_n=1; the single symbol ranks top, never both sides.
         assert [i.action for i in out[dates[0]]] == ['BUY']
+
+
+class TestStatArbTurnoverControls:
+    """Phase E stat-arb turnover controls: rank-stability band (hysteresis),
+    minimum holding period, conviction sizing, and the recoverability of the
+    pre-Phase-E behavior via the new params. The universe has 10 scored
+    symbols (top_n = 10//5 = 2; default band exit_n = ceil(2.0*2) = 4)."""
+
+    UNIVERSE_N = 10
+
+    def _frames(self, n_days=12):
+        return {f'S{i:02d}': noisy_frame(n=n_days, seed=100 + i)
+                for i in range(self.UNIVERSE_N)}
+
+    def _monotone(self):
+        # S00 highest (+0.9) .. S09 lowest (-0.9), strictly monotone.
+        return {f'S{i:02d}': 0.9 - 0.2 * i for i in range(self.UNIVERSE_N)}
+
+    def _fill(self, portfolio, intents, fill_date):
+        for intent in intents:
+            qty = 100 if intent.action == 'BUY' else -100
+            portfolio.add_position(Position(
+                asset=intent.asset, quantity=qty, avg_entry_price=100.0,
+                current_price=100.0, timestamp=fill_date))
+
+    # ---- Rank-stability band (hysteresis) ----------------------------
+    def test_name_inside_wider_band_is_held_not_exited(self):
+        # A held long that slips from the top-2 ENTRY set to rank 3 stays
+        # inside the top-4 HOLD band (exit_n = ceil(2.0*2) = 4): it must NOT
+        # be exited. Mondays fall on day 0 and day 5; on day 5 the entry's
+        # age is 5 so the minimum-hold (default 5) does not interfere.
+        frames = self._frames()
+        dates = frames['S00'].index
+        base = self._monotone()
+        # Day 5: S00 drops to rank 3 (still in band) — S02 climbs into top-2.
+        day5 = dict(base)
+        day5['S00'] = 0.45  # below S01(.7), S02(.5); above S03(.3): rank 3
+        sm = DateScoreModel(schedule={dates[5]: day5}, default=base)
+        desk = make_stat_arb_desk(sm)  # band 2.0, min-hold 5, conviction on
+        portfolio = PortfolioManager(1_000_000.0)
+
+        out0 = drive(desk, frames, dates[:1], portfolio)
+        assert sorted(i.asset.symbol for i in out0[dates[0]]
+                      if i.action == 'BUY') == ['S00', 'S01']
+        self._fill(portfolio, out0[dates[0]], dates[1])
+
+        out = drive(desk, frames, dates[1:6], portfolio)
+        # No rebalance Tue..Fri; only day 5 (Monday) rebalances.
+        for d in dates[1:5]:
+            assert out[d] == []
+        day5_acts = {(i.asset.symbol, i.action) for i in out[dates[5]]}
+        assert ('S00', 'SELL') not in day5_acts   # held: still in band
+        assert ('S02', 'BUY') in day5_acts          # new entrant top-2
+
+    def test_name_leaving_wider_band_is_exited(self):
+        # The same setup but S00 falls BELOW the top-4 band (to rank 7):
+        # it must be exited with a "left the long hold band" reason.
+        frames = self._frames()
+        dates = frames['S00'].index
+        base = self._monotone()
+        day5 = dict(base)
+        day5['S00'] = -0.5  # rank 7 of 10: out of the top-4 hold band
+        sm = DateScoreModel(schedule={dates[5]: day5}, default=base)
+        desk = make_stat_arb_desk(sm)
+        portfolio = PortfolioManager(1_000_000.0)
+
+        out0 = drive(desk, frames, dates[:1], portfolio)
+        self._fill(portfolio, out0[dates[0]], dates[1])
+        out = drive(desk, frames, dates[1:6], portfolio)
+        s00 = [i for i in out[dates[5]] if i.asset.symbol == 'S00']
+        assert len(s00) == 1
+        assert s00[0].action == 'SELL'
+        assert 'left the long hold band' in s00[0].reason
+
+    def test_band_mult_one_recovers_exit_on_leaving_entry_decile(self):
+        # RECOVERABILITY: stat_arb_exit_band_mult=1.0 makes exit_n == top_n,
+        # so a name that merely leaves the top-2 ENTRY set (here to rank 3,
+        # which the default band would HOLD) is exited immediately.
+        frames = self._frames()
+        dates = frames['S00'].index
+        base = self._monotone()
+        day5 = dict(base)
+        day5['S00'] = 0.45  # rank 3: inside default band, outside entry top-2
+        sm = DateScoreModel(schedule={dates[5]: day5}, default=base)
+        desk = make_stat_arb_desk(sm, stat_arb_exit_band_mult=1.0,
+                                  stat_arb_min_hold_days=0)
+        portfolio = PortfolioManager(1_000_000.0)
+
+        out0 = drive(desk, frames, dates[:1], portfolio)
+        self._fill(portfolio, out0[dates[0]], dates[1])
+        out = drive(desk, frames, dates[1:6], portfolio)
+        s00 = [i for i in out[dates[5]] if i.asset.symbol == 'S00']
+        assert [i.action for i in s00] == ['SELL']  # old behavior: exited
+
+    # ---- Minimum holding period --------------------------------------
+    def test_min_hold_blocks_early_exit_then_allows_it(self):
+        # With refit every day, every day is a rebalance day. S00 leaves the
+        # band starting day 1 but is NOT a flip; the default 5-day minimum
+        # hold keeps it until its age reaches 5 (day 5), then it exits.
+        frames = self._frames()
+        dates = frames['S00'].index
+        base = self._monotone()
+        later = dict(base)
+        later['S00'] = -0.5  # rank 7: out of band, but NOT bottom-2 (no flip)
+        sm = DateScoreModel(schedule={d: later for d in dates[1:]},
+                            default=base)
+        desk = make_stat_arb_desk(sm, stat_arb_refit_every=1)  # daily rebal
+        portfolio = PortfolioManager(1_000_000.0)
+
+        out0 = drive(desk, frames, dates[:1], portfolio)
+        self._fill(portfolio, out0[dates[0]], dates[1])
+        out = drive(desk, frames, dates[1:6], portfolio)
+        # Days 1..4 (age 1..4 < 5): held despite leaving the band.
+        for d in dates[1:5]:
+            assert [i for i in out[d] if i.asset.symbol == 'S00'] == []
+        # Day 5 (age 5, no longer < min-hold): finally exited.
+        s00 = [i for i in out[dates[5]] if i.asset.symbol == 'S00']
+        assert [i.action for i in s00] == ['SELL']
+
+    def test_min_hold_zero_recovers_immediate_exit(self):
+        # RECOVERABILITY: stat_arb_min_hold_days=0 exits the name the moment
+        # it leaves the band (here band mult 1.0 too, the full old behavior),
+        # on the very next rebalance — no holding grace.
+        frames = self._frames()
+        dates = frames['S00'].index
+        base = self._monotone()
+        later = dict(base)
+        later['S00'] = -0.5
+        sm = DateScoreModel(schedule={d: later for d in dates[1:]},
+                            default=base)
+        desk = make_stat_arb_desk(sm, stat_arb_refit_every=1,
+                                  stat_arb_exit_band_mult=1.0,
+                                  stat_arb_min_hold_days=0)
+        portfolio = PortfolioManager(1_000_000.0)
+        out0 = drive(desk, frames, dates[:1], portfolio)
+        self._fill(portfolio, out0[dates[0]], dates[1])
+        out = drive(desk, frames, dates[1:3], portfolio)
+        s00 = [i for i in out[dates[1]] if i.asset.symbol == 'S00']
+        assert [i.action for i in s00] == ['SELL']  # exited at age 1
+
+    def test_flip_is_exempt_from_min_hold(self):
+        # A held leg that FLIPS to the opposite side must close immediately
+        # (no-flip rule) even with age < min-hold: the close has to fill
+        # before the opposite-side entry. S00 (long, age 1) is driven to the
+        # very bottom so it now ranks SHORT.
+        frames = self._frames()
+        dates = frames['S00'].index
+        base = self._monotone()
+        flip = dict(base)
+        flip['S00'] = -10.0  # rank last: desired side flips long -> short
+        sm = DateScoreModel(schedule={dates[1]: flip}, default=base)
+        desk = make_stat_arb_desk(sm, stat_arb_refit_every=1)  # min-hold 5
+        portfolio = PortfolioManager(1_000_000.0)
+        out0 = drive(desk, frames, dates[:1], portfolio)
+        self._fill(portfolio, out0[dates[0]], dates[1])
+        out = drive(desk, frames, dates[1:2], portfolio)
+        s00 = [i for i in out[dates[1]] if i.asset.symbol == 'S00']
+        assert len(s00) == 1
+        assert s00[0].action == 'SELL'
+        assert 'flip to opposite side' in s00[0].reason
+
+    # ---- Conviction sizing -------------------------------------------
+    def test_conviction_sizing_bounds_gross_by_old_flat_total(self):
+        # Conviction-sized legs never exceed the per-leg cap, and book gross
+        # stays <= the old flat book's total (n_entries * per_leg_cap).
+        frames = self._frames()
+        dates = frames['S00'].index
+        sm = DateScoreModel(default=self._monotone())
+        desk = make_stat_arb_desk(sm)  # conviction on by default
+        out = drive(desk, frames, dates[:1], PortfolioManager(1_000_000.0))
+        intents = out[dates[0]]
+        top_n = max(1, self.UNIVERSE_N // 5)
+        per_leg_cap = 0.4 * min(0.25, 1.0 / (2 * top_n))
+        for intent in intents:
+            assert 0 < intent.size_fraction <= per_leg_cap + 1e-12
+        gross = sum(i.size_fraction for i in intents)
+        assert gross <= len(intents) * per_leg_cap + 1e-12
+        # Conviction comes in strictly UNDER the flat total here (the weaker
+        # legs price below the cap), proving it is not just the flat book.
+        assert gross < len(intents) * per_leg_cap
+
+    def test_near_zero_score_leg_is_floored_not_dropped(self):
+        # A near-zero-|score| leg in a batch alongside a strong leg is
+        # floored to a small, strictly-positive size (DeskIntent requires
+        # size_fraction > 0) rather than rounding to 0; the floor is well
+        # below the per-leg cap so it cannot inflate gross.
+        desk = make_stat_arb_desk(DateScoreModel(default=self._monotone()))
+        top_n = max(1, self.UNIVERSE_N // 5)
+        per_leg_cap = 0.4 * min(0.25, 1.0 / (2 * top_n))
+        floor = max(per_leg_cap * 0.05, 1e-6)
+        # S01 strong (|0.7|), S00 near-zero (|1e-9|): the weak leg floors.
+        # Both on the SAME side so the per-side budget covers the pair.
+        scores = {'S01': 0.7, 'S00': 1e-9}
+        desired = {'S01': 'short', 'S00': 'short'}
+        sizes = desk._stat_arb_sizes(['S01', 'S00'], scores, desired,
+                                     0.4, top_n)
+        assert sizes['S00'] == pytest.approx(floor)
+        assert 0 < sizes['S00'] < sizes['S01'] <= per_leg_cap + 1e-12
+
+    def test_conviction_sizing_is_dollar_neutral_across_sides(self):
+        # REGRESSION for the per-side budgeting fix: conviction sizing must
+        # NOT leak net directional exposure when one side is more confident
+        # than the other. Budgeting per side keeps long gross ~ short gross
+        # even under strong cross-side |score| asymmetry; pooling both sides
+        # (the bug) would drive the confident side to the cap and starve the
+        # other, taking a large net directional position on a desk that is
+        # supposed to be market-neutral.
+        desk = make_stat_arb_desk(DateScoreModel(default=self._monotone()))
+        top_n = max(1, self.UNIVERSE_N // 5)
+        per_leg_cap = 0.4 * min(0.25, 1.0 / (2 * top_n))
+        # Confident longs, weak shorts (the exact asymmetry that leaked beta).
+        entry = ['L0', 'L1', 'S0', 'S1']
+        desired = {'L0': 'long', 'L1': 'long', 'S0': 'short', 'S1': 'short'}
+        scores = {'L0': 0.40, 'L1': 0.35, 'S0': -0.08, 'S1': -0.06}
+        sizes = desk._stat_arb_sizes(entry, scores, desired, 0.4, top_n)
+        long_gross = sizes['L0'] + sizes['L1']
+        short_gross = sizes['S0'] + sizes['S1']
+        # Per side, gross stays near the (equal) per-side budget; the net is a
+        # small residual from per-leg-cap clamping, FAR below the directional
+        # tilt that pooled budgeting would produce (~0.13 here).
+        assert abs(long_gross - short_gross) < 0.5 * per_leg_cap
+        # Each side is still conviction-tilted internally and cap-bounded.
+        assert sizes['L0'] > sizes['L1']
+        assert sizes['S0'] > sizes['S1']
+        assert max(sizes.values()) <= per_leg_cap + 1e-12
+
+    def test_all_zero_scores_fall_back_to_flat(self):
+        # All-zero |score| -> conviction is undefined; sizing falls back to
+        # the flat per-leg cap so every leg still trades.
+        frames = self._frames()
+        dates = frames['S00'].index
+        zero_scores = {f'S{i:02d}': 0.0 for i in range(self.UNIVERSE_N)}
+        sm = DateScoreModel(default=zero_scores)
+        desk = make_stat_arb_desk(sm)
+        out = drive(desk, frames, dates[:1], PortfolioManager(1_000_000.0))
+        top_n = max(1, self.UNIVERSE_N // 5)
+        per_leg_cap = 0.4 * min(0.25, 1.0 / (2 * top_n))
+        for intent in out[dates[0]]:
+            assert intent.size_fraction == pytest.approx(per_leg_cap)
+
+    # ---- Turnover reduction (the key regression) ---------------------
+    def test_turnover_drops_vs_recovered_old_behavior(self):
+        # KEY REGRESSION: on a synthetic universe whose marginal names
+        # oscillate across the decile boundary every Monday, the NEW
+        # defaults (band 2.0 + min-hold 5) round-trip FEWER stat-arb legs
+        # than the params set to recover the old behavior (band 1.0 +
+        # min-hold 0) — while still trading. Pins the hysteresis so a future
+        # change that re-introduces churn fails here.
+        n_days = 40
+        frames = {f'S{i:02d}': noisy_frame(n=n_days, seed=300 + i)
+                  for i in range(self.UNIVERSE_N)}
+        dates = frames['S00'].index
+        base = self._monotone()
+        rng = np.random.default_rng(7)
+        schedule = {}
+        for d in dates:                # jitter the ranking every Monday
+            if d.weekday() == 0:
+                schedule[d] = {s: base[s] + rng.normal(0.0, 0.25)
+                               for s in base}
+
+        def run(recover_old):
+            sm = DateScoreModel(schedule=schedule, default=base)
+            kwargs = {}
+            if recover_old:
+                kwargs = dict(stat_arb_exit_band_mult=1.0,
+                              stat_arb_min_hold_days=0,
+                              stat_arb_size_by_conviction=False)
+            desk = make_stat_arb_desk(sm, **kwargs)
+            engine = BacktestEngine(desk=desk, initial_capital=1_000_000.0,
+                                    commission=0.0)
+            with _patched_fetch(frames):
+                engine.run(sorted(frames), '2023-01-01', '2023-04-30',
+                           benchmark_symbol=None)
+            exits = [n for n in desk.notes
+                     if n.data.get('book') == 'stat_arb'
+                     and n.message.startswith('Stat-arb exit')]
+            entries = [n for n in desk.notes
+                       if n.data.get('book') == 'stat_arb'
+                       and (n.message.startswith('Stat-arb LONG')
+                            or n.message.startswith('Stat-arb SHORT'))]
+            return len(exits), len(entries)
+
+        new_exits, new_entries = run(recover_old=False)
+        old_exits, old_entries = run(recover_old=True)
+        assert new_entries > 0           # the new book still trades
+        assert new_exits < old_exits     # fewer round-trips than old
+        # And no churn pathology: new book does not exit more than it enters.
+        assert new_exits <= new_entries
 
 
 class TestPairsBook:
@@ -593,6 +1018,80 @@ class TestOrphanSweep:
         assert sweep_notes[0].data['book'] == 'stat_arb'  # C7 filterable
         assert sweep_notes[0].data['symbol'] == 'GAP'
         assert sweep_notes[0].data['direction'] == 'short'
+
+
+class TestRegimeGuardAndRecoverability:
+    """The Phase E sharpening must not perturb the (untouched) HMM regime
+    engine, and the full pre-Phase-E behavior must be recoverable by setting
+    the new params to their old values."""
+
+    def _universe(self, n_symbols=10, n_days=12):
+        return {f'S{i:02d}': noisy_frame(n=n_days, seed=100 + i)
+                for i in range(n_symbols)}
+
+    def _scores(self, n_symbols=10):
+        return {f'S{i:02d}': 0.9 - 0.2 * i for i in range(n_symbols)}
+
+    def test_regime_series_unchanged_by_stat_arb_and_mr_params(self):
+        # REGIME GUARD: the regime posterior series depends only on the
+        # regime controller; toggling every new stat-arb/MR param must leave
+        # regime_series byte-identical (the regime engine was not touched).
+        frames = self._universe()
+        dates = frames['S00'].index
+        schedule = {
+            dates[0]: probs_for('trending', 0.80),
+            dates[1]: probs_for('mean_reverting', 0.75),
+            dates[2]: probs_for('trending', 0.66),
+        }
+
+        def regime_series_for(**params):
+            desk = make_desk(regime_schedule=schedule,
+                             scores=self._scores(), **params)
+            drive(desk, frames, dates[:3], PortfolioManager(1_000_000.0))
+            return desk.regime_series
+
+        sharpened = regime_series_for()  # all sharpened defaults
+        old = regime_series_for(stat_arb_exit_band_mult=1.0,
+                                stat_arb_min_hold_days=0,
+                                stat_arb_size_by_conviction=False,
+                                mr_size_by_conviction=False)
+        assert sharpened == old
+        # And the series is the scripted regime, untouched by either config.
+        assert [e['state'] for e in sharpened] == \
+            ['trending', 'mean_reverting', 'trending']
+
+    def test_full_old_config_recovers_flat_immediate_exit_book(self):
+        # RECOVERABILITY: the documented old-behavior config (band 1.0,
+        # min-hold 0, flat stat-arb + MR sizing) reproduces the pre-Phase-E
+        # stat-arb book — flat per-leg sizing AND exit-the-moment-a-name-
+        # leaves-the-entry-decile.
+        frames = self._universe()
+        dates = frames['S00'].index
+        base = self._scores()
+        # Day 5 (Monday): S00 drops to rank 3 — held by the new band, but
+        # exited under the old (band 1.0) behavior.
+        day5 = dict(base)
+        day5['S00'] = 0.45
+        sm = DateScoreModel(schedule={dates[5]: day5}, default=base)
+        desk = make_stat_arb_desk(
+            sm, stat_arb_exit_band_mult=1.0, stat_arb_min_hold_days=0,
+            stat_arb_size_by_conviction=False)
+        portfolio = PortfolioManager(1_000_000.0)
+
+        out0 = drive(desk, frames, dates[:1], portfolio)
+        # Old flat sizing: every entered leg at 0.4 * 0.25 = 0.1.
+        for intent in out0[dates[0]]:
+            assert intent.size_fraction == pytest.approx(0.4 * 0.25)
+        for intent in out0[dates[0]]:
+            qty = 100 if intent.action == 'BUY' else -100
+            portfolio.add_position(Position(
+                asset=intent.asset, quantity=qty, avg_entry_price=100.0,
+                current_price=100.0, timestamp=dates[1]))
+
+        out = drive(desk, frames, dates[1:6], portfolio)
+        s00 = [i for i in out[dates[5]] if i.asset.symbol == 'S00']
+        # Old behavior: leaving the top-2 entry decile exits immediately.
+        assert [i.action for i in s00] == ['SELL']
 
 
 class TestEndToEndWithEngine:

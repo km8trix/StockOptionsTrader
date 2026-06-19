@@ -11,11 +11,24 @@ tunable, validated to sum <= 1.0):
         std: LONG below -`mr_entry_z`, SHORT above +`mr_entry_z`. Exits:
         position age >= `mr_max_age_days` trading days, z crossing 0, or
         the regime leaving mean_reverting (the whole book flattens with
-        one note).
+        one note). Entries are CONVICTION-SIZED by default
+        (`mr_size_by_conviction`): each scales by its z-excess
+        (|z| - mr_entry_z) within the unchanged per-entry cap, so the
+        strongest signal sizes at the cap and weaker ones get less; set
+        False for flat sizing.
     stat_arb (0.4) — cross-sectional gradient-boosting scores via the
         desk's own walk-forward controller: LONG the top max(1, n//5)
         ranked symbols, SHORT the bottom max(1, n//5). To limit turnover
-        the book rebalances ONLY on Mondays or on stat-arb refit days.
+        the book rebalances ONLY on Mondays or on stat-arb refit days,
+        and adds two further turnover controls: a RANK-STABILITY BAND
+        (`stat_arb_exit_band_mult`, default 2.0) holds a leg until it
+        leaves a band ~2x wider than the tight entry decile (hysteresis),
+        and a MINIMUM HOLDING PERIOD (`stat_arb_min_hold_days`, default 5)
+        blocks early rebalance exits (a flip and the shared stop-loss are
+        exempt). Entries are CONVICTION-SIZED by |score|
+        (`stat_arb_size_by_conviction`, default True) within the unchanged
+        per-leg cap. Each new control's old-behavior value (mult 1.0,
+        min-hold 0, flat sizing) is recoverable.
     pairs (0.2) — Engle-Granger cointegration pairs (refit every 63
         days): enter when |z| > `pairs_entry_z` (short the rich leg, long
         the cheap leg), exit when |z| < `pairs_exit_z` or the pair
@@ -110,8 +123,12 @@ class RenaissanceDesk(Desk):
                  mr_max_age_days: int = 5,
                  mr_return_days: int = 3,
                  mr_z_window: int = 60,
+                 mr_size_by_conviction: bool = True,
                  pairs_entry_z: float = 2.0,
                  pairs_exit_z: float = 0.5,
+                 stat_arb_exit_band_mult: float = 2.0,
+                 stat_arb_min_hold_days: int = 5,
+                 stat_arb_size_by_conviction: bool = True,
                  regime_controller: Optional[WalkForwardController] = None,
                  stat_arb_controller: Optional[WalkForwardController] = None,
                  pairs_controller: Optional[WalkForwardController] = None):
@@ -149,8 +166,32 @@ class RenaissanceDesk(Desk):
         self.mr_max_age_days = mr_max_age_days
         self.mr_return_days = mr_return_days
         self.mr_z_window = mr_z_window
+        self.mr_size_by_conviction = mr_size_by_conviction
         self.pairs_entry_z = pairs_entry_z
         self.pairs_exit_z = pairs_exit_z
+
+        # --- Stat-arb turnover control + conviction sizing -------------
+        # Rank-stability band (hysteresis): a held leg is exited only when
+        # it leaves a WIDER band than the tight top/bottom-n//5 ENTRY set.
+        # Multiplier on the entry band width: exit longs that fall below
+        # the top ceil(stat_arb_exit_band_mult * top_n), shorts that rise
+        # above the bottom ceil(stat_arb_exit_band_mult * top_n). >= 1.0;
+        # 1.0 recovers the old "exit the moment it leaves top/bottom-n//5"
+        # behavior. Default 2.0 widens the hold band to ~2*top_n.
+        if stat_arb_exit_band_mult < 1.0:
+            raise ValueError(
+                "stat_arb_exit_band_mult must be >= 1.0, got "
+                f"{stat_arb_exit_band_mult}")
+        self.stat_arb_exit_band_mult = stat_arb_exit_band_mult
+        # Minimum trading days a stat-arb leg must be held before a
+        # rebalance may exit it (the no-flip close and the shared
+        # stop-loss are exempt). 0 recovers the old behavior.
+        if stat_arb_min_hold_days < 0:
+            raise ValueError(
+                "stat_arb_min_hold_days must be >= 0, got "
+                f"{stat_arb_min_hold_days}")
+        self.stat_arb_min_hold_days = stat_arb_min_hold_days
+        self.stat_arb_size_by_conviction = stat_arb_size_by_conviction
 
         self._regime_controller = (
             regime_controller if regime_controller is not None
@@ -482,10 +523,11 @@ class RenaissanceDesk(Desk):
             return intents
 
         n_signals = len(candidates)
-        size_fraction = weight * min(0.25, 1.0 / max(4, n_signals))
+        sizes = self._mr_sizes(candidates, weight, n_signals)
         for symbol, z_score, direction in candidates:
             asset = _stock(symbol)
             action = 'BUY' if direction == 'long' else 'SHORT'
+            size_fraction = sizes[symbol]
             intents.append(DeskIntent(
                 asset=asset, action=action, size_fraction=size_fraction,
                 reason=(f"mean-reversion {direction}: z={z_score:+.2f} "
@@ -504,6 +546,50 @@ class RenaissanceDesk(Desk):
                 z=z_score, size_fraction=size_fraction,
                 prob_mean_reverting=prob_mr, n_signals=n_signals)
         return intents
+
+    def _mr_sizes(self, candidates: List[Tuple[str, float, str]],
+                  weight: float, n_signals: int) -> Dict[str, float]:
+        """Per-entry size_fractions for the mean-reversion entries.
+
+        per_entry_cap = weight * min(0.25, 1/max(4, n_signals)) is the
+        unchanged flat per-entry size. Flat mode (mr_size_by_conviction
+        False) gives every entry that cap exactly (old behavior).
+
+        Conviction mode scales each entry by its z-EXCESS — how far |z|
+        overshoots the entry threshold, conviction = |z| - mr_entry_z >= 0
+        — relative to the strongest signal in the batch:
+        size = per_entry_cap * (conviction / max_conviction). The strongest
+        signal sizes at the cap and weaker ones get proportionally less, so
+        no entry ever exceeds the old per-entry notional and total book
+        gross stays <= the old level. A strictly positive floor keeps every
+        signalled name tradable (DeskIntent requires size_fraction > 0)."""
+        per_entry_cap = weight * min(0.25, 1.0 / max(4, n_signals))
+        if not self.mr_size_by_conviction:
+            return {symbol: per_entry_cap for symbol, _, _ in candidates}
+        # Normalize the z-excess conviction WITHIN each side (long / short)
+        # so cross-side conviction asymmetry does not tilt the book's net
+        # exposure: each side's strongest signal sizes at the cap, weaker
+        # ones proportionally less, keeping the long/short gross mix at the
+        # old (flat) level rather than letting one side dominate purely
+        # because its signals overshoot the threshold by more.
+        sizes: Dict[str, float] = {}
+        for side in ('long', 'short'):
+            side_convs = {symbol: max(0.0, abs(z) - self.mr_entry_z)
+                          for symbol, z, direction in candidates
+                          if direction == side}
+            if not side_convs:
+                continue
+            max_conv = max(side_convs.values())
+            if max_conv <= 0.0:
+                # Every signal on this side sits exactly on the threshold.
+                for symbol in side_convs:
+                    sizes[symbol] = per_entry_cap
+                continue
+            for symbol, conv in side_convs.items():
+                sizes[symbol] = min(per_entry_cap,
+                                    max(per_entry_cap * (conv / max_conv),
+                                        1e-6))
+        return sizes
 
     # ------------------------------------------------------------------
     # Stat-arb book
@@ -540,40 +626,78 @@ class RenaissanceDesk(Desk):
                   if symbol not in longs]
         desired = {symbol: 'long' for symbol in longs}
         desired.update({symbol: 'short' for symbol in shorts})
-        size_fraction = weight * min(0.25, 1.0 / (2 * top_n))
+
+        # ---- Rank-stability band (hysteresis) -------------------------
+        # The ENTRY set is the tight top/bottom-top_n above. The EXIT
+        # (hold) band is wider: exit_n = ceil(mult * top_n), capped to the
+        # universe. A held long survives while it is among the top exit_n;
+        # a held short survives while it is among the bottom exit_n. With
+        # mult=1.0, exit_n == top_n and the old behavior is recovered. This
+        # stops a name oscillating across the decile boundary from churning
+        # in (entry set) and out (held set) on consecutive rebalances.
+        exit_n = min(n_scored,
+                     max(top_n,
+                         int(np.ceil(self.stat_arb_exit_band_mult * top_n))))
+        band_longs = {symbol for symbol, _ in ranked[:exit_n]}
+        band_shorts = {symbol for symbol, _ in ranked[-exit_n:]
+                       if symbol not in band_longs}
 
         intents: List[DeskIntent] = []
         book_assets = {asset: state
                        for asset, state in self._book_positions.items()
                        if state['book'] == 'stat_arb'}
 
-        # ---- Exits: holdings that left their side of the ranking ------
+        # ---- Exits: holdings that left their side's HOLD band ---------
+        # A leg is exited only if it has fallen out of the wider hold band
+        # for its side. A held name that would FLIP (now ranks on the
+        # opposite side's hold band) must always close first (no-flip
+        # rule) and is exempt from the minimum holding period — the open
+        # opposite-side entry below depends on that close filling. The
+        # shared stop-loss (in apply_risk) is independent of this exit.
         for asset in sorted(book_assets, key=lambda a: a.symbol):
             state = book_assets[asset]
-            if desired.get(asset.symbol) == state['direction']:
+            direction = state['direction']
+            in_band = (asset.symbol in band_longs if direction == 'long'
+                       else asset.symbol in band_shorts)
+            if in_band:
                 continue
+            opposite = ('short' if direction == 'long' else 'long')
+            would_flip = (desired.get(asset.symbol) == opposite)
+            age = self._day_index - state['entry_day']
+            if not would_flip and age < self.stat_arb_min_hold_days:
+                # Held the minimum period: keep it even though it left the
+                # band, so a marginal name does not round-trip early.
+                continue
+            reason = ('flip to opposite side' if would_flip
+                      else f"left the {direction} hold band (top/bottom-"
+                           f"{exit_n})")
             intents.append(DeskIntent(
                 asset=asset,
-                action=self._close_action(state['direction']),
+                action=self._close_action(direction),
                 size_fraction=1.0,
-                reason='stat-arb rebalance: symbol left the '
-                       f"{state['direction']} book"))
+                reason=f"stat-arb rebalance: {reason}"))
             del self._book_positions[asset]
             self.note(
                 'signal',
-                f"Stat-arb exit {asset.symbol}: no longer in the "
-                f"{state['direction']} top/bottom-{top_n} ranking",
+                f"Stat-arb exit {asset.symbol}: {reason} "
+                f"(held {age} trading day(s))",
                 book='stat_arb', symbol=asset.symbol,
-                direction=state['direction'], score=scores.get(asset.symbol))
+                direction=direction, score=scores.get(asset.symbol),
+                exit_n=exit_n, age_days=age, flip=would_flip)
 
         # ---- Entries (a flip waits for the close to fill first) -------
-        for symbol in longs + shorts:
+        # Only names free to enter actually get sized; conviction sizing
+        # distributes the book gross across THOSE legs by |score|.
+        entry_symbols = [symbol for symbol in longs + shorts
+                         if self._symbol_is_free(symbol, portfolio)]
+        sizes = self._stat_arb_sizes(entry_symbols, scores, desired,
+                                     weight, top_n)
+        for symbol in entry_symbols:
             direction = desired[symbol]
-            if not self._symbol_is_free(symbol, portfolio):
-                continue
             asset = _stock(symbol)
             action = 'BUY' if direction == 'long' else 'SHORT'
             score = scores[symbol]
+            size_fraction = sizes[symbol]
             intents.append(DeskIntent(
                 asset=asset, action=action, size_fraction=size_fraction,
                 reason=(f"stat-arb {direction}: score {score:+.4f} ranks in "
@@ -591,14 +715,77 @@ class RenaissanceDesk(Desk):
                 score=score, size_fraction=size_fraction, top_n=top_n)
 
         if intents:
+            per_leg_cap = weight * min(0.25, 1.0 / (2 * top_n))
             self.note(
                 'allocation',
                 f"Stat-arb rebalance ({'refit day' if refit_today else 'Monday'}): "
                 f"{n_scored} scored, longs {longs}, shorts {shorts}, "
-                f"{size_fraction:.1%} per leg",
+                f"hold band top/bottom-{exit_n}, per-leg cap "
+                f"{per_leg_cap:.1%}"
+                f"{' (conviction-sized)' if self.stat_arb_size_by_conviction else ''}",
                 book='stat_arb', longs=longs, shorts=shorts, top_n=top_n,
-                size_fraction=size_fraction)
+                exit_n=exit_n, per_leg_cap=per_leg_cap,
+                conviction=self.stat_arb_size_by_conviction)
         return intents
+
+    def _stat_arb_sizes(self, entry_symbols: List[str],
+                        scores: Dict[str, float],
+                        desired: Dict[str, str], weight: float,
+                        top_n: int) -> Dict[str, float]:
+        """Per-leg size_fractions for the stat-arb entries this rebalance.
+
+        Flat mode (stat_arb_size_by_conviction False) reproduces the old
+        sizing exactly: every leg gets weight * min(0.25, 1/(2*top_n)).
+
+        Conviction mode budgets EACH SIDE INDEPENDENTLY to preserve the
+        book's DOLLAR-NEUTRALITY: the long legs share a budget of
+        per_leg_cap * n_long and the short legs a budget of per_leg_cap *
+        n_short, each distributed WITHIN its side in proportion to |score|
+        and clamped to [floor, per_leg_cap]. Budgeting per side (rather than
+        pooling both sides) keeps long gross == short gross == the old
+        neutral level, so a confident-long / weak-short rebalance cannot tilt
+        the book net-directional — only the within-side sizes vary by
+        conviction. (Pooling both sides, as an earlier cut did, let
+        cross-side score asymmetry leak ~15-18% net beta into a
+        market-neutral book.)
+
+        GROSS BOUND: every leg is clamped to <= per_leg_cap — the SAME
+        ceiling the flat book used — so each side's gross is <= n_side *
+        per_leg_cap (the old flat per-side total) and the whole book <=
+        n_entries * per_leg_cap. The small floor can only ever raise a
+        near-zero leg back toward the cap, never above it; a leg that still
+        rounds to 0 shares at fill is handled by the existing
+        reconcile/Book-cleanup grace path. apply_risk still owns the absolute
+        position-size limit on top of this.
+        """
+        per_leg_cap = weight * min(0.25, 1.0 / (2 * top_n))
+        if not entry_symbols:
+            return {}
+        if not self.stat_arb_size_by_conviction:
+            return {symbol: per_leg_cap for symbol in entry_symbols}
+
+        floor = max(per_leg_cap * 0.05, 1e-6)
+        sizes: Dict[str, float] = {}
+        # Budget each side (long / short) on its own so the two sides keep
+        # equal gross (net ~ 0); conviction only shifts sizes WITHIN a side.
+        for side in ('long', 'short'):
+            side_symbols = [symbol for symbol in entry_symbols
+                            if desired.get(symbol) == side]
+            if not side_symbols:
+                continue
+            side_budget = per_leg_cap * len(side_symbols)
+            abs_scores = {symbol: abs(float(scores[symbol]))
+                          for symbol in side_symbols}
+            total_abs = sum(abs_scores.values())
+            if total_abs <= 0.0:
+                # All scores zero on this side: flat so every leg trades.
+                for symbol in side_symbols:
+                    sizes[symbol] = per_leg_cap
+                continue
+            for symbol in side_symbols:
+                raw = side_budget * (abs_scores[symbol] / total_abs)
+                sizes[symbol] = min(per_leg_cap, max(raw, floor))
+        return sizes
 
     # ------------------------------------------------------------------
     # Pairs book

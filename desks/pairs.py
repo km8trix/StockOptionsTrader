@@ -16,8 +16,8 @@ Fit procedure:
     3. Hedge ratio beta = OLS slope of log(a) on log(b) (with intercept).
        Pairs with beta <= 0 are skipped (an inverse hedge is not a
        tradable long/short spread here).
-    4. spread = log(a) - beta * log(b); its mean and POPULATION std
-       (ddof=0) are stored. Near-zero spread std is skipped.
+    4. spread = log(a) - beta * log(b); its mean and SAMPLE std
+       (ddof=1) are stored. Near-zero spread std is skipped.
     5. Keep at most `max_pairs` (default 5) by lowest p-value (ties break
        by symbol pair for determinism).
 
@@ -25,6 +25,22 @@ predict(data, date) -> {'pairs': [{'a', 'b', 'beta', 'z'}]} where z is
 the current spread z-score. Numerical guards: a leg with no usable bar,
 mismatched latest bar dates between the legs, or non-positive prices
 cause that pair to be skipped for the day (logged at DEBUG).
+
+Z-SCORE REFINEMENT (roadmap Phase 5 "pairs ddof + rolling mean"):
+    - The stored spread std uses ddof=1 (sample std) rather than the old
+      population std (ddof=0). For the train-window length this is a tiny
+      sqrt(n/(n-1)) rescale, but it is the unbiased estimator and matches
+      the Sharpe/Sortino ddof=1 convention adopted in Phase 3.
+    - The z-score centers on a ROLLING mean of the most recent
+      `z_mean_window` spread observations (computed live in predict() from
+      the date-sliced leg histories) instead of the static fit-window
+      `spread_mean`. A cointegrated spread's level drifts slowly between
+      63-day refits; centering on the trailing window tracks that drift so
+      |z| reflects the CURRENT deviation, not the deviation from a stale
+      fit-time average. The rolling mean uses ONLY past spread values
+      (index <= date), so it remains leakage-free. With
+      `z_mean_window=None` the model recovers the old static-mean
+      behavior exactly (`spread_mean` is still stored either way).
 """
 
 from __future__ import annotations
@@ -46,11 +62,28 @@ class PairsCointegrationModel(WalkForwardModel):
     """Engle-Granger pairs scanner with stored spread parameters."""
 
     def __init__(self, max_pairs: int = 5, p_threshold: float = 0.05,
-                 max_symbols: int = 40, min_overlap: int = 60):
+                 max_symbols: int = 40, min_overlap: int = 60,
+                 z_mean_window: Optional[int] = 60,
+                 spread_std_ddof: int = 1):
         self.max_pairs = max_pairs
         self.p_threshold = p_threshold
         self.max_symbols = max_symbols
         self.min_overlap = min_overlap
+        #: Delta-degrees-of-freedom for the spread std. Default 1 (sample/
+        #: unbiased, matching the project-wide Sharpe/Sortino ddof=1
+        #: convention); set 0 to recover the pre-Phase-E population std and
+        #: thus the exact pre-Phase-E z-score (full opt-out).
+        if spread_std_ddof not in (0, 1):
+            raise ValueError(
+                f"spread_std_ddof must be 0 or 1, got {spread_std_ddof}")
+        self.spread_std_ddof = spread_std_ddof
+        #: Trailing # of spread observations used to center the predict()
+        #: z-score (rolling mean). None recovers the static fit-window
+        #: `spread_mean` behavior. Must be >= 2 when set.
+        if z_mean_window is not None and z_mean_window < 2:
+            raise ValueError(
+                f"z_mean_window must be >= 2 (or None), got {z_mean_window}")
+        self.z_mean_window = z_mean_window
         #: Fitted pairs: {'a','b','beta','p_value','spread_mean','spread_std'}
         self.pairs: List[Dict] = []
         self._fitted = False
@@ -134,7 +167,7 @@ class PairsCointegrationModel(WalkForwardModel):
                 continue
 
             spread = series_a - beta * series_b
-            spread_std = float(np.std(spread))  # population std (ddof=0)
+            spread_std = float(np.std(spread, ddof=self.spread_std_ddof))
             if spread_std <= 1e-12:
                 logger.debug("Pair %s/%s skipped: zero spread std",
                              sym_a, sym_b)
@@ -158,6 +191,15 @@ class PairsCointegrationModel(WalkForwardModel):
 
         Returns {'pairs': [{'a','b','beta','z'}]}; pairs whose legs lack a
         shared latest bar (missing/stale leg) are skipped for the day.
+
+        z = (today's spread - center) / spread_std, where `center` is the
+        rolling mean of the most recent `z_mean_window` spread observations
+        (over the legs' overlapping, date-sliced dates) when z_mean_window
+        is set, else the static fit-window `spread_mean`. The rolling mean
+        uses ONLY past spread values (the frames are already sliced to
+        index <= date by the controller), so it is leakage-free. If too few
+        overlapping rows exist to form the window, the static `spread_mean`
+        is used as a graceful fallback.
         """
         if not self._fitted:
             return {'pairs': []}
@@ -177,7 +219,28 @@ class PairsCointegrationModel(WalkForwardModel):
                              log_a.index[-1], log_b.index[-1])
                 continue
             spread = float(log_a.iloc[-1]) - pair['beta'] * float(log_b.iloc[-1])
-            z_score = (spread - pair['spread_mean']) / pair['spread_std']
+            center = self._z_center(pair, log_a, log_b)
+            z_score = (spread - center) / pair['spread_std']
             priced.append({'a': pair['a'], 'b': pair['b'],
                            'beta': pair['beta'], 'z': float(z_score)})
         return {'pairs': priced}
+
+    def _z_center(self, pair: Dict, log_a: pd.Series,
+                  log_b: pd.Series) -> float:
+        """Center for the predict() z-score.
+
+        Rolling mean of the trailing `z_mean_window` spread observations on
+        the legs' overlapping dates (today's bar included; only past data,
+        as the frames are date-sliced upstream). Falls back to the static
+        fit-window `spread_mean` when z_mean_window is None or there are
+        fewer than `z_mean_window` overlapping rows."""
+        window = self.z_mean_window
+        if window is None:
+            return pair['spread_mean']
+        common = log_a.index.intersection(log_b.index)
+        if len(common) < window:
+            return pair['spread_mean']
+        tail = common[-window:]
+        spread = (log_a.loc[tail].to_numpy(dtype=float)
+                  - pair['beta'] * log_b.loc[tail].to_numpy(dtype=float))
+        return float(np.mean(spread))
