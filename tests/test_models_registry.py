@@ -24,15 +24,16 @@ from desks.registry import create_desk
 from desks.walk_forward import WalkForwardController, WalkForwardModel
 
 # The exact (ordered) registry contract. Phase B appended the two neural
-# models (mlp, lstm) to available_models(), so the registry now advertises
-# five ids — 'gbm' still first as the default, the neural pair last.
-EXPECTED_IDS = ['gbm', 'lightgbm', 'stacking', 'mlp', 'lstm']
+# models (mlp, lstm); Phase D appended the transparent factor model that
+# powers the AQR desk ('factor', last), so the registry now advertises six
+# ids — 'gbm' still first as the default.
+EXPECTED_IDS = ['gbm', 'lightgbm', 'stacking', 'mlp', 'lstm', 'factor']
 EXPECTED_NAMES = ['Gradient Boosting', 'LightGBM', 'Stacking Ensemble',
-                  'Neural MLP', 'Neural LSTM']
+                  'Neural MLP', 'Neural LSTM', 'Factor (AQR)']
 
 
 class TestAvailableModels:
-    def test_returns_exactly_five_models_in_order(self):
+    def test_returns_exactly_six_models_in_order(self):
         models = available_models()
         assert [m['id'] for m in models] == EXPECTED_IDS
         assert [m['name'] for m in models] == EXPECTED_NAMES

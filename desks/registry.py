@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
+from desks.aqr import AqrDesk
 from desks.base import Desk
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
@@ -82,6 +83,20 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#3fb950',
         'factory': TwoSigmaDesk,
+    },
+    'aqr': {
+        'name': 'AQR Desk',
+        'firm_inspiration': 'AQR Capital Management',
+        'description': ('Transparent classical-quant cross-sectional '
+                        'long/short equity: price-based factors (momentum, '
+                        'low-volatility, reversal, risk-adjusted momentum) '
+                        'standardized cross-sectionally and combined by '
+                        'ridge regression rank the universe — long the top '
+                        'quantile, short the bottom, dollar-balanced.'),
+        'status': 'ready',
+        'activates_in_phase': None,
+        'accent': '#f0883e',
+        'factory': AqrDesk,
     },
 }
 

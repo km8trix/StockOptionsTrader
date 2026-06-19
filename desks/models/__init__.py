@@ -58,6 +58,14 @@ _MODEL_SPECS: Dict[str, Dict[str, str]] = {
                         'direction; deterministic, train-window '
                         'standardized. Requires the torch package.'),
     },
+    'factor': {
+        'name': 'Factor (AQR)',
+        'description': ('Transparent price-based cross-sectional factor '
+                        'model (momentum / low-vol / reversal / '
+                        'risk-adjusted momentum) standardized cross-'
+                        'sectionally per date and combined by ridge '
+                        'regression; powers the AQR desk.'),
+    },
 }
 
 
@@ -79,7 +87,7 @@ def build_model(model_key: str) -> WalkForwardModel:
     Args:
         model_key: one of the ids from :func:`available_models`
             (``'gbm'``, ``'lightgbm'``, ``'stacking'``, ``'mlp'``,
-            ``'lstm'``).
+            ``'lstm'``, ``'factor'``).
 
     Returns:
         A new, unfitted model instance.
@@ -110,6 +118,11 @@ def build_model(model_key: str) -> WalkForwardModel:
     if model_key == 'lstm':
         from desks.models.neural import SequenceModel
         return SequenceModel()
+    if model_key == 'factor':
+        # Transparent price-based factor model (AQR). Local import keeps the
+        # registry import light and mirrors the other zoo entries.
+        from desks.models.factor import FactorModel
+        return FactorModel()
     raise ValueError(f"Unknown model: {model_key}")
 
 
