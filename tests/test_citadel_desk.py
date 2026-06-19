@@ -27,7 +27,9 @@ from backtesting.backtest_engine import BacktestEngine
 from core.models import Asset, AssetType, Position
 from data.market_data import MarketDataHandler
 from desks.citadel import CitadelDesk, clamp_renormalize, pod_score_inputs
+from desks.factor_risk import FactorRiskModel
 from desks.foundation import FoundationDesk
+from desks.models.factor import FACTOR_COLUMNS
 from desks.ml_model import GradientBoostingModel
 from desks.pods import MeanReversionPod, MomentumPod, Pod, StatArbPod
 from desks.renaissance import RenaissanceDesk
@@ -1054,3 +1056,310 @@ class TestNoPodHistoryRegression:
         report = engine.run(['N1', 'N2'], '2023-01-01', '2023-04-01',
                             benchmark_symbol=None)
         assert 'pod_history' not in report
+
+
+# ======================================================================
+# Phase E: factor-neutral pods (the FactorRiskModel + factor-neutrality
+# band wired into Citadel).
+#
+# A FactorRiskModel measures the aggregate book's net loading on the four
+# AQR price factors; the central risk book caps how directional the WHOLE
+# book may get on any single factor (max_factor_exposure, ON at 0.25 by
+# default). These tests pin: the constructor params + validation; the gate
+# is registered ON by default and absent when disabled; the NEUTRALITY
+# REGRESSION (a real factor-tilted backtest stays inside the band with the
+# gate ON and EXCEEDS it disabled, while pods still trade); determinism;
+# recoverability of the pre-Phase-E path; and the factor-exposure notes /
+# status transparency surface. The pod machinery (drawdown / probation /
+# cut / reallocation / attribution) is unchanged — the existing classes
+# above already pass with the gate ON by default (frames stay inside the
+# band), so this section adds the new surface rather than re-deriving them.
+# ======================================================================
+FACTOR_DATES = pd.bdate_range('2022-06-01', periods=120)
+
+
+def _tilt_frame(seed, drift, n=120, start='2022-06-01', vol=0.012):
+    """Seeded synthetic OHLCV with next-open = prior close (engine-faithful
+    fills); a per-symbol drift separates the names by momentum so the book
+    can actually load a factor."""
+    rng = np.random.default_rng(seed)
+    rets = rng.normal(drift, vol, n)
+    close = 100.0 * np.cumprod(1.0 + rets)
+    open_ = np.empty(n)
+    open_[0] = close[0]
+    open_[1:] = close[:-1]
+    index = pd.bdate_range(start, periods=n)
+    return pd.DataFrame({
+        'open': open_, 'high': np.maximum(open_, close),
+        'low': np.minimum(open_, close), 'close': close,
+        'volume': np.full(n, 500_000.0),
+    }, index=index)
+
+
+def _factor_universe():
+    """A factor-tilted universe: symbol i carries drift 0.0011*(i-3), so the
+    names separate strongly by momentum (a real factor cross-section)."""
+    return {f'S{i}': _tilt_frame(50 + i, 0.0011 * (i - 3)) for i in range(7)}
+
+
+class _OneDayTiltPod(Pod):
+    """Long the top-momentum name and short the bottom-momentum name on a
+    single rebalance day — a deliberately factor-directional book the band
+    must rein in."""
+
+    def __init__(self, day_index=70, signals=None):
+        super().__init__(key='tilt', name='Tilt Pod')
+        self._day = FACTOR_DATES[day_index]
+        self._signals = signals or {'S6': 'BUY', 'S0': 'SHORT'}
+
+    def generate_signals(self, all_data, date):
+        if pd.Timestamp(date) != self._day:
+            return {}
+        return dict(self._signals)
+
+
+def _run_factor_backtest(monkeypatch, band, universe=None, pod=None):
+    universe = universe if universe is not None else _factor_universe()
+    pod = pod if pod is not None else _OneDayTiltPod()
+
+    def fake_fetch(self, symbol, start_date, end_date):
+        return universe.get(symbol, pd.DataFrame())
+
+    monkeypatch.setattr(MarketDataHandler, 'fetch_stock_data', fake_fetch)
+    desk = make_desk([pod], weights={'tilt': 1.0}, max_factor_exposure=band)
+    engine = BacktestEngine(desk=desk, initial_capital=100_000.0)
+    report = engine.run(sorted(universe), '2022-06-01', '2022-12-01',
+                        benchmark_symbol=None)
+    return desk, report, engine, universe
+
+
+def _realized_book_factor_exposure(engine, universe):
+    """The desk's aggregate REALIZED held-book net factor exposure at the
+    final bar, measured independently of the desk (same FactorRiskModel,
+    same latest-close marks, same per-symbol netting)."""
+    last = FACTOR_DATES[-1]
+    sliced = {s: f[f.index <= last] for s, f in universe.items()}
+    model = FactorRiskModel()
+    loadings = model.loadings(sliced, last)
+    prices = {s: float(universe[s]['close'].iloc[-1]) for s in universe}
+    per_symbol = CentralRiskBook().compute_exposures(
+        engine.portfolio, prices)['per_symbol']
+    capital = engine.portfolio.get_portfolio_value()  # capital_allocation 1.0
+    return model.book_exposure(per_symbol, loadings, capital), per_symbol
+
+
+class TestFactorNeutralityConstruction:
+    def test_band_on_by_default(self):
+        desk = make_desk([_OneDayTiltPod()], weights={'tilt': 1.0})
+        assert desk.max_factor_exposure == 0.25
+        assert 'factor_neutrality' in desk.risk_book._custom_limits
+
+    def test_band_none_registers_no_limit(self):
+        desk = make_desk([_OneDayTiltPod()], weights={'tilt': 1.0},
+                         max_factor_exposure=None)
+        assert desk.max_factor_exposure is None
+        assert 'factor_neutrality' not in desk.risk_book._custom_limits
+
+    @pytest.mark.parametrize('bad', [0.0, -0.1])
+    def test_non_positive_band_rejected(self, bad):
+        with pytest.raises(ValueError, match='max_factor_exposure'):
+            make_desk([_OneDayTiltPod()], weights={'tilt': 1.0},
+                      max_factor_exposure=bad)
+
+    def test_default_factor_risk_model_is_full_four_factor(self):
+        desk = make_desk([_OneDayTiltPod()], weights={'tilt': 1.0})
+        assert isinstance(desk.factor_risk_model, FactorRiskModel)
+        assert tuple(desk.factor_risk_model.factors) == tuple(FACTOR_COLUMNS)
+
+    def test_injected_factor_risk_model_is_respected(self):
+        injected = FactorRiskModel(factors=['momentum'])
+        desk = make_desk([_OneDayTiltPod()], weights={'tilt': 1.0},
+                         factor_risk_model=injected)
+        assert desk.factor_risk_model is injected
+
+    def test_injected_risk_book_still_gets_the_gate_when_on(self):
+        book = CentralRiskBook(max_gross=2.0, max_symbol=1.0, max_net=2.0)
+        make_desk([_OneDayTiltPod()], weights={'tilt': 1.0},
+                  risk_book=book, max_factor_exposure=0.25)
+        assert 'factor_neutrality' in book._custom_limits
+
+    def test_injected_risk_book_ungated_when_band_disabled(self):
+        book = CentralRiskBook(max_gross=2.0, max_symbol=1.0, max_net=2.0)
+        make_desk([_OneDayTiltPod()], weights={'tilt': 1.0},
+                  risk_book=book, max_factor_exposure=None)
+        assert 'factor_neutrality' not in book._custom_limits
+
+    def test_status_carries_factor_neutrality_block(self):
+        desk = make_desk([_OneDayTiltPod()], weights={'tilt': 1.0})
+        block = desk.get_status()['factor_neutrality']
+        assert set(block) == {'band', 'book_factor_exposure'}
+        assert block['band'] == 0.25
+        assert isinstance(block['book_factor_exposure'], dict)
+
+    def test_status_band_none_when_disabled(self):
+        desk = make_desk([_OneDayTiltPod()], weights={'tilt': 1.0},
+                         max_factor_exposure=None)
+        assert desk.get_status()['factor_neutrality']['band'] is None
+
+
+class TestFactorNeutralityRegression:
+    """THE key regression: a real factor-tilted Citadel backtest keeps the
+    aggregate book net factor exposure inside the band when the gate is ON
+    and EXCEEDS it when the gate is disabled — while pods still trade."""
+
+    # A band loose enough to admit at least one leg of the tilt yet bound the
+    # realized held book; the disabled run exceeds it (see the assertions).
+    BAND = 0.35
+
+    def test_band_disabled_book_exceeds_the_band(self, monkeypatch):
+        desk, report, engine, universe = _run_factor_backtest(
+            monkeypatch, band=None)
+        assert report['trades']  # pods traded the full tilt
+        exposure, per_symbol = _realized_book_factor_exposure(
+            engine, universe)
+        worst = max(abs(v) for v in exposure.values())
+        # The disabled book loads a factor well past the band under test.
+        assert worst > self.BAND
+        assert desk.get_status()['factor_neutrality']['band'] is None
+
+    def test_band_on_keeps_book_within_band_and_pods_still_trade(
+            self, monkeypatch):
+        desk, report, engine, universe = _run_factor_backtest(
+            monkeypatch, band=self.BAND)
+        # Pods still trade: the gate is a band, not a blanket ban.
+        assert report['trades']
+        exposure, per_symbol = _realized_book_factor_exposure(
+            engine, universe)
+        assert per_symbol  # the desk holds a real book
+        worst = max(abs(v) for v in exposure.values())
+        # ON, the realized book stays inside the band the disabled run blew.
+        assert worst <= self.BAND + 1e-9
+
+    def test_on_admits_strictly_fewer_opens_than_disabled(self, monkeypatch):
+        # The gate's effect is real: it blocks at least one directional open
+        # that the disabled book admits.
+        _, report_off, _, _ = _run_factor_backtest(monkeypatch, band=None)
+        _, report_on, _, _ = _run_factor_backtest(monkeypatch, band=self.BAND)
+        opens_off = [t for t in report_off['trades']
+                     if t['action'] in ('BUY', 'SHORT')]
+        opens_on = [t for t in report_on['trades']
+                    if t['action'] in ('BUY', 'SHORT')]
+        assert len(opens_on) < len(opens_off)
+
+    def test_a_factor_block_note_is_emitted_when_the_gate_bites(
+            self, monkeypatch):
+        # The blocked directional open surfaces as a 'risk' note naming the
+        # central risk book and the factor-neutrality custom limit.
+        desk, _, _, _ = _run_factor_backtest(monkeypatch, band=self.BAND)
+        risk_notes = [n for n in desk.notes
+                      if n.category == 'risk'
+                      and 'factor_neutrality' in n.message]
+        assert risk_notes
+        assert all('Central risk book blocked' in n.message
+                   for n in risk_notes)
+
+
+class TestFactorNeutralityDeterminism:
+    def test_two_on_runs_are_byte_identical(self, monkeypatch):
+        _, report1, _, _ = _run_factor_backtest(monkeypatch, band=0.35)
+        _, report2, _, _ = _run_factor_backtest(monkeypatch, band=0.35)
+        assert report1['trades'] == report2['trades']
+        assert report1['pod_history'] == report2['pod_history']
+        assert report1['trader_notes'] == report2['trader_notes']
+
+
+class TestFactorNeutralityRecoverable:
+    """band=None reproduces the pre-Phase-E path: no factor limit, no
+    factor-exposure note, no measured exposure — the desk's order flow,
+    notes and risk book are exactly the old behavior."""
+
+    def test_disabled_emits_no_factor_exposure_note(self, monkeypatch):
+        desk, _, _, _ = _run_factor_backtest(monkeypatch, band=None)
+        factor_notes = [n for n in desk.notes
+                        if 'factor_exposure' in n.data]
+        assert factor_notes == []
+
+    def test_disabled_book_factor_exposure_surface_stays_empty(
+            self, monkeypatch):
+        desk, _, _, _ = _run_factor_backtest(monkeypatch, band=None)
+        assert desk.get_status()['factor_neutrality'][
+            'book_factor_exposure'] == {}
+
+    def test_disabled_run_completes_with_full_pod_history(self, monkeypatch):
+        _, report, _, universe = _run_factor_backtest(monkeypatch, band=None)
+        assert 'summary' in report
+        assert len(report['pod_history']) == len(FACTOR_DATES)
+        assert_live_weight_conservation(report['pod_history'])
+
+
+class TestFactorExposureTransparency:
+    """The factor-exposure transparency note + status surface, exercised on a
+    day the desk both holds a book AND generates intents (the only day the
+    production path measures the held book — see the QA note on the
+    intent-less-day gap)."""
+
+    def _held_book_universe(self):
+        return _factor_universe()
+
+    def test_note_and_status_report_the_held_book_exposure(self, monkeypatch):
+        # A pod that BOTH opens the directional tilt early AND emits a fresh
+        # (gate-passing, neutral-ish) intent late, so the held book is
+        # measured on the late day: the info note + status carry the book's
+        # net factor exposure, the band, and the worst factor.
+        universe = self._held_book_universe()
+
+        class _HoldThenPokePod(Pod):
+            def __init__(self):
+                super().__init__(key='tilt', name='Tilt Pod')
+
+            def generate_signals(self, all_data, date):
+                if pd.Timestamp(date) == FACTOR_DATES[60]:
+                    return {'S6': 'BUY'}          # open a +momentum long
+                if pd.Timestamp(date) == FACTOR_DATES[90]:
+                    return {'S3': 'BUY'}          # a later, mild open
+                return {}
+
+        desk, _, _, _ = _run_factor_backtest(
+            monkeypatch, band=1.0, universe=universe,
+            pod=_HoldThenPokePod())  # wide band: keep the tilt, just measure
+        info_notes = [n for n in desk.notes
+                      if n.category == 'info' and 'factor_exposure' in n.data]
+        assert info_notes
+        note = info_notes[-1]
+        assert note.category == 'info'   # NOT 'allocation' (C9 isolation)
+        assert set(note.data) >= {'factor_exposure', 'band', 'worst_factor'}
+        assert note.data['band'] == 1.0
+        assert set(note.data['factor_exposure']) == set(FACTOR_COLUMNS)
+        worst = note.data['worst_factor']
+        assert worst in FACTOR_COLUMNS
+        # The status surface mirrors the latest measured exposure.
+        status = desk.get_status()['factor_neutrality']
+        assert status['band'] == 1.0
+        assert set(status['book_factor_exposure']) == set(FACTOR_COLUMNS)
+        assert any(v != 0.0
+                   for v in status['book_factor_exposure'].values())
+
+    def test_factor_exposure_note_is_info_not_allocation(self, monkeypatch):
+        # The transparency note must stay OUT of the 'allocation' category so
+        # the C9 reallocation-note counts the existing tests assert == 1 are
+        # never perturbed.
+        universe = self._held_book_universe()
+
+        class _HoldThenPokePod(Pod):
+            def __init__(self):
+                super().__init__(key='tilt', name='Tilt Pod')
+
+            def generate_signals(self, all_data, date):
+                if pd.Timestamp(date) == FACTOR_DATES[60]:
+                    return {'S6': 'BUY'}
+                if pd.Timestamp(date) == FACTOR_DATES[90]:
+                    return {'S3': 'BUY'}
+                return {}
+
+        desk, _, _, _ = _run_factor_backtest(
+            monkeypatch, band=1.0, universe=universe, pod=_HoldThenPokePod())
+        factor_notes = [n for n in desk.notes if 'factor_exposure' in n.data]
+        assert factor_notes
+        assert all(n.category == 'info' for n in factor_notes)
+        assert all('factor_exposure' not in n.data
+                   for n in desk.notes if n.category == 'allocation')

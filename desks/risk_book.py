@@ -93,6 +93,15 @@ class CentralRiskBook:
     {'desk_capital', 'gross', 'net', 'short', 'per_symbol', 'intent_value',
      'candidate_gross', 'candidate_net', 'candidate_symbol',
      'candidate_short'}.
+
+    factor_neutrality_limit(model, loadings_ref, band) is a built-in FACTORY
+    that returns such a check_fn enforcing a per-factor net-exposure BAND on
+    the candidate book (the CitadelDesk registers it to keep its pods
+    factor-neutral). It composes with the dollar limits and the Greeks
+    overlay without changing any of them — just another custom limit reading
+    the same running per_symbol state, so the whole batch stays inside the
+    band cumulatively. See its docstring for the loadings-reference protocol
+    and the graceful-degrade / disable semantics.
     """
 
     def __init__(self, capital_allocation: float = 1.0,
@@ -134,6 +143,100 @@ class CentralRiskBook:
             raise ValueError(f"check_fn for limit '{name}' must be callable")
         self._custom_limits[name] = check_fn
         logger.info("CentralRiskBook: registered custom limit '%s'", name)
+
+    # ------------------------------------------------------------------
+    # Factor-neutrality band (registerable custom limit)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def factor_neutrality_limit(model, loadings_ref: Dict,
+                                band: float) -> Callable:
+        """Build a custom check_fn enforcing a per-factor net-exposure BAND.
+
+        The returned ``check_fn(intent, state)`` follows the custom-limit
+        protocol (return None to pass, a reason to block). It measures the
+        CANDIDATE book's net factor exposure per factor — the running held
+        ``state['per_symbol']`` dollar exposures (prior approvals in the
+        batch already committed) with the candidate symbol overridden to its
+        post-trade ``state['candidate_symbol']`` value — using ``model`` (a
+        :class:`desks.factor_risk.FactorRiskModel`) and the CURRENT loadings,
+        and BLOCKS an open that would push any factor's |net exposure| beyond
+        ``max(band, |held exposure on that factor|)``: a within-band factor
+        may not cross the band, and a factor ALREADY over the band (held
+        positions drift out as loadings rotate — the gate never force-unwinds,
+        exactly like the Greeks overlay) may not be made WORSE, while a
+        CORRECTIVE open that reduces or holds it PASSES (so the desk can hedge
+        back toward neutral instead of being trapped directional). The band is
+        a fraction of desk capital (``book_exposure`` normalizes by capital).
+        Boundary semantics match the dollar limits: exactly at the ceiling
+        passes, any amount over (strict ``>``) blocks. This is an ACCUMULATION
+        backstop on NEW opens, NOT a realized-held-book cap — held exposure
+        can drift as loadings rotate; the desk de-risks by closing (the
+        Citadel transparency note surfaces the realized exposure each day).
+
+        loadings_ref is a MUTABLE container (a ``dict`` holding the live
+        loadings under a fixed key, or a 1-element list) the DESK refreshes
+        each simulated day — registered ONCE, it always reads the day's
+        loadings without re-registration. Two shapes are accepted:
+          * ``{'loadings': {symbol: {factor: float}}}`` (preferred), or
+          * any object exposing ``[0]`` that returns that loadings dict
+            (e.g. a 1-element list ``[loadings]``).
+
+        CUMULATIVE by construction (it reads the running per_symbol state, so
+        the whole approved batch stays inside the band). GRACEFUL: a band of
+        ``None`` / non-positive disables the gate (always pass — recovers the
+        old non-factor-gated behavior); no loadings / no model likewise pass
+        (no false block), exactly like the Greeks overlay degrading when its
+        feed is silent. Closing intents never reach here (the book approves
+        SELL/COVER before custom limits).
+        """
+
+        def _current_loadings() -> Dict:
+            ref = loadings_ref
+            if isinstance(ref, dict):
+                return ref.get('loadings') or {}
+            try:
+                return ref[0] or {}
+            except (IndexError, TypeError, KeyError):
+                return {}
+
+        def check_fn(intent: DeskIntent, state: Dict) -> Optional[str]:
+            if band is None or band <= 0 or model is None:
+                return None  # gate disabled -> old behavior recovered
+            loadings = _current_loadings()
+            if not loadings:
+                return None  # graceful: no loadings -> pass (no false block)
+            desk_capital = state['desk_capital']
+            if desk_capital <= 0:
+                return None  # base undefined -> dollar checks already gate
+            # The gate is an ACCUMULATION backstop (like the Greeks overlay),
+            # MONOTONE-IMPROVEMENT-aware: it measures the running HELD book
+            # AND the candidate book. A within-band factor may not be pushed
+            # past the band; a factor ALREADY over the band (held positions
+            # drift out as loadings rotate — the gate never force-unwinds)
+            # may not be made WORSE, but a corrective open that strictly
+            # reduces or holds it PASSES (so the desk can hedge back toward
+            # neutral instead of being trapped directional).
+            held = model.book_exposure(
+                state['per_symbol'], loadings, desk_capital)
+            candidate = model.candidate_exposure(
+                state['per_symbol'], intent.asset.symbol,
+                state['candidate_symbol'], loadings, desk_capital)
+            for factor, exposure in candidate.items():
+                held_f = abs(held.get(factor, 0.0))
+                ceiling = max(band, held_f)
+                if abs(exposure) > ceiling:
+                    extra = ""
+                    if held_f > band:
+                        extra = (f" (held {held.get(factor, 0.0):+.2%}; an "
+                                 "open may not worsen an already-breaching "
+                                 "factor)")
+                    return (
+                        f"net {factor} factor exposure would reach "
+                        f"{exposure:+.2%} of desk capital, beyond the "
+                        f"+/-{band:.2%} factor-neutrality band{extra}")
+            return None
+
+        return check_fn
 
     # ------------------------------------------------------------------
     # Exposure measurement
