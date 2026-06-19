@@ -39,7 +39,8 @@ import pandas as pd
 import pytest
 
 from desks.features import cross_sectional_rank
-from desks.models.factor import (FACTOR_COLUMNS, FactorModel, _factor_exposures,
+from desks.models.factor import (_MIN_ROWS, FACTOR_COLUMNS, FactorModel,
+                                  _factor_exposures, _raw_factor_panel,
                                   _trailing_return, _trailing_vol)
 from desks.walk_forward import WalkForwardModel
 
@@ -407,3 +408,148 @@ class TestLearnableSignal:
         # Loose threshold: a transparent factor model should at least line up
         # directionally with the cross-sectional truth.
         assert corr > 0.3
+
+
+# ----------------------------------------------------------------------
+# Golden equivalence: the vectorized _raw_factor_panel is BYTE-IDENTICAL
+# to the original O(n^2) prefix loop it replaced.
+# ----------------------------------------------------------------------
+def _loop_raw_factor_panel(data):
+    """The ORIGINAL O(n^2) prefix-loop implementation of _raw_factor_panel,
+    frozen here verbatim as the golden oracle.
+
+    For every row it re-runs the (unchanged) ``_factor_exposures`` on the
+    growing prefix ``close[:i+1]`` — exactly the pre-optimization algorithm —
+    so any divergence between the vectorized panel and this loop is caught.
+    """
+    panel = {}
+    for symbol, frame in data.items():
+        if frame is None or frame.empty or 'close' not in frame.columns:
+            continue
+        close = frame['close'].astype(float)
+        n = len(close)
+        if n < _MIN_ROWS:
+            continue
+        rows = {c: [] for c in FACTOR_COLUMNS}
+        idx = []
+        for i in range(n):
+            exp = _factor_exposures(close.iloc[:i + 1])
+            if exp is None:
+                continue
+            idx.append(close.index[i])
+            for c in FACTOR_COLUMNS:
+                rows[c].append(exp[c])
+        if not idx:
+            continue
+        panel[symbol] = pd.DataFrame(rows, index=pd.Index(idx))
+    return panel
+
+
+def _walk(n: int, seed: int, start: float = 100.0, vol: float = 0.02):
+    rng = np.random.default_rng(seed)
+    return start * np.exp(np.cumsum(rng.normal(0.0, vol, n)))
+
+
+def _close_frame(values, datetime_index: bool = True) -> pd.DataFrame:
+    """Minimal OHLCV-ish frame carrying a 'close' column (all the panel uses)."""
+    values = np.asarray(values, dtype=float)
+    if datetime_index:
+        index = pd.date_range('2021-01-04', periods=len(values), freq='B')
+    else:
+        index = pd.RangeIndex(len(values))
+    return pd.DataFrame(
+        {'close': values, 'volume': np.full(len(values), 1_000.0)}, index=index)
+
+
+def _golden_cases():
+    """Synthetic frames spanning the documented edge cases: lengths just at /
+    around _MIN_ROWS and the 21 / 60 / 252 factor boundaries, a flat (zero-vol)
+    stretch, an embedded zero price, embedded NaNs, and a non-datetime index."""
+    cases = {}
+    # Varying lengths, including very short ones near _MIN_ROWS and the
+    # momentum-skip (21), vol-window (60) and momentum-lookback (252) edges.
+    for length in (5, 6, 7, 8, 10, 20, 21, 22, 23, 40,
+                   59, 60, 61, 100, 251, 252, 253, 300):
+        cases[f'len_{length}'] = _close_frame(_walk(length, seed=length))
+    # A flat (constant-price) middle segment -> zero trailing vol exercises the
+    # risk_adj_mom small-vol guard and the low_vol sign on a degenerate window.
+    flat = np.concatenate([_walk(30, 1), np.full(40, 150.0), _walk(30, 2, 150.0)])
+    cases['flat_segment'] = _close_frame(flat)
+    # An embedded zero price -> _trailing_return start_px==0 guard AND an inf
+    # return that survives pct_change().dropna() in the vol window.
+    z = _walk(90, 3)
+    z[45] = 0.0
+    cases['zero_price'] = _close_frame(z)
+    # Embedded NaNs -> the pct_change/dropna count diverges from the row index,
+    # exercising the clean-return-count mapping and the finite price guards.
+    nanc = _walk(130, 4)
+    nanc[60] = np.nan
+    nanc[61] = np.nan
+    nanc[100] = np.nan
+    cases['nan_holes'] = _close_frame(nanc)
+    # Same prices on a plain RangeIndex (no DatetimeIndex) to pin the index
+    # construction too.
+    cases['int_index'] = _close_frame(_walk(120, 5), datetime_index=False)
+    return cases
+
+
+class TestRawFactorPanelGolden:
+    """The vectorized _raw_factor_panel must reproduce the prefix loop exactly."""
+
+    @pytest.mark.parametrize('name', sorted(_golden_cases()))
+    def test_vectorized_panel_is_byte_identical_per_frame(self, name):
+        frame = _golden_cases()[name]
+        new = _raw_factor_panel({name: frame})
+        ref = _loop_raw_factor_panel({name: frame})
+        assert set(new) == set(ref), (
+            f'symbol membership diverged for {name}: '
+            f'{set(new) ^ set(ref)}')
+        for symbol in ref:
+            pd.testing.assert_frame_equal(
+                new[symbol], ref[symbol],
+                check_exact=True, check_dtype=True,
+                check_names=True, check_freq=True)
+
+    def test_vectorized_panel_byte_identical_multi_symbol(self):
+        # All frames in one panel call (the realistic cross-sectional shape):
+        # the vectorized output is byte-identical to the loop, symbol for symbol.
+        data = _golden_cases()
+        new = _raw_factor_panel(data)
+        ref = _loop_raw_factor_panel(data)
+        assert set(new) == set(ref)
+        for symbol in ref:
+            pd.testing.assert_frame_equal(
+                new[symbol], ref[symbol], check_exact=True)
+        assert sum(len(v) for v in new.values()) > 0  # non-trivial coverage
+
+    def test_factor_values_scores_and_trades_unchanged(self):
+        # End to end: identical raw panels imply identical standardized panels,
+        # ridge weights, and predict scores — i.e. the AQR desk's trades are
+        # provably unchanged by the optimization. We fit/predict against the
+        # SAME data and assert the model's scores equal those derived from the
+        # frozen-loop raw panel run through the model's own standardize+dot.
+        data = panel(n_symbols=10, n=260)
+        model = FactorModel()
+        model.fit(data)
+        assert not model.is_degraded  # a real ridge fit
+
+        from desks.models.factor import _standardized_panel
+        # Scores via the (vectorized) production path.
+        as_of = data['S00'].index[-1]
+        prod_scores = model.predict(data, as_of)
+
+        # Scores recomputed from the FROZEN-LOOP raw panel, standardized and
+        # dotted with the same fitted weights.
+        loop_std = _standardized_panel(_loop_raw_factor_panel(data))
+        weights = np.array([model.factor_weights[c] for c in FACTOR_COLUMNS],
+                           dtype=float)
+        loop_scores = {}
+        for symbol, std_frame in loop_std.items():
+            if std_frame.empty:
+                continue
+            latest = std_frame.iloc[-1].reindex(FACTOR_COLUMNS).fillna(0.0)
+            loop_scores[symbol] = float(np.dot(weights, latest.to_numpy(float)))
+
+        assert prod_scores.keys() == loop_scores.keys()
+        for symbol in loop_scores:
+            assert prod_scores[symbol] == loop_scores[symbol]  # byte-identical

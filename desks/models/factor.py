@@ -77,6 +77,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.linear_model import Ridge
 
 from desks import features as feature_lib
@@ -180,6 +181,99 @@ def _factor_exposures(close: pd.Series) -> Optional[Dict[str, float]]:
     return exposures
 
 
+def _trailing_return_series(
+        close_vals: np.ndarray, lookback: int, skip: int) -> np.ndarray:
+    """Vectorized per-row equivalent of :func:`_trailing_return` over EVERY
+    prefix ``close[:i+1]`` of ``close_vals``, in O(n) for the whole series.
+
+    Row ``i`` reproduces ``_trailing_return(close[:i+1], lookback, skip)``
+    bit-for-bit, including the documented short-history edge cases:
+
+      * ``i == 0`` (prefix length < 2) -> NaN;
+      * the skip->no-skip fallback when there isn't a full ``skip`` of room
+        (the loop's ``end_idx = n-1-skip < 1`` branch, here ``i-skip < 1``,
+        falls back to ``end = i``);
+      * the start-index clamp to 0 on short history;
+      * ``start >= end`` -> NaN;
+      * the finite / non-zero start-price and finite end-price guards.
+
+    The per-row arithmetic is the identical IEEE ``end_px/start_px - 1.0``,
+    so the result is byte-identical to the prefix loop.
+    """
+    n = close_vals.shape[0]
+    i = np.arange(n)
+    end = i - skip
+    end = np.where(end < 1, i, end)          # skip -> no-skip fallback
+    start = np.maximum(end - lookback, 0)     # clamp start to 0
+    valid = (i >= 1) & (start < end)
+    start_px = close_vals[start]
+    end_px = close_vals[end]
+    ok = (valid & np.isfinite(start_px) & (start_px != 0.0)
+          & np.isfinite(end_px))
+    out = np.full(n, np.nan)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = end_px / start_px - 1.0
+    out[ok] = ratio[ok]
+    return out
+
+
+def _trailing_vol_series(close: pd.Series, lookback: int) -> np.ndarray:
+    """Vectorized per-row equivalent of :func:`_trailing_vol`, in O(n).
+
+    Row ``i`` reproduces ``_trailing_vol(close[:i+1], lookback)`` exactly:
+    ``close[:i+1].pct_change().dropna().tail(lookback).std()`` (ddof=1) with
+    the same NaN-drop, the same trailing-window-of-clean-returns selection,
+    and the same ``<2 returns`` / non-finite -> NaN guards.
+
+    Because ``pct_change`` only looks back one row, the prefix's clean
+    returns are simply the global clean-return stream truncated to positions
+    ``<= i``; ``tail(lookback)`` of that prefix is therefore a trailing
+    window over the clean-return stream. Each distinct window's std is
+    computed once (the long full-length tail is batched via a strided view),
+    then mapped back to rows by the running count of clean returns. Both the
+    per-window ``np.std(..., ddof=1)`` and the batched two-pass std are
+    byte-identical to ``pandas.Series.std`` (see ``tests/test_factor_model``
+    golden check).
+    """
+    n = len(close)
+    rets = close.pct_change()
+    notna = rets.notna().to_numpy()
+    # cum[i] = number of clean (non-NaN) returns at positions <= i, i.e. the
+    # ``len(rets)`` the loop's _trailing_vol sees for the prefix close[:i+1].
+    cum = np.cumsum(notna)
+    clean = rets.to_numpy()[notna]            # clean-return stream (order kept)
+    k = clean.shape[0]
+
+    # vol_j[j] = std of the trailing window of clean returns ENDING at clean
+    # index j (the window is clean[max(0, j-lookback+1) : j+1]).
+    vol_j = np.full(k, np.nan)
+    # A non-finite return (e.g. an inf from a zero price) makes its windows'
+    # std non-finite; that is squashed to NaN by the finite guard below, just
+    # as the loop's ``np.isfinite(vol)`` check does, so the arithmetic warning
+    # it raises along the way carries no information — silence it.
+    with np.errstate(invalid='ignore'):
+        if k >= lookback:
+            # Warm-up windows (length 2 .. lookback-1): the whole clean prefix.
+            for j in range(1, lookback - 1):
+                vol_j[j] = np.std(clean[:j + 1], ddof=1)
+            # Full-length windows (length == lookback): batched two-pass std,
+            # byte-identical to per-window np.std on each contiguous row.
+            sw = sliding_window_view(clean, lookback)   # row m -> clean[m:m+L]
+            means = sw.mean(axis=1, keepdims=True)
+            var = ((sw - means) ** 2).sum(axis=1) / (lookback - 1)
+            vol_j[lookback - 1:] = np.sqrt(var)
+        else:
+            for j in range(1, k):
+                vol_j[j] = np.std(clean[:j + 1], ddof=1)
+    vol_j[~np.isfinite(vol_j)] = np.nan           # finite guard
+
+    out = np.full(n, np.nan)
+    jj = cum - 1                                   # clean index of latest return
+    has = jj >= 1                                  # need >= 2 clean returns
+    out[has] = vol_j[jj[has]]
+    return out
+
+
 def _raw_factor_panel(
         data: Dict[str, pd.DataFrame]
 ) -> Dict[str, pd.DataFrame]:
@@ -189,6 +283,13 @@ def _raw_factor_panel(
     (backward-looking), so the panel is leakage-free and is the input to the
     per-date cross-sectional standardization. Symbols too short to form any
     factor are dropped.
+
+    Vectorized: rather than re-running :func:`_factor_exposures` on a growing
+    prefix for every row (O(n^2) per symbol), the four factors are computed
+    over the whole series at once in O(n) via :func:`_trailing_return_series`
+    and :func:`_trailing_vol_series`. The output is byte-identical to the
+    former prefix loop (guarded by the golden test in
+    ``tests/test_factor_model.py``).
     """
     panel: Dict[str, pd.DataFrame] = {}
     for symbol, frame in data.items():
@@ -198,18 +299,40 @@ def _raw_factor_panel(
         n = len(close)
         if n < _MIN_ROWS:
             continue
-        rows: Dict[str, List[float]] = {c: [] for c in FACTOR_COLUMNS}
-        idx: List = []
-        for i in range(n):
-            exp = _factor_exposures(close.iloc[:i + 1])
-            if exp is None:
-                continue
-            idx.append(close.index[i])
-            for c in FACTOR_COLUMNS:
-                rows[c].append(exp[c])
-        if not idx:
+        close_vals = close.to_numpy(dtype=float)
+
+        mom = _trailing_return_series(close_vals, _MOM_LOOKBACK, _MOM_SKIP)
+        rev_raw = _trailing_return_series(close_vals, _REVERSAL_LOOKBACK, 0)
+        vol = _trailing_vol_series(close, _VOL_LOOKBACK)
+
+        finite_mom = np.isfinite(mom)
+        finite_rev = np.isfinite(rev_raw)
+        finite_vol = np.isfinite(vol)
+
+        # Same signing as _factor_exposures (HIGHER = more attractive), with
+        # a non-finite factor treated as 0.0 on that axis.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            risk = np.where(finite_mom & finite_vol & (vol > 1e-9),
+                            mom / vol, 0.0)
+        col_arrays = {
+            'momentum': np.where(finite_mom, mom, 0.0),
+            'reversal': np.where(finite_rev, -rev_raw, 0.0),
+            'low_vol': np.where(finite_vol, -vol, 0.0),
+            'risk_adj_mom': risk,
+        }
+
+        # _factor_exposures returns a row only when the prefix has >= _MIN_ROWS
+        # rows (i >= _MIN_ROWS-1) AND at least one factor is finite.
+        keep = ((np.arange(n) >= _MIN_ROWS - 1)
+                & (finite_mom | finite_rev | finite_vol))
+        if not keep.any():
             continue
-        panel[symbol] = pd.DataFrame(rows, index=pd.Index(idx))
+        # Build the index exactly as the former loop did (``pd.Index`` over a
+        # list of the kept timestamps) so a DatetimeIndex carries no ``freq``
+        # — a boolean mask would otherwise preserve it and diverge.
+        panel[symbol] = pd.DataFrame(
+            {c: col_arrays[c][keep] for c in FACTOR_COLUMNS},
+            index=pd.Index(close.index[keep].tolist()))
     return panel
 
 
