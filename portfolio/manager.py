@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple
-from core.models import Asset, Position, Trade, Order, OrderType
+from core.models import Asset, Position, Trade, Order
 from analysis.research_stats import (deflated_sharpe_ratio,
                                      probabilistic_sharpe_ratio)
 

@@ -6,7 +6,7 @@ Enforces trading rules and position limits
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence
-from core.models import Asset, Position
+from core.models import Position
 from datetime import datetime
 
 import numpy as np

@@ -50,7 +50,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from core.models import Asset, AssetType
+from core.models import Asset
 from desks.base import DeskIntent
 
 logger = logging.getLogger(__name__)

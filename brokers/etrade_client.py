@@ -28,7 +28,6 @@ never transport-retried (that is what the idempotency dance is for).
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import time
