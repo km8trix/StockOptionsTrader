@@ -56,18 +56,29 @@ class DynamicReweighter:
     desk's capital_allocation in place and records the rebalance.
     """
 
+    #: Supported weighting modes -> the allocator method each invokes.
+    _WEIGHTING_MODES = ('risk_parity', 'performance')
+
     def __init__(self,
                  allocator: Optional[CrossDeskCapitalAllocator] = None,
                  rebalance_every: int = 21,
-                 warmup: int = 0):
+                 warmup: int = 0,
+                 weighting: str = 'risk_parity'):
         if rebalance_every < 1:
             raise ValueError(
                 f"rebalance_every must be >= 1; got {rebalance_every}")
         if warmup < 0:
             raise ValueError(f"warmup must be >= 0; got {warmup}")
+        if weighting not in self._WEIGHTING_MODES:
+            raise ValueError(
+                f"weighting must be one of {self._WEIGHTING_MODES}; "
+                f"got {weighting!r}")
         self.allocator = allocator or CrossDeskCapitalAllocator()
         self.rebalance_every = int(rebalance_every)
         self.warmup = int(warmup)
+        #: 'risk_parity' (default, byte-identical) -> inverse-vol; 'performance'
+        #: -> opt-in guarded risk-adjusted performance tilt.
+        self.weighting = weighting
         self._curves: Dict[str, List[Tuple[pd.Timestamp, float]]] = {}
         #: Append-only audit of every rebalance actually applied.
         self.rebalance_log: List[Dict] = []
@@ -124,20 +135,34 @@ class DynamicReweighter:
         # Record WHY (if at all) this rebalance is degenerate, so an
         # equal-weight fallback is auditable rather than masquerading as a real
         # risk-parity decision (a flat/missing/short solo curve forces the
-        # allocator's WHOLE-FUND equal-weight fallback).
+        # allocator's WHOLE-FUND equal-weight fallback). degenerate_desks is the
+        # SAME gate both weighting modes use, so it audits either mode.
         degraded = self.allocator.degenerate_desks(returns_by_desk)
-        weights = self.allocator.risk_parity_weights(returns_by_desk)
+        # Mode selection: default 'risk_parity' calls risk_parity_weights
+        # EXACTLY as before (byte-identical); 'performance' opts into the
+        # guarded risk-adjusted tilt.
+        if self.weighting == 'performance':
+            weights = self.allocator.performance_weights(returns_by_desk)
+        else:
+            weights = self.allocator.risk_parity_weights(returns_by_desk)
 
-        # Defence-in-depth: the allocator scales weights to target_gross <= 1.0,
-        # so this is unreachable with the stock allocator — but the fund does
-        # NOT re-validate the sum after a mid-run write, so assert the contract
-        # loudly at the mutation site rather than over-deploying silently.
+        # Defence-in-depth at the mutation site: NEVER write an over-leveraged
+        # set to the live book. Compare against the allocator's OWN target_gross
+        # (not a literal 1.0 — a sub-1.0 target must be honored too); on a
+        # breach, renormalize the weights DOWN to target_gross rather than only
+        # logging and deploying past target. Both built-in modes already sum to
+        # target_gross exactly, so this is a no-op on every normal path (the
+        # default risk-parity weights are written unchanged).
+        target_gross = self.allocator.target_gross
         total = sum(weights.values())
-        if total > 1.0 + _SUM_TOL:
+        if total > target_gross + _SUM_TOL:
             logger.error(
-                "Reweight on %s (day %d) produced weights summing to %.6f > 1.0"
-                " — over-leverage risk; check the allocator", as_of.date(),
-                day_number, total)
+                "Reweight on %s (day %d) produced weights summing to %.6f > "
+                "target_gross %.4g — renormalizing down (allocator contract "
+                "breach?)", as_of.date(), day_number, total, target_gross)
+            if total > 0.0:
+                weights = {key: target_gross * weight / total
+                           for key, weight in weights.items()}
 
         for desk in desks:
             if desk.key in weights:
@@ -149,6 +174,7 @@ class DynamicReweighter:
             'weights': dict(weights),
             'fallback': bool(degraded),
             'degraded_desks': sorted(degraded),
+            'mode': self.weighting,
         })
         if degraded:
             logger.warning(
