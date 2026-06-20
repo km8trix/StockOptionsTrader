@@ -63,6 +63,7 @@ class ReweightingFundBacktest:
                  per_contract_commission: float = 0.65,
                  rebalance_every: int = 21, warmup: int = 0,
                  target_gross: float = 1.0,
+                 weighting: str = 'risk_parity',
                  risk_aggregator=None, seed: Optional[int] = None,
                  solo_curve_provider: Optional[SoloCurveProvider] = None,
                  orchestrator_factory: Optional[OrchestratorFactory] = None):
@@ -80,6 +81,8 @@ class ReweightingFundBacktest:
         self.rebalance_every = rebalance_every
         self.warmup = warmup
         self.target_gross = target_gross
+        # 'risk_parity' (default, unchanged) or opt-in guarded 'performance'.
+        self.weighting = weighting
         self.risk_aggregator = risk_aggregator
         self.seed = seed
         self._solo_curve_provider = (solo_curve_provider
@@ -115,7 +118,8 @@ class ReweightingFundBacktest:
         orchestrator = self._orchestrator_factory(self.allocations)
         reweighter = DynamicReweighter(
             CrossDeskCapitalAllocator(self.target_gross),
-            rebalance_every=self.rebalance_every, warmup=self.warmup)
+            rebalance_every=self.rebalance_every, warmup=self.warmup,
+            weighting=self.weighting)
         reweighter.set_curves(curves)
 
         engine = BacktestEngine(
