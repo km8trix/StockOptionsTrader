@@ -65,6 +65,7 @@ class ReweightingFundBacktest:
                  target_gross: float = 1.0,
                  weighting: str = 'risk_parity',
                  risk_aggregator=None, seed: Optional[int] = None,
+                 sizing_modulator=None,
                  solo_curve_provider: Optional[SoloCurveProvider] = None,
                  orchestrator_factory: Optional[OrchestratorFactory] = None):
         if not allocations:
@@ -85,6 +86,11 @@ class ReweightingFundBacktest:
         self.weighting = weighting
         self.risk_aggregator = risk_aggregator
         self.seed = seed
+        # OPTIONAL, OFF-BY-DEFAULT gated RL execution throttle (Phase F unit 2).
+        # None (default) => the fund pass is byte-identical to before. Only the
+        # FUND pass receives it — the N solo passes measure undistorted desk
+        # risk and must never be throttled.
+        self.sizing_modulator = sizing_modulator
         self._solo_curve_provider = (solo_curve_provider
                                      or self._default_solo_curve)
         self._orchestrator_factory = (orchestrator_factory
@@ -169,4 +175,5 @@ class ReweightingFundBacktest:
     def _default_orchestrator(self,
                               allocations: Dict[str, float]) -> FundOrchestrator:
         return create_fund_orchestrator(
-            allocations, risk_aggregator=self.risk_aggregator)
+            allocations, risk_aggregator=self.risk_aggregator,
+            sizing_modulator=self.sizing_modulator)

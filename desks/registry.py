@@ -156,7 +156,8 @@ def create_desk(key: str, capital_allocation: float = 1.0,
 
 
 def create_fund_orchestrator(allocations: Dict[str, float],
-                             risk_aggregator=None) -> FundOrchestrator:
+                             risk_aggregator=None,
+                             sizing_modulator=None) -> FundOrchestrator:
     """Instantiate the named ready desks at the given capital_allocations and
     wire them into a FundOrchestrator (convenience over create_desk + manual
     construction).
@@ -167,10 +168,47 @@ def create_fund_orchestrator(allocations: Dict[str, float],
     optional PortfolioRiskAggregator as ``risk_aggregator`` for the
     account-level overlay. Insertion order of ``allocations`` is preserved as
     the desk order (which the orchestrator's deterministic netting relies on).
+
+    ``sizing_modulator`` (OPTIONAL, OFF BY DEFAULT) is the gated RL execution
+    throttle (Phase F unit 2). When None (the default) the orchestrator step is
+    byte-identical to before — nothing auto-enables it. Build one with
+    :func:`create_rl_execution_throttle`; it is a STRICTLY SUBTRACTIVE size
+    throttle, never a desk, never model-selectable, never live.
     """
     if not allocations:
         raise ValueError(
             "create_fund_orchestrator requires at least one desk allocation")
     desks = [create_desk(key, allocation)
              for key, allocation in allocations.items()]
-    return FundOrchestrator(desks, risk_aggregator=risk_aggregator)
+    return FundOrchestrator(desks, risk_aggregator=risk_aggregator,
+                            sizing_modulator=sizing_modulator)
+
+
+def create_rl_execution_throttle(policy=None, scale_min: float = 0.5,
+                                 scale_max: float = 1.0, enabled: bool = True,
+                                 scaler=None):
+    """Build a configured (orchestrator-detached) RL execution throttle.
+
+    This is the ONLY registry entry point for the Phase F unit 2 throttle. It
+    deliberately returns a detached :class:`RLExecutionThrottle` — the caller
+    must explicitly pass it as ``sizing_modulator=`` to
+    :func:`create_fund_orchestrator` (or directly to ``FundOrchestrator``) for
+    it to take effect. It is NOT registered as a Desk, is NOT model-selectable,
+    is NOT added to any default fund, and NOTHING auto-enables it. Clearing the
+    research gate does not change that.
+
+    ``policy`` is a FROZEN ``ThrottlePolicy`` (or None => identity pass-through);
+    ``scale_max`` is HARD-CLAMPED to <= 1.0 inside the throttle (subtractive
+    only). ``enabled=False`` makes the throttle a pure identity, and a still-
+    untrained policy carries a NO-OP PRIOR (outputs ~scale_max), so even an
+    attached-but-untrained policy leaves sizes essentially unchanged — throttling
+    only ever shrinks once a policy has learned a signal. Only ``enabled=True``
+    AND a trained ``ThrottlePolicy`` actually throttles.
+    """
+    # Imported lazily so the registry (and therefore the GUI) never hard-fails
+    # to import when the optional torch wheel is missing — only constructing a
+    # ThrottlePolicy requires torch, never importing this factory.
+    from desks.rl_execution import RLExecutionThrottle
+    return RLExecutionThrottle(
+        policy=policy, scale_min=scale_min, scale_max=scale_max,
+        enabled=enabled, scaler=scaler)
