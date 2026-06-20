@@ -113,8 +113,7 @@ class EnhancedMeanReversionStrategy(Strategy):
             return 'HOLD'
         
         current = data.iloc[-1]
-        prev = data.iloc[-2]
-        
+
         # Check multiple conditions
         at_lower_band = current['close'] <= current['bb_lower']
         at_upper_band = current['close'] >= current['bb_upper']
@@ -129,12 +128,12 @@ class EnhancedMeanReversionStrategy(Strategy):
         price_vs_sma = current['close'] / current['sma_20']
         extreme_deviation = price_vs_sma < 0.95 or price_vs_sma > 1.05
         
-        # BUY: Multiple conditions align for oversold
-        if at_lower_band and rsi_oversold and extreme_deviation:
+        # BUY: Multiple conditions align for oversold, confirmed by volume
+        if at_lower_band and rsi_oversold and extreme_deviation and volume_spike:
             return 'BUY'
-        
-        # SELL: Multiple conditions align for overbought
-        if at_upper_band and rsi_overbought and extreme_deviation:
+
+        # SELL: Multiple conditions align for overbought, confirmed by volume
+        if at_upper_band and rsi_overbought and extreme_deviation and volume_spike:
             return 'SELL'
         
         return 'HOLD'

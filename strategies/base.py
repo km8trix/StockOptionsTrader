@@ -75,7 +75,7 @@ class MomentumStrategy(Strategy):
         price_above_sma20 = current['close'] > current['sma_20']
         price_above_sma50 = current['close'] > current['sma_50']
         
-        if macd_bullish and price_above_sma50:
+        if (macd_bullish or rsi_bullish) and price_above_sma20 and price_above_sma50:
             return 'BUY'
         elif macd_bearish or rsi_bearish:
             return 'SELL'
