@@ -20,6 +20,23 @@
     simulation-only and never trades live; in backtests its options are priced
     synthetically (Black-Scholes) until E*TRADE quotes arrive in Phase 9.
 </p>
+
+<!-- Phase F research note: purely informational. This documents the
+     existence of the gated RL execution throttle so the surface is honest,
+     WITHOUT exposing any control to enable it. There is intentionally no
+     toggle, button, or API route here — the throttle is not a selectable
+     desk, is off by default, and is never wired into any live path. -->
+<p class="desk-footnote">
+    <i class="bi bi-clipboard-data" aria-hidden="true"></i>
+    <span class="badge-phase">Experimental · Disabled · Research-only</span>
+    Research note: an experimental reinforcement-learning execution throttle
+    (Phase F) exists in the codebase as a strictly subtractive, backtest-only
+    sizing modulator. It is gated OFF by default, is not a selectable desk,
+    and is never live — it can only ever shrink a desk-intended size in
+    research backtests and has no order-routing or E*TRADE path. There is no
+    control to enable it from this interface by design; clearing its research
+    validation gate does not auto-enable it.
+</p>
 {% endblock %}
 
 {% block extra_js %}

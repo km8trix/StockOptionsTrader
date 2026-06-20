@@ -66,6 +66,7 @@ from portfolio.risk_manager import RiskManager
 
 if TYPE_CHECKING:  # annotation only
     from portfolio.risk_aggregator import PortfolioRiskAggregator
+    from desks.rl_execution import RLExecutionThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,8 @@ class FundOrchestrator:
 
     def __init__(self, desks: List[Desk],
                  risk_manager: Optional[RiskManager] = None,
-                 risk_aggregator: Optional['PortfolioRiskAggregator'] = None):
+                 risk_aggregator: Optional['PortfolioRiskAggregator'] = None,
+                 sizing_modulator: Optional['RLExecutionThrottle'] = None):
         if not desks:
             raise ValueError("FundOrchestrator requires at least one desk")
         keys = [desk.key for desk in desks]
@@ -144,6 +146,12 @@ class FundOrchestrator:
         # Optional account-level overlay (gross leverage / correlation /
         # sector) run AFTER the unified apply_risk; None -> not enforced.
         self.risk_aggregator = risk_aggregator
+        # OPTIONAL, OFF-BY-DEFAULT, GATED RL execution throttle (Phase F unit 2).
+        # When None (the default) step() is byte-identical to before — the
+        # modulator call is simply skipped. The throttle is STRICTLY
+        # SUBTRACTIVE: it can only ever shrink opening-stock sizes, never grow
+        # them, so the fund gross is always <= baseline. See desks.rl_execution.
+        self.sizing_modulator = sizing_modulator
         #: Conflict notes the orchestrator itself raises (kept separate from
         #: the account desk's risk notes and the sub-desks' own notes).
         self._own_notes: List[TraderNote] = []
@@ -204,6 +212,13 @@ class FundOrchestrator:
                 tagged.append(_Tagged(intent, desk, account_fraction))
 
         netted = self._net_intents(tagged)
+        # OPTIONAL gated RL throttle (Phase F unit 2): runs BEFORE apply_risk so
+        # the risk gate only ever sees the final, SMALLER sizes — strictly
+        # safer. Off by default (None) => byte-identical to before. At this
+        # point intents are ACCOUNT-ABSOLUTE size_fraction.
+        if self.sizing_modulator is not None:
+            netted = self.sizing_modulator.apply(netted, portfolio, all_data,
+                                                 date)
         self._account.set_clock(date)
         approved = self._account.apply_risk(netted, portfolio, all_data, date)
 
