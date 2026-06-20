@@ -284,6 +284,48 @@ class SyntheticIVModel:
         return max(IV_FLOOR, iv)
 
 
+def skew_adjusted_iv(base_iv: float, spot: float, strike: float,
+                     slope: Optional[float], t_years: Optional[float] = None,
+                     ) -> float:
+    """Per-strike IV from a flat base IV via a deterministic linear
+    moneyness skew (OPT-IN; the desk's vol-surface feature).
+
+    Equity index/single-name skew: out-of-the-money PUTS are bid up and
+    out-of-the-money CALLS are cheapened, so IV is a DECREASING function
+    of strike. We parametrize it on log-moneyness
+
+        k = ln(strike / spot)
+
+    (k < 0 below spot — the put wing; k > 0 above spot — the call wing)
+    and tilt the base IV linearly:
+
+        iv(k) = base_iv * (1 - slope * k)
+
+    so a POSITIVE `slope` lifts IV for k < 0 (OTM puts richer) and lowers
+    it for k > 0 (OTM calls cheaper) — the empirical equity smirk. k = 0
+    (at-the-money) reproduces base_iv EXACTLY. The result is floored at
+    IV_FLOOR so a steep slope on a far wing can never produce a
+    non-positive vol (which would break Black-Scholes).
+
+    NO-LOOKAHEAD: both spot and strike are same-day, caller-supplied
+    inputs; the skew is a pure function of them and introduces no time
+    dependence on future bars. `t_years` is accepted for signature
+    compatibility / future term-structure use but the linear form does
+    not consume it.
+
+    OPT-IN CONTRACT: slope is None or 0.0 -> the function returns base_iv
+    UNCHANGED (the flat surface), so the desk's default path is
+    byte-identical to the pre-surface behavior.
+    """
+    if slope is None or slope == 0.0:
+        return base_iv
+    if spot <= 0.0 or strike <= 0.0:
+        return base_iv
+    k = math.log(strike / spot)
+    iv = base_iv * (1.0 - slope * k)
+    return max(IV_FLOOR, iv)
+
+
 def price_option(asset: Asset, underlying_frame: pd.DataFrame, date,
                  spot: float, iv_model: SyntheticIVModel,
                  rate: float = DEFAULT_RATE) -> Optional[float]:
