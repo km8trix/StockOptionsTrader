@@ -78,7 +78,6 @@ def main() -> int:
             # Guaranteed backstop via the client (route uses a separate
             # broker registry that this flow never populated).
             try:
-                import os
                 from brokers.etrade_auth import EtradeAuthManager
                 from brokers.etrade_client import EtradeClient
                 client = EtradeClient(EtradeAuthManager())

@@ -19,7 +19,7 @@ used as the feature row at predict time, where no label is needed).
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd

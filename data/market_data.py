@@ -9,9 +9,8 @@ import os
 
 import pandas as pd
 import numpy as np
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from typing import Dict, Optional, Union
-from core.models import Asset, AssetType
 from data.cache import OHLCVCache
 
 logger = logging.getLogger(__name__)

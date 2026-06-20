@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional, List
-from core.models import Asset, AssetType, Order, OrderStatus, OrderType, Position
+from core.models import Asset, Order, OrderStatus, OrderType, Position
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
 from brokers.base import ExecutionBroker

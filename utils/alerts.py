@@ -8,7 +8,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 from enum import Enum
 
 logger = logging.getLogger(__name__)
