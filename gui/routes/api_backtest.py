@@ -593,62 +593,6 @@ def backtest_job_status(job_id):
     return jsonify(job)
 
 
-@backtest_bp.route('/backtest', methods=['POST'])
-def run_backtest():
-    """Run backtest with given parameters"""
-    try:
-        data = request.get_json(silent=True) or {}
-
-        symbols = _parse_symbols(data.get('symbols', ''))
-        if symbols is None:
-            return jsonify({'error': 'symbols must be a comma-separated '
-                                     'string or a list of strings'}), 400
-        if not symbols:
-            return jsonify({'error': 'No symbols provided'}), 400
-            
-        strategy_name = data.get('strategy', 'momentum').lower()
-        start_date = data.get('start_date', '2023-01-01')
-        end_date = data.get('end_date', '2023-12-31')
-        initial_capital = float(data.get('initial_capital', 100000))
-        position_size = float(data.get('position_size', 0.1))
-        
-        if strategy_name not in STRATEGIES:
-            return jsonify({'error': f'Unknown strategy: {strategy_name}'}), 400
-
-        seed, seed_err = _parse_seed(data)
-        if seed_err:
-            return jsonify({'error': seed_err}), 400
-
-        realistic, realistic_err = _parse_realistic_fills(data)
-        if realistic_err:
-            return jsonify({'error': realistic_err}), 400
-
-        strategy_instance = STRATEGIES[strategy_name]()
-        backtester = BacktestEngine(
-            strategy_instance, initial_capital=initial_capital, seed=seed,
-            enable_realistic_fills=realistic)
-
-        results = backtester.run(symbols, start_date, end_date, position_size)
-
-        if 'error' in results:
-            return jsonify({'error': results['error']}), 400
-
-        # Additive data provenance: which provider served each symbol.
-        results['data_sources'] = {
-            symbol: _fetch_info(backtester.market_data, symbol)
-            for symbol in symbols
-        }
-        # Run-level reproducibility provenance, parity with the async path.
-        results['provenance'] = capture_run_provenance(seed)
-
-        # Normalize dates + null any NaN summary metric, parity with the async
-        # path — without this a NaN Sharpe/Sortino/Calmar would make jsonify
-        # raise and the run would 500 with no diagnostic.
-        return jsonify(_json_safe_report(results))
-    except Exception:
-        logger.error('Backtest failed', exc_info=True)
-        return jsonify({'error': 'Backtest failed'}), 500
-
 @backtest_bp.route('/strategies', methods=['GET'])
 def list_strategies():
     """Get available strategies"""
