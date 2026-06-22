@@ -23,10 +23,23 @@ class TradingDatabase:
         if db_path and db_path != ':memory:':
             os.makedirs(os.path.dirname(db_path) or '.', exist_ok=True)
         self.init_database()
-    
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open a connection with WAL + a busy timeout so the threaded
+        single-worker app (JobManager, scheduler, keepalive) avoids
+        'database is locked' under concurrent reads/writes.
+
+        ponytail: per-call connect stays (already thread-safe); thread-local
+        pooling would be a perf optimization this single-worker app does not need.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")  # ms: wait on lock, don't error
+        return conn
+
     def init_database(self):
         """Initialize database schema"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         # Backtests table
@@ -103,7 +116,7 @@ class TradingDatabase:
                      symbols: List[str], initial_capital: float, 
                      strategy: str, parameters: Dict, results: Dict) -> int:
         """Save backtest results"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -136,7 +149,7 @@ class TradingDatabase:
     def save_trade(self, backtest_id: int, symbol: str, side: str, 
                    price: float, quantity: float, commission: float, pnl: float):
         """Save individual trade"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         pnl_percent = (pnl / (price * quantity)) * 100 if price * quantity > 0 else 0
@@ -152,7 +165,7 @@ class TradingDatabase:
     def create_alert(self, alert_type: str, symbol: str, message: str, 
                     priority: str = 'normal', details: Dict = None):
         """Create an alert"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -165,7 +178,7 @@ class TradingDatabase:
     
     def get_alerts(self, unread_only: bool = False) -> List[Dict]:
         """Get alerts"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -182,7 +195,7 @@ class TradingDatabase:
     
     def mark_alert_read(self, alert_id: int):
         """Mark alert as read"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('UPDATE alerts SET is_read = 1 WHERE id = ?', (alert_id,))
@@ -192,7 +205,7 @@ class TradingDatabase:
     
     def get_backtest(self, backtest_id: int) -> Optional[Dict]:
         """Get backtest by ID"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -210,7 +223,7 @@ class TradingDatabase:
     
     def get_backtests(self, limit: int = 50) -> List[Dict]:
         """Get recent backtests"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -223,7 +236,7 @@ class TradingDatabase:
     
     def get_backtest_trades(self, backtest_id: int) -> List[Dict]:
         """Get trades for a backtest"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -236,7 +249,7 @@ class TradingDatabase:
     
     def delete_backtest(self, backtest_id: int):
         """Delete backtest and related trades"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('DELETE FROM trades WHERE backtest_id = ?', (backtest_id,))
