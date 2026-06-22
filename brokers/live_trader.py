@@ -41,7 +41,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime
-from typing import Dict, List, Optional, Union, cast
+from typing import Callable, Dict, List, Optional, Union, cast
 
 from brokers.base import ExecutionBroker
 from brokers.circuit_breaker import (DailyLossCircuitBreaker, DailyLossGate,
@@ -50,6 +50,7 @@ from brokers.etrade_auth import EtradeAuthManager
 from brokers.etrade_client import (EtradeClient, build_equity_order,
                                    build_option_order, build_spread_order)
 from core.models import Asset, AssetType, OrderType
+from utils import metrics
 from utils.audit import AuditLog
 from utils.kill_switch import KillSwitch
 
@@ -114,7 +115,10 @@ class LiveEtradeBroker(ExecutionBroker):
                  audit: Optional[AuditLog] = None,
                  circuit_breaker=_AUTO,
                  price_sanity_threshold: Optional[float] =
-                 DEFAULT_PRICE_SANITY_THRESHOLD):
+                 DEFAULT_PRICE_SANITY_THRESHOLD,
+                 reference_price_fn: Optional[Callable[[str], Optional[float]]]
+                 = None,
+                 quote_divergence_threshold: float = 0.05):
         if isinstance(auth, EtradeClient) or hasattr(auth, "preview_order"):
             # prebuilt (or fake) client — narrowed by the isinstance/duck check
             self.client: EtradeClient = cast(EtradeClient, auth)
@@ -137,6 +141,12 @@ class LiveEtradeBroker(ExecutionBroker):
         # single-instrument limit or a spread net price implausibly far from
         # the market before it reaches E*TRADE.
         self.price_sanity_threshold = price_sanity_threshold
+        # Optional second live-quote source for a sanity cross-check. When set,
+        # get_current_price() compares E*TRADE's quote against it and WARNS on
+        # material divergence. FAIL-OPEN: a missing/flaky reference never blocks
+        # trading. Default None => no cross-check (byte-identical behavior).
+        self.reference_price_fn = reference_price_fn
+        self.quote_divergence_threshold = quote_divergence_threshold
 
     def _build_daily_loss_gate(self, kill_switch: KillSwitch,
                                audit: Optional[AuditLog]) -> DailyLossGate:
@@ -327,12 +337,41 @@ class LiveEtradeBroker(ExecutionBroker):
         if quote is None:
             logger.warning("No live quote for %s", symbol)
             return None
+        price: float | None = None
         if quote.get("last") is not None:
-            return float(quote["last"])
-        bid, ask = quote.get("bid"), quote.get("ask")
-        if bid is not None and ask is not None:
-            return (float(bid) + float(ask)) / 2.0
-        return None
+            price = float(quote["last"])
+        else:
+            bid, ask = quote.get("bid"), quote.get("ask")
+            if bid is not None and ask is not None:
+                price = (float(bid) + float(ask)) / 2.0
+        if price is None:
+            return None
+        self._cross_check_price(symbol, price)
+        return price
+
+    def _cross_check_price(self, symbol: str, primary: float) -> None:
+        """Compare the primary (E*TRADE) price against the optional second
+        live-quote source. FAIL-OPEN: a missing or failing reference NEVER
+        blocks trading — it only warns and counts a metric on material
+        divergence (the primary price is always returned unchanged)."""
+        if self.reference_price_fn is None:
+            return
+        try:
+            reference = self.reference_price_fn(symbol)
+        except Exception:  # noqa: BLE001 - a flaky reference must not break pricing
+            logger.warning("Reference quote source failed for %s", symbol,
+                           exc_info=True)
+            return
+        if reference is None or reference <= 0:
+            return
+        divergence = abs(primary - reference) / reference
+        if divergence > self.quote_divergence_threshold:
+            metrics.inc("quote_divergence_total", {"symbol": symbol})
+            logger.warning(
+                "Quote divergence for %s: primary=%.4f reference=%.4f "
+                "(%.1f%% > %.1f%% threshold)",
+                symbol, primary, reference,
+                divergence * 100, self.quote_divergence_threshold * 100)
 
     # ------------------------------------------------------------------
     # PatientExecutor protocol
