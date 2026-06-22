@@ -147,3 +147,43 @@ def analyze_stock(symbol):
     except Exception:
         logger.error('Stock analysis failed', exc_info=True)
         return jsonify({'error': 'Analysis failed'}), 500
+
+
+@analysis_bp.route('/chart/<symbol>')
+def chart_data(symbol):
+    """Daily OHLCV for the Production charts page, shaped for Lightweight
+    Charts: {symbol, candles:[{time,open,high,low,close}], volume:[{time,value}]}.
+
+    Deliberately strategy-free — this is a Production market view, not Strategy
+    research, so it never imports the strategy stack (cf. /analyze).
+    """
+    try:
+        symbol = symbol.upper()
+        days_back = request.args.get('days', 252, type=int)
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now()
+                      - timedelta(days=days_back)).strftime('%Y-%m-%d')
+
+        data = market_data.fetch_stock_data(symbol, start_date, end_date)
+        if data is None or data.empty:
+            return jsonify({'error': f'No data found for {symbol}'}), 404
+
+        recent = data.tail(MAX_CHART_ROWS).copy()
+        recent.index = pd.to_datetime(recent.index).strftime('%Y-%m-%d')
+
+        candles, volume = [], []
+        for time_str, row in recent.iterrows():
+            o, h, lo, c = row['open'], row['high'], row['low'], row['close']
+            if pd.isna(o) or pd.isna(h) or pd.isna(lo) or pd.isna(c):
+                continue
+            candles.append({'time': time_str, 'open': float(o), 'high': float(h),
+                            'low': float(lo), 'close': float(c)})
+            vol = row.get('volume')
+            volume.append({'time': time_str,
+                           'value': float(vol) if not pd.isna(vol) else 0.0})
+
+        return jsonify({'symbol': symbol, 'candles': candles, 'volume': volume,
+                        'data_source': _fetch_info(market_data, symbol)})
+    except Exception:
+        logger.error('Chart data failed for %s', symbol, exc_info=True)
+        return jsonify({'error': 'Failed to load chart data'}), 500

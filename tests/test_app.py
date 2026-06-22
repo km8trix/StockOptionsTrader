@@ -303,6 +303,31 @@ def patch_fetch(monkeypatch):
     return _patch
 
 
+class TestChartData:
+    """Production /charts page + /api/chart endpoint (Phase B chart shell)."""
+
+    def test_chart_endpoint_returns_lightweight_charts_shape(
+            self, client, make_ohlcv, patch_fetch):
+        patch_fetch({'TEST': make_ohlcv(n_days=30)})
+        r = client.get('/api/chart/TEST')
+        assert r.status_code == 200
+        j = r.get_json()
+        assert j['symbol'] == 'TEST'
+        assert len(j['candles']) > 0
+        assert len(j['volume']) == len(j['candles'])  # index-aligned
+        assert set(j['candles'][0]) == {'time', 'open', 'high', 'low', 'close'}
+
+    def test_chart_endpoint_404_for_no_data(self, client, patch_fetch):
+        patch_fetch({})  # fetch returns None for any symbol
+        assert client.get('/api/chart/NOPE').status_code == 404
+
+    def test_charts_page_is_production_and_ships_the_library(self, client):
+        html = client.get('/charts').get_data(as_text=True)
+        assert 'lightweight-charts.standalone' in html
+        assert 'id="chartContainer"' in html
+        assert 'ws-badge-production' in html  # Production workspace badge
+
+
 class TestAnalysisProvenance:
     def test_analyze_includes_data_source_matching_contract(
             self, client, monkeypatch, make_ohlcv, patch_fetch):

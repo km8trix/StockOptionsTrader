@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block title %}Charts · StockOptionsTrader{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-baseline justify-content-between mb-3">
+    <div class="d-flex align-items-baseline gap-3">
+        <h1 class="page-title">Charts</h1>
+        <p class="page-subtitle">Daily candles · live last-price &amp; positions coming next</p>
+    </div>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <form id="chartForm" class="row g-2 align-items-end" novalidate>
+            <div class="col-auto">
+                <label class="form-label" for="chartSymbol">Symbol</label>
+                <input type="text" class="form-control form-control-sm" id="chartSymbol"
+                       value="SPY" autocomplete="off" spellcheck="false"
+                       style="text-transform:uppercase;max-width:140px;">
+            </div>
+            <div class="col-auto">
+                <button type="submit" class="btn btn-primary btn-sm" id="chartLoadBtn">
+                    <i class="bi bi-bar-chart-line" aria-hidden="true"></i> Load
+                </button>
+            </div>
+            <div class="col">
+                <div class="provenance-caption" id="chartStatus"></div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <div id="chartContainer" style="height:480px;"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='vendor/lightweight-charts/lightweight-charts.standalone.production.js') }}"></script>
+<script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+{% endblock %}
