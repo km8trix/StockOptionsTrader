@@ -12,9 +12,33 @@
 <body class="d-flex flex-column min-vh-100">
     <nav class="navbar navbar-expand-lg app-nav sticky-top" aria-label="Main navigation">
         <div class="container-fluid">
+            {# Two workspaces: Sandbox = Strategy layer (never live), Production
+               = Desk layer (live-capable). The split mirrors the desks-vs-
+               strategies architecture so the nav itself teaches the model. #}
+            {% set sandbox_items = [
+                ('/analysis', 'Analysis'),
+                ('/backtest', 'Backtest'),
+                ('/paper_trade', 'Paper Trading'),
+            ] %}
+            {% set production_items = [
+                ('/floor', 'Trading Floor'),
+                ('/live', 'Live'),
+            ] %}
+            {% set sandbox_paths = sandbox_items | map(attribute=0) | list %}
+            {% set production_paths = production_items | map(attribute=0) | list %}
+            {% set section = 'sandbox' if request.path in sandbox_paths
+                             else ('production' if request.path in production_paths
+                                   else '') %}
             <a class="navbar-brand" href="/">
                 <i class="bi bi-terminal-fill" aria-hidden="true"></i>StockOptionsTrader
             </a>
+            {% if section == 'sandbox' %}
+            <span class="ws-badge ws-badge-sandbox"
+                  title="Research &amp; practice — nothing here trades live">SANDBOX · non-live</span>
+            {% elif section == 'production' %}
+            <span class="ws-badge ws-badge-production"
+                  title="Live-capable workspace">PRODUCTION</span>
+            {% endif %}
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
                     data-bs-target="#navbarNav" aria-controls="navbarNav"
                     aria-expanded="false" aria-label="Toggle navigation">
@@ -22,26 +46,39 @@
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto">
-                    {% set nav_items = [
-                        ('/', 'Dashboard'),
-                        ('/analysis', 'Analysis'),
-                        ('/backtest', 'Backtest'),
-                        ('/paper_trade', 'Paper Trading'),
-                        ('/floor', 'Trading Floor'),
-                        ('/live', 'Live'),
-                    ] %}
-                    {% for href, label in nav_items %}
                     <li class="nav-item">
-                        <a class="nav-link{% if request.path == href %} active{% endif %}"
-                           {% if request.path == href %}aria-current="page"{% endif %}
-                           href="{{ href }}">{{ label }}{% if href == '/live' %}
-                            <!-- env/connection dot: hidden until live.js (the
-                                 only status poller) paints it on the Live page;
-                                 it stays absent everywhere else by design. -->
-                            <span id="navLiveDot" class="nav-live-dot d-none"
-                                  aria-hidden="true"></span>{% endif %}</a>
+                        <a class="nav-link{% if request.path == '/' %} active{% endif %}"
+                           {% if request.path == '/' %}aria-current="page"{% endif %}
+                           href="/">Dashboard</a>
                     </li>
-                    {% endfor %}
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle{% if section == 'sandbox' %} active{% endif %}"
+                           href="#" role="button" data-bs-toggle="dropdown"
+                           aria-expanded="false">Sandbox</a>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li><h6 class="dropdown-header">Research &amp; practice · never live</h6></li>
+                            {% for href, label in sandbox_items %}
+                            <li><a class="dropdown-item{% if request.path == href %} active{% endif %}"
+                                   href="{{ href }}">{{ label }}</a></li>
+                            {% endfor %}
+                        </ul>
+                    </li>
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle{% if section == 'production' %} active{% endif %}"
+                           href="#" role="button" data-bs-toggle="dropdown"
+                           aria-expanded="false">Production</a>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li><h6 class="dropdown-header">Desks · live-capable</h6></li>
+                            {% for href, label in production_items %}
+                            <li><a class="dropdown-item{% if request.path == href %} active{% endif %}"
+                                   href="{{ href }}">{{ label }}{% if href == '/live' %}
+                                <!-- env/connection dot: hidden until live.js (the
+                                     only status poller) paints it on the Live page. -->
+                                <span id="navLiveDot" class="nav-live-dot d-none"
+                                      aria-hidden="true"></span>{% endif %}</a></li>
+                            {% endfor %}
+                        </ul>
+                    </li>
                 </ul>
             </div>
         </div>
