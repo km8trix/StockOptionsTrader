@@ -8,6 +8,7 @@ side effect.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 
@@ -26,6 +27,9 @@ except ImportError:  # pragma: no cover - depends on parallel work landing
     setup_logging = None
 
 logger = logging.getLogger(__name__)
+
+# Registered once per process (create_app runs many times in tests).
+_shutdown_hook_registered = False
 
 
 def _env_truthy(value: str | None) -> bool:
@@ -105,6 +109,15 @@ def create_app(config: dict | None = None) -> Flask:
     except Exception:  # pragma: no cover - never block app startup
         logger.warning('Keep-alive restart-recovery hook failed',
                        exc_info=True)
+
+    # Graceful shutdown: stop background threads (keep-alive, scheduler) once
+    # per process so `docker stop` / Ctrl-C tears them down cleanly. atexit
+    # fires on gunicorn worker exit and dev-server KeyboardInterrupt alike.
+    global _shutdown_hook_registered
+    if not _shutdown_hook_registered:
+        from gui.routes.api_live import shutdown_background_workers
+        atexit.register(shutdown_background_workers)
+        _shutdown_hook_registered = True
 
     @app.context_processor
     def inject_kill_switch_banner():
