@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from datetime import datetime
 from typing import Optional, Tuple
 from strategies.base import Strategy
 from core.models import Asset

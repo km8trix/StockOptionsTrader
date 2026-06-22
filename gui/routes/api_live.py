@@ -456,6 +456,22 @@ def keepalive_unavailable_reason() -> str:
             or 'Token keep-alive is unavailable')
 
 
+def shutdown_background_workers() -> None:
+    """Best-effort: stop the keep-alive and live-scheduler threads on process
+    shutdown so a ``docker stop`` / Ctrl-C tears them down cleanly instead of
+    orphaning daemon threads mid-cycle. Never raises, and never constructs a
+    scheduler that was not already running (reads the singletons directly)."""
+    with _singleton_lock:
+        workers = [w for w in (_keepalive_scheduler, _scheduler)
+                   if w is not None]
+    for worker in workers:
+        try:
+            worker.stop()
+        except Exception:  # noqa: BLE001 - shutdown must never raise
+            logger.warning('Error stopping %s during shutdown',
+                           type(worker).__name__, exc_info=True)
+
+
 def _start_keepalive_best_effort() -> None:
     """Begin (or resume after a pause) the token keep-alive loop following a
     successful connect. Best-effort and silent on failure — keeping the

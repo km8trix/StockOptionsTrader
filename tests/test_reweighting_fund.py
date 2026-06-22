@@ -24,11 +24,9 @@ import desks.registry as registry
 from backtesting.backtest_engine import BacktestEngine
 from backtesting.reweighting_fund import ReweightingFundBacktest
 from data.market_data import MarketDataHandler
-from desks.capital_allocator import CrossDeskCapitalAllocator
 from desks.dynamic_reweighter import DynamicReweighter
 from desks.orchestrator import FundOrchestrator
-from tests.test_fund_orchestrator import (ScriptedDesk, flat_frame, intent,
-                                          stock, wide_risk)
+from tests.test_fund_orchestrator import (ScriptedDesk, flat_frame, wide_risk)
 
 START, END = '2022-01-01', '2022-12-31'
 N_DAYS = 60

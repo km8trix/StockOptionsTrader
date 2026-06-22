@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        # requirements.txt is the runtime source of truth (matches the Docker
+        # image); .[dev] adds the lint/type/test tooling. torch (the [ai] extra)
+        # is intentionally omitted — the neural-model tests import-guard it and
+        # skip, keeping CI fast.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .[dev]
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type-check money path (mypy on brokers/ + execution/)
+        run: mypy
+
+      - name: Tests + coverage
+        run: pytest --cov=. --cov-report=term-missing
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        # Validates the Dockerfile and that requirements.txt installs cleanly
+        # in the slim runtime image.
+        run: docker build -t stockoptionstrader:ci .

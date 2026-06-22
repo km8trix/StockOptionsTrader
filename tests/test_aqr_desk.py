@@ -29,7 +29,7 @@ import pandas as pd
 import pytest
 
 from backtesting.backtest_engine import BacktestEngine
-from core.models import Asset, AssetType, Position
+from core.models import Asset, AssetType
 from data.market_data import MarketDataHandler
 from desks.aqr import AqrDesk
 from desks.cross_sectional import CrossSectionalLongShortDesk

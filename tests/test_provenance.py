@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 
 import numpy as np
-import pytest
 
 from backtesting.backtest_engine import BacktestEngine
 from strategies.base import MomentumStrategy

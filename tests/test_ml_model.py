@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from desks.ml_model import FEATURE_COLUMNS, GradientBoostingModel
 

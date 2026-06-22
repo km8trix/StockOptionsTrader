@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable, Dict, Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -176,7 +176,7 @@ class DailyLossGate:
         self.value_fn = value_fn
         self._clock = clock or breaker._clock
         self._lock = threading.Lock()
-        self._sod_date = None
+        self._sod_date: Optional[date] = None
         self._sod_value: Optional[float] = None
 
     @property

@@ -272,6 +272,7 @@ class MarketDataHandler:
             info['provider'] = used_provider
             self._last_fetch_info[symbol] = info
 
+            assert used_provider is not None  # a non-empty fetch has a provider
             if sqlite_cache is not None:
                 try:
                     sqlite_cache.store(symbol, data, used_provider,

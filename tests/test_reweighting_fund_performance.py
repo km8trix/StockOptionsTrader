@@ -23,7 +23,6 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import pytest
 
-import backtesting.reweighting_fund as rf_module
 from backtesting.backtest_engine import BacktestEngine
 from backtesting.reweighting_fund import ReweightingFundBacktest
 from data.market_data import MarketDataHandler

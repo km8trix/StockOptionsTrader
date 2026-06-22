@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
-import pytest
 
 from utils.jobs import MAX_FINISHED_JOBS, JobManager, get_job_manager
 

@@ -8,11 +8,16 @@ side effect.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 
-from flask import Flask, jsonify
+from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
+
+from utils import metrics
+from utils.logging_config import (
+    get_correlation_id, new_correlation_id, set_correlation_id)
 
 # utils/logging_config is being added in a parallel Phase 1 task; the app
 # must still start if it has not landed yet.
@@ -22,6 +27,9 @@ except ImportError:  # pragma: no cover - depends on parallel work landing
     setup_logging = None
 
 logger = logging.getLogger(__name__)
+
+# Registered once per process (create_app runs many times in tests).
+_shutdown_hook_registered = False
 
 
 def _env_truthy(value: str | None) -> bool:
@@ -102,6 +110,15 @@ def create_app(config: dict | None = None) -> Flask:
         logger.warning('Keep-alive restart-recovery hook failed',
                        exc_info=True)
 
+    # Graceful shutdown: stop background threads (keep-alive, scheduler) once
+    # per process so `docker stop` / Ctrl-C tears them down cleanly. atexit
+    # fires on gunicorn worker exit and dev-server KeyboardInterrupt alike.
+    global _shutdown_hook_registered
+    if not _shutdown_hook_registered:
+        from gui.routes.api_live import shutdown_background_workers
+        atexit.register(shutdown_background_workers)
+        _shutdown_hook_registered = True
+
     @app.context_processor
     def inject_kill_switch_banner():
         """Kill-switch banner state for base.html (Phase 9).
@@ -117,10 +134,34 @@ def create_app(config: dict | None = None) -> Flask:
         from gui.routes.api_live import kill_switch_engaged
         return {'kill_switch_engaged': kill_switch_engaged()}
 
+    # --- Observability: correlation ids + request metrics (Phase 4) ---
+    @app.before_request
+    def _bind_correlation_id():
+        # Honor an upstream/proxy-supplied id; otherwise mint a fresh one.
+        incoming = request.headers.get('X-Request-ID')
+        if incoming:
+            set_correlation_id(incoming)
+            g.correlation_id = incoming
+        else:
+            g.correlation_id = new_correlation_id()
+
+    @app.after_request
+    def _record_request(response):
+        response.headers['X-Request-ID'] = get_correlation_id()
+        metrics.inc('http_requests_total',
+                    {'status': f'{response.status_code // 100}xx'})
+        return response
+
     @app.route('/health')
     def health():
         """Liveness probe (Docker healthcheck target in Phase 4)."""
         return jsonify({'status': 'ok', 'service': 'stock-options-trader'}), 200
+
+    @app.route('/metrics')
+    def metrics_endpoint():
+        """Prometheus text exposition of in-process metrics (Phase 4 ops)."""
+        return Response(metrics.render(),
+                        mimetype='text/plain; version=0.0.4')
 
     @app.errorhandler(400)
     def bad_request(error):

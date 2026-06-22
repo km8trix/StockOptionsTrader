@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from backtesting.backtest_engine import BacktestEngine
-from core.models import Asset, AssetType, Position, Trade
+from core.models import Asset, AssetType, Position
 from data.market_data import MarketDataHandler
 from desks.base import Desk, DeskIntent
 from portfolio.manager import PortfolioManager
@@ -374,7 +374,6 @@ class TestStrategyModeUntouched:
             self, patch_market_data):
         df = linear_frame()
         patch_market_data({'TST': df})
-        dates = df.index
 
         class ShortingStrategy(Strategy):
             def __init__(self):
