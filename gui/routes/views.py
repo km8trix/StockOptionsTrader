@@ -25,6 +25,12 @@ def analysis_page():
 def floor_page():
     return render_template('floor.html')
 
+@views_bp.route('/charts')
+def charts_page():
+    # Production live-market chart (Lightweight Charts). Always a Production
+    # page, so base.html resolves the PRODUCTION section without ?ws.
+    return render_template('charts.html')
+
 @views_bp.route('/live')
 def live_page():
     return render_template('live.html')
