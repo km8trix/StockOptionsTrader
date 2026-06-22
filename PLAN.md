@@ -1,9 +1,19 @@
 # StockOptionsTrader — Master Plan (approved 2026-06-11)
 
-Goal: evolve this prototype into a professional-grade personal quant platform that emulates the
-*process* of Renaissance Technologies, Citadel, and Jane Street at retail scale: rigorous
-no-lookahead backtesting, walk-forward validation, enforced risk management, firm-style trading
-desks, and a hardened paper→live pipeline through E*TRADE (sole brokerage).
+> **Status (2026-06-21):** all 9 phases below are complete and merged to `main`, as is the
+> later AI+Quant desk program (Two Sigma, AQR, autonomy layer). This document is the
+> **historical build plan** — see [README](README.md#status) for live status. Remaining work
+> is operational (CI/observability) and E*TRADE production-key activation, not new strategy
+> architecture.
+
+Goal: a professional-grade personal **low-frequency systematic trading** platform that mimics the
+*process* of Renaissance Technologies, Citadel, and Jane Street at retail scale — **not** their
+high-frequency or live market-making infrastructure, which retail cannot replicate. Desks
+rebalance on daily-to-monthly cadences and hold options for weeks; the firm names are *process
+templates* (portfolio construction, risk allocation, research discipline), not return targets.
+Core disciplines: rigorous no-lookahead backtesting, walk-forward validation, enforced risk
+management, firm-style trading desks, and a hardened paper→live pipeline through E*TRADE (sole
+brokerage).
 
 ## Architecture target
 

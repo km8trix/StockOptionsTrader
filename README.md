@@ -8,6 +8,13 @@ fund orchestrator and an autonomy layer. See the [Architecture](#architecture)
 section below for how they fit together, and [PLAN.md](PLAN.md) for the approved
 roadmap and current status.
 
+It runs **low-frequency, daily-cadence systematic strategies** — desks rebalance on
+daily-to-monthly schedules and hold options for weeks. It is **not** high-frequency
+trading or live market-making, neither of which is reachable on retail infrastructure
+(the Avellaneda-Stoikov market maker is simulation-only and never trades). The firm
+names are **process templates** — how those shops construct portfolios and allocate
+risk — not performance claims; the platform does not promise returns.
+
 ## Architecture
 
 StockOptionsTrader is a multi-desk quant-trading **simulation** platform that mimics the *process* of Citadel, Jane Street, Renaissance, Two Sigma, and AQR — combining AI trading (ML + neural nets) with quant trading (statistical and factor models). It models how these firms construct portfolios and allocate risk; it does **not** promise or imply returns. Every risky change is validated through a research-integrity gate (Deflated/Probabilistic Sharpe + multiple-testing correction) and defaults to byte-identical current behavior. The platform is **backtest/simulation-first** and never routes a live order without explicit, deliberate wiring — there is no live order path in the autonomy layer at all.
