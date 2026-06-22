@@ -18,6 +18,39 @@
     </div>
 </div>
 
+<!-- Workspace chooser: Sandbox (research, never live) vs Production (desks, live) -->
+<div class="row g-2 mb-3">
+    <div class="col-md-6">
+        <div class="card h-100 ws-choose">
+            <div class="card-body">
+                <span class="ws-badge ws-badge-sandbox d-inline-block mb-2">SANDBOX · non-live</span>
+                <h2 class="h5 card-title">Research &amp; practice</h2>
+                <p class="text-secondary mb-3">Analyze symbols, backtest <strong>strategies</strong>,
+                    and paper trade. Nothing here ever places a live order.</p>
+                <div class="d-flex gap-2 flex-wrap">
+                    <a href="/analysis" class="btn btn-sm btn-outline-secondary">Analysis</a>
+                    <a href="/backtest" class="btn btn-sm btn-outline-secondary">Backtest</a>
+                    <a href="/paper_trade" class="btn btn-sm btn-outline-secondary">Paper Trading</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card h-100 ws-choose">
+            <div class="card-body">
+                <span class="ws-badge ws-badge-production d-inline-block mb-2">PRODUCTION</span>
+                <h2 class="h5 card-title">Desks &amp; live trading</h2>
+                <p class="text-secondary mb-3">Run the firm-style <strong>desks</strong>, review the
+                    trading floor, and connect E*TRADE for live execution.</p>
+                <div class="d-flex gap-2 flex-wrap">
+                    <a href="/floor" class="btn btn-sm btn-outline-secondary">Trading Floor</a>
+                    <a href="/live" class="btn btn-sm btn-outline-secondary">Live</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Portfolio metric cards -->
 <div id="portfolioMetrics" class="row g-2 mb-3">
     <div class="col-6 col-lg-3">
