@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from desks import features as fl
 from desks.features import (BASE_FEATURE_COLUMNS, EXTRA_FEATURE_COLUMNS,
                             FEATURE_COLUMNS, base_feature_frame,
                             cross_sectional_rank, extended_feature_frame)

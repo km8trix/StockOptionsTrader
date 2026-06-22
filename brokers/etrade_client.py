@@ -33,7 +33,7 @@ import random
 import time
 import uuid
 from datetime import date as date_type, datetime
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from brokers.etrade_auth import EtradeAuthExpired, EtradeAuthManager
 # Safe (acyclic): execution imports core/utils only, never brokers.
@@ -143,7 +143,7 @@ def build_equity_order(symbol: str, action: str, quantity: int,
     """
     if action not in ("BUY", "SELL"):
         raise ValueError(f"equity action {action!r} must be BUY or SELL")
-    order = {
+    order: Dict[str, Any] = {
         "allOrNone": False,
         "priceType": "LIMIT" if limit_price is not None else "MARKET",
         "orderTerm": "GOOD_FOR_DAY",
@@ -175,7 +175,7 @@ def build_option_order(symbol: str, call_put: str, strike: float, expiry,
     execution.patient_executor.round_tick for the rationale — float64
     cannot represent half-cent boundaries exactly).
     """
-    order = {
+    order: Dict[str, Any] = {
         "allOrNone": False,
         "priceType": "LIMIT" if limit_price is not None else "MARKET",
         "orderTerm": "GOOD_FOR_DAY",
@@ -497,6 +497,10 @@ class EtradeClient:
             raise EtradeOrderRejected(
                 "place_order requires PreviewIds — preview first")
         client_order_id = order_request.get("clientOrderId")
+        if not isinstance(client_order_id, str):
+            raise EtradeOrderRejected(
+                "order_request missing clientOrderId — build via "
+                "build_equity_order/build_option_order")
         payload = {"PlaceOrderRequest": dict(order_request)}
         payload["PlaceOrderRequest"]["PreviewIds"] = preview_ids
         path = f"/v1/accounts/{account_id_key}/orders/place.json"

@@ -79,7 +79,7 @@ class Order:
     asset: Asset
     order_type: OrderType
     quantity: int
-    price: float
+    price: Optional[float]  # None for MARKET orders (no limit price)
     timestamp: datetime
     order_id: str
     status: OrderStatus = OrderStatus.PENDING

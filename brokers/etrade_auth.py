@@ -341,6 +341,8 @@ class EtradeAuthManager:
     def start_auth(self) -> str:
         """Leg 1: fetch a request token; return the authorize URL."""
         self._require_configured()
+        assert self.consumer_key is not None  # guaranteed by _require_configured
+        assert self.consumer_secret is not None
         session = self._session_factory(self.consumer_key,
                                         self.consumer_secret)
         response = session.get(REQUEST_TOKEN_URL)
@@ -370,6 +372,8 @@ class EtradeAuthManager:
         """Leg 3: exchange the request token + verifier for an access
         token, persist it, and return status()."""
         self._require_configured()
+        assert self.consumer_key is not None  # guaranteed by _require_configured
+        assert self.consumer_secret is not None
         if self._pending is None:
             raise EtradeAuthError(
                 "No authorization in progress — call start_auth() first")
@@ -463,6 +467,9 @@ class EtradeAuthManager:
     # Client surface
     # ------------------------------------------------------------------
     def _build_session(self, row: sqlite3.Row):
+        # A persisted token row implies the manager was configured.
+        assert self.consumer_key is not None
+        assert self.consumer_secret is not None
         if self._session is None:
             self._session = self._session_factory(
                 self.consumer_key, self.consumer_secret,

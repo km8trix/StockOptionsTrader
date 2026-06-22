@@ -4,10 +4,8 @@ Base Strategy Class - Framework for implementing trading strategies
 
 from abc import ABC, abstractmethod
 import pandas as pd
-import numpy as np
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from core.models import Asset, AssetType, OrderType, Order
+from typing import Dict
+from core.models import Asset, AssetType
 from data.market_data import MarketDataHandler
 
 

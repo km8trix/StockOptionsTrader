@@ -41,7 +41,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, cast
 
 from brokers.base import ExecutionBroker
 from brokers.circuit_breaker import (DailyLossCircuitBreaker, DailyLossGate,
@@ -116,7 +116,8 @@ class LiveEtradeBroker(ExecutionBroker):
                  price_sanity_threshold: Optional[float] =
                  DEFAULT_PRICE_SANITY_THRESHOLD):
         if isinstance(auth, EtradeClient) or hasattr(auth, "preview_order"):
-            self.client: EtradeClient = auth  # prebuilt (or fake) client
+            # prebuilt (or fake) client — narrowed by the isinstance/duck check
+            self.client: EtradeClient = cast(EtradeClient, auth)
             # Surface the client's own gate (if any) for the session.
             self.circuit_breaker = getattr(self.client, "circuit_breaker",
                                            None)
@@ -225,6 +226,7 @@ class LiveEtradeBroker(ExecutionBroker):
         else:
             option_action = ("BUY_OPEN" if order_type == OrderType.BUY
                              else "SELL_CLOSE")
+            assert asset.strike_price is not None  # option assets carry a strike
             request = build_option_order(
                 asset.symbol,
                 "CALL" if asset.asset_type is AssetType.CALL else "PUT",
