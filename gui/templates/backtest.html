@@ -22,12 +22,17 @@
                             <input type="radio" class="btn-check" name="btMode"
                                    id="modeStrategy" value="strategy" checked>
                             <label class="btn btn-outline-secondary" for="modeStrategy">Strategy</label>
+                            {# Desk/Fund backtests belong to the Production workspace
+                               (reached via /backtest?ws=production, e.g. the Trading
+                               Floor's "Run a desk backtest"). Sandbox = strategy only. #}
+                            {% if ws == 'production' %}
                             <input type="radio" class="btn-check" name="btMode"
                                    id="modeDesk" value="desk">
                             <label class="btn btn-outline-secondary" for="modeDesk">Desk</label>
                             <input type="radio" class="btn-check" name="btMode"
                                    id="modeFund" value="fund">
                             <label class="btn btn-outline-secondary" for="modeFund">Fund</label>
+                            {% endif %}
                         </div>
                     </div>
                     <div class="mb-3" id="strategyField">

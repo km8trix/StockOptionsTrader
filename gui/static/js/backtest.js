@@ -392,6 +392,9 @@ function fundAllocations() {
 
 /** Wire the mode toggle and honor a /backtest?desk=<key> deep link. */
 async function initDeskMode() {
+    // Sandbox workspace renders Strategy mode only (no Desk/Fund radios), so
+    // skip all desk/fund wiring — listeners, the desk fetch, and the deep link.
+    if (!document.getElementById('modeDesk')) return;
     document.querySelectorAll('input[name="btMode"]').forEach((radio) => {
         radio.addEventListener('change', applyMode);
     });

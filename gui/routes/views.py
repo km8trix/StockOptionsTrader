@@ -1,5 +1,5 @@
 # gui/routes/views.py
-from flask import Blueprint, render_template
+from flask import Blueprint, render_template, request
 
 views_bp = Blueprint('views', __name__)
 
@@ -9,7 +9,9 @@ def index():
 
 @views_bp.route('/backtest')
 def backtest_page():
-    return render_template('backtest.html')
+    # ws=production reveals Desk/Fund modes (Production workspace); the default
+    # (Sandbox) shows strategy backtests only.
+    return render_template('backtest.html', ws=request.args.get('ws'))
 
 @views_bp.route('/paper_trade')
 def paper_trade_page():
