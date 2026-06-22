@@ -162,19 +162,21 @@ class TradingDatabase:
         conn.commit()
         conn.close()
     
-    def create_alert(self, alert_type: str, symbol: str, message: str, 
-                    priority: str = 'normal', details: Dict = None):
-        """Create an alert"""
+    def create_alert(self, alert_type: str, symbol: str, message: str,
+                    priority: str = 'normal', details: Dict = None) -> int:
+        """Create an alert; returns the new row id."""
         conn = self._connect()
         cursor = conn.cursor()
-        
+
         cursor.execute('''
             INSERT INTO alerts (alert_type, symbol, message, priority, details)
             VALUES (?, ?, ?, ?, ?)
         ''', (alert_type, symbol, message, priority, json.dumps(details or {})))
-        
+
+        alert_id = cursor.lastrowid
         conn.commit()
         conn.close()
+        return alert_id
     
     def get_alerts(self, unread_only: bool = False) -> List[Dict]:
         """Get alerts"""
@@ -199,7 +201,21 @@ class TradingDatabase:
         cursor = conn.cursor()
         
         cursor.execute('UPDATE alerts SET is_read = 1 WHERE id = ?', (alert_id,))
-        
+
+        conn.commit()
+        conn.close()
+
+    def mark_all_alerts_read(self):
+        """Mark every alert read."""
+        conn = self._connect()
+        conn.execute('UPDATE alerts SET is_read = 1')
+        conn.commit()
+        conn.close()
+
+    def clear_alerts(self):
+        """Delete all alerts."""
+        conn = self._connect()
+        conn.execute('DELETE FROM alerts')
         conn.commit()
         conn.close()
     

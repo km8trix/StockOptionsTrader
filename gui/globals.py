@@ -18,7 +18,9 @@ from portfolio.risk_manager import RiskManager
 # so they keep their import-time initialization and existing
 # ``from gui.globals import market_data`` callers work unchanged.
 market_data = MarketDataHandler()
-alert_manager = AlertManager()
+# Persist alerts via the lazy shared DB (the lambda defers get_db, defined
+# below, so no SQLite file is created until the first alert operation).
+alert_manager = AlertManager(db_provider=lambda: get_db())
 risk_manager = RiskManager()
 
 _db = None
