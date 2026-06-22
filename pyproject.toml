@@ -28,6 +28,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest==9.0.3",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.15",
+    "mypy==2.1.0",
 ]
 # Optional ML models ('lightgbm'/'stacking'/'mlp'/'lstm' walk-forward
 # models). macOS also needs the OpenMP runtime for lightgbm:
@@ -49,3 +52,16 @@ exclude = ["readme*", "tests*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+# Default rule set (pyflakes F + pycodestyle E/W) is enough; ruff auto-excludes
+# .gitignore'd paths (.venv, build artifacts).
+target-version = "py310"
+line-length = 100
+
+[tool.mypy]
+# Scoped to the money path (brokers/ + execution/) — the rest of the tree is
+# untyped and would only add noise. Third-party stubs are frequently absent
+# for the data/quant deps, so missing imports are ignored.
+files = ["brokers", "execution"]
+ignore_missing_imports = true
