@@ -49,7 +49,7 @@ function deskCard(desk) {
         `<p class="desk-desc flex-grow-1">${escapeHTML(desk.description ?? '')}</p>` +
         (ready
             ? '<a class="btn btn-outline-secondary btn-sm align-self-start" ' +
-              `href="/backtest?desk=${encodeURIComponent(desk.key)}">` +
+              `href="/backtest?ws=production&desk=${encodeURIComponent(desk.key)}">` +
               '<i class="bi bi-play-fill" aria-hidden="true"></i> Run a desk backtest</a>'
             : '') +
         '</div></div></div>'

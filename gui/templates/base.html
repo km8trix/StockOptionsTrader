@@ -26,8 +26,11 @@
             ] %}
             {% set sandbox_paths = sandbox_items | map(attribute=0) | list %}
             {% set production_paths = production_items | map(attribute=0) | list %}
-            {% set section = 'sandbox' if request.path in sandbox_paths
-                             else ('production' if request.path in production_paths
+            {# /backtest is a Sandbox path by default but flips to Production
+               when reached with ?ws=production (desk/fund backtests). #}
+            {% set section = 'production' if (request.path in production_paths
+                                 or request.args.get('ws') == 'production')
+                             else ('sandbox' if request.path in sandbox_paths
                                    else '') %}
             <a class="navbar-brand" href="/">
                 <i class="bi bi-terminal-fill" aria-hidden="true"></i>StockOptionsTrader

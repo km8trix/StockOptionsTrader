@@ -1466,8 +1466,9 @@ class TestDeskModeBacktest:
         assert rows[0]['strategy'] == 'momentum'
 
     def test_backtest_page_ships_desk_mode_controls(self, client):
-        """The page carries the mode toggle + desk picker for backtest.js."""
-        html = client.get('/backtest').get_data(as_text=True)
+        """The Production backtest page (ws=production) carries the mode toggle
+        + desk picker for backtest.js; the Sandbox page is strategy-only."""
+        html = client.get('/backtest?ws=production').get_data(as_text=True)
         assert 'id="modeDesk"' in html
         assert 'id="btDesk"' in html
         assert 'id="traderNotesCard"' in html
@@ -1480,6 +1481,8 @@ class TestDeskModeBacktest:
         assert 'id="podCards"' in html
         assert 'id="podAllocChart"' in html
         assert 'id="notePodFilters"' in html
+        # Sandbox workspace is strategy-only — the Desk radio is not rendered.
+        assert 'id="modeDesk"' not in client.get('/backtest').get_data(as_text=True)
         # Phase 8: structures table + portfolio-Greeks card (contracts
         # C11/C12), painted by backtest.js only for janestreet runs.
         assert 'id="structuresCard"' in html
