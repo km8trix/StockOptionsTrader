@@ -10,6 +10,7 @@
     {% block extra_css %}{% endblock %}
 </head>
 <body class="d-flex flex-column min-vh-100">
+    <a href="#main-content" class="skip-link">Skip to main content</a>
     <nav class="navbar navbar-expand-lg app-nav sticky-top" aria-label="Main navigation">
         <div class="container-fluid">
             {# Two workspaces: Sandbox = Strategy layer (never live), Production
@@ -153,7 +154,7 @@
         </div>
     </div>
 
-    <main class="container-fluid py-3 flex-grow-1">
+    <main id="main-content" tabindex="-1" class="container-fluid py-3 flex-grow-1">
         {% block content %}{% endblock %}
     </main>
 

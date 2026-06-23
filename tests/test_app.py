@@ -444,6 +444,35 @@ class TestResponsiveLayout:
         assert 'non-live' in html
 
 
+class TestAccessibility:
+    """UX polish phase 4: skip link, chart text alternatives, motion/focus."""
+
+    def test_skip_link_and_main_landmark_on_every_page(self, client):
+        for path in ('/', '/charts', '/backtest', '/live'):
+            html = client.get(path).get_data(as_text=True)
+            assert 'href="#main-content"' in html, path
+            assert 'Skip to main content' in html, path
+            assert 'id="main-content"' in html, path
+
+    def test_charts_have_text_alternatives(self, client):
+        charts = client.get('/charts').get_data(as_text=True)
+        assert 'role="img"' in charts
+        assert 'aria-label="Daily price chart' in charts
+        backtest = client.get('/backtest').get_data(as_text=True)
+        # Each Plotly chart container carries a descriptive label.
+        for label in ('Equity curve versus SPY benchmark', 'Drawdown over time',
+                      'Portfolio Greeks over time'):
+            assert f'aria-label="{label}' in backtest, label
+        analysis = client.get('/analysis').get_data(as_text=True)
+        assert 'Price chart with technical indicators' in analysis
+
+    def test_reduced_motion_and_focus_styles_present(self):
+        css = (REPO_ROOT / 'gui' / 'static' / 'css' / 'style.css').read_text()
+        assert 'prefers-reduced-motion: reduce' in css
+        assert ':focus-visible' in css
+        assert '.skip-link' in css
+
+
 class TestAnalysisProvenance:
     def test_analyze_includes_data_source_matching_contract(
             self, client, monkeypatch, make_ohlcv, patch_fetch):

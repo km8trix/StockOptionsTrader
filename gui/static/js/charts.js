@@ -46,6 +46,8 @@ async function loadChart(symbol) {
         candleSeries.setData([]);
         volumeSeries.setData([]);
         status.textContent = `No data for ${symbol}.`;
+        document.getElementById('chartContainer').setAttribute(
+            'aria-label', `No price data for ${symbol}`);
         stopLive();
         clearPositions();
         return;
@@ -67,6 +69,11 @@ async function loadChart(symbol) {
     const src = payload.data_source && payload.data_source.provider;
     status.textContent = `${payload.symbol} · ${payload.candles.length} daily bars`
         + (src ? ` · source: ${src}` : '');
+    // Keep the chart's screen-reader label in sync with what's drawn (the
+    // canvas itself is opaque to assistive tech).
+    document.getElementById('chartContainer').setAttribute('aria-label',
+        `${payload.symbol} daily price chart, ${payload.candles.length} bars`
+        + (src ? `, source ${src}` : ''));
     startLive(payload.symbol);
     loadPositions(payload.symbol);
 }
