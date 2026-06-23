@@ -1085,7 +1085,17 @@ function renderEquityChart(report) {
     layout.yaxis.tickformat = ',.0f';
     addRegimeBands(report, traces, layout);
     addWalkForwardMarkers(report, history, traces, layout);
-    Plotly.react(document.getElementById('equityChart'), traces, layout, PLOT_CONFIG);
+    const eqEl = document.getElementById('equityChart');
+    Plotly.react(eqEl, traces, layout, PLOT_CONFIG);
+    // Keep the screen-reader label in sync with the plotted data.
+    const eqRet = history.length >= 2 && history[0].portfolio_value
+        ? (history[history.length - 1].portfolio_value / history[0].portfolio_value - 1) * 100
+        : null;
+    eqEl.setAttribute('aria-label',
+        `Equity curve over ${history.length} points`
+        + (eqRet != null ? `, total return ${eqRet.toFixed(1)}%` : '')
+        + (report.benchmark && report.benchmark.symbol
+            ? `, versus ${report.benchmark.symbol} benchmark` : ''));
 }
 
 /**
@@ -1208,7 +1218,12 @@ function renderDrawdownChart(series) {
     const layout = baseLayout(t, 200);
     layout.showlegend = false;
     layout.yaxis.title = { text: 'DD (%)', font: { size: 10, color: t.muted } };
-    Plotly.react(document.getElementById('drawdownChart'), traces, layout, PLOT_CONFIG);
+    const ddEl = document.getElementById('drawdownChart');
+    Plotly.react(ddEl, traces, layout, PLOT_CONFIG);
+    const worstDd = series.length
+        ? Math.min(...series.map((p) => p.drawdown_pct)) : null;
+    ddEl.setAttribute('aria-label', 'Drawdown over time'
+        + (worstDd != null ? `, worst ${worstDd.toFixed(1)}%` : ''));
 }
 
 /* ==========================================================================
@@ -2148,7 +2163,10 @@ function renderCompare(a, b) {
     const layout = baseLayout(t, 320);
     layout.yaxis.title = { text: 'Value ($)', font: { size: 10, color: t.muted } };
     layout.yaxis.tickformat = ',.0f';
-    Plotly.react(document.getElementById('compareChart'), traces, layout, PLOT_CONFIG);
+    const cmpEl = document.getElementById('compareChart');
+    Plotly.react(cmpEl, traces, layout, PLOT_CONFIG);
+    cmpEl.setAttribute('aria-label',
+        `Equity comparison: ${a.name || 'backtest A'} versus ${b.name || 'backtest B'}`);
 
     if (missing > 0) {
         showToast('warning',
