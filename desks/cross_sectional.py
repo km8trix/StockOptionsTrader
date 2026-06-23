@@ -87,7 +87,9 @@ class CrossSectionalLongShortDesk(Desk):
                  quantile: float = 0.2,
                  target_gross: float = 1.0,
                  max_name_size: float = 0.10,
-                 min_scored: int = 4):
+                 min_scored: int = 4,
+                 exit_quantile: Optional[float] = None,
+                 min_holding_days: int = 0):
         super().__init__(
             key=key,
             name=name,
@@ -114,6 +116,29 @@ class CrossSectionalLongShortDesk(Desk):
         self.target_gross = target_gross
         self.max_name_size = max_name_size
         self.min_scored = min_scored
+
+        # Turnover control (opt-in; the defaults below are a strict no-op, so
+        # an un-configured desk's book is byte-identical to before). Two knobs:
+        #   * exit_quantile widens the band a HELD name may sit in before it is
+        #     closed (hysteresis): names ENTER on the top/bottom `quantile`, but
+        #     a held name is only dropped once it falls outside the wider
+        #     `exit_quantile` band — damping churn from names oscillating around
+        #     the entry threshold.
+        #   * min_holding_days keeps a freshly-opened name for at least N
+        #     trading days before it can be dropped to flat.
+        # Neither blocks a genuine flip: a name that crosses into the OPPOSITE
+        # entry set still reverses (strong signal wins over the turnover damp).
+        if exit_quantile is None:
+            exit_quantile = quantile
+        if not (quantile <= exit_quantile <= 0.5):
+            raise ValueError(
+                f"exit_quantile {exit_quantile} must be in "
+                f"[quantile={quantile}, 0.5]")
+        if min_holding_days < 0:
+            raise ValueError(
+                f"min_holding_days {min_holding_days} must be >= 0")
+        self._exit_quantile = exit_quantile
+        self.min_holding_days = min_holding_days
 
         #: Note text style: ``note_label`` is the human label in trader
         #: notes (e.g. 'Two-Sigma'); ``reason_prefix`` is the lower-case tag
@@ -227,6 +252,33 @@ class CrossSectionalLongShortDesk(Desk):
 
         desired: Dict[str, str] = {symbol: 'long' for symbol in longs}
         desired.update({symbol: 'short' for symbol in shorts})
+
+        # --- Turnover control: retain held names that should not churn yet ---
+        # No-op under the defaults (exit_quantile == quantile and
+        # min_holding_days == 0), so `desired` is byte-identical to before. Only
+        # genuinely-held legs are retained; unfilled/closing bookkeeping is left
+        # to the reconcile grace + orphan sweep, untouched.
+        if self.min_holding_days > 0 or self._exit_quantile > self.quantile:
+            k_exit = max(k, int(self._exit_quantile * n_scored))
+            for asset, state in self._book_positions.items():
+                symbol = asset.symbol
+                if symbol in desired or state.get('closing'):
+                    continue  # already wanted (entry/flip), or mid-close
+                position = portfolio.get_position(asset)
+                if position is None or position.quantity == 0:
+                    continue  # only retain legs that actually filled
+                direction = state['direction']
+                held_days = self._day_index - state.get('entry_day',
+                                                        self._day_index)
+                keep = (self.min_holding_days > 0
+                        and held_days < self.min_holding_days)
+                if not keep:
+                    rank = rank_of.get(symbol)
+                    if rank is not None:  # scored with a bar today
+                        keep = (rank < k_exit if direction == 'long'
+                                else rank >= n_scored - k_exit)
+                if keep:
+                    desired[symbol] = direction
 
         # ONE reconcile against the freshly-desired book: names that keep
         # their side are HELD untouched, names that left their side are closed
