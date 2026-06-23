@@ -292,6 +292,10 @@ function renderChart(payload) {
         responsive: true, displaylogo: false,
         modeBarButtonsToRemove: ['lasso2d', 'select2d', 'autoScale2d'],
     });
+    // Keep the screen-reader label in sync with the charted symbol/overlay.
+    chartEl.setAttribute('aria-label',
+        `${payload.symbol || 'Symbol'} price chart with technical indicators`
+        + (payload.strategy ? `, ${payload.strategy} signals overlaid` : ''));
 
     if (payload.strategy && Array.isArray(payload.signals) && signals.length === 0) {
         showToast('info', `No ${payload.strategy} signals in the charted window`);
