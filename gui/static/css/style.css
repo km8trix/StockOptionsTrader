@@ -1313,3 +1313,28 @@ th.sortable .sort-arrow {
 .glossary-list dt { font-weight: 600; color: var(--text); margin-top: var(--sp-3); }
 .glossary-list dt:first-child { margin-top: 0; }
 .glossary-list dd { color: var(--text-muted); margin-bottom: 0; }
+
+/* Accessibility (UX polish 4). Skip-to-content link: off-screen until a
+   keyboard user tabs to it, then it lands top-left as the first focus stop. */
+.skip-link { position: absolute; left: -999px; top: 0; z-index: 2000;
+    background: var(--accent); color: #fff; padding: var(--sp-2) var(--sp-4);
+    border-radius: 0 0 6px 0; text-decoration: none; }
+.skip-link:focus { left: 0; }
+
+/* Visible focus ring for keyboard users on every interactive element (the
+   dark theme otherwise suppresses the default outline on some controls). */
+a:focus-visible, button:focus-visible, .nav-link:focus-visible,
+[tabindex]:focus-visible, .dropdown-item:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+    border-radius: 3px;
+}
+#main-content:focus { outline: none; }  /* programmatic target, not a control */
+
+/* Respect reduced-motion: drop the decorative animations/transitions. */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+    }
+}

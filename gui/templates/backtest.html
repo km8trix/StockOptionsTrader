@@ -239,14 +239,18 @@
                     <span class="provenance-caption" id="equityProvenance"></span>
                 </div>
                 <div class="card-body p-2">
-                    <div id="equityChart" style="min-height: 320px;"></div>
+                    <div id="equityChart" role="img"
+                         aria-label="Equity curve versus SPY benchmark"
+                         style="min-height: 320px;"></div>
                 </div>
             </div>
 
             <div class="card mb-2">
                 <div class="card-header">Drawdown</div>
                 <div class="card-body p-2">
-                    <div id="drawdownChart" style="min-height: 200px;"></div>
+                    <div id="drawdownChart" role="img"
+                         aria-label="Drawdown over time"
+                         style="min-height: 200px;"></div>
                 </div>
             </div>
 
@@ -292,7 +296,9 @@
                     <span class="provenance-caption" id="reweightCaption">(risk-parity weights &middot; rebalanced in-run)</span>
                 </div>
                 <div class="card-body p-2">
-                    <div id="reweightChart" style="min-height: 260px;"></div>
+                    <div id="reweightChart" role="img"
+                         aria-label="Fund desk reweighting over time"
+                         style="min-height: 260px;"></div>
                 </div>
             </div>
 
@@ -306,7 +312,9 @@
                     <span class="provenance-caption">(delta / vega primary &middot; click legend for gamma / theta)</span>
                 </div>
                 <div class="card-body p-2">
-                    <div id="greeksChart" style="min-height: 240px;"></div>
+                    <div id="greeksChart" role="img"
+                         aria-label="Portfolio Greeks over time (delta, gamma, theta, vega)"
+                         style="min-height: 240px;"></div>
                 </div>
             </div>
 
@@ -321,7 +329,9 @@
                 </div>
                 <div class="card-body p-2">
                     <div class="row g-2 mb-2" id="podCards"></div>
-                    <div id="podAllocChart" style="min-height: 260px;"></div>
+                    <div id="podAllocChart" role="img"
+                         aria-label="Pod capital allocation over time"
+                         style="min-height: 260px;"></div>
                 </div>
             </div>
 
@@ -419,7 +429,9 @@
             <div class="card">
                 <div class="card-header">Equity curves</div>
                 <div class="card-body p-2">
-                    <div id="compareChart" style="min-height: 320px;"></div>
+                    <div id="compareChart" role="img"
+                         aria-label="Equity curves comparison across backtests"
+                         style="min-height: 320px;"></div>
                 </div>
             </div>
         </div>
