@@ -240,4 +240,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setDefaultDates();
     _pingHealth();
     setInterval(_pingHealth, 60000);
+    // Activate any explain() info popovers on the page (Bootstrap bundle is
+    // loaded ahead of this script in base.html).
+    document.querySelectorAll('[data-bs-toggle="popover"]').forEach(
+        (el) => new bootstrap.Popover(el));
 });

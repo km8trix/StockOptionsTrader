@@ -83,10 +83,37 @@
                             {% endfor %}
                         </ul>
                     </li>
+                    <li class="nav-item">
+                        <button class="nav-link glossary-trigger" type="button"
+                                data-bs-toggle="offcanvas" data-bs-target="#glossaryPanel"
+                                aria-label="Open glossary">
+                            <i class="bi bi-question-circle" aria-hidden="true"></i> Glossary
+                        </button>
+                    </li>
                 </ul>
             </div>
         </div>
     </nav>
+
+    <!-- Glossary offcanvas: plain-language definitions of the platform's terms,
+         reachable from the nav on every page. Single copy source is
+         gui/glossary.py (also feeds the explain() info popovers via GLOSSARY). -->
+    <div class="offcanvas offcanvas-end" tabindex="-1" id="glossaryPanel"
+         aria-labelledby="glossaryLabel">
+        <div class="offcanvas-header">
+            <h2 class="offcanvas-title h5" id="glossaryLabel">Glossary</h2>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas"
+                    aria-label="Close glossary"></button>
+        </div>
+        <div class="offcanvas-body">
+            <dl class="glossary-list mb-0">
+                {% for term, defn in GLOSSARY.items() %}
+                <dt>{{ term }}</dt>
+                <dd>{{ defn }}</dd>
+                {% endfor %}
+            </dl>
+        </div>
+    </div>
 
     <!-- Kill-switch banner (Phase 9): the markup ships on every page so the
          engaged state is unmistakable everywhere WITHOUT adding status

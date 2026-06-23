@@ -1303,3 +1303,13 @@ th.sortable .sort-arrow {
     border: 1px solid rgba(240, 180, 40, 0.4); }
 .ws-badge-production { background: rgba(68, 147, 248, 0.15); color: #4493f8;
     border: 1px solid rgba(68, 147, 248, 0.4); }
+
+/* explain() inline help button + glossary offcanvas list. */
+.explain-btn { background: none; border: 0; padding: 0; margin-left: 0.25rem;
+    color: var(--text-muted); line-height: 1; cursor: pointer;
+    font-size: 0.8em; vertical-align: middle; }
+.explain-btn:hover, .explain-btn:focus-visible { color: var(--accent); }
+.glossary-trigger { background: none; border: 0; }
+.glossary-list dt { font-weight: 600; color: var(--text); margin-top: var(--sp-3); }
+.glossary-list dt:first-child { margin-top: 0; }
+.glossary-list dd { color: var(--text-muted); margin-bottom: 0; }

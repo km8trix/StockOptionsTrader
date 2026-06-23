@@ -1,0 +1,15 @@
+{# Inline glossary help. {{ explain('Desk') }} renders a small info button that
+   pops the term's definition (looked up in the GLOSSARY context var, so the
+   copy matches the glossary offcanvas). Import `with context` so GLOSSARY is
+   in scope: {% from 'macros.html' import explain with context %}.
+   Bootstrap inits the popover in utils.js; trigger=focus keeps it keyboard-
+   dismissable. Renders nothing for an unknown term. #}
+{% macro explain(term) -%}
+{%- set defn = GLOSSARY.get(term) if GLOSSARY else None -%}
+{%- if defn -%}
+<button type="button" class="explain-btn" data-bs-toggle="popover"
+        data-bs-trigger="focus" data-bs-placement="top"
+        data-bs-title="{{ term }}" data-bs-content="{{ defn }}"
+        aria-label="What is {{ term }}?"><i class="bi bi-info-circle" aria-hidden="true"></i></button>
+{%- endif -%}
+{%- endmacro %}

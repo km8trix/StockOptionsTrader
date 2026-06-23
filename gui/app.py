@@ -81,6 +81,12 @@ def create_app(config: dict | None = None) -> Flask:
             app_version = '0.1.0'
         return {'app_version': app_version}
 
+    @app.context_processor
+    def inject_glossary():
+        """Expose the glossary to every template (offcanvas + explain() macro)."""
+        from gui.glossary import GLOSSARY
+        return {'GLOSSARY': GLOSSARY}
+
     # Import blueprints inside the factory so importing gui.app stays cheap
     # and side-effect free until an app is actually built.
     from gui.routes.views import views_bp
