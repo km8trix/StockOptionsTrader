@@ -378,6 +378,32 @@ class TestChartPositionOverlay:
         assert client.get('/api/live/positions/SPY').get_json() == {'positions': []}
 
 
+class TestGlossary:
+    """UX polish phase 1: glossary offcanvas + explain() info popovers."""
+
+    def test_glossary_has_core_terms(self):
+        from gui.glossary import GLOSSARY
+        assert {'Sandbox', 'Production', 'Desk', 'Strategy'} <= set(GLOSSARY)
+        assert all(GLOSSARY.values())  # no empty definitions
+
+    def test_offcanvas_ships_on_every_page(self, client):
+        import markupsafe
+        from gui.glossary import GLOSSARY
+        # Jinja autoescapes the copy (e.g. & -> &amp;), so compare escaped.
+        sandbox_html = str(markupsafe.escape(GLOSSARY['Sandbox']))
+        for path in ('/', '/charts', '/backtest'):
+            html = client.get(path).get_data(as_text=True)
+            assert 'id="glossaryPanel"' in html, path
+            # The actual definition copy is rendered, not just the panel shell.
+            assert sandbox_html in html, path
+
+    def test_dashboard_renders_explain_popovers(self, client):
+        html = client.get('/').get_data(as_text=True)
+        assert 'data-bs-toggle="popover"' in html
+        assert 'data-bs-title="Sandbox"' in html
+        assert 'data-bs-title="Production"' in html
+
+
 class TestAnalysisProvenance:
     def test_analyze_includes_data_source_matching_contract(
             self, client, monkeypatch, make_ohlcv, patch_fetch):
