@@ -404,6 +404,29 @@ class TestGlossary:
         assert 'data-bs-title="Production"' in html
 
 
+class TestConfirmModal:
+    """UX polish phase 2: themed confirm modal replaces native window.confirm()."""
+
+    def test_shared_modal_ships_on_every_page(self, client):
+        for path in ('/', '/live', '/charts'):
+            html = client.get(path).get_data(as_text=True)
+            assert 'id="confirmModal"' in html, path
+            assert 'id="confirmModalConfirm"' in html, path
+
+    def test_live_js_uses_confirm_modal_not_native(self):
+        live_js = (REPO_ROOT / 'gui' / 'static' / 'js' / 'live.js').read_text()
+        # All four prompts now route through the themed helper...
+        assert 'confirmModal(' in live_js
+        # ...and none of them call the native dialog any more.
+        assert 'window.confirm' not in live_js
+
+    def test_helper_falls_back_to_native_confirm(self):
+        # The helper keeps a native-confirm fallback if the shell is missing.
+        utils_js = (REPO_ROOT / 'gui' / 'static' / 'js' / 'utils.js').read_text()
+        assert 'function confirmModal' in utils_js
+        assert 'window.confirm' in utils_js  # the documented fallback
+
+
 class TestAnalysisProvenance:
     def test_analyze_includes_data_source_matching_contract(
             self, client, monkeypatch, make_ohlcv, patch_fetch):

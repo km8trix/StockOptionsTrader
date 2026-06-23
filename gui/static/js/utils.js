@@ -236,6 +236,38 @@ async function _pingHealth() {
     }
 }
 
+// Themed yes/no confirmation backed by the shared #confirmModal in base.html.
+// Resolves true on confirm, false on cancel/dismiss/Escape. Drop-in for
+// window.confirm() so prompts match the app theme and are focus-managed.
+// Falls back to the native dialog if the modal shell or Bootstrap is absent.
+function confirmModal({ title, body, confirmText = 'Confirm', variant = 'primary' } = {}) {
+    const el = document.getElementById('confirmModal');
+    if (!el || !window.bootstrap) {
+        return Promise.resolve(window.confirm(body || title || 'Are you sure?'));
+    }
+    el.querySelector('#confirmModalTitle').textContent = title || 'Are you sure?';
+    el.querySelector('#confirmModalBody').textContent = body || '';
+    const confirmBtn = el.querySelector('#confirmModalConfirm');
+    confirmBtn.textContent = confirmText;
+    confirmBtn.className = `btn btn-${variant}`;
+    const modal = bootstrap.Modal.getOrCreateInstance(el);
+    return new Promise((resolve) => {
+        const cleanup = () => {
+            confirmBtn.removeEventListener('click', onConfirm);
+            el.removeEventListener('hidden.bs.modal', onHidden);
+        };
+        // Resolve on the click itself (not on the hide animation) so the
+        // decision is independent of transition timing; hidden.bs.modal then
+        // covers cancel / backdrop / Escape. cleanup() makes either path fire
+        // once.
+        function onConfirm() { cleanup(); modal.hide(); resolve(true); }
+        function onHidden() { cleanup(); resolve(false); }
+        confirmBtn.addEventListener('click', onConfirm);
+        el.addEventListener('hidden.bs.modal', onHidden);
+        modal.show();
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     setDefaultDates();
     _pingHealth();
