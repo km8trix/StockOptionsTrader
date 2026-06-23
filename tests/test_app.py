@@ -427,6 +427,23 @@ class TestConfirmModal:
         assert 'window.confirm' in utils_js  # the documented fallback
 
 
+class TestResponsiveLayout:
+    """UX polish phase 3: page headers stack on mobile; badge stays compact."""
+
+    def test_page_headers_stack_on_mobile(self, client):
+        # flex-column flex-md-row => stacked on phones, row on >=md.
+        for path in ('/', '/charts'):
+            html = client.get(path).get_data(as_text=True)
+            assert 'flex-column flex-md-row' in html, path
+
+    def test_sandbox_badge_suffix_hidden_on_mobile(self, client):
+        # The verbose "· non-live" suffix is hidden <sm so brand+badge+toggler
+        # stay on one nav line; "SANDBOX" itself always shows.
+        html = client.get('/backtest').get_data(as_text=True)
+        assert 'd-none d-sm-inline' in html
+        assert 'non-live' in html
+
+
 class TestAnalysisProvenance:
     def test_analyze_includes_data_source_matching_contract(
             self, client, monkeypatch, make_ohlcv, patch_fetch):
