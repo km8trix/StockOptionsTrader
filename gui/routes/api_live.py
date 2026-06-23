@@ -1337,6 +1337,47 @@ def live_portfolio(id_key):
     return jsonify({'positions': _redact_account_numbers(positions or [])})
 
 
+@live_bp.route('/positions/<symbol>', methods=['GET'])
+def live_symbol_positions(symbol):
+    """Configured-account positions for ONE symbol — the Charts entry-price
+    overlay. Scoped server-side to ETRADE_ACCOUNT_ID_KEY so the chart page
+    never needs the (secret) id_key and only ever sees the charted symbol; no
+    account-number fields are returned. Gated/fail-closed like every live route
+    (409 when not connected); returns [] when flat in that symbol.
+    """
+    client, err = _require_client()
+    if err is not None:
+        return err
+    account_id_key = os.environ.get("ETRADE_ACCOUNT_ID_KEY")
+    if not account_id_key:
+        return jsonify({'error': 'ETRADE_ACCOUNT_ID_KEY not configured'}), 503
+    want = (symbol or '').strip().upper()
+    if not want:
+        return jsonify({'error': 'symbol is required'}), 400
+    try:
+        raw = client.get_portfolio(account_id_key)
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
+        logger.error('Failed to read portfolio for chart overlay',
+                     exc_info=True)
+        return jsonify({'error': 'Failed to read portfolio'}), 500
+    out = []
+    for pos in (raw or []):
+        sym = ((pos.get('Product') or {}).get('symbol')
+               or pos.get('symbolDescription') or '').strip().upper()
+        if sym != want:
+            continue
+        out.append({
+            'symbol': want,
+            'quantity': pos.get('quantity'),
+            'price_paid': pos.get('pricePaid'),
+            'position_type': pos.get('positionType'),
+        })
+    return jsonify({'positions': out})
+
+
 # -------------------- R4: quotes --------------------
 
 @live_bp.route('/quotes', methods=['GET'])
