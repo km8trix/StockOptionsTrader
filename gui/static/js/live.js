@@ -314,8 +314,11 @@ async function renewToken() {
 }
 
 async function disconnect() {
-    if (!window.confirm('Disconnect from E*TRADE? You will need to run the ' +
-        'full OAuth flow to reconnect.')) return;
+    if (!(await confirmModal({
+        title: 'Disconnect from E*TRADE?',
+        body: 'You will need to run the full OAuth flow to reconnect.',
+        confirmText: 'Disconnect', variant: 'danger',
+    }))) return;
     const restore = btnLoading(document.getElementById('btnDisconnect'));
     try {
         const data = await fetchJSON('/api/live/auth/disconnect',
@@ -520,7 +523,11 @@ async function refreshWorkingOrders() {
 }
 
 async function cancelWorkingOrder(orderId, btn, accountKey) {
-    if (!window.confirm(`Cancel order ${orderId}?`)) return;
+    if (!(await confirmModal({
+        title: 'Cancel order?',
+        body: `Cancel working order ${orderId}? This cannot be undone.`,
+        confirmText: 'Cancel order', variant: 'danger',
+    }))) return;
     const restore = btnLoading(btn);
     // A GUI-placed order is cancelled through the shared client by passing
     // its account_id_key; a patient-executor working order omits it and the
@@ -1463,9 +1470,13 @@ async function startScheduler() {
     }
     const label = interval === null ? 'the configured interval'
         : `every ${interval} minutes`;
-    if (!window.confirm('Start the market-hours scheduler? It will run ' +
-        `evaluate_once() ${label} during NYSE hours until stopped, ` +
-        'and pause itself on any kill-switch or circuit-breaker halt.')) {
+    if (!(await confirmModal({
+        title: 'Start the market-hours scheduler?',
+        body: `It will run evaluate_once() ${label} during NYSE hours until `
+            + 'stopped, and pause itself on any kill-switch or circuit-breaker '
+            + 'halt.',
+        confirmText: 'Start scheduler',
+    }))) {
         return;
     }
     const body = { action: 'start' };
@@ -1487,8 +1498,12 @@ async function startScheduler() {
 }
 
 async function stopScheduler() {
-    if (!window.confirm('Stop the scheduler? Automatic evaluations halt ' +
-        'until it is started again. Working orders are not affected.')) {
+    if (!(await confirmModal({
+        title: 'Stop the scheduler?',
+        body: 'Automatic evaluations halt until it is started again. Working '
+            + 'orders are not affected.',
+        confirmText: 'Stop scheduler', variant: 'danger',
+    }))) {
         return;
     }
     const restore = btnLoading(document.getElementById('btnSchedStop'));
