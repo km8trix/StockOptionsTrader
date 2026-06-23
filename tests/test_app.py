@@ -328,6 +328,56 @@ class TestChartData:
         assert 'ws-badge-production' in html  # Production workspace badge
 
 
+class TestChartPositionOverlay:
+    """GET /api/live/positions/<symbol> — the Charts entry-price overlay."""
+
+    def test_409_when_not_connected(self, client):
+        # No connected client wired -> _require_client returns 409, fail-closed.
+        assert client.get('/api/live/positions/SPY').status_code == 409
+
+    def _connect(self, monkeypatch, portfolio):
+        """Wire a fake connected client returning `portfolio` from get_portfolio."""
+        import gui.routes.api_live as api_live
+
+        class FakeMgr:
+            def status(self):
+                return {'state': 'connected'}
+
+        class FakeClient:
+            def get_portfolio(self, _id_key):
+                return portfolio
+
+        monkeypatch.setattr(api_live, 'get_auth_manager', lambda: FakeMgr())
+        monkeypatch.setattr(api_live, 'get_client', lambda: FakeClient())
+        monkeypatch.setenv('ETRADE_ACCOUNT_ID_KEY', 'ACCT')
+
+    def test_503_without_configured_account(self, client, monkeypatch):
+        self._connect(monkeypatch, [])
+        monkeypatch.delenv('ETRADE_ACCOUNT_ID_KEY', raising=False)
+        assert client.get('/api/live/positions/SPY').status_code == 503
+
+    def test_filters_to_symbol_and_projects_fields(self, client, monkeypatch):
+        self._connect(monkeypatch, [
+            {'Product': {'symbol': 'SPY'}, 'quantity': 100,
+             'pricePaid': 123.45, 'positionType': 'LONG'},
+            {'symbolDescription': 'AAPL', 'quantity': -10,
+             'pricePaid': 200.0, 'positionType': 'SHORT'},
+        ])
+        j = client.get('/api/live/positions/spy').get_json()  # case-insensitive
+        assert j['positions'] == [{
+            'symbol': 'SPY', 'quantity': 100,
+            'price_paid': 123.45, 'position_type': 'LONG',
+        }]
+        # No account-number fields leak into the chart payload.
+        assert 'ACCT' not in client.get('/api/live/positions/SPY').get_data(as_text=True)
+
+    def test_empty_when_flat_in_symbol(self, client, monkeypatch):
+        self._connect(monkeypatch, [
+            {'Product': {'symbol': 'AAPL'}, 'quantity': 5, 'pricePaid': 1.0},
+        ])
+        assert client.get('/api/live/positions/SPY').get_json() == {'positions': []}
+
+
 class TestAnalysisProvenance:
     def test_analyze_includes_data_source_matching_contract(
             self, client, monkeypatch, make_ohlcv, patch_fetch):

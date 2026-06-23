@@ -1,12 +1,13 @@
 // Production Charts page: daily candlestick + volume via the vendored
-// Lightweight Charts library, fed by /api/chart/<symbol>. Live last-price and
-// position overlays land in a follow-up; this is the read-only chart shell.
+// Lightweight Charts library, fed by /api/chart/<symbol>, with a polled live
+// last-price line and your entry-price overlay for the configured live account.
 
 let chart = null;
 let candleSeries = null;
 let volumeSeries = null;
 let livePriceLine = null;     // current last-price marker on the candle series
 let liveTimer = null;         // setInterval handle for the quote poll
+let positionLines = [];       // entry-price overlay line(s) for this symbol
 const LIVE_POLL_MS = 10000;   // poll the gated /api/live/quotes every 10s
 
 function initChart() {
@@ -40,12 +41,13 @@ async function loadChart(symbol) {
     const status = document.getElementById('chartStatus');
     status.textContent = `Loading ${symbol}…`;
     const payload = await fetchJSON(`/api/chart/${encodeURIComponent(symbol)}`);
-    if (!payload) { status.textContent = ''; stopLive(); return; }  // fetchJSON toasted
+    if (!payload) { status.textContent = ''; stopLive(); clearPositions(); return; }  // fetchJSON toasted
     if (!payload.candles || payload.candles.length === 0) {
         candleSeries.setData([]);
         volumeSeries.setData([]);
         status.textContent = `No data for ${symbol}.`;
         stopLive();
+        clearPositions();
         return;
     }
     candleSeries.setData(payload.candles);
@@ -66,10 +68,41 @@ async function loadChart(symbol) {
     status.textContent = `${payload.symbol} · ${payload.candles.length} daily bars`
         + (src ? ` · source: ${src}` : '');
     startLive(payload.symbol);
+    loadPositions(payload.symbol);
 }
 
 function stopLive() {
     if (liveTimer !== null) { clearInterval(liveTimer); liveTimer = null; }
+}
+
+function clearPositions() {
+    for (const line of positionLines) candleSeries.removePriceLine(line);
+    positionLines = [];
+}
+
+// Draw your entry-price line(s) for the charted symbol from the configured
+// live account (cost basis doesn't move intraday, so this is fetch-once per
+// load, not polled). Fail-open: not-connected / flat / any error just leaves
+// the chart clean — reload to retry, same contract as the live quote poll.
+async function loadPositions(symbol) {
+    clearPositions();
+    const data = await fetchJSON(
+        `/api/live/positions/${encodeURIComponent(symbol)}`, { silent: true });
+    for (const pos of (data && data.positions) || []) {
+        const price = pos.price_paid != null ? Number(pos.price_paid) : NaN;
+        if (!Number.isFinite(price) || price <= 0) continue;
+        const qty = pos.quantity != null ? Number(pos.quantity) : null;
+        const isShort = pos.position_type === 'SHORT' || (qty != null && qty < 0);
+        const qtyLabel = qty != null ? `${Math.abs(qty)} ` : '';
+        positionLines.push(candleSeries.createPriceLine({
+            price,
+            color: isShort ? '#ef5350' : '#26a69a',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: `${isShort ? 'short' : 'long'} ${qtyLabel}@ ${price.toFixed(2)}`,
+        }));
+    }
 }
 
 // Poll the EXISTING gated quote endpoint (/api/live/quotes, 409 when E*TRADE is
