@@ -142,20 +142,31 @@ def _stock(symbol: str) -> Asset:
 
 
 def pod_score_inputs(returns: Sequence[float], vol_floor: float = 0.05,
-                     score_floor: float = 0.05) -> Dict[str, float]:
+                     score_floor: float = 0.05,
+                     robust: bool = False) -> Dict[str, float]:
     """Reallocation inputs for one pod from its daily NAV returns.
 
-    sharpe = mean/std * sqrt(252) with the POPULATION std (ddof=0, the
-    project-wide convention); 0.0 when std == 0 (no dispersion -> no
-    risk-adjusted signal). score floors sharpe at 0; vol floors the
-    annualized std at vol_floor; raw = max(score_floor, score) / vol.
+    Default (``robust=False``): sharpe = mean/std * sqrt(252) with the
+    POPULATION std (ddof=0, the project-wide convention); 0.0 when std == 0.
+    ``robust=True``: a MAD-based robust Sharpe — location = median(r), scale =
+    median(|r - median(r)|) * 1.4826 (the normal-consistency constant, so MAD
+    estimates sigma). It resists return outliers — a single blow-up day no
+    longer dominates a pod's score or vol the way mean/std let it.
+
+    Both modes: score floors sharpe at 0; vol floors the annualized scale at
+    vol_floor; raw = max(score_floor, score) / vol.
     """
     values = np.asarray(list(returns), dtype=float)
-    mean = float(np.mean(values)) if values.size else 0.0
-    std = float(np.std(values)) if values.size else 0.0
-    sharpe = 0.0 if std <= 0 else mean / std * float(np.sqrt(252.0))
+    if robust:
+        loc = float(np.median(values)) if values.size else 0.0
+        mad = float(np.median(np.abs(values - loc))) if values.size else 0.0
+        scale = mad * 1.4826  # MAD -> sigma for ~normal data
+    else:
+        loc = float(np.mean(values)) if values.size else 0.0
+        scale = float(np.std(values)) if values.size else 0.0
+    sharpe = 0.0 if scale <= 0 else loc / scale * float(np.sqrt(252.0))
     score = max(0.0, sharpe)
-    vol = max(vol_floor, std * float(np.sqrt(252.0)))
+    vol = max(vol_floor, scale * float(np.sqrt(252.0)))
     raw = max(score_floor, score) / vol
     return {'sharpe': sharpe, 'score': score, 'vol': vol, 'raw': raw}
 
@@ -263,6 +274,7 @@ class CitadelDesk(Desk):
                  weight_max: float = 0.50,
                  vol_floor: float = 0.05,
                  score_floor: float = 0.05,
+                 robust_pod_sharpe: bool = False,
                  max_factor_exposure: Optional[float] = 0.25,
                  factor_risk_model: Optional[FactorRiskModel] = None):
         super().__init__(
@@ -333,6 +345,7 @@ class CitadelDesk(Desk):
         self.weight_max = weight_max
         self.vol_floor = vol_floor
         self.score_floor = score_floor
+        self.robust_pod_sharpe = robust_pod_sharpe
 
         self.risk_book = (risk_book if risk_book is not None
                           else CentralRiskBook(
@@ -888,7 +901,8 @@ class CitadelDesk(Desk):
                 returns = self._nav_returns[pod_key][
                     -self.sharpe_window_days:]
                 info = pod_score_inputs(returns, vol_floor=self.vol_floor,
-                                        score_floor=self.score_floor)
+                                        score_floor=self.score_floor,
+                                        robust=self.robust_pod_sharpe)
                 inputs[pod_key] = info
                 raw[pod_key] = info['raw']
             new_weights = clamp_renormalize(raw, target, self.weight_min,

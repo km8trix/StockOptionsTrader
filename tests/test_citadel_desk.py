@@ -1363,3 +1363,41 @@ class TestFactorExposureTransparency:
         assert all(n.category == 'info' for n in factor_notes)
         assert all('factor_exposure' not in n.data
                    for n in desk.notes if n.category == 'allocation')
+
+
+class TestRobustPodSharpe:
+    """Phase 5: opt-in MAD-based robust pod Sharpe (default mean/std unchanged)."""
+
+    def test_default_is_population_mean_std_sharpe(self):
+        # robust=False reproduces the prior mean/std (ddof=0) Sharpe exactly.
+        returns = [0.01, -0.02, 0.015, -0.005, 0.008]
+        v = np.asarray(returns)
+        expected = float(np.mean(v)) / float(np.std(v)) * np.sqrt(252.0)
+        assert pod_score_inputs(returns)['sharpe'] == pytest.approx(expected)
+
+    def test_robust_uses_median_and_scaled_mad(self):
+        returns = [0.01, -0.02, 0.015, -0.005, 0.008]
+        v = np.asarray(returns)
+        loc = float(np.median(v))
+        scale = float(np.median(np.abs(v - loc))) * 1.4826
+        expected = loc / scale * np.sqrt(252.0)
+        assert pod_score_inputs(returns, robust=True)['sharpe'] == pytest.approx(
+            expected)
+
+    def test_robust_scale_resists_an_outlier(self):
+        # One blow-up day inflates the std-based vol enormously, but the
+        # MAD-based scale barely moves — that outlier-resistance in the scale
+        # estimate is the whole point of the robust mode. (The median location
+        # is stable over the real 63-day window; scale is the cleaner probe.)
+        clean = [0.01, -0.005, 0.008, -0.003, 0.006, -0.004, 0.007, -0.002]
+        outlier = clean + [0.40]
+        r_clean = pod_score_inputs(clean, robust=True)['vol']
+        r_out = pod_score_inputs(outlier, robust=True)['vol']
+        n_clean = pod_score_inputs(clean)['vol']
+        n_out = pod_score_inputs(outlier)['vol']
+        assert abs(r_out - r_clean) < abs(n_out - n_clean)
+
+    def test_desk_threads_robust_flag(self):
+        pods = [ScriptedPod('alpha'), ScriptedPod('beta')]
+        assert make_desk(pods, robust_pod_sharpe=True).robust_pod_sharpe is True
+        assert make_desk(pods).robust_pod_sharpe is False  # default off
