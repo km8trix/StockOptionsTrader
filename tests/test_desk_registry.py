@@ -6,6 +6,7 @@ import re
 
 import pytest
 
+from desks.aqr import AqrDesk
 from desks.base import Desk
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
@@ -264,3 +265,40 @@ class TestRobustPodSharpeEnabled:
         desk = create_desk('citadel', capital_allocation=0.25)
         assert desk.capital_allocation == 0.25
         assert desk.robust_pod_sharpe is True
+
+
+class TestSignalStrengthEnabled:
+    """Phase 5: the production cross-sectional desks ship signal-strength
+    (conviction) sizing on (mechanism + desk-class defaults stay equal-weight;
+    the registry is the config point)."""
+
+    @pytest.mark.parametrize('key', ['twosigma', 'aqr'])
+    def test_cross_sectional_desks_enable_signal_strength(self, key):
+        assert create_desk(key).size_by_signal_strength is True
+
+    def test_enabled_through_the_model_selection_path(self):
+        # twosigma is model-selectable; the config must apply on that branch
+        # too (create_desk merges turnover + config on BOTH paths).
+        desk = create_desk('twosigma', model_key='gbm')
+        assert desk.size_by_signal_strength is True
+        assert desk._exit_quantile == 0.3  # turnover still applied alongside
+
+    def test_desk_class_defaults_stay_equal_weight(self):
+        assert TwoSigmaDesk().size_by_signal_strength is False
+        assert AqrDesk().size_by_signal_strength is False
+
+
+class TestAmericanPricingEnabled:
+    """Phase 5: production Jane Street prices its option legs American (the
+    registry is the config point; the desk-class default stays european)."""
+
+    def test_janestreet_enables_american(self):
+        assert create_desk('janestreet').exercise_style == 'american'
+
+    def test_desk_class_default_stays_european(self):
+        assert JaneStreetDesk().exercise_style == 'european'
+
+    def test_capital_allocation_still_threads(self):
+        desk = create_desk('janestreet', capital_allocation=0.2)
+        assert desk.capital_allocation == 0.2
+        assert desk.exercise_style == 'american'
