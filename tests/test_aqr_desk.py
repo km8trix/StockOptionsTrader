@@ -168,6 +168,13 @@ class TestRegistryAndIdentity:
         with pytest.raises(TypeError):
             AqrDesk(model_key='factor')
 
+    def test_signal_strength_flag_threads_to_the_shared_book(self):
+        # Phase 5: AqrDesk forwards size_by_signal_strength to the shared
+        # cross-sectional book; default off (equal-weight, byte-identical).
+        assert AqrDesk().size_by_signal_strength is False
+        assert AqrDesk(size_by_signal_strength=True).size_by_signal_strength \
+            is True
+
     def test_injected_controller_is_used(self):
         ctrl = stub_controller(monotone_scores())
         desk = AqrDesk(controller=ctrl)
