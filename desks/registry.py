@@ -75,6 +75,13 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#d29922',
         'factory': JaneStreetDesk,
+        # American pricing (Phase 5): every Jane Street option leg is a
+        # single-name equity option (American in reality), so production
+        # prices fills + structure marks with the CRR binomial tree, picking
+        # up the early-exercise premium the put wings carry. Greeks stay
+        # Black-Scholes; the desk-class default stays european (byte-
+        # identical). This is the config point.
+        'config': {'exercise_style': 'american'},
     },
     'twosigma': {
         'name': 'Two Sigma Desk',
@@ -93,6 +100,11 @@ _DESK_SPECS: Dict[str, Dict] = {
         # vs the 20% entry quantile) and a 3-day minimum hold, damping churn.
         # The book mechanics + defaults stay no-op; this is the config point.
         'turnover': {'exit_quantile': 0.3, 'min_holding_days': 3},
+        # Signal-strength sizing (Phase 5): production splits each side's
+        # budget by |alpha score| (conviction) instead of equal-weight,
+        # clamped to the equal-weight cap so the book stays dollar-neutral
+        # and gross-bounded. Desk-class default stays equal-weight.
+        'config': {'size_by_signal_strength': True},
     },
     'aqr': {
         'name': 'AQR Desk',
@@ -108,6 +120,9 @@ _DESK_SPECS: Dict[str, Dict] = {
         'accent': '#f0883e',
         'factory': AqrDesk,
         'turnover': {'exit_quantile': 0.3, 'min_holding_days': 3},
+        # Signal-strength sizing (Phase 5): same conviction tilt as Two Sigma
+        # (per-side |score| budgeting, dollar-neutral, gross-bounded).
+        'config': {'size_by_signal_strength': True},
     },
 }
 
