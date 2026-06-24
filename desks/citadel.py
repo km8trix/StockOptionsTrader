@@ -437,6 +437,7 @@ class CitadelDesk(Desk):
     def get_status(self) -> Dict:
         status = super().get_status()
         status['pods'] = self._pod_snapshot()
+        status['robust_pod_sharpe'] = self.robust_pod_sharpe
         # AQR-style transparency: the operator sees the book's net factor
         # exposures (fraction of desk capital) and the neutrality band in
         # force. None band -> the gate is off; the field reports that.

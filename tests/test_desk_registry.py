@@ -243,3 +243,24 @@ class TestTurnoverEnabled:
         # A desk without a turnover spec constructs exactly as before.
         desk = create_desk('foundation')
         assert getattr(desk, 'min_holding_days', 0) == 0
+
+
+class TestRobustPodSharpeEnabled:
+    """Phase 5: production Citadel scores its pods by median / MAD (the
+    registry is the config point; the desk-class default stays mean/std)."""
+
+    def test_citadel_enables_robust_pod_sharpe(self):
+        desk = create_desk('citadel')
+        assert desk.robust_pod_sharpe is True
+        assert desk.get_status()['robust_pod_sharpe'] is True
+
+    def test_default_citadel_desk_keeps_mean_std(self):
+        # Constructing the desk class directly is unchanged (byte-identical).
+        assert CitadelDesk().robust_pod_sharpe is False
+        assert CitadelDesk().get_status()['robust_pod_sharpe'] is False
+
+    def test_config_spread_preserves_capital_allocation(self):
+        # The new 'config' kwargs merge must not disturb capital_allocation.
+        desk = create_desk('citadel', capital_allocation=0.25)
+        assert desk.capital_allocation == 0.25
+        assert desk.robust_pod_sharpe is True
