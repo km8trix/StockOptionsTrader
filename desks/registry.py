@@ -83,6 +83,11 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#3fb950',
         'factory': TwoSigmaDesk,
+        # Turnover control (Phase 5): production desks run with a mild
+        # hysteresis band (hold names while they stay in the top/bottom 30%,
+        # vs the 20% entry quantile) and a 3-day minimum hold, damping churn.
+        # The book mechanics + defaults stay no-op; this is the config point.
+        'turnover': {'exit_quantile': 0.3, 'min_holding_days': 3},
     },
     'aqr': {
         'name': 'AQR Desk',
@@ -97,6 +102,7 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#f0883e',
         'factory': AqrDesk,
+        'turnover': {'exit_quantile': 0.3, 'min_holding_days': 3},
     },
 }
 
@@ -146,13 +152,16 @@ def create_desk(key: str, capital_allocation: float = 1.0,
             f"Desk '{key}' activates in Phase {spec['activates_in_phase']}")
     logger.info("Creating desk %s (capital_allocation=%.2f, model_key=%s)",
                 key, capital_allocation, model_key)
+    # Production turnover config (empty for desks that don't declare it, so
+    # those construct exactly as before).
+    turnover = spec.get('turnover', {})
     if model_key is not None:
         if key not in _MODEL_SELECTABLE_DESKS:
             raise ValueError(
                 f"Desk '{key}' does not support model selection")
         return spec['factory'](capital_allocation=capital_allocation,
-                               model_key=model_key)
-    return spec['factory'](capital_allocation=capital_allocation)
+                               model_key=model_key, **turnover)
+    return spec['factory'](capital_allocation=capital_allocation, **turnover)
 
 
 def create_fund_orchestrator(allocations: Dict[str, float],
