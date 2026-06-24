@@ -221,3 +221,25 @@ class TestCreateFundOrchestrator:
         orch = create_fund_orchestrator({'foundation': 1.0},
                                         risk_aggregator=agg)
         assert orch.risk_aggregator is agg
+
+
+class TestTurnoverEnabled:
+    """Phase 5: the production cross-sectional desks ship turnover control on
+    (mechanism + defaults stay no-op; the registry is the config point)."""
+
+    @pytest.mark.parametrize('key', ['twosigma', 'aqr'])
+    def test_cross_sectional_desks_enable_turnover(self, key):
+        desk = create_desk(key)
+        assert desk._exit_quantile == 0.3   # hysteresis band wider than entry
+        assert desk.min_holding_days == 3
+
+    def test_turnover_enabled_through_model_selection_path(self):
+        # twosigma is model-selectable; turnover must apply on that branch too.
+        desk = create_desk('twosigma', model_key='gbm')
+        assert desk._exit_quantile == 0.3
+        assert desk.min_holding_days == 3
+
+    def test_non_turnover_desk_keeps_defaults(self):
+        # A desk without a turnover spec constructs exactly as before.
+        desk = create_desk('foundation')
+        assert getattr(desk, 'min_holding_days', 0) == 0
