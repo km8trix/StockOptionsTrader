@@ -18,7 +18,8 @@ from core.models import Asset, AssetType
 from desks.options_pricing import (HV_WINDOW, IV_FLOOR,
                                    OpenBBEarningsCalendar,
                                    SyntheticEarningsCalendar,
-                                   SyntheticIVModel, black_scholes_greeks,
+                                   SyntheticIVModel, american_binomial_price,
+                                   black_scholes_greeks,
                                    black_scholes_price, price_option)
 
 
@@ -288,3 +289,75 @@ class TestPriceOption:
         with pytest.raises(ValueError, match="needs an option asset"):
             price_option(Asset('XYZ', AssetType.STOCK), frame_with_jump(),
                          '2023-02-01', 100.0, SyntheticIVModel())
+
+    def test_exercise_american_routes_to_binomial(self):
+        frame = frame_with_jump()
+        date = frame.index[28]
+        expiry = (date + pd.Timedelta(days=30)).strftime('%Y-%m-%d')
+        asset = Asset('XYZ', AssetType.PUT, strike_price=100.0,
+                      expiration_date=expiry)
+        model = SyntheticIVModel()
+        iv = model.iv('XYZ', frame, date)
+        price = price_option(asset, frame, date, spot=92.0, iv_model=model,
+                             exercise='american')
+        assert price == pytest.approx(
+            american_binomial_price(92.0, 100.0, 30 / 365.0, iv,
+                                    rate=0.045, right='put'), abs=1e-12)
+
+    def test_bad_exercise_raises(self):
+        with pytest.raises(ValueError, match='exercise'):
+            price_option(Asset('XYZ', AssetType.CALL, strike_price=100.0,
+                               expiration_date='2024-01-04'),
+                         frame_with_jump(), '2023-02-01', 100.0,
+                         SyntheticIVModel(), exercise='bermudan')
+
+
+class TestAmericanBinomial:
+    """CRR binomial American pricer (no dividends)."""
+
+    @pytest.mark.parametrize('spot,strike,t,vol,rate', [
+        (100, 100, 1.0, 0.2, 0.05),
+        (110, 100, 0.5, 0.3, 0.03),
+        (90, 100, 0.25, 0.4, 0.01),
+    ])
+    def test_american_call_equals_european_no_dividends(
+            self, spot, strike, t, vol, rate):
+        # With no dividend yield, early exercise of a call is never optimal:
+        # the American call collapses to the European value (within the
+        # binomial's discretization error at 200 steps).
+        amer = american_binomial_price(spot, strike, t, vol, rate, 'call')
+        euro = black_scholes_price(spot, strike, t, vol, rate, 'call')
+        assert amer == pytest.approx(euro, abs=0.05)
+
+    def test_american_put_carries_early_exercise_premium(self):
+        # A deep ITM put with a positive rate is worth more alive-or-exercised
+        # than the European put (which cannot capture early exercise).
+        amer = american_binomial_price(80, 100, 1.0, 0.3, 0.06, 'put')
+        euro = black_scholes_price(80, 100, 1.0, 0.3, 0.06, 'put')
+        assert amer > euro
+        assert amer >= 100 - 80  # never worth less than immediate exercise
+
+    def test_never_below_intrinsic(self):
+        for right, spot in (('call', 130), ('put', 70)):
+            price = american_binomial_price(spot, 100, 0.5, 0.25, 0.04, right)
+            intrinsic = abs(spot - 100)
+            assert price >= intrinsic - 1e-9
+
+    def test_expired_is_intrinsic(self):
+        assert american_binomial_price(110, 100, 0.0, 0.2, 0.05, 'call') == 10.0
+        assert american_binomial_price(90, 100, -1.0, 0.2, 0.05, 'put') == 10.0
+
+    def test_zero_vol_degenerates_to_max_intrinsic_european(self):
+        # vol<=0: no diffusion -> max(intrinsic, European). Never raises.
+        amer = american_binomial_price(95, 100, 0.5, 0.0, 0.05, 'put')
+        euro = black_scholes_price(95, 100, 0.5, 0.0, 0.05, 'put')
+        assert amer == pytest.approx(max(5.0, euro), abs=1e-9)
+
+    def test_invalid_right_raises(self):
+        with pytest.raises(ValueError, match='call.*put|right'):
+            american_binomial_price(100, 100, 1.0, 0.2, 0.05, 'straddle')
+
+    def test_step_refinement_is_stable(self):
+        coarse = american_binomial_price(95, 100, 1.0, 0.3, 0.05, 'put', steps=100)
+        fine = american_binomial_price(95, 100, 1.0, 0.3, 0.05, 'put', steps=400)
+        assert coarse == pytest.approx(fine, abs=0.05)
