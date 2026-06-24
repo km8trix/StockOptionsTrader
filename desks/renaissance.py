@@ -76,6 +76,7 @@ import pandas as pd
 from core.models import Asset, AssetType
 from desks.base import Desk, DeskIntent
 from desks.ml_model import GradientBoostingModel
+from desks.options_pricing import EarningsCalendar
 from desks.pairs import PairsCointegrationModel
 from desks.regime import RegimeHMMModel
 from desks.walk_forward import WalkForwardController, WalkForwardFit
@@ -129,6 +130,9 @@ class RenaissanceDesk(Desk):
                  stat_arb_exit_band_mult: float = 2.0,
                  stat_arb_min_hold_days: int = 5,
                  stat_arb_size_by_conviction: bool = True,
+                 earnings_calendar: Optional[EarningsCalendar] = None,
+                 avoid_earnings_entries: bool = False,
+                 earnings_entry_window_days: int = 5,
                  regime_controller: Optional[WalkForwardController] = None,
                  stat_arb_controller: Optional[WalkForwardController] = None,
                  pairs_controller: Optional[WalkForwardController] = None):
@@ -193,6 +197,23 @@ class RenaissanceDesk(Desk):
         self.stat_arb_min_hold_days = stat_arb_min_hold_days
         self.stat_arb_size_by_conviction = stat_arb_size_by_conviction
 
+        # --- Earnings-entry gate (opt-in, default no-op) ---------------
+        # When avoid_earnings_entries is on AND a calendar is injected,
+        # the single-name books (mean_reversion, stat_arb) skip OPENING a
+        # position in a symbol whose next scheduled earnings fall within
+        # earnings_entry_window_days calendar days — an idiosyncratic
+        # earnings jump swamps the regime/MR/score signal. Exits are never
+        # gated (you must always be able to get out). The pairs book is
+        # deliberately out of scope (two correlated legs is a separate
+        # design question). Default off / no calendar -> byte-identical.
+        if earnings_entry_window_days < 0:
+            raise ValueError(
+                "earnings_entry_window_days must be >= 0, got "
+                f"{earnings_entry_window_days}")
+        self.earnings_calendar = earnings_calendar
+        self.avoid_earnings_entries = avoid_earnings_entries
+        self.earnings_entry_window_days = earnings_entry_window_days
+
         self._regime_controller = (
             regime_controller if regime_controller is not None
             else WalkForwardController(RegimeHMMModel(),
@@ -249,6 +270,10 @@ class RenaissanceDesk(Desk):
         status['regime'] = (self._current_regime['state']
                             if self._current_regime else None)
         status['book_weights'] = dict(self.book_weights)
+        status['avoid_earnings_entries'] = self.avoid_earnings_entries
+        if self.avoid_earnings_entries:
+            status['earnings_entry_window_days'] = \
+                self.earnings_entry_window_days
         return status
 
     def _controllers(self):
@@ -420,6 +445,25 @@ class RenaissanceDesk(Desk):
         position = portfolio.get_position(asset)
         return position is None or position.quantity == 0
 
+    def _earnings_imminent(self, symbol: str, date) -> bool:
+        """True when `symbol` has scheduled earnings within
+        earnings_entry_window_days calendar days ON OR AFTER `date`
+        (inclusive of the earnings date itself).
+
+        NO-LOOKAHEAD: next_earnings(symbol, date) judges against the NEXT
+        pre-announced date as of that same `date`, so it introduces no
+        future information. Returns False unless the gate is enabled AND a
+        calendar is injected — so the default path is always a no-op.
+        """
+        if not self.avoid_earnings_entries or self.earnings_calendar is None:
+            return False
+        current = pd.Timestamp(date).date()
+        earnings = self.earnings_calendar.next_earnings(symbol, current)
+        if earnings is None:
+            return False
+        days_to_e = (earnings - current).days
+        return 0 <= days_to_e <= self.earnings_entry_window_days
+
     # ------------------------------------------------------------------
     # Mean-reversion book
     # ------------------------------------------------------------------
@@ -515,9 +559,20 @@ class RenaissanceDesk(Desk):
             if z_score is None:
                 continue
             if z_score < -self.mr_entry_z:
-                candidates.append((symbol, z_score, 'long'))
+                direction = 'long'
             elif z_score > self.mr_entry_z:
-                candidates.append((symbol, z_score, 'short'))
+                direction = 'short'
+            else:
+                continue
+            if self._earnings_imminent(symbol, date):
+                self.note(
+                    'signal',
+                    f"Mean-reversion {direction} {symbol} skipped: earnings "
+                    f"within {self.earnings_entry_window_days}d (z={z_score:+.2f})",
+                    book='mean_reversion', symbol=symbol, direction=direction,
+                    z=z_score, skipped='earnings')
+                continue
+            candidates.append((symbol, z_score, direction))
 
         if not candidates:
             return intents
@@ -688,8 +743,18 @@ class RenaissanceDesk(Desk):
         # ---- Entries (a flip waits for the close to fill first) -------
         # Only names free to enter actually get sized; conviction sizing
         # distributes the book gross across THOSE legs by |score|.
-        entry_symbols = [symbol for symbol in longs + shorts
-                         if self._symbol_is_free(symbol, portfolio)]
+        free = [symbol for symbol in longs + shorts
+                if self._symbol_is_free(symbol, portfolio)]
+        entry_symbols = [symbol for symbol in free
+                         if not self._earnings_imminent(symbol, date)]
+        skipped_earnings = [symbol for symbol in free
+                            if symbol not in entry_symbols]
+        if skipped_earnings:
+            self.note(
+                'signal',
+                f"Stat-arb skipped {skipped_earnings}: earnings within "
+                f"{self.earnings_entry_window_days}d",
+                book='stat_arb', skipped=skipped_earnings)
         sizes = self._stat_arb_sizes(entry_symbols, scores, desired,
                                      weight, top_n)
         for symbol in entry_symbols:

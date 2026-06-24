@@ -23,6 +23,7 @@ from core.models import Asset, AssetType, Position
 from data.market_data import MarketDataHandler
 from desks.foundation import FoundationDesk
 from desks.ml_model import GradientBoostingModel
+from desks.options_pricing import SyntheticEarningsCalendar
 from desks.regime import REGIME_LABELS
 from desks.renaissance import RenaissanceDesk
 from desks.walk_forward import WalkForwardController, WalkForwardModel
@@ -1252,3 +1253,76 @@ class TestEndToEndWithEngine:
         assert not report.get('regime_series')
         # Phase 7 regression (C8): same for pod_history.
         assert not report.get('pod_history')
+
+
+class TestEarningsEntryGate:
+    """Opt-in earnings-entry gate on the single-name books (Phase 5).
+
+    Default off / no calendar -> no-op; when on, a name with earnings
+    inside the window is skipped at ENTRY only (exits are never gated).
+    """
+
+    DROP_START = 73  # MRX trips a LONG this day (mirrors TestMeanReversion)
+
+    def _mr_frames(self):
+        return {'MRX': noisy_frame(
+            n=90, seed=5, drop_window=(self.DROP_START, self.DROP_START + 3))}
+
+    def _active(self, dates, **kwargs):
+        return make_desk(
+            regime_schedule={d: probs_for('mean_reverting', 0.90)
+                             for d in dates}, **kwargs)
+
+    def test_gate_off_by_default_and_window_validation(self):
+        desk = make_desk()
+        assert desk.avoid_earnings_entries is False
+        # No calendar + gate off -> never imminent (pure no-op path).
+        assert desk._earnings_imminent('ANY', pd.Timestamp('2023-06-01')) \
+            is False
+        with pytest.raises(ValueError):
+            RenaissanceDesk(earnings_entry_window_days=-1)
+
+    def test_imminent_earnings_blocks_mr_entry(self):
+        frames = self._mr_frames()
+        dates = frames['MRX'].index
+        trigger = dates[self.DROP_START]
+        desk = self._active(
+            dates, avoid_earnings_entries=True,
+            earnings_calendar=SyntheticEarningsCalendar({'MRX': [trigger]}))
+        out = drive(desk, frames, dates[70:self.DROP_START + 1],
+                    PortfolioManager(100000.0))
+        # The would-be LONG is suppressed and a skip note records why.
+        assert out[trigger] == []
+        skips = [n for n in desk.notes
+                 if n.data.get('skipped') == 'earnings']
+        assert len(skips) == 1 and skips[0].data['symbol'] == 'MRX'
+
+    def test_earnings_outside_window_allows_mr_entry(self):
+        frames = self._mr_frames()
+        dates = frames['MRX'].index
+        trigger = dates[self.DROP_START]
+        far = (pd.Timestamp(trigger) + pd.Timedelta(days=30)).date()
+        desk = self._active(
+            dates, avoid_earnings_entries=True, earnings_entry_window_days=5,
+            earnings_calendar=SyntheticEarningsCalendar({'MRX': [far]}))
+        out = drive(desk, frames, dates[70:self.DROP_START + 1],
+                    PortfolioManager(100000.0))
+        # Earnings 30d out (> 5d window): entry fires exactly as ungated.
+        assert [i.action for i in out[trigger]] == ['BUY']
+
+    def test_imminent_earnings_blocks_stat_arb_leg(self):
+        frames = {f'S{i:02d}': noisy_frame(n=10, seed=100 + i)
+                  for i in range(10)}
+        dates = frames['S00'].index  # dates[0] = Monday refit day
+        # S00 is the top long leg; earnings on the rebalance day skip it
+        # while the other long leg S01 still enters.
+        desk = make_desk(
+            scores={f'S{i:02d}': 0.9 - 0.2 * i for i in range(10)},
+            avoid_earnings_entries=True,
+            earnings_calendar=SyntheticEarningsCalendar({'S00': [dates[0]]}))
+        out = drive(desk, frames, dates[:1], PortfolioManager(100000.0))
+        symbols = {i.asset.symbol for i in out[dates[0]]}
+        assert 'S00' not in symbols and 'S01' in symbols
+        skips = [n for n in desk.notes
+                 if n.data.get('skipped') == ['S00']]
+        assert len(skips) == 1 and skips[0].data['book'] == 'stat_arb'
