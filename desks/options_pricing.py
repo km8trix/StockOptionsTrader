@@ -147,6 +147,54 @@ def black_scholes_greeks(spot: float, strike: float, t_years: float,
     }
 
 
+def american_binomial_price(spot: float, strike: float, t_years: float,
+                            vol: float, rate: float = DEFAULT_RATE,
+                            right: str = 'call', steps: int = 200) -> float:
+    """American (early-exercise) option price via a Cox-Ross-Rubinstein tree.
+
+    Same conventions as ``black_scholes_price`` (no dividend yield; ``rate`` is
+    the continuously-compounded risk-free rate). Early exercise is taken at
+    every node, so the result is always >= the European value and >= immediate
+    intrinsic. With no dividends an American CALL equals the European call
+    (early exercise is never optimal); an American PUT carries an early-exercise
+    premium that grows with rate and moneyness. Degenerate inputs (t<=0, vol<=0,
+    steps<1) fall back to ``max(intrinsic, European)`` — there is no diffusion
+    to discretize. ``steps`` trades accuracy for cost (200 ~ a cent on a
+    $100 underlier).
+    """
+    right = _validate_right(right)
+    intrinsic = (max(0.0, spot - strike) if right == 'call'
+                 else max(0.0, strike - spot))
+    if t_years <= 0 or vol <= 0 or steps < 1:
+        return float(max(intrinsic,
+                         black_scholes_price(spot, strike, t_years, vol,
+                                             rate, right)))
+
+    dt = t_years / steps
+    u = math.exp(vol * math.sqrt(dt))
+    d = 1.0 / u
+    disc = math.exp(-rate * dt)
+    # Risk-neutral up-probability; clamp against tiny FP drift when rate*dt is
+    # large relative to the vol step (keeps it a valid probability).
+    p = min(1.0, max(0.0, (math.exp(rate * dt) - d) / (u - d)))
+
+    # Terminal payoffs: node i has i down-moves and (steps - i) up-moves.
+    values = [
+        (max(0.0, spot * u ** (steps - i) * d ** i - strike) if right == 'call'
+         else max(0.0, strike - spot * u ** (steps - i) * d ** i))
+        for i in range(steps + 1)
+    ]
+    # Backward induction, taking the better of continuation and exercise.
+    for step in range(steps - 1, -1, -1):
+        for i in range(step + 1):
+            cont = disc * (p * values[i] + (1.0 - p) * values[i + 1])
+            node = spot * u ** (step - i) * d ** i
+            ex = (max(0.0, node - strike) if right == 'call'
+                  else max(0.0, strike - node))
+            values[i] = cont if cont >= ex else ex
+    return float(max(values[0], intrinsic))
+
+
 # ----------------------------------------------------------------------
 # Earnings calendars
 # ----------------------------------------------------------------------
@@ -328,14 +376,22 @@ def skew_adjusted_iv(base_iv: float, spot: float, strike: float,
 
 def price_option(asset: Asset, underlying_frame: pd.DataFrame, date,
                  spot: float, iv_model: SyntheticIVModel,
-                 rate: float = DEFAULT_RATE) -> Optional[float]:
+                 rate: float = DEFAULT_RATE,
+                 exercise: str = 'european') -> Optional[float]:
     """Synthetic fair value of an option Asset at `date` (PRICING REALITY).
 
     Vol comes from iv_model (which slices the frame to index < date per
     the no-lookahead rule); spot is passed in by the CALLER — fill-day
     OPEN for fills, session CLOSE for mark-to-market. Returns None when
     the IV model has insufficient prior history.
+
+    ``exercise`` selects the pricing model: ``'european'`` (default, unchanged
+    Black-Scholes) or ``'american'`` (CRR binomial with early exercise). The
+    default keeps every existing caller byte-identical.
     """
+    if exercise not in ('european', 'american'):
+        raise ValueError(
+            f"exercise must be 'european' or 'american', got {exercise!r}")
     if asset.asset_type not in (AssetType.CALL, AssetType.PUT):
         raise ValueError(f"price_option needs an option asset, got {asset}")
     if asset.strike_price is None or asset.expiration_date is None:
@@ -344,12 +400,16 @@ def price_option(asset: Asset, underlying_frame: pd.DataFrame, date,
     expiry = pd.Timestamp(asset.expiration_date).date()
     t_years = (expiry - pd.Timestamp(date).date()).days / 365.0
     if t_years <= 0:
-        # Expired (or expiring today): intrinsic, no vol needed.
+        # Expired (or expiring today): intrinsic, no vol needed (same for both
+        # exercise styles).
         return black_scholes_price(spot, asset.strike_price, 0.0, 0.0,
                                    rate, asset.asset_type.value)
 
     vol = iv_model.iv(asset.symbol, underlying_frame, date)
     if vol is None:
         return None
+    if exercise == 'american':
+        return american_binomial_price(spot, asset.strike_price, t_years, vol,
+                                       rate, asset.asset_type.value)
     return black_scholes_price(spot, asset.strike_price, t_years, vol,
                                rate, asset.asset_type.value)
