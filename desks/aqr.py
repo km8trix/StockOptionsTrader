@@ -65,7 +65,8 @@ class AqrDesk(CrossSectionalLongShortDesk):
                  max_name_size: float = 0.10,
                  min_scored: int = 4,
                  exit_quantile: Optional[float] = None,
-                 min_holding_days: int = 0):
+                 min_holding_days: int = 0,
+                 size_by_signal_strength: bool = False):
         # A single fixed factor controller. Tests may inject an explicit
         # ``controller=`` (e.g. a stub) exactly like the other desks; the
         # default wraps a fresh FactorModel. AQR is NOT model-selectable —
@@ -97,6 +98,7 @@ class AqrDesk(CrossSectionalLongShortDesk):
             min_scored=min_scored,
             exit_quantile=exit_quantile,
             min_holding_days=min_holding_days,
+            size_by_signal_strength=size_by_signal_strength,
         )
 
     # ------------------------------------------------------------------

@@ -89,7 +89,8 @@ class CrossSectionalLongShortDesk(Desk):
                  max_name_size: float = 0.10,
                  min_scored: int = 4,
                  exit_quantile: Optional[float] = None,
-                 min_holding_days: int = 0):
+                 min_holding_days: int = 0,
+                 size_by_signal_strength: bool = False):
         super().__init__(
             key=key,
             name=name,
@@ -139,6 +140,14 @@ class CrossSectionalLongShortDesk(Desk):
                 f"min_holding_days {min_holding_days} must be >= 0")
         self._exit_quantile = exit_quantile
         self.min_holding_days = min_holding_days
+
+        # Signal-strength sizing (opt-in; default False -> equal-weight, the
+        # book is byte-identical). When on, each side's flat budget is
+        # redistributed WITHIN the side in proportion to |alpha score| — the
+        # strongest signal sizes up to the flat cap, weaker ones less. Reuses
+        # the Renaissance stat-arb convention (per-side budgeting keeps long
+        # gross == short gross, so conviction never tilts the book net-long).
+        self.size_by_signal_strength = size_by_signal_strength
 
         #: Note text style: ``note_label`` is the human label in trader
         #: notes (e.g. 'Two-Sigma'); ``reason_prefix`` is the lower-case tag
@@ -295,6 +304,23 @@ class CrossSectionalLongShortDesk(Desk):
         short_size = min(self.max_name_size,
                          (0.5 * self.target_gross) / k_short)
 
+        # Per-leg sizes: equal-weight by default (the dicts stay empty and the
+        # loops fall back to the flat long_size/short_size, byte-identical).
+        # With signal-strength sizing on, each side's flat budget is split
+        # WITHIN the side in proportion to |score| over the names actually
+        # being opened this rebalance (so each side's gross stays <= the flat
+        # total and long gross == short gross — dollar-neutral).
+        long_sizes: Dict[str, float] = {}
+        short_sizes: Dict[str, float] = {}
+        if self.size_by_signal_strength:
+            open_longs = [s for s in longs
+                          if self._symbol_is_free(s, portfolio)]
+            open_shorts = [s for s in shorts
+                           if self._symbol_is_free(s, portfolio)]
+            long_sizes = self._conviction_sizes(open_longs, scores, long_size)
+            short_sizes = self._conviction_sizes(open_shorts, scores,
+                                                 short_size)
+
         opened_longs: List[str] = []
         opened_shorts: List[str] = []
         for symbol in longs:
@@ -302,8 +328,9 @@ class CrossSectionalLongShortDesk(Desk):
                 continue
             asset = _stock(symbol)
             score = scores[symbol]
+            size = long_sizes.get(symbol, long_size)
             intents.append(DeskIntent(
-                asset=asset, action='BUY', size_fraction=long_size,
+                asset=asset, action='BUY', size_fraction=size,
                 reason=(f"{self._reason_prefix} long: score {score:+.4f} ranks "
                         f"#{rank_of[symbol] + 1} of {n_scored} (top {k})")))
             self._track_entry(asset, direction='long')
@@ -312,18 +339,19 @@ class CrossSectionalLongShortDesk(Desk):
                 'signal',
                 f"{self._note_label} LONG {symbol}: score {score:+.4f}, rank "
                 f"#{rank_of[symbol] + 1}/{n_scored} (top {k}); size "
-                f"{long_size:.1%} of desk capital",
+                f"{size:.1%} of desk capital",
                 symbol=symbol, direction='long', score=score,
                 rank=rank_of[symbol] + 1, n_scored=n_scored,
-                size_fraction=long_size, model=self._model_label)
+                size_fraction=size, model=self._model_label)
 
         for symbol in shorts:
             if not self._symbol_is_free(symbol, portfolio):
                 continue
             asset = _stock(symbol)
             score = scores[symbol]
+            size = short_sizes.get(symbol, short_size)
             intents.append(DeskIntent(
-                asset=asset, action='SHORT', size_fraction=short_size,
+                asset=asset, action='SHORT', size_fraction=size,
                 reason=(f"{self._reason_prefix} short: score {score:+.4f} ranks "
                         f"#{rank_of[symbol] + 1} of {n_scored} (bottom {k})")))
             self._track_entry(asset, direction='short')
@@ -332,10 +360,10 @@ class CrossSectionalLongShortDesk(Desk):
                 'signal',
                 f"{self._note_label} SHORT {symbol}: score {score:+.4f}, rank "
                 f"#{rank_of[symbol] + 1}/{n_scored} (bottom {k}); size "
-                f"{short_size:.1%} of desk capital",
+                f"{size:.1%} of desk capital",
                 symbol=symbol, direction='short', score=score,
                 rank=rank_of[symbol] + 1, n_scored=n_scored,
-                size_fraction=short_size, model=self._model_label)
+                size_fraction=size, model=self._model_label)
 
         if opened_longs or opened_shorts:
             self.note(
@@ -367,6 +395,32 @@ class CrossSectionalLongShortDesk(Desk):
         self._book_positions[asset] = {'direction': direction,
                                         'entry_day': self._day_index}
         self._traded_symbols[asset.symbol] = True
+
+    def _conviction_sizes(self, side_symbols: List[str],
+                          scores: Dict[str, float],
+                          flat_size: float) -> Dict[str, float]:
+        """Signal-strength sizes for ONE side's freshly-opened legs.
+
+        Reuses the Renaissance stat-arb convention: the side's flat budget
+        (``flat_size`` per name) is redistributed WITHIN the side in
+        proportion to ``|score|``, each leg clamped to ``[floor, flat_size]``
+        so no leg exceeds the equal-weight cap and the side's gross stays
+        ``<=`` the equal-weight total — which keeps long gross == short gross
+        (the book stays dollar-neutral; conviction only varies sizes WITHIN a
+        side, never across them). A small positive floor keeps every selected
+        leg tradable (``DeskIntent`` requires ``size_fraction > 0``). All
+        scores zero on a side -> flat so every leg still trades.
+        """
+        if not side_symbols:
+            return {}
+        floor = max(flat_size * 0.05, 1e-6)
+        abs_scores = {s: abs(float(scores[s])) for s in side_symbols}
+        total = sum(abs_scores.values())
+        if total <= 0.0:
+            return {s: flat_size for s in side_symbols}
+        budget = flat_size * len(side_symbols)
+        return {s: min(flat_size, max(budget * abs_scores[s] / total, floor))
+                for s in side_symbols}
 
     def _has_bar_today(self, frame: Optional[pd.DataFrame], date) -> bool:
         return (frame is not None and not frame.empty

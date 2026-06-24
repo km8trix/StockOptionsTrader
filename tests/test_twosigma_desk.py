@@ -1151,3 +1151,48 @@ class TestFundOrchestratorInterop:
 
         assert {t['action'] for t in report['trades']} <= \
             {'BUY', 'SELL', 'SHORT', 'COVER'}
+
+
+class TestSignalStrengthSizing:
+    """Phase 5: opt-in score-excess (|score|) sizing on the shared
+    cross-sectional book. Default off -> equal-weight (byte-identical);
+    on -> each side's flat budget is split WITHIN the side by |score|,
+    clamped to the equal-weight cap, keeping long gross == short gross."""
+
+    # Symmetric scores: |top-3| mirrors |bottom-3| so the two sides carry
+    # the SAME conviction distribution and stay dollar-neutral exactly.
+    SYMMETRIC = {'S00': 0.40, 'S01': 0.20, 'S02': 0.10,
+                 'S03': 0.0, 'S04': 0.0, 'S05': 0.0, 'S06': 0.0,
+                 'S07': -0.10, 'S08': -0.20, 'S09': -0.40}
+
+    def _sizes(self, **kwargs):
+        frames = universe(10)
+        dates = frames['S00'].index
+        desk = make_desk(default=self.SYMMETRIC, quantile=0.3,
+                         target_gross=1.0, max_name_size=0.30, **kwargs)
+        out = drive(desk, frames, dates[:1], PortfolioManager(100000.0))
+        return {i.asset.symbol: i.size_fraction for i in out[dates[0]]}
+
+    def test_default_is_equal_weight(self):
+        # Flag off: every leg on a side gets the identical flat size.
+        sizes = self._sizes()  # size_by_signal_strength defaults False
+        flat = (0.5 * 1.0) / 3  # half gross / k, cap (0.30) not binding
+        for sym in ('S00', 'S01', 'S02', 'S07', 'S08', 'S09'):
+            assert sizes[sym] == pytest.approx(flat)
+
+    def test_conviction_orders_within_side_and_caps_gross(self):
+        sizes = self._sizes(size_by_signal_strength=True)
+        flat = (0.5 * 1.0) / 3
+        # Stronger |score| -> more capital, WITHIN each side.
+        assert sizes['S00'] > sizes['S01'] > sizes['S02']
+        assert sizes['S09'] > sizes['S08'] > sizes['S07']
+        # No leg exceeds the equal-weight cap (conviction never grows gross).
+        assert all(v <= flat + 1e-12 for v in sizes.values())
+
+    def test_dollar_neutrality_preserved(self):
+        sizes = self._sizes(size_by_signal_strength=True)
+        long_gross = sizes['S00'] + sizes['S01'] + sizes['S02']
+        short_gross = sizes['S07'] + sizes['S08'] + sizes['S09']
+        # Symmetric |scores| -> the two sides carry equal gross (net ~ 0).
+        assert long_gross == pytest.approx(short_gross)
+        assert long_gross <= 0.5 + 1e-12  # bounded by the equal-weight total

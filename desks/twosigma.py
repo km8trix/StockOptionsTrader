@@ -107,7 +107,8 @@ class TwoSigmaDesk(CrossSectionalLongShortDesk):
                  max_name_size: float = 0.10,
                  min_scored: int = 4,
                  exit_quantile: Optional[float] = None,
-                 min_holding_days: int = 0):
+                 min_holding_days: int = 0,
+                 size_by_signal_strength: bool = False):
         # Controller precedence (documented contract, mirrors Foundation):
         #   1. an explicit ``controller`` wins, untouched — a single
         #      controller (tests inject this);
@@ -161,6 +162,7 @@ class TwoSigmaDesk(CrossSectionalLongShortDesk):
             min_scored=min_scored,
             exit_quantile=exit_quantile,
             min_holding_days=min_holding_days,
+            size_by_signal_strength=size_by_signal_strength,
         )
 
     # ------------------------------------------------------------------
