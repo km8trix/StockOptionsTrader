@@ -757,3 +757,42 @@ class TestEndToEndWithEngine:
         first = fingerprint()
         assert fingerprint() == first
         assert fingerprint() == first
+
+
+class TestExerciseStyle:
+    """Phase 5: opt-in American (early-exercise) pricing on the desk's option
+    legs. Default 'european' is byte-identical Black-Scholes; 'american' adds
+    the early-exercise premium real single-name equity options carry. Price
+    layer only (fills + structure marks); greeks stay Black-Scholes."""
+
+    def test_default_is_european(self):
+        assert JaneStreetDesk().exercise_style == 'european'
+
+    def test_invalid_style_raises(self):
+        with pytest.raises(ValueError, match="exercise_style must be"):
+            JaneStreetDesk(exercise_style='bermudan')
+
+    def test_european_leg_matches_black_scholes(self):
+        from desks.options_pricing import black_scholes_price
+        desk = JaneStreetDesk()  # default european
+        got = desk._price_leg(100.0, 95.0, 0.25, 0.30, 'put')
+        assert got == black_scholes_price(100.0, 95.0, 0.25, 0.30,
+                                          desk.rate, 'put')
+
+    def test_american_put_carries_early_exercise_premium(self):
+        # Deep ITM put with positive carry: early exercise has real value,
+        # so the American leg prices strictly above its European twin.
+        eu = JaneStreetDesk(exercise_style='european')
+        am = JaneStreetDesk(exercise_style='american')
+        eu_px = eu._price_leg(80.0, 110.0, 0.5, 0.30, 'put')
+        am_px = am._price_leg(80.0, 110.0, 0.5, 0.30, 'put')
+        assert am_px > eu_px
+
+    def test_american_call_no_dividend_equals_european(self):
+        # No dividends are modeled, so an American call never exercises early
+        # -> it equals the European (Black-Scholes) value.
+        am = JaneStreetDesk(exercise_style='american')
+        eu = JaneStreetDesk(exercise_style='european')
+        am_c = am._price_leg(100.0, 95.0, 0.5, 0.30, 'call')
+        eu_c = eu._price_leg(100.0, 95.0, 0.5, 0.30, 'call')
+        assert am_c == pytest.approx(eu_c, rel=1e-3)

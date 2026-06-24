@@ -99,8 +99,9 @@ import pandas as pd
 from core.models import Asset, AssetType
 from desks.base import Desk, DeskIntent
 from desks.options_pricing import (DEFAULT_RATE, EarningsCalendar,
-                                   SyntheticIVModel, black_scholes_greeks,
-                                   black_scholes_price, skew_adjusted_iv)
+                                   SyntheticIVModel, american_binomial_price,
+                                   black_scholes_greeks, black_scholes_price,
+                                   skew_adjusted_iv)
 from desks.options_pricing import price_option as _price_option
 from desks.regime import RegimeHMMModel
 from desks.renaissance import TaggedWalkForwardFit
@@ -177,7 +178,18 @@ class JaneStreetDesk(Desk):
                  #: count as the earnings window for the rank exclusion
                  #: (inclusive of the earnings date itself). Only consulted
                  #: when exclude_earnings_from_iv_rank is on.
-                 iv_rank_earnings_window_days: int = 5):
+                 iv_rank_earnings_window_days: int = 5,
+                 #: Exercise style for the desk's option marks/fills.
+                 #: 'european' (default, Black-Scholes -> byte-identical) or
+                 #: 'american' (CRR binomial early exercise). Every Jane
+                 #: Street option leg is a single-name equity option (the vrp
+                 #: and earnings books trade iron condors on the underlyings;
+                 #: relative_value is stock-only), which are American in
+                 #: reality -> 'american' adds the early-exercise premium the
+                 #: put wings carry. PRICE LAYER ONLY (fills + structure
+                 #: marks); GREEKS stay Black-Scholes either way (American
+                 #: greeks is a follow-up).
+                 exercise_style: str = 'european'):
         super().__init__(
             key='janestreet',
             name='Jane Street Desk',
@@ -195,6 +207,10 @@ class JaneStreetDesk(Desk):
         if not (14 <= earnings_dte_days <= 30):
             raise ValueError(f"earnings_dte_days {earnings_dte_days} must "
                              f"be in the 14-30 band")
+        if exercise_style not in ('european', 'american'):
+            raise ValueError(
+                "exercise_style must be 'european' or 'american', got "
+                f"{exercise_style!r}")
 
         weights = dict(DEFAULT_BOOK_WEIGHTS)
         if book_weights is not None:
@@ -236,6 +252,7 @@ class JaneStreetDesk(Desk):
         self.vol_skew_slope = vol_skew_slope
         self.exclude_earnings_from_iv_rank = exclude_earnings_from_iv_rank
         self.iv_rank_earnings_window_days = iv_rank_earnings_window_days
+        self.exercise_style = exercise_style
 
         self._regime_controller = (
             regime_controller if regime_controller is not None
@@ -352,6 +369,20 @@ class JaneStreetDesk(Desk):
     # ------------------------------------------------------------------
     # Engine pricing hook (no-lookahead: see desks/options_pricing)
     # ------------------------------------------------------------------
+    def _price_leg(self, spot: float, strike: float, t_years: float,
+                   iv: float, right: str) -> float:
+        """One option leg's price under the desk's ``exercise_style``:
+        Black-Scholes ('european', the default -> byte-identical) or the CRR
+        binomial tree ('american'), which adds the early-exercise premium
+        real single-name equity options carry (chiefly on the put wings;
+        an American call with no modeled dividend equals its European value).
+        Marks/fills only — greeks stay Black-Scholes.
+        """
+        if self.exercise_style == 'american':
+            return american_binomial_price(spot, strike, t_years, iv,
+                                           self.rate, right)
+        return black_scholes_price(spot, strike, t_years, iv, self.rate, right)
+
     def price_option(self, asset: Asset, underlying_frame: pd.DataFrame,
                      date, spot: float) -> Optional[float]:
         """Synthetic fair value the engine fills/marks against — the
@@ -369,7 +400,8 @@ class JaneStreetDesk(Desk):
         """
         if self.vol_skew_slope is None:
             return _price_option(asset, underlying_frame, date, spot,
-                                 self.iv_model, rate=self.rate)
+                                 self.iv_model, rate=self.rate,
+                                 exercise=self.exercise_style)
         if asset.asset_type not in (AssetType.CALL, AssetType.PUT):
             raise ValueError(
                 f"price_option needs an option asset, got {asset}")
@@ -389,8 +421,8 @@ class JaneStreetDesk(Desk):
         if base_iv is None:
             return None
         leg_iv = self._surface_iv(base_iv, spot, asset.strike_price, t_years)
-        return black_scholes_price(spot, asset.strike_price, t_years, leg_iv,
-                                   self.rate, asset.asset_type.value)
+        return self._price_leg(spot, asset.strike_price, t_years, leg_iv,
+                               asset.asset_type.value)
 
     # ------------------------------------------------------------------
     # One simulated day
@@ -806,8 +838,8 @@ class JaneStreetDesk(Desk):
             if inputs is None:
                 continue
             spot, iv, t_years = inputs
-            marks[leg['asset']] = black_scholes_price(
-                spot, leg['asset'].strike_price, t_years, iv, self.rate,
+            marks[leg['asset']] = self._price_leg(
+                spot, leg['asset'].strike_price, t_years, iv,
                 leg['asset'].asset_type.value)
         return marks
 
