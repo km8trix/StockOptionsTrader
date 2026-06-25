@@ -134,3 +134,10 @@ def test_make_edgar_fetcher_requires_user_agent(monkeypatch):
     monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     with pytest.raises(ValueError, match="SEC_USER_AGENT"):
         ec.make_edgar_fetcher()
+
+
+def test_read_symbols_file_skips_blanks_and_comments(tmp_path):
+    from data.earnings_cache import _read_symbols_file
+    p = tmp_path / 'universe.txt'
+    p.write_text('AAPL\n\n  MSFT  \n# a comment\nNVDA\n')
+    assert _read_symbols_file(str(p)) == ['AAPL', 'MSFT', 'NVDA']

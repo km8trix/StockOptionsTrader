@@ -295,21 +295,45 @@ class EarningsCache:
             conn.close()
 
 
+def _read_symbols_file(path: str) -> List[str]:
+    """Tickers from a file: one per line, blank lines and # comments skipped."""
+    out = []
+    with open(path) as fh:
+        for line in fh:
+            token = line.strip()
+            if token and not token.startswith('#'):
+                out.append(token)
+    return out
+
+
 if __name__ == '__main__':  # operator CLI (networked, one-time):
     #   SEC_USER_AGENT='You you@email.com' python -m data.earnings_cache
+    #   python -m data.earnings_cache --symbols-file universe.txt
     #   python -m data.earnings_cache --source yfinance AAPL MSFT
     import argparse
 
     parser = argparse.ArgumentParser(prog='python -m data.earnings_cache')
     parser.add_argument('symbols', nargs='*',
                         help='tickers (default: data.universe.LARGE_CAP_100)')
+    parser.add_argument('--symbols-file', metavar='PATH',
+                        help='read tickers from a file, one per line '
+                             '(blank lines and # comments skipped); '
+                             'mutually exclusive with positional tickers')
     parser.add_argument('--source', choices=['edgar', 'yfinance'], default='edgar',
                         help='earnings source (default: edgar — deepest, free; '
                              'needs SEC_USER_AGENT)')
     cli = parser.parse_args()
 
-    syms = cli.symbols
-    if not syms:
+    if cli.symbols_file and cli.symbols:
+        parser.error('pass tickers as arguments OR --symbols-file, not both')
+    if cli.symbols_file:
+        try:
+            syms = _read_symbols_file(cli.symbols_file)
+        except OSError as exc:
+            parser.error(f'--symbols-file: {exc}')
+    elif cli.symbols:
+        syms = cli.symbols
+    else:
         from data.universe import LARGE_CAP_100
         syms = LARGE_CAP_100
     logging.basicConfig(level=logging.INFO)
