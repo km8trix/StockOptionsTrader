@@ -45,6 +45,14 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#58a6ff',
         'factory': RenaissanceDesk,
+        # Earnings-entry gate (Phase 9): production Renaissance skips opening
+        # new single-name MR / stat-arb positions within a few days of a
+        # scheduled report (an idiosyncratic earnings jump swamps the signal).
+        # create_desk lazily attaches an offline EarningsCache as the calendar
+        # (see below); the desk-class default stays off and an un-ingested
+        # cache reads empty, so this is byte-identical until the operator runs
+        # `python -m data.earnings_cache`. Exits are never gated.
+        'config': {'avoid_earnings_entries': True},
     },
     'citadel': {
         'name': 'Citadel Desk',
@@ -176,11 +184,20 @@ def create_desk(key: str, capital_allocation: float = 1.0,
     # those construct exactly as before): 'turnover' (cross-sectional churn
     # control) and 'config' (per-desk feature flags, e.g. citadel's robust
     # pod Sharpe) are merged into the factory call.
+    # Validate model_key BEFORE constructing anything, so a rejected call
+    # never instantiates the EarningsCache below.
+    if model_key is not None and key not in _MODEL_SELECTABLE_DESKS:
+        raise ValueError(f"Desk '{key}' does not support model selection")
     factory_kwargs = {**spec.get('turnover', {}), **spec.get('config', {})}
+    # The earnings-entry gate is a dead flag without a calendar; attach an
+    # OFFLINE EarningsCache (pure SQLite reads — no network in the backtest
+    # loop). Imported and constructed lazily HERE, never at module import, so
+    # listing/registering desks never opens the db. An un-ingested cache reads
+    # empty => next_earnings None => byte-identical to no gate.
+    if factory_kwargs.get('avoid_earnings_entries'):
+        from data.earnings_cache import EarningsCache
+        factory_kwargs.setdefault('earnings_calendar', EarningsCache())
     if model_key is not None:
-        if key not in _MODEL_SELECTABLE_DESKS:
-            raise ValueError(
-                f"Desk '{key}' does not support model selection")
         return spec['factory'](capital_allocation=capital_allocation,
                                model_key=model_key, **factory_kwargs)
     return spec['factory'](capital_allocation=capital_allocation,
