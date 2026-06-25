@@ -1,0 +1,291 @@
+/* ==========================================================================
+   redesign.css — "Terminal Pro" elevation layer
+   A polished, desktop-first uplift of the base terminal theme, scoped to the
+   flagship pages via `body.ui-next` (Dashboard + Trading Floor). Pages without
+   that class are visually UNCHANGED — this is a flagship-first rollout.
+   Additive only: new tokens below are inert where .ui-next is absent.
+   Builds on style.css tokens (--bg, --surface, --accent, --gain, etc.).
+   ========================================================================== */
+
+:root,
+[data-bs-theme="dark"] {
+    /* Brand accent (a touch more vivid than --accent) + signature gradient,
+       used sparingly: primary actions, hero accents, desk bars. */
+    --brand: #5b8cff;
+    --brand-2: #8ba6ff;
+    --brand-grad: linear-gradient(135deg, #5b8cff 0%, #8b6cff 100%);
+
+    /* Elevated surface + radii (the base 6px reads utilitarian; 10–14px reads
+       modern fintech without going soft). */
+    --surface-elev: #1b222c;
+    --radius-sm: 8px;
+    --radius: 12px;
+    --radius-lg: 16px;
+
+    /* Elevation: depth instead of flat hairlines. */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.30);
+    --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.38);
+    --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.48);
+    --ring: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+/* --------------------------------------------------------------------------
+   Page backdrop — subtle brand aurora, fixed so it doesn't scroll-jump
+   -------------------------------------------------------------------------- */
+body.ui-next {
+    background:
+        radial-gradient(1200px 620px at 12% -12%, rgba(91, 140, 255, 0.10), transparent 60%),
+        radial-gradient(1000px 520px at 100% -4%, rgba(139, 108, 255, 0.07), transparent 55%),
+        var(--bg);
+    background-attachment: fixed;
+}
+
+/* --------------------------------------------------------------------------
+   Page header — stronger display hierarchy
+   -------------------------------------------------------------------------- */
+.ui-next .page-title {
+    font-size: 27px;
+    font-weight: 760;
+    letter-spacing: -0.022em;
+    line-height: 1.1;
+}
+
+.ui-next .page-subtitle {
+    color: var(--text-muted);
+    font-size: 13px;
+    letter-spacing: 0.01em;
+}
+
+/* --------------------------------------------------------------------------
+   Cards — layered surface + elevation (no hover-lift on data panels)
+   -------------------------------------------------------------------------- */
+.ui-next .card {
+    border-radius: var(--radius);
+    border-color: var(--border);
+    background: linear-gradient(180deg, var(--surface-elev), var(--surface));
+    box-shadow: var(--shadow-sm), var(--ring);
+}
+
+.ui-next .card-header {
+    padding: var(--sp-3) var(--sp-4);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+}
+
+/* --------------------------------------------------------------------------
+   Metric cards — bigger numbers, gentle hover, a true hero KPI
+   -------------------------------------------------------------------------- */
+.ui-next .metric-card {
+    border-radius: var(--radius);
+    background: linear-gradient(180deg, var(--surface-elev), var(--surface));
+    box-shadow: var(--shadow-sm);
+    padding: var(--sp-4);
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.ui-next .metric-card:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+}
+
+.ui-next .metric-value {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+
+.ui-next .metric-label {
+    font-size: 10.5px;
+}
+
+/* Hero KPI — the portfolio "balance" card, like a consumer fintech hero. */
+.ui-next .metric-card--hero {
+    border-color: rgba(91, 140, 255, 0.38);
+    background:
+        radial-gradient(130% 130% at 0% 0%, rgba(91, 140, 255, 0.20), transparent 52%),
+        linear-gradient(180deg, var(--surface-elev), var(--surface));
+}
+
+.ui-next .metric-card--hero .metric-label {
+    color: var(--brand-2);
+}
+
+.ui-next .metric-card--hero .metric-value {
+    font-size: 34px;
+    font-weight: 760;
+}
+
+/* --------------------------------------------------------------------------
+   Workspace chooser cards — interactive, so they lift
+   -------------------------------------------------------------------------- */
+.ui-next .ws-choose {
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.ui-next .ws-choose:hover {
+    transform: translateY(-3px);
+    box-shadow: var(--shadow-md);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+/* --------------------------------------------------------------------------
+   Desk cards — the Trading Floor centerpiece: firm-accent bar, corner glow,
+   colored icon, lift. Accent comes from the inline --desk-accent (floor.js).
+   -------------------------------------------------------------------------- */
+.ui-next .desk-card {
+    position: relative;
+    overflow: hidden;
+    border-radius: var(--radius);
+    background: linear-gradient(180deg, var(--surface-elev), var(--surface));
+    box-shadow: var(--shadow-sm);
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.ui-next .desk-card::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 3px;
+    background: var(--desk-accent, var(--accent));
+    opacity: 0.95;
+}
+
+.ui-next .desk-card::after {
+    content: "";
+    position: absolute;
+    top: -45%;
+    right: -18%;
+    width: 190px;
+    height: 190px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--desk-accent, var(--accent)), transparent 70%);
+    opacity: 0.12;
+    pointer-events: none;
+}
+
+.ui-next .desk-card:hover {
+    transform: translateY(-3px);
+    box-shadow: var(--shadow-lg);
+    border-color: color-mix(in srgb, var(--desk-accent, var(--accent)) 55%, var(--border));
+}
+
+.ui-next .desk-card .card-header {
+    color: var(--text);
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 14px;
+    font-weight: 650;
+}
+
+.ui-next .desk-card .card-header .bi {
+    color: var(--desk-accent, var(--accent));
+}
+
+.ui-next .desk-firm-tag {
+    display: inline-block;
+    color: var(--desk-accent, var(--accent));
+    background: color-mix(in srgb, var(--desk-accent, var(--accent)) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--desk-accent, var(--accent)) 30%, transparent);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-bottom: var(--sp-3);
+}
+
+.ui-next .desk-desc {
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+/* --------------------------------------------------------------------------
+   Buttons — gradient primary, refined outline
+   -------------------------------------------------------------------------- */
+.ui-next .btn {
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    transition: transform 0.12s ease, box-shadow 0.16s ease, filter 0.16s ease,
+        background-color 0.16s ease, border-color 0.16s ease;
+}
+
+.ui-next .btn-primary {
+    background: var(--brand-grad);
+    border: none;
+    box-shadow: 0 2px 10px rgba(91, 140, 255, 0.32);
+}
+
+.ui-next .btn-primary:hover {
+    filter: brightness(1.08);
+    box-shadow: 0 5px 16px rgba(91, 140, 255, 0.42);
+    transform: translateY(-1px);
+}
+
+.ui-next .btn-outline-secondary {
+    border-color: var(--border);
+    color: var(--text);
+}
+
+.ui-next .btn-outline-secondary:hover {
+    background: var(--surface-2);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    color: var(--text);
+}
+
+/* --------------------------------------------------------------------------
+   Pills / badges — modern rounded chips
+   -------------------------------------------------------------------------- */
+.ui-next .ws-badge,
+.ui-next .badge-ready,
+.ui-next .badge-phase {
+    border-radius: 999px;
+    letter-spacing: 0.04em;
+}
+
+.ui-next .badge-ready {
+    color: var(--gain);
+    background: var(--gain-dim);
+    border: 1px solid color-mix(in srgb, var(--gain) 35%, transparent);
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+/* --------------------------------------------------------------------------
+   Tables — quieter header, soft row hover
+   -------------------------------------------------------------------------- */
+.ui-next .table thead th {
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    border-bottom-color: var(--border);
+}
+
+.ui-next .table tbody tr {
+    transition: background-color 0.12s ease;
+}
+
+.ui-next .table tbody tr:hover {
+    background-color: var(--surface-2);
+}
+
+/* --------------------------------------------------------------------------
+   Accessibility — honor reduced-motion: kill transforms/transitions
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+    .ui-next .card,
+    .ui-next .metric-card,
+    .ui-next .ws-choose,
+    .ui-next .desk-card,
+    .ui-next .btn {
+        transition: none;
+    }
+
+    .ui-next .metric-card:hover,
+    .ui-next .ws-choose:hover,
+    .ui-next .desk-card:hover,
+    .ui-next .btn-primary:hover {
+        transform: none;
+    }
+}
