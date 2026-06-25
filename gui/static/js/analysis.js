@@ -10,18 +10,19 @@ const SYMBOL_RE = /^[A-Za-z][A-Za-z.\-]{0,9}$/;
    ========================================================================== */
 
 function themeVar(name, fallback) {
-    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    // Tokens live on `body.ui-next`, not <html> — read from body.
+    const v = getComputedStyle(document.body).getPropertyValue(name).trim();
     return v || fallback;
 }
 
 function plotlyTheme() {
     return {
-        text: themeVar('--text', '#e6edf3'),
-        muted: themeVar('--text-muted', '#8b949e'),
-        grid: themeVar('--border', '#2d333b'),
-        accent: themeVar('--accent', '#4493f8'),
-        gain: themeVar('--gain', '#3fb950'),
-        loss: themeVar('--loss', '#f85149'),
+        text: themeVar('--text', '#e8edf6'),
+        muted: themeVar('--text-muted', '#8a93a6'),
+        grid: themeVar('--border', 'rgba(255,255,255,0.06)'),
+        accent: themeVar('--accent', '#d4af37'),
+        gain: themeVar('--gain', '#00d084'),
+        loss: themeVar('--loss', '#ff4757'),
     };
 }
 
@@ -168,7 +169,7 @@ function renderChart(payload) {
             type: 'scatter', name: 'Bollinger 20·2σ', x: dates,
             y: col(rows, dates, 'bb_lower'),
             line: { width: 0 }, fill: 'tonexty',
-            fillcolor: 'rgba(68, 147, 248, 0.08)',
+            fillcolor: 'rgba(212, 175, 55, 0.08)',
             hoverinfo: 'skip', yaxis: 'y',
         },
         {
@@ -187,7 +188,7 @@ function renderChart(payload) {
             marker: {
                 color: close.map((c, i) =>
                     c !== null && open[i] !== null && c < open[i]
-                        ? 'rgba(248, 81, 73, 0.45)' : 'rgba(63, 185, 80, 0.45)'),
+                        ? 'rgba(255, 71, 87, 0.45)' : 'rgba(0, 208, 132, 0.45)'),
             },
             yaxis: 'y2', showlegend: false,
         },
@@ -198,7 +199,7 @@ function renderChart(payload) {
             marker: {
                 color: col(rows, dates, 'macd_hist').map((v) =>
                     v !== null && v < 0
-                        ? 'rgba(248, 81, 73, 0.45)' : 'rgba(63, 185, 80, 0.45)'),
+                        ? 'rgba(255, 71, 87, 0.45)' : 'rgba(0, 208, 132, 0.45)'),
             },
             yaxis: 'y3', showlegend: false,
         },
@@ -230,7 +231,7 @@ function renderChart(payload) {
             type: 'scatter', mode: 'markers', name: 'BUY',
             x: buys.map((s) => s.date), y: buys.map((s) => s.price),
             marker: { symbol: 'triangle-up', size: 11, color: t.gain,
-                      line: { color: '#0d1117', width: 1 } },
+                      line: { color: '#0f111a', width: 1 } },
             yaxis: 'y',
         });
     }
@@ -239,7 +240,7 @@ function renderChart(payload) {
             type: 'scatter', mode: 'markers', name: 'SELL',
             x: sells.map((s) => s.date), y: sells.map((s) => s.price),
             marker: { symbol: 'triangle-down', size: 11, color: t.loss,
-                      line: { color: '#0d1117', width: 1 } },
+                      line: { color: '#0f111a', width: 1 } },
             yaxis: 'y',
         });
     }
@@ -262,7 +263,7 @@ function renderChart(payload) {
                   font: { size: 10, color: t.muted }, bgcolor: 'rgba(0,0,0,0)' },
         dragmode: 'pan',
         hovermode: 'x unified',
-        hoverlabel: { bgcolor: '#1c232d', bordercolor: t.grid,
+        hoverlabel: { bgcolor: '#1e233a', bordercolor: t.grid,
                       font: { size: 11, color: t.text } },
         bargap: 0.25,
         xaxis: {

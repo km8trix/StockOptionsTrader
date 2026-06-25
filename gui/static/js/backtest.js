@@ -112,7 +112,7 @@ const REGIME_META = {
     trending:       { label: 'Trending',
                       band: 'rgba(63, 185, 80, 0.10)', color: '#3fb950' },
     high_vol:       { label: 'High-vol',
-                      band: 'rgba(248, 81, 73, 0.10)', color: '#f85149' },
+                      band: 'rgba(255, 71, 87, 0.10)', color: '#ff4757' },
 };
 
 let pollTimer = null;
@@ -135,18 +135,19 @@ let expandedStructures = new Set();   // structure _key -> legs row open
    ========================================================================== */
 
 function themeVar(name, fallback) {
-    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    // Tokens live on `body.ui-next`, not <html> — read from body.
+    const v = getComputedStyle(document.body).getPropertyValue(name).trim();
     return v || fallback;
 }
 
 function plotlyTheme() {
     return {
-        text: themeVar('--text', '#e6edf3'),
-        muted: themeVar('--text-muted', '#8b949e'),
-        grid: themeVar('--border', '#2d333b'),
-        accent: themeVar('--accent', '#4493f8'),
-        gain: themeVar('--gain', '#3fb950'),
-        loss: themeVar('--loss', '#f85149'),
+        text: themeVar('--text', '#e8edf6'),
+        muted: themeVar('--text-muted', '#8a93a6'),
+        grid: themeVar('--border', 'rgba(255,255,255,0.06)'),
+        accent: themeVar('--accent', '#d4af37'),
+        gain: themeVar('--gain', '#00d084'),
+        loss: themeVar('--loss', '#ff4757'),
     };
 }
 
@@ -162,7 +163,7 @@ function baseLayout(t, height) {
         legend: { orientation: 'h', y: 1.04, x: 0,
                   font: { size: 10, color: t.muted }, bgcolor: 'rgba(0,0,0,0)' },
         hovermode: 'x unified',
-        hoverlabel: { bgcolor: '#1c232d', bordercolor: t.grid,
+        hoverlabel: { bgcolor: '#1e233a', bordercolor: t.grid,
                       font: { size: 11, color: t.text } },
         xaxis: { gridcolor: t.grid, zerolinecolor: t.grid,
                  tickfont: { size: 10, color: t.muted } },
@@ -1212,7 +1213,7 @@ function renderDrawdownChart(series) {
         x: series.map((p) => p.date),
         y: series.map((p) => p.drawdown_pct),
         fill: 'tozeroy',
-        fillcolor: 'rgba(248, 81, 73, 0.18)',
+        fillcolor: 'rgba(255, 71, 87, 0.18)',
         line: { color: t.loss, width: 1.25 },
     }];
     const layout = baseLayout(t, 200);

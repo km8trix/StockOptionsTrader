@@ -1,0 +1,465 @@
+/* ==========================================================================
+   redesign.css — "Modern Financial Professional" (Gold & Dark)
+   A gold-on-navy fintech theme, scoped to the flagship pages via
+   `body.ui-next` (Dashboard + Trading Floor). Pages without that class are
+   visually UNCHANGED — flagship-first rollout. Achieved purely by overriding
+   the style.css design tokens on `body.ui-next`, so existing components
+   (cards, tables, nav, footer) re-skin automatically.
+
+   FONTS: Satoshi (UI) + JetBrains Mono (numbers) are vendored locally under
+   gui/static/vendor/fonts/ (zero-CDN, Docker-ready) and declared just below.
+   ========================================================================== */
+
+/* Vendored web fonts — Fontshare Satoshi + JetBrains Mono (latin subsets).
+   font-display:swap so the fallback stack paints first; only fetched on
+   .ui-next pages where these families are actually used. */
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-400.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-500.woff2') format('woff2'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-700.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-900.woff2') format('woff2'); font-weight: 900; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('../vendor/fonts/jetbrains-mono-400.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('../vendor/fonts/jetbrains-mono-500.woff2') format('woff2'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('../vendor/fonts/jetbrains-mono-700.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+
+body.ui-next {
+    /* ---- Palette: Gold & Dark ---- */
+    --bg: #0f111a;            /* deep navy page */
+    --surface: #161a2b;      /* cards, nav, panels */
+    --surface-2: #1e233a;    /* hover / inset / elevated top */
+    --surface-elev: #1e233a;
+    --border: rgba(255, 255, 255, 0.06);
+    --text: #e8edf6;
+    --text-muted: #8a93a6;   /* slate */
+
+    --accent: #d4af37;       /* gold brand */
+    --brand: #d4af37;
+    --gold-grad: linear-gradient(135deg, #d4af37 0%, #f1c40f 100%);
+    --gain: #00d084;         /* rise green */
+    --gain-dim: rgba(0, 208, 132, 0.12);
+    --loss: #ff4757;         /* fall red */
+    --loss-dim: rgba(255, 71, 87, 0.12);
+
+    /* Map Bootstrap tokens onto the gold/navy palette */
+    --bs-body-bg: var(--bg);
+    --bs-body-color: var(--text);
+    --bs-border-color: var(--border);
+    --bs-link-color: var(--accent);
+    --bs-success: var(--gain);
+    --bs-danger: var(--loss);
+
+    /* ---- Type: Satoshi UI + JetBrains Mono numbers (fallbacks until vendored) ---- */
+    --font-ui: 'Satoshi', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+        'Helvetica Neue', Arial, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo,
+        Consolas, 'Liberation Mono', monospace;
+
+    /* ---- Geometry / motion ---- */
+    --radius-sm: 8px;
+    --radius: 14px;
+    --radius-lg: 18px;
+    --ease: cubic-bezier(0.4, 0, 0.2, 1);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-md: 0 10px 26px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.55);
+    --glow-gold: 0 10px 30px rgba(212, 175, 55, 0.22);
+    --ring: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+
+    /* Subtle gold corner glow on the deep navy, nothing more. */
+    background:
+        radial-gradient(900px 480px at 100% -8%, rgba(212, 175, 55, 0.08), transparent 55%),
+        var(--bg);
+    background-attachment: fixed;
+}
+
+/* Firefox scrollbar; WebKit below */
+body.ui-next {
+    scrollbar-color: #2d3748 transparent;
+    scrollbar-width: thin;
+}
+
+body.ui-next ::-webkit-scrollbar { width: 10px; height: 10px; }
+body.ui-next ::-webkit-scrollbar-track { background: transparent; }
+body.ui-next ::-webkit-scrollbar-thumb {
+    background: #2d3748;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+body.ui-next ::-webkit-scrollbar-thumb:hover { background: #3a4658; }
+
+/* --------------------------------------------------------------------------
+   Sticky navigation — blurred navy, gold logo chip, gold active underline
+   -------------------------------------------------------------------------- */
+body.ui-next .app-nav {
+    min-height: 64px;
+    background: color-mix(in srgb, #161a2b 92%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+}
+
+body.ui-next .app-nav .navbar-brand .bi {
+    display: inline-block;
+    background: var(--gold-grad);
+    color: #0f111a;
+    padding: 3px 6px;
+    border-radius: 7px;
+    transform: rotate(3deg);
+    box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35);
+}
+
+body.ui-next .app-nav .nav-link {
+    border-radius: 0;
+    border-bottom: 2px solid transparent;
+    transition: color 0.16s var(--ease), border-color 0.16s var(--ease);
+}
+
+body.ui-next .app-nav .nav-link.active {
+    background: transparent;
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+/* --------------------------------------------------------------------------
+   Page header
+   -------------------------------------------------------------------------- */
+body.ui-next .page-title {
+    font-size: 27px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+}
+
+body.ui-next .page-subtitle { color: var(--text-muted); font-size: 13px; }
+
+/* --------------------------------------------------------------------------
+   Cards — navy surface, hairline border, smooth -4px lift + gold glow
+   -------------------------------------------------------------------------- */
+body.ui-next .card {
+    border-radius: var(--radius);
+    border-color: var(--border);
+    background: var(--surface);
+    box-shadow: var(--shadow-sm), var(--ring);
+}
+
+body.ui-next .card-header {
+    padding: 14px 18px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    border-bottom-color: var(--border);
+}
+
+/* --------------------------------------------------------------------------
+   Metric cards + the hero "Account portfolio" card
+   -------------------------------------------------------------------------- */
+body.ui-next .metric-card {
+    border-radius: var(--radius);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-sm);
+    padding: 18px;
+    transition: transform 0.2s var(--ease), box-shadow 0.2s var(--ease);
+}
+
+body.ui-next .metric-card:hover {
+    transform: translateY(-4px);
+    box-shadow: var(--shadow-md), var(--glow-gold);
+}
+
+body.ui-next .metric-value { font-size: 26px; font-weight: 700; letter-spacing: -0.01em; }
+body.ui-next .metric-label { font-size: 10.5px; }
+
+/* Account portfolio hero: diagonal gradient, oversized mono balance, gold label */
+body.ui-next .metric-card--hero {
+    border-color: rgba(212, 175, 55, 0.30);
+    background: linear-gradient(135deg, #1e233a 0%, #161a2b 100%);
+}
+
+body.ui-next .metric-card--hero::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: var(--radius);
+    box-shadow: inset 0 0 0 1px rgba(212, 175, 55, 0.12);
+    pointer-events: none;
+}
+
+body.ui-next .metric-card--hero { position: relative; }
+body.ui-next .metric-card--hero .metric-label { color: var(--accent); letter-spacing: 0.1em; }
+body.ui-next .metric-card--hero .metric-value { font-size: 36px; font-weight: 800; }
+
+/* --------------------------------------------------------------------------
+   Workspace chooser cards — lift on hover
+   -------------------------------------------------------------------------- */
+body.ui-next .ws-choose {
+    transition: transform 0.2s var(--ease), box-shadow 0.2s var(--ease), border-color 0.2s var(--ease);
+}
+
+body.ui-next .ws-choose:hover {
+    transform: translateY(-4px);
+    box-shadow: var(--shadow-md), var(--glow-gold);
+    border-color: rgba(212, 175, 55, 0.30);
+}
+
+/* --------------------------------------------------------------------------
+   Desk cards — firm-accent bar + corner glow (firm identity preserved on the
+   gold theme; accent comes from inline --desk-accent set by floor.js)
+   -------------------------------------------------------------------------- */
+body.ui-next .desk-card {
+    position: relative;
+    overflow: hidden;
+    border-radius: var(--radius);
+    background: linear-gradient(180deg, var(--surface-2), var(--surface));
+    box-shadow: var(--shadow-sm);
+    transition: transform 0.2s var(--ease), box-shadow 0.2s var(--ease), border-color 0.2s var(--ease);
+}
+
+body.ui-next .desk-card::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 3px;
+    background: var(--desk-accent, var(--accent));
+}
+
+body.ui-next .desk-card::after {
+    content: "";
+    position: absolute;
+    top: -45%;
+    right: -18%;
+    width: 190px;
+    height: 190px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--desk-accent, var(--accent)), transparent 70%);
+    opacity: 0.12;
+    pointer-events: none;
+}
+
+body.ui-next .desk-card:hover {
+    transform: translateY(-4px);
+    box-shadow: var(--shadow-lg);
+    border-color: color-mix(in srgb, var(--desk-accent, var(--accent)) 55%, var(--border));
+}
+
+body.ui-next .desk-card .card-header {
+    color: var(--text);
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 14px;
+    font-weight: 650;
+}
+
+body.ui-next .desk-card .card-header .bi { color: var(--desk-accent, var(--accent)); }
+
+body.ui-next .desk-firm-tag {
+    display: inline-block;
+    color: var(--desk-accent, var(--accent));
+    background: color-mix(in srgb, var(--desk-accent, var(--accent)) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--desk-accent, var(--accent)) 30%, transparent);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-bottom: 12px;
+}
+
+body.ui-next .desk-desc { color: var(--text-muted); font-size: 13px; line-height: 1.5; }
+
+/* --------------------------------------------------------------------------
+   Buttons — gold gradient primary (black text), refined outline
+   -------------------------------------------------------------------------- */
+body.ui-next .btn {
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    transition: transform 0.14s var(--ease), box-shadow 0.18s var(--ease), filter 0.18s var(--ease);
+}
+
+body.ui-next .btn-primary {
+    background: var(--gold-grad);
+    border: none;
+    color: #0f111a;
+    box-shadow: 0 2px 10px rgba(212, 175, 55, 0.30);
+}
+
+body.ui-next .btn-primary:hover {
+    color: #0f111a;
+    filter: brightness(1.06);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 18px rgba(212, 175, 55, 0.45);
+}
+
+body.ui-next .btn-outline-secondary { border-color: var(--border); color: var(--text); }
+body.ui-next .btn-outline-secondary:hover {
+    background: var(--surface-2);
+    border-color: rgba(212, 175, 55, 0.45);
+    color: var(--text);
+}
+
+/* Content links read gold (brand), excluding buttons and nav links which
+   carry their own treatment. */
+body.ui-next a:not(.btn):not(.nav-link):not(.navbar-brand) { color: var(--accent); }
+body.ui-next a:not(.btn):not(.nav-link):not(.navbar-brand):hover {
+    color: color-mix(in srgb, var(--accent) 80%, #fff);
+}
+
+/* --------------------------------------------------------------------------
+   Pills / badges
+   -------------------------------------------------------------------------- */
+body.ui-next .ws-badge,
+body.ui-next .badge-ready,
+body.ui-next .badge-phase { border-radius: 999px; letter-spacing: 0.04em; }
+
+body.ui-next .badge-ready {
+    color: var(--gain);
+    background: var(--gain-dim);
+    border: 1px solid color-mix(in srgb, var(--gain) 35%, transparent);
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+/* --------------------------------------------------------------------------
+   Ranking table — borderless, white/5 header, white/2 row hover, mono nums
+   -------------------------------------------------------------------------- */
+body.ui-next .table { --bs-table-bg: transparent; }
+
+body.ui-next .table thead th {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border-bottom: none;
+}
+
+body.ui-next .table tbody td { border-color: var(--border); }
+
+body.ui-next .table tbody tr { transition: background-color 0.12s var(--ease); }
+body.ui-next .table tbody tr:hover { background-color: rgba(255, 255, 255, 0.02); }
+
+/* --------------------------------------------------------------------------
+   Status footer — system health bar with a pulsing dot
+   -------------------------------------------------------------------------- */
+body.ui-next .status-bar {
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+body.ui-next .status-dot {
+    box-shadow: 0 0 0 0 rgba(0, 208, 132, 0.5);
+    animation: ui-next-pulse 2s var(--ease) infinite;
+}
+
+@keyframes ui-next-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(0, 208, 132, 0.45); }
+    70% { box-shadow: 0 0 0 6px rgba(0, 208, 132, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(0, 208, 132, 0); }
+}
+
+/* --------------------------------------------------------------------------
+   Page-specific components (rollout: Analysis / Backtest / Charts / Live /
+   Paper). Forms, toggles, modals, dropdowns, and page chips the generic
+   rules don't reach.
+   -------------------------------------------------------------------------- */
+/* style.css uses --accent-dim for focus rings + note chips; define it gold so
+   they stop reading blue under the gold theme. */
+body.ui-next { --accent-dim: rgba(212, 175, 55, 0.15); }
+
+body.ui-next .form-control,
+body.ui-next .form-select {
+    background-color: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+}
+
+body.ui-next .form-control:focus,
+body.ui-next .form-select:focus {
+    background-color: var(--surface-2);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.20);
+    color: var(--text);
+}
+
+body.ui-next .form-control::placeholder { color: var(--text-muted); opacity: 1; }
+body.ui-next .form-control.is-invalid,
+body.ui-next .form-select.is-invalid { border-color: var(--loss); }
+body.ui-next .form-label { color: var(--text-muted); letter-spacing: 0.05em; }
+
+/* Checkboxes / switches / radio toggles → gold */
+body.ui-next .form-check-input:checked { background-color: var(--accent); border-color: var(--accent); }
+body.ui-next .form-check-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.20);
+}
+body.ui-next .btn-check:checked + .btn-outline-secondary {
+    background: var(--gold-grad);
+    border-color: transparent;
+    color: #0f111a;
+    font-weight: 700;
+}
+
+/* Backtest note chips + progress + paper risk feedback */
+body.ui-next .note-line { border-left-color: var(--accent); background-color: var(--accent-dim); }
+body.ui-next .note-line.note-warn { border-left-color: #e0a030; background-color: rgba(212, 175, 55, 0.10); }
+body.ui-next .progress-app { background-color: var(--surface-2); }
+body.ui-next .risk-feedback.risk-breach { color: #e0a030; }
+
+/* Modals / offcanvas / dropdowns */
+body.ui-next .modal-content,
+body.ui-next .offcanvas {
+    background: var(--surface);
+    border-color: var(--border);
+    color: var(--text);
+}
+body.ui-next .modal-header,
+body.ui-next .modal-footer,
+body.ui-next .offcanvas-header { border-color: var(--border); }
+body.ui-next .dropdown-menu { background: var(--surface-2); border-color: var(--border); }
+body.ui-next .dropdown-item { color: var(--text); }
+body.ui-next .dropdown-item:hover,
+body.ui-next .dropdown-item:focus { background: var(--surface); color: var(--accent); }
+body.ui-next .dropdown-header { color: var(--text-muted); }
+
+/* Live page chips / filters / environment badge */
+body.ui-next .metric-chip { background: var(--surface-2); border-color: var(--border); }
+body.ui-next .metric-chip-label { color: var(--text-muted); }
+body.ui-next .audit-filter {
+    background: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text);
+}
+body.ui-next .audit-filter:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.18);
+}
+body.ui-next .env-badge.env-sandbox {
+    color: #f0b428;
+    border-color: #f0b428;
+    background: rgba(240, 180, 40, 0.12);
+}
+body.ui-next .env-badge.env-production {
+    color: #fff;
+    border-color: var(--loss);
+    background: var(--loss);
+}
+
+/* --------------------------------------------------------------------------
+   Accessibility — reduced-motion kills transforms, lifts, and the pulse
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+    body.ui-next .card,
+    body.ui-next .metric-card,
+    body.ui-next .ws-choose,
+    body.ui-next .desk-card,
+    body.ui-next .btn { transition: none; }
+
+    body.ui-next .metric-card:hover,
+    body.ui-next .ws-choose:hover,
+    body.ui-next .desk-card:hover,
+    body.ui-next .btn-primary:hover { transform: none; }
+
+    body.ui-next .status-dot { animation: none; }
+}
