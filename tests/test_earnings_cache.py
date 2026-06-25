@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 
 import pandas as pd
+import pytest
 
 from data.earnings_cache import EarningsCache
 from desks.options_pricing import EarningsCalendar, SyntheticEarningsCalendar
@@ -84,3 +85,52 @@ def test_persists_across_reopen(tmp_path):
     EarningsCache(db).store('AAPL', ['2026-09-01'])
     # A fresh handle on the same file sees the stored date.
     assert EarningsCache(db).next_earnings('AAPL', '2026-01-01') == dt.date(2026, 9, 1)
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_make_edgar_fetcher_extracts_8k_item_202_dates(monkeypatch):
+    # No live network: canned SEC JSON routed by URL. Earnings = 8-K Item 2.02
+    # filing dates, across filings.recent AND the older filings.files batch.
+    import data.earnings_cache as ec
+
+    tickers = {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}}
+    submissions = {"filings": {
+        "recent": {
+            "form": ["8-K", "8-K", "10-Q"],
+            "items": ["2.02,9.01", "5.02", ""],     # 5.02 (mgmt change) and 10-Q ignored
+            "filingDate": ["2026-01-30", "2026-02-15", "2026-02-01"],
+        },
+        "files": [{"name": "CIK0000320193-submissions-001.json"}],
+    }}
+    older = {"form": ["8-K"], "items": ["2.02"], "filingDate": ["2019-01-29"]}
+
+    def fake_get(url, timeout=None, headers=None):
+        if "company_tickers" in url:
+            return _FakeResp(tickers)
+        if url.endswith("001.json"):
+            return _FakeResp(older)
+        return _FakeResp(submissions)
+
+    monkeypatch.setattr("requests.get", fake_get)
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)
+
+    fetch = ec.make_edgar_fetcher(user_agent="Test test@example.com")
+    assert fetch("AAPL") == [dt.date(2019, 1, 29), dt.date(2026, 1, 30)]  # sorted, 2.02 only
+    assert fetch("ZZZZ") == []  # unknown ticker -> US filers only
+
+
+def test_make_edgar_fetcher_requires_user_agent(monkeypatch):
+    import data.earnings_cache as ec
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    with pytest.raises(ValueError, match="SEC_USER_AGENT"):
+        ec.make_edgar_fetcher()

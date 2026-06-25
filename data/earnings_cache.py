@@ -96,6 +96,88 @@ def _yfinance_earnings_dates(symbol: str) -> List[date_type]:
         return []
 
 
+# ----------------------------------------------------------------------
+# SEC EDGAR fetcher — free, authoritative, decades deep
+# ----------------------------------------------------------------------
+# Earnings date := the 8-K Item 2.02 ("Results of Operations") filing date,
+# i.e. the actual press release. Reliable from ~Aug 2004, when the SEC
+# restructured 8-K items; older filings tag 2.02 inconsistently (a documented
+# depth caveat, not a bug). US filers only.
+_SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json'
+_SEC_SUBMISSIONS_URL = 'https://data.sec.gov/submissions/CIK{cik}.json'
+
+
+def _sec_get(url: str, user_agent: str):  # pragma: no cover — network path
+    """GET + parse a SEC JSON endpoint, honoring SEC fair-access policy."""
+    import time
+
+    import requests
+
+    resp = requests.get(url, timeout=30, headers={
+        'User-Agent': user_agent, 'Accept-Encoding': 'gzip, deflate'})
+    resp.raise_for_status()
+    time.sleep(0.11)  # SEC asks for <10 requests/second
+    return resp.json()
+
+
+def _edgar_cik_map(user_agent: str) -> Dict[str, str]:  # pragma: no cover
+    """ticker (upper) -> zero-padded 10-digit CIK, from SEC's master list."""
+    data = _sec_get(_SEC_TICKERS_URL, user_agent)
+    return {row['ticker'].upper(): f"{int(row['cik_str']):010d}"
+            for row in data.values()}
+
+
+def _edgar_earnings_dates(cik: str, user_agent: str) -> List[date_type]:  # pragma: no cover
+    """Every 8-K Item 2.02 filing date for a CIK, across ALL history.
+
+    Walks filings.recent plus the older filings.files batches so depth goes
+    back as far as EDGAR has the filer's 8-Ks, not just the recent ~1000.
+    """
+    main = _sec_get(_SEC_SUBMISSIONS_URL.format(cik=cik), user_agent)
+    batches = [main['filings']['recent']]
+    for older in main['filings'].get('files', []):
+        batches.append(_sec_get(
+            f"https://data.sec.gov/submissions/{older['name']}", user_agent))
+    dates = []
+    for batch in batches:
+        forms = batch['form']
+        items = batch.get('items') or [''] * len(forms)
+        for form, item, filed in zip(forms, items, batch['filingDate']):
+            if form == '8-K' and '2.02' in (item or ''):
+                dates.append(pd.Timestamp(filed).date())
+    return dates
+
+
+def make_edgar_fetcher(user_agent: Optional[str] = None
+                       ) -> Callable[[str], List[date_type]]:
+    """Build an EDGAR earnings-date fetcher for EarningsCache.ingest().
+
+    SEC fair-access REQUIRES a User-Agent naming a real contact; pass one or
+    set SEC_USER_AGENT (e.g. 'Jane Doe jane@example.com'). The ticker->CIK map
+    is fetched ONCE and shared across symbols. Unknown tickers (e.g. foreign
+    6-K filers not in EDGAR's equity list) degrade to [].
+    """
+    ua = user_agent or os.environ.get('SEC_USER_AGENT')
+    if not ua:
+        raise ValueError(
+            "EDGAR needs a contact User-Agent; set SEC_USER_AGENT="
+            "'Your Name your@email.com' (SEC fair-access policy).")
+    cik_map = _edgar_cik_map(ua)
+
+    def fetch(symbol: str) -> List[date_type]:
+        cik = cik_map.get(symbol.upper())
+        if cik is None:
+            logger.warning("EDGAR: no CIK for %s (US filers only); skipped", symbol)
+            return []
+        try:
+            return sorted(set(_edgar_earnings_dates(cik, ua)))
+        except Exception as exc:  # pragma: no cover — degrade per symbol
+            logger.warning("EDGAR earnings unavailable for %s: %s", symbol, exc)
+            return []
+
+    return fetch
+
+
 class EarningsCache:
     """Offline, SQLite-backed earnings calendar (EarningsCalendar protocol).
 
@@ -213,15 +295,26 @@ class EarningsCache:
             conn.close()
 
 
-if __name__ == '__main__':  # operator CLI: python -m data.earnings_cache AAPL ...
-    import sys
+if __name__ == '__main__':  # operator CLI (networked, one-time):
+    #   SEC_USER_AGENT='You you@email.com' python -m data.earnings_cache
+    #   python -m data.earnings_cache --source yfinance AAPL MSFT
+    import argparse
 
-    syms = sys.argv[1:]
+    parser = argparse.ArgumentParser(prog='python -m data.earnings_cache')
+    parser.add_argument('symbols', nargs='*',
+                        help='tickers (default: data.universe.LARGE_CAP_100)')
+    parser.add_argument('--source', choices=['edgar', 'yfinance'], default='edgar',
+                        help='earnings source (default: edgar — deepest, free; '
+                             'needs SEC_USER_AGENT)')
+    cli = parser.parse_args()
+
+    syms = cli.symbols
     if not syms:
         from data.universe import LARGE_CAP_100
         syms = LARGE_CAP_100
     logging.basicConfig(level=logging.INFO)
-    result = EarningsCache().ingest(syms)
-    print(f"Ingested earnings for {len(result)} symbols "
-          f"({sum(result.values())} dates) into "
-          f"{os.environ.get('TRADING_DB_PATH') or 'trading_data.db'}")
+    fetcher = make_edgar_fetcher() if cli.source == 'edgar' else None
+    cache = EarningsCache()
+    result = cache.ingest(syms, fetcher=fetcher)
+    print(f"Ingested earnings ({cli.source}) for {len(result)} symbols "
+          f"({sum(result.values())} dates) into {cache.db_path}")
