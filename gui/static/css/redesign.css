@@ -6,13 +6,20 @@
    the style.css design tokens on `body.ui-next`, so existing components
    (cards, tables, nav, footer) re-skin automatically.
 
-   FONTS: the spec calls for 'Satoshi' (UI) + 'JetBrains Mono' (numbers).
-   This app is intentionally zero-CDN (Docker-ready), so they are declared
-   with graceful fallbacks below and only activate once the .woff2 files are
-   vendored. To enable, drop the files under gui/static/vendor/fonts/ and add:
-     @font-face { font-family:'Satoshi'; src:url('../vendor/fonts/Satoshi-Variable.woff2') format('woff2'); font-weight:300 900; }
-     @font-face { font-family:'JetBrains Mono'; src:url('../vendor/fonts/JetBrainsMono.woff2') format('woff2'); font-weight:400 700; }
+   FONTS: Satoshi (UI) + JetBrains Mono (numbers) are vendored locally under
+   gui/static/vendor/fonts/ (zero-CDN, Docker-ready) and declared just below.
    ========================================================================== */
+
+/* Vendored web fonts — Fontshare Satoshi + JetBrains Mono (latin subsets).
+   font-display:swap so the fallback stack paints first; only fetched on
+   .ui-next pages where these families are actually used. */
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-400.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-500.woff2') format('woff2'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-700.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'Satoshi'; src: url('../vendor/fonts/satoshi-900.woff2') format('woff2'); font-weight: 900; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('../vendor/fonts/jetbrains-mono-400.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('../vendor/fonts/jetbrains-mono-500.woff2') format('woff2'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('../vendor/fonts/jetbrains-mono-700.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
 
 body.ui-next {
     /* ---- Palette: Gold & Dark ---- */
@@ -349,6 +356,94 @@ body.ui-next .status-dot {
     0% { box-shadow: 0 0 0 0 rgba(0, 208, 132, 0.45); }
     70% { box-shadow: 0 0 0 6px rgba(0, 208, 132, 0); }
     100% { box-shadow: 0 0 0 0 rgba(0, 208, 132, 0); }
+}
+
+/* --------------------------------------------------------------------------
+   Page-specific components (rollout: Analysis / Backtest / Charts / Live /
+   Paper). Forms, toggles, modals, dropdowns, and page chips the generic
+   rules don't reach.
+   -------------------------------------------------------------------------- */
+/* style.css uses --accent-dim for focus rings + note chips; define it gold so
+   they stop reading blue under the gold theme. */
+body.ui-next { --accent-dim: rgba(212, 175, 55, 0.15); }
+
+body.ui-next .form-control,
+body.ui-next .form-select {
+    background-color: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+}
+
+body.ui-next .form-control:focus,
+body.ui-next .form-select:focus {
+    background-color: var(--surface-2);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.20);
+    color: var(--text);
+}
+
+body.ui-next .form-control::placeholder { color: var(--text-muted); opacity: 1; }
+body.ui-next .form-control.is-invalid,
+body.ui-next .form-select.is-invalid { border-color: var(--loss); }
+body.ui-next .form-label { color: var(--text-muted); letter-spacing: 0.05em; }
+
+/* Checkboxes / switches / radio toggles → gold */
+body.ui-next .form-check-input:checked { background-color: var(--accent); border-color: var(--accent); }
+body.ui-next .form-check-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.20);
+}
+body.ui-next .btn-check:checked + .btn-outline-secondary {
+    background: var(--gold-grad);
+    border-color: transparent;
+    color: #0f111a;
+    font-weight: 700;
+}
+
+/* Backtest note chips + progress + paper risk feedback */
+body.ui-next .note-line { border-left-color: var(--accent); background-color: var(--accent-dim); }
+body.ui-next .note-line.note-warn { border-left-color: #e0a030; background-color: rgba(212, 175, 55, 0.10); }
+body.ui-next .progress-app { background-color: var(--surface-2); }
+body.ui-next .risk-feedback.risk-breach { color: #e0a030; }
+
+/* Modals / offcanvas / dropdowns */
+body.ui-next .modal-content,
+body.ui-next .offcanvas {
+    background: var(--surface);
+    border-color: var(--border);
+    color: var(--text);
+}
+body.ui-next .modal-header,
+body.ui-next .modal-footer,
+body.ui-next .offcanvas-header { border-color: var(--border); }
+body.ui-next .dropdown-menu { background: var(--surface-2); border-color: var(--border); }
+body.ui-next .dropdown-item { color: var(--text); }
+body.ui-next .dropdown-item:hover,
+body.ui-next .dropdown-item:focus { background: var(--surface); color: var(--accent); }
+body.ui-next .dropdown-header { color: var(--text-muted); }
+
+/* Live page chips / filters / environment badge */
+body.ui-next .metric-chip { background: var(--surface-2); border-color: var(--border); }
+body.ui-next .metric-chip-label { color: var(--text-muted); }
+body.ui-next .audit-filter {
+    background: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text);
+}
+body.ui-next .audit-filter:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.18);
+}
+body.ui-next .env-badge.env-sandbox {
+    color: #f0b428;
+    border-color: #f0b428;
+    background: rgba(240, 180, 40, 0.12);
+}
+body.ui-next .env-badge.env-production {
+    color: #fff;
+    border-color: var(--loss);
+    background: var(--loss);
 }
 
 /* --------------------------------------------------------------------------

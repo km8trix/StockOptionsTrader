@@ -14,7 +14,7 @@ function initChart() {
     const el = document.getElementById('chartContainer');
     chart = LightweightCharts.createChart(el, {
         autoSize: true,
-        layout: { background: { color: 'transparent' }, textColor: '#8b949e' },
+        layout: { background: { color: 'transparent' }, textColor: '#8a93a6' },
         grid: {
             vertLines: { color: 'rgba(255,255,255,0.05)' },
             horzLines: { color: 'rgba(255,255,255,0.05)' },
@@ -24,13 +24,13 @@ function initChart() {
         crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
     candleSeries = chart.addCandlestickSeries({
-        upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
-        wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+        upColor: '#00d084', downColor: '#ff4757', borderVisible: false,
+        wickUpColor: '#00d084', wickDownColor: '#ff4757',
     });
     volumeSeries = chart.addHistogramSeries({
         priceFormat: { type: 'volume' },
         priceScaleId: '',
-        color: 'rgba(120,120,140,0.4)',
+        color: 'rgba(138,147,166,0.25)',
     });
     volumeSeries.priceScale().applyOptions({
         scaleMargins: { top: 0.8, bottom: 0 },
@@ -61,7 +61,7 @@ async function loadChart(symbol) {
         return {
             time: v.time,
             value: v.value,
-            color: up ? 'rgba(38,166,154,0.4)' : 'rgba(239,83,80,0.4)',
+            color: up ? 'rgba(0,208,132,0.35)' : 'rgba(255,71,87,0.35)',
         };
     });
     volumeSeries.setData(vol);
@@ -103,7 +103,7 @@ async function loadPositions(symbol) {
         const qtyLabel = qty != null ? `${Math.abs(qty)} ` : '';
         positionLines.push(candleSeries.createPriceLine({
             price,
-            color: isShort ? '#ef5350' : '#26a69a',
+            color: isShort ? '#ff4757' : '#00d084',
             lineWidth: 1,
             lineStyle: LightweightCharts.LineStyle.Dotted,
             axisLabelVisible: true,
@@ -129,7 +129,7 @@ async function pollLive(symbol) {
     }
     if (livePriceLine) candleSeries.removePriceLine(livePriceLine);
     livePriceLine = candleSeries.createPriceLine({
-        price: last, color: '#4493f8', lineWidth: 1,
+        price: last, color: '#d4af37', lineWidth: 1,
         lineStyle: LightweightCharts.LineStyle.Dashed,
         axisLabelVisible: true, title: 'last',
     });
