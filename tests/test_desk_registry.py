@@ -302,3 +302,37 @@ class TestAmericanPricingEnabled:
         desk = create_desk('janestreet', capital_allocation=0.2)
         assert desk.capital_allocation == 0.2
         assert desk.exercise_style == 'american'
+
+
+class TestEarningsGateEnabled:
+    """Phase 9: production Renaissance gates new single-name entries near
+    earnings, with an OFFLINE EarningsCache the registry attaches lazily. The
+    desk-class default stays off, and an un-ingested cache is a no-op."""
+
+    def test_renaissance_enables_gate_with_offline_calendar(self, monkeypatch, tmp_path):
+        from data.earnings_cache import EarningsCache
+        # Isolate the cache db so the read can't pick up a real earnings_data.db.
+        monkeypatch.setenv('EARNINGS_DB_PATH', str(tmp_path / 'earnings_data.db'))
+        desk = create_desk('renaissance')
+        assert desk.avoid_earnings_entries is True
+        assert isinstance(desk.earnings_calendar, EarningsCache)
+        # Un-ingested cache => no-op (no file even created on read).
+        assert desk.earnings_calendar.next_earnings('AAPL', '2026-01-01') is None
+        assert desk._earnings_imminent('AAPL', '2026-01-01') is False
+
+    def test_desk_class_default_stays_off(self):
+        assert RenaissanceDesk().avoid_earnings_entries is False
+        assert RenaissanceDesk().earnings_calendar is None
+
+    def test_capital_allocation_still_threads(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('EARNINGS_DB_PATH', str(tmp_path / 'earnings_data.db'))
+        desk = create_desk('renaissance', capital_allocation=0.3)
+        assert desk.capital_allocation == 0.3
+        assert desk.avoid_earnings_entries is True
+
+    def test_construction_creates_no_db_file(self, monkeypatch, tmp_path):
+        # Building the desk (and its cache) must not touch disk until ingest.
+        db = tmp_path / 'earnings_data.db'
+        monkeypatch.setenv('EARNINGS_DB_PATH', str(db))
+        create_desk('renaissance')
+        assert not db.exists()
