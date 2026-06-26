@@ -164,11 +164,18 @@ class _StandardScaler:
     are re-applied verbatim at predict time. A zero-std (constant) column is
     given unit std so transform never divides by zero (the centered column is
     then all zeros, contributing no signal — the correct degenerate result).
+
+    Standardized values are clipped to ``[-clip, +clip]`` (default 5 sigma)
+    so a fat-tailed input — an earnings gap or regime break that lands many
+    standard deviations out — cannot dominate the network's first layer.
+    ``clip=None`` disables the clip. Deterministic; preserves the in-run
+    byte-identical guarantee.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clip: Optional[float] = 5.0) -> None:
         self.mean_: Optional[np.ndarray] = None
         self.std_: Optional[np.ndarray] = None
+        self.clip = clip
 
     def fit(self, x_matrix: np.ndarray) -> "_StandardScaler":
         self.mean_ = x_matrix.mean(axis=0)
@@ -184,7 +191,10 @@ class _StandardScaler:
     def transform(self, x_matrix: np.ndarray) -> np.ndarray:
         if self.mean_ is None or self.std_ is None:
             raise RuntimeError('_StandardScaler.transform before fit')
-        return (x_matrix - self.mean_) / self.std_
+        z = (x_matrix - self.mean_) / self.std_
+        if self.clip is not None:
+            z = np.clip(z, -self.clip, self.clip)
+        return z
 
 
 # ----------------------------------------------------------------------
