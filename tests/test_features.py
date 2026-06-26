@@ -67,10 +67,11 @@ class TestColumnContract:
     def test_extended_columns_in_documented_order(self):
         frame = extended_feature_frame(synth())
         assert list(frame.columns) == list(FEATURE_COLUMNS)
-        # baseline (5) + extras (5) + seasonal (5) = 15.
-        assert len(FEATURE_COLUMNS) == 15
+        # baseline (5) + extras (6) + seasonal (5) = 16.
+        assert len(FEATURE_COLUMNS) == 16
         assert list(EXTRA_FEATURE_COLUMNS) == [
-            'ret_5', 'ret_10', 'vol_20', 'momentum_10', 'zscore_20']
+            'ret_5', 'ret_10', 'vol_20', 'momentum_10', 'zscore_20',
+            'dollar_vol_ratio']
         assert list(SEASONAL_FEATURE_COLUMNS) == [
             'dow_sin', 'dow_cos', 'month_sin', 'month_cos', 'turn_of_month']
 
@@ -137,6 +138,47 @@ class TestSeasonalFeatures:
         cols = list(SEASONAL_FEATURE_COLUMNS)
         pd.testing.assert_frame_equal(
             full.loc[common, cols], prefix.loc[common, cols])
+
+
+class TestDollarVolumeFeature:
+    def test_dollar_vol_ratio_matches_close_times_volume(self):
+        frame = synth(seed=4, n=120)
+        ext = extended_feature_frame(frame)
+        # Reconstruct on the surviving (post-warm-up) index.
+        dollar_vol = frame['close'] * frame['volume']
+        expected = (dollar_vol / dollar_vol.rolling(20).mean()).reindex(
+            ext.index)
+        pd.testing.assert_series_equal(
+            ext['dollar_vol_ratio'], expected, check_names=False)
+
+    def test_dollar_vol_ratio_distinct_from_share_volume_ratio(self):
+        # The whole point: dollar terms carry info the share ratio lacks.
+        ext = extended_feature_frame(synth(seed=5, n=120))
+        assert not np.allclose(
+            ext['dollar_vol_ratio'].to_numpy(),
+            ext['volume_ratio'].to_numpy())
+
+    def test_dollar_vol_ratio_is_finite(self):
+        ext = extended_feature_frame(synth(seed=6, n=120))
+        vals = ext['dollar_vol_ratio'].to_numpy(dtype=float)
+        assert not np.isnan(vals).any()
+        assert not np.isinf(vals).any()
+
+    def test_dollar_vol_ratio_has_no_lookahead(self):
+        # Backward-looking only — truncating future rows leaves earlier
+        # rows' value byte-identical.
+        full = extended_feature_frame(synth(seed=7, n=120))
+        prefix = extended_feature_frame(synth(seed=7, n=120).iloc[:80])
+        common = prefix.index.intersection(full.index)
+        pd.testing.assert_series_equal(
+            full.loc[common, 'dollar_vol_ratio'],
+            prefix.loc[common, 'dollar_vol_ratio'])
+
+    def test_dollar_vol_ratio_deterministic(self):
+        a = extended_feature_frame(synth(seed=8, n=90))
+        b = extended_feature_frame(synth(seed=8, n=90))
+        pd.testing.assert_series_equal(
+            a['dollar_vol_ratio'], b['dollar_vol_ratio'])
 
 
 class TestNoNaNOrInf:

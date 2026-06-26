@@ -52,7 +52,8 @@ BASE_FEATURE_COLUMNS: Sequence[str] = (
 #: :func:`extended_feature_frame`). Kept separate from the baseline so a
 #: caller can ask for just the golden-equivalent set when it wants parity.
 EXTRA_FEATURE_COLUMNS: Sequence[str] = (
-    'ret_5', 'ret_10', 'vol_20', 'momentum_10', 'zscore_20')
+    'ret_5', 'ret_10', 'vol_20', 'momentum_10', 'zscore_20',
+    'dollar_vol_ratio')
 
 #: Calendar/seasonality features derived from the frame's DatetimeIndex
 #: (documented in :func:`extended_feature_frame`). Cyclically encoded so the
@@ -164,6 +165,13 @@ def extended_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
                      ((close-mean_20)/std_20) — a mean-reversion signal
                      measuring how stretched price is from its recent
                      average; 0.0 when the 20-day std is zero.
+        dollar_vol_ratio
+                     dollar (turnover) volume vs its 20-day average:
+                     (close*volume) / mean_20(close*volume). volume_ratio
+                     captures SHARE volume vs average; this captures DOLLAR
+                     volume, so a $2 name and a $2,000 name with equal share
+                     volume are no longer indistinguishable in liquidity —
+                     cross-name turnover comparability the share ratio lacks.
 
     Plus seasonal columns (:data:`SEASONAL_FEATURE_COLUMNS`) derived from
     the DatetimeIndex — documented daily-equity seasonality the price
@@ -198,6 +206,11 @@ def extended_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
     roll_std_20 = close.rolling(window=20).std()
     extras['zscore_20'] = np.where(
         roll_std_20 > 0, (close - roll_mean_20) / roll_std_20, 0.0)
+    # Dollar (turnover) volume vs its 20-day average — backward-looking,
+    # like volume_ratio but in dollar terms. A zero 20-day average (all-zero
+    # volume window) yields inf, swept to NaN by the combined drop below.
+    dollar_vol = close * data['volume']
+    extras['dollar_vol_ratio'] = dollar_vol / dollar_vol.rolling(20).mean()
 
     # Calendar/seasonality features from the DatetimeIndex. Each is a
     # function of the row's OWN timestamp only (no look-ahead), defined on

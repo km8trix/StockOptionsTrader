@@ -160,9 +160,9 @@ class TestLightGBMDeterminism:
         assert a == b
 
     def test_uses_extended_feature_columns(self):
-        # The model shares the extended feature set (15 columns:
-        # 5 baseline + 5 price extras + 5 seasonal).
-        assert len(FEATURE_COLUMNS) == 15
+        # The model shares the extended feature set (16 columns:
+        # 5 baseline + 6 price extras + 5 seasonal).
+        assert len(FEATURE_COLUMNS) == 16
 
 
 class TestStackingMetaModel:
