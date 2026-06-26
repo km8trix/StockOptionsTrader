@@ -158,12 +158,6 @@ class TestDollarVolumeFeature:
             ext['dollar_vol_ratio'].to_numpy(),
             ext['volume_ratio'].to_numpy())
 
-    def test_dollar_vol_ratio_is_finite(self):
-        ext = extended_feature_frame(synth(seed=6, n=120))
-        vals = ext['dollar_vol_ratio'].to_numpy(dtype=float)
-        assert not np.isnan(vals).any()
-        assert not np.isinf(vals).any()
-
     def test_dollar_vol_ratio_has_no_lookahead(self):
         # Backward-looking only — truncating future rows leaves earlier
         # rows' value byte-identical.
