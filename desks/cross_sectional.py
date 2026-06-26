@@ -157,9 +157,12 @@ class CrossSectionalLongShortDesk(Desk):
         # 1 / (1 + lambda * normalized_dispersion), where dispersion is the std
         # of the committee members' per-symbol scores (a free uncertainty
         # proxy) normalized by the cross-section median; the per-side budget is
-        # then renormalized exactly like signal-strength sizing, so gross and
-        # dollar-neutrality are preserved while risk concentrates on the names
-        # the ensemble AGREES on. Needs >= 2 committee members to mean anything:
+        # then renormalized per side exactly like signal-strength sizing: each
+        # side's gross is bounded by its equal-weight budget, and long gross ==
+        # short gross only when disagreement is SYMMETRIC across sides (same
+        # caveat as signal-strength sizing -- asymmetric disagreement tilts the
+        # book just as asymmetric |scores| would). Risk concentrates on the
+        # names the ensemble AGREES on. Needs >= 2 committee members to matter:
         # a single-member committee has zero dispersion everywhere, so the
         # multiplier degrades to 1 (no change). See `_committee_dispersion`.
         if disagreement_lambda < 0.0:
