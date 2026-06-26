@@ -1196,3 +1196,109 @@ class TestSignalStrengthSizing:
         # Symmetric |scores| -> the two sides carry equal gross (net ~ 0).
         assert long_gross == pytest.approx(short_gross)
         assert long_gross <= 0.5 + 1e-12  # bounded by the equal-weight total
+
+
+class TestUncertaintyScaledSizing:
+    """Kronos idea #3: opt-in committee-disagreement sizing. Default off ->
+    byte-identical; on -> a name's conviction size is shrunk by
+    1 / (1 + lambda * normalized_dispersion), where dispersion is the std of
+    the committee members' per-symbol scores, normalized by the cross-section
+    median. Concentrates risk on the names the ensemble AGREES on while
+    renormalizing per side so gross and dollar-neutrality are preserved."""
+
+    def test_bad_disagreement_lambda_raises(self):
+        with pytest.raises(ValueError):
+            make_desk(default=monotone_scores(), disagreement_lambda=-0.1)
+
+    def test_conviction_size_shrinks_with_disagreement(self):
+        # The literal acceptance test: two EQUAL-|score| legs on one side, the
+        # one the committee disagrees about more is sized SMALLER. Exercises
+        # _conviction_sizes directly so the multiplier is isolated from ranking.
+        desk = make_desk(default=monotone_scores(),
+                         shrink_by_disagreement=True, disagreement_lambda=1.0)
+        sizes = desk._conviction_sizes(
+            ['A', 'B'], {'A': 0.2, 'B': 0.2}, flat_size=0.10,
+            disagreement={'A': 2.0, 'B': 0.0})  # A disagrees more
+        assert sizes['A'] < sizes['B']
+
+    def test_committee_dispersion_is_std_across_members(self):
+        # Two members; per-symbol dispersion is the population std across them.
+        frames = universe(4)
+        dates = frames['S00'].index
+        desk = TwoSigmaDesk(models=['gbm', 'lightgbm'],
+                            risk_manager=wide_risk())
+        desk._committee = [
+            ('gbm', stub_controller({'S00': 0.4, 'S01': 0.2})),
+            ('lightgbm', stub_controller({'S00': 0.0, 'S01': 0.2})),
+        ]
+        for _, controller in desk._committee:
+            controller.maybe_refit(frames, dates[0])
+        disp = desk._committee_dispersion(frames, dates[0])
+        assert disp['S00'] == pytest.approx(0.2)  # pstdev([0.4, 0.0])
+        assert disp['S01'] == pytest.approx(0.0)  # members agree -> no spread
+
+    def test_single_member_committee_has_no_dispersion(self):
+        # One member -> nothing to disagree with -> dispersion empty, and the
+        # multiplier degrades to 1 (a single-member desk is unaffected).
+        desk = make_desk(default=monotone_scores(),
+                         shrink_by_disagreement=True)
+        frames = universe(10)
+        dates = frames['S00'].index
+        drive(desk, frames, dates[:1], PortfolioManager(100000.0))
+        sliced = {s: f[f.index <= dates[0]] for s, f in frames.items()}
+        assert desk._committee_dispersion(sliced, dates[0]) == {}
+
+    # A 2-member committee whose averaged scores rank S00..S09 monotone, with
+    # SYMMETRIC disagreement: S00 (top long) and S09 (bottom short) carry 4x
+    # the cross-section's median dispersion, every other name carries the
+    # baseline. member = mean +/- spread, so the mean is preserved and the
+    # per-symbol pstdev equals `spread`.
+    MEAN = {'S00': 0.40, 'S01': 0.20, 'S02': 0.10, 'S03': 0.0, 'S04': 0.0,
+            'S05': 0.0, 'S06': 0.0, 'S07': -0.10, 'S08': -0.20, 'S09': -0.40}
+    SPREAD = {s: (0.20 if s in ('S00', 'S09') else 0.05) for s in MEAN}
+
+    def _committee_sizes(self, **kwargs):
+        frames = universe(10)
+        dates = frames['S00'].index
+        desk = TwoSigmaDesk(models=['gbm', 'lightgbm'], risk_manager=wide_risk(),
+                            quantile=0.3, target_gross=1.0, max_name_size=0.30,
+                            **kwargs)
+        member_a = {s: self.MEAN[s] + self.SPREAD[s] for s in self.MEAN}
+        member_b = {s: self.MEAN[s] - self.SPREAD[s] for s in self.MEAN}
+        desk._committee = [('gbm', stub_controller(member_a)),
+                           ('lightgbm', stub_controller(member_b))]
+        desk._model_label = 'gbm+lightgbm'
+        out = drive(desk, frames, dates[:1], PortfolioManager(100000.0))
+        return {i.asset.symbol: i.size_fraction for i in out[dates[0]]}
+
+    def test_committee_off_is_equal_weight(self):
+        # Flag off: the 2-member committee sizes equal-weight (flat) — the new
+        # path is inert, so the book is byte-identical to before.
+        sizes = self._committee_sizes()  # shrink_by_disagreement defaults False
+        flat = (0.5 * 1.0) / 3
+        for sym in ('S00', 'S01', 'S02', 'S07', 'S08', 'S09'):
+            assert sizes[sym] == pytest.approx(flat)
+
+    def test_committee_on_shrinks_the_disagreed_name(self):
+        sizes = self._committee_sizes(shrink_by_disagreement=True,
+                                      disagreement_lambda=1.0)
+        flat = (0.5 * 1.0) / 3
+        # The high-disagreement leg on each side is sized SMALLER than its
+        # equal-conviction, low-disagreement peers (which stay at the flat cap).
+        assert sizes['S00'] < sizes['S01']
+        assert sizes['S00'] < sizes['S02']
+        assert sizes['S09'] < sizes['S08']
+        assert sizes['S09'] < sizes['S07']
+        assert sizes['S01'] == pytest.approx(flat)
+        assert sizes['S08'] == pytest.approx(flat)
+        # No leg grows past the equal-weight cap (shrink never adds gross).
+        assert all(v <= flat + 1e-12 for v in sizes.values())
+
+    def test_committee_on_preserves_dollar_neutrality(self):
+        sizes = self._committee_sizes(shrink_by_disagreement=True,
+                                      disagreement_lambda=1.0)
+        long_gross = sizes['S00'] + sizes['S01'] + sizes['S02']
+        short_gross = sizes['S07'] + sizes['S08'] + sizes['S09']
+        # Symmetric disagreement -> the two sides shrink identically, so long
+        # gross == short gross (the book stays dollar-neutral).
+        assert long_gross == pytest.approx(short_gross)

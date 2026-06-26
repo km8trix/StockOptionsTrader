@@ -41,6 +41,7 @@ MARGIN IS NOT MODELED: shorts use the shared cash-account approximation
 from __future__ import annotations
 
 import logging
+import statistics
 from abc import abstractmethod
 from datetime import date as date_type
 from typing import Dict, List, Optional, Tuple
@@ -90,7 +91,9 @@ class CrossSectionalLongShortDesk(Desk):
                  min_scored: int = 4,
                  exit_quantile: Optional[float] = None,
                  min_holding_days: int = 0,
-                 size_by_signal_strength: bool = False):
+                 size_by_signal_strength: bool = False,
+                 shrink_by_disagreement: bool = False,
+                 disagreement_lambda: float = 1.0):
         super().__init__(
             key=key,
             name=name,
@@ -148,6 +151,25 @@ class CrossSectionalLongShortDesk(Desk):
         # the Renaissance stat-arb convention (per-side budgeting keeps long
         # gross == short gross, so conviction never tilts the book net-long).
         self.size_by_signal_strength = size_by_signal_strength
+
+        # Uncertainty-scaled sizing (opt-in; default False -> byte-identical).
+        # When on, each name's conviction size is multiplied by
+        # 1 / (1 + lambda * normalized_dispersion), where dispersion is the std
+        # of the committee members' per-symbol scores (a free uncertainty
+        # proxy) normalized by the cross-section median; the per-side budget is
+        # then renormalized per side exactly like signal-strength sizing: each
+        # side's gross is bounded by its equal-weight budget, and long gross ==
+        # short gross only when disagreement is SYMMETRIC across sides (same
+        # caveat as signal-strength sizing -- asymmetric disagreement tilts the
+        # book just as asymmetric |scores| would). Risk concentrates on the
+        # names the ensemble AGREES on. Needs >= 2 committee members to matter:
+        # a single-member committee has zero dispersion everywhere, so the
+        # multiplier degrades to 1 (no change). See `_committee_dispersion`.
+        if disagreement_lambda < 0.0:
+            raise ValueError(
+                f"disagreement_lambda {disagreement_lambda} must be >= 0")
+        self.shrink_by_disagreement = shrink_by_disagreement
+        self.disagreement_lambda = disagreement_lambda
 
         #: Note text style: ``note_label`` is the human label in trader
         #: notes (e.g. 'Two-Sigma'); ``reason_prefix`` is the lower-case tag
@@ -312,14 +334,18 @@ class CrossSectionalLongShortDesk(Desk):
         # total and long gross == short gross — dollar-neutral).
         long_sizes: Dict[str, float] = {}
         short_sizes: Dict[str, float] = {}
-        if self.size_by_signal_strength:
+        if self.size_by_signal_strength or self.shrink_by_disagreement:
+            # Cross-section-normalized committee disagreement (empty unless the
+            # opt-in flag is on AND there is real spread to normalize against).
+            disagreement = self._disagreement_weights(all_data, date)
             open_longs = [s for s in longs
                           if self._symbol_is_free(s, portfolio)]
             open_shorts = [s for s in shorts
                            if self._symbol_is_free(s, portfolio)]
-            long_sizes = self._conviction_sizes(open_longs, scores, long_size)
+            long_sizes = self._conviction_sizes(open_longs, scores, long_size,
+                                                disagreement)
             short_sizes = self._conviction_sizes(open_shorts, scores,
-                                                 short_size)
+                                                 short_size, disagreement)
 
         opened_longs: List[str] = []
         opened_shorts: List[str] = []
@@ -398,29 +424,92 @@ class CrossSectionalLongShortDesk(Desk):
 
     def _conviction_sizes(self, side_symbols: List[str],
                           scores: Dict[str, float],
-                          flat_size: float) -> Dict[str, float]:
-        """Signal-strength sizes for ONE side's freshly-opened legs.
+                          flat_size: float,
+                          disagreement: Optional[Dict[str, float]] = None,
+                          ) -> Dict[str, float]:
+        """Per-leg sizes for ONE side's freshly-opened legs.
 
         Reuses the Renaissance stat-arb convention: the side's flat budget
         (``flat_size`` per name) is redistributed WITHIN the side in
-        proportion to ``|score|``, each leg clamped to ``[floor, flat_size]``
-        so no leg exceeds the equal-weight cap and the side's gross stays
-        ``<=`` the equal-weight total — which keeps long gross == short gross
-        (the book stays dollar-neutral; conviction only varies sizes WITHIN a
-        side, never across them). A small positive floor keeps every selected
-        leg tradable (``DeskIntent`` requires ``size_fraction > 0``). All
-        scores zero on a side -> flat so every leg still trades.
+        proportion to a per-leg WEIGHT, each leg clamped to
+        ``[floor, flat_size]`` so no leg exceeds the equal-weight cap and the
+        side's gross stays ``<=`` the equal-weight total — which keeps long
+        gross == short gross (the book stays dollar-neutral; conviction only
+        varies sizes WITHIN a side, never across them). A small positive floor
+        keeps every selected leg tradable (``DeskIntent`` requires
+        ``size_fraction > 0``). All weights zero on a side -> flat so every leg
+        still trades.
+
+        The weight is ``|score|`` when ``size_by_signal_strength`` is on (else
+        uniform), multiplied by ``1 / (1 + lambda * normalized_dispersion)``
+        when ``shrink_by_disagreement`` is on and ``disagreement`` carries a
+        normalized value for the symbol — shrinking names the committee
+        disagrees about. With both flags off this method is not reached; with
+        only signal-strength on (``disagreement`` empty) the weight is exactly
+        ``|score|`` as before — byte-identical.
         """
         if not side_symbols:
             return {}
         floor = max(flat_size * 0.05, 1e-6)
-        abs_scores = {s: abs(float(scores[s])) for s in side_symbols}
-        total = sum(abs_scores.values())
+        if self.size_by_signal_strength:
+            weights = {s: abs(float(scores[s])) for s in side_symbols}
+        else:
+            weights = {s: 1.0 for s in side_symbols}
+        if disagreement:
+            lam = self.disagreement_lambda
+            weights = {s: w / (1.0 + lam * disagreement.get(s, 0.0))
+                       for s, w in weights.items()}
+        total = sum(weights.values())
         if total <= 0.0:
             return {s: flat_size for s in side_symbols}
         budget = flat_size * len(side_symbols)
-        return {s: min(flat_size, max(budget * abs_scores[s] / total, floor))
+        return {s: min(flat_size, max(budget * weights[s] / total, floor))
                 for s in side_symbols}
+
+    def _committee_dispersion(self, all_data: Dict[str, pd.DataFrame],
+                              date) -> Dict[str, float]:
+        """Per-symbol std of the committee members' scores at ``date``.
+
+        A FREE uncertainty proxy: a high std means the ensemble disagrees
+        about the name. Re-runs each member's ``predict`` (cheap, deterministic,
+        and only paid on the opt-in ``shrink_by_disagreement`` path) and takes
+        the population std across the members that scored each symbol. A symbol
+        scored by fewer than 2 members gets dispersion 0 (no disagreement to
+        measure); a single-member committee therefore returns all-zero, so the
+        size multiplier degrades to 1 (no change).
+        """
+        if len(self._committee) < 2:
+            return {}
+        per_symbol: Dict[str, List[float]] = {}
+        for _, controller in self._committee:
+            result = controller.predict(all_data, date)
+            if result is None:
+                continue
+            for symbol, score in result.items():
+                per_symbol.setdefault(symbol, []).append(float(score))
+        return {symbol: statistics.pstdev(vals) if len(vals) >= 2 else 0.0
+                for symbol, vals in per_symbol.items()}
+
+    def _disagreement_weights(self, all_data: Dict[str, pd.DataFrame],
+                              date) -> Dict[str, float]:
+        """Committee dispersion normalized by its cross-section median.
+
+        Empty unless ``shrink_by_disagreement`` is on AND there is real spread
+        to normalize against (a positive median dispersion). Normalizing per
+        rebalance makes a name's shrink RELATIVE to the day's typical
+        disagreement, so a uniform shrink (everyone equally uncertain) leaves
+        the book unchanged after the per-side renormalization — only names that
+        disagree MORE than their peers shrink.
+        """
+        if not self.shrink_by_disagreement:
+            return {}
+        raw = self._committee_dispersion(all_data, date)
+        if not raw:
+            return {}
+        normalizer = statistics.median(raw.values())
+        if normalizer <= 0.0:
+            return {}
+        return {symbol: d / normalizer for symbol, d in raw.items()}
 
     def _has_bar_today(self, frame: Optional[pd.DataFrame], date) -> bool:
         return (frame is not None and not frame.empty
