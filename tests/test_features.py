@@ -23,8 +23,9 @@ import pandas as pd
 import pytest
 
 from desks.features import (BASE_FEATURE_COLUMNS, EXTRA_FEATURE_COLUMNS,
-                            FEATURE_COLUMNS, base_feature_frame,
-                            cross_sectional_rank, extended_feature_frame)
+                            FEATURE_COLUMNS, SEASONAL_FEATURE_COLUMNS,
+                            base_feature_frame, cross_sectional_rank,
+                            extended_feature_frame)
 from desks.ml_model import GradientBoostingModel
 
 # C1 FIX (landed): the zero-spread fallbacks in
@@ -63,12 +64,15 @@ class TestColumnContract:
         assert list(BASE_FEATURE_COLUMNS) == [
             'ret_1', 'rsi', 'macd', 'bb_position', 'volume_ratio']
 
-    def test_extended_has_ten_columns_in_documented_order(self):
+    def test_extended_columns_in_documented_order(self):
         frame = extended_feature_frame(synth())
         assert list(frame.columns) == list(FEATURE_COLUMNS)
-        assert len(FEATURE_COLUMNS) == 10
+        # baseline (5) + extras (5) + seasonal (5) = 15.
+        assert len(FEATURE_COLUMNS) == 15
         assert list(EXTRA_FEATURE_COLUMNS) == [
             'ret_5', 'ret_10', 'vol_20', 'momentum_10', 'zscore_20']
+        assert list(SEASONAL_FEATURE_COLUMNS) == [
+            'dow_sin', 'dow_cos', 'month_sin', 'month_cos', 'turn_of_month']
 
     def test_extended_is_superset_of_base(self):
         base = base_feature_frame(synth())
@@ -101,6 +105,38 @@ class TestColumnContract:
         # On non-trivial (random-walk) data the two columns are distinct.
         assert not np.allclose(
             ext['momentum_10'].to_numpy(), ext['ret_10'].to_numpy())
+
+
+class TestSeasonalFeatures:
+    def test_seasonal_columns_match_index_encoding(self):
+        ext = extended_feature_frame(synth(seed=1, n=120))
+        idx = ext.index
+        dow = idx.dayofweek.to_numpy(dtype=float)
+        month = idx.month.to_numpy(dtype=float)
+        assert np.allclose(ext['dow_sin'].to_numpy(),
+                           np.sin(2 * np.pi * dow / 5.0))
+        assert np.allclose(ext['dow_cos'].to_numpy(),
+                           np.cos(2 * np.pi * dow / 5.0))
+        assert np.allclose(ext['month_sin'].to_numpy(),
+                           np.sin(2 * np.pi * month / 12.0))
+        assert np.allclose(ext['month_cos'].to_numpy(),
+                           np.cos(2 * np.pi * month / 12.0))
+        expected_tom = ((idx.day <= 3) | (idx.day >= 28)).astype(float)
+        assert np.array_equal(ext['turn_of_month'].to_numpy(), expected_tom)
+        # Cyclic encodings stay in [-1, 1]; the flag is binary.
+        for col in ('dow_sin', 'dow_cos', 'month_sin', 'month_cos'):
+            assert ext[col].abs().max() <= 1.0
+        assert set(np.unique(ext['turn_of_month'].to_numpy())) <= {0.0, 1.0}
+
+    def test_seasonal_has_no_lookahead(self):
+        # Each seasonal value depends ONLY on its own date — truncating
+        # future rows leaves earlier rows' seasonal columns byte-identical.
+        full = extended_feature_frame(synth(seed=2, n=120))
+        prefix = extended_feature_frame(synth(seed=2, n=120).iloc[:80])
+        common = prefix.index.intersection(full.index)
+        cols = list(SEASONAL_FEATURE_COLUMNS)
+        pd.testing.assert_frame_equal(
+            full.loc[common, cols], prefix.loc[common, cols])
 
 
 class TestNoNaNOrInf:

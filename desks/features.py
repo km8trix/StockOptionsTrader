@@ -54,9 +54,17 @@ BASE_FEATURE_COLUMNS: Sequence[str] = (
 EXTRA_FEATURE_COLUMNS: Sequence[str] = (
     'ret_5', 'ret_10', 'vol_20', 'momentum_10', 'zscore_20')
 
-#: Full extended column order: baseline followed by extras.
+#: Calendar/seasonality features derived from the frame's DatetimeIndex
+#: (documented in :func:`extended_feature_frame`). Cyclically encoded so the
+#: models see no false ordinal jump at the wrap (Friday->Monday,
+#: December->January).
+SEASONAL_FEATURE_COLUMNS: Sequence[str] = (
+    'dow_sin', 'dow_cos', 'month_sin', 'month_cos', 'turn_of_month')
+
+#: Full extended column order: baseline, then extras, then seasonal.
 FEATURE_COLUMNS: Sequence[str] = (
-    tuple(BASE_FEATURE_COLUMNS) + tuple(EXTRA_FEATURE_COLUMNS))
+    tuple(BASE_FEATURE_COLUMNS) + tuple(EXTRA_FEATURE_COLUMNS)
+    + tuple(SEASONAL_FEATURE_COLUMNS))
 
 
 # ----------------------------------------------------------------------
@@ -157,6 +165,18 @@ def extended_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
                      measuring how stretched price is from its recent
                      average; 0.0 when the 20-day std is zero.
 
+    Plus seasonal columns (:data:`SEASONAL_FEATURE_COLUMNS`) derived from
+    the DatetimeIndex — documented daily-equity seasonality the price
+    features cannot express:
+
+        dow_sin/cos     day-of-week (Mon=0..Fri=4) on a 5-day cycle,
+                        sin/cos encoded (Monday/Friday effects).
+        month_sin/cos   month-of-year on a 12-month cycle, sin/cos encoded
+                        (January / month-of-year effect).
+        turn_of_month   1.0 on the first/last few calendar days
+                        (``day <= 3 or day >= 28``), else 0.0 — the
+                        turn-of-month effect.
+
     The extras are computed from raw ``close`` (independent of indicator
     enrichment), then concatenated with :func:`base_feature_frame` and a
     single combined NaN/non-finite drop is applied so the warm-up rows of
@@ -179,11 +199,28 @@ def extended_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
     extras['zscore_20'] = np.where(
         roll_std_20 > 0, (close - roll_mean_20) / roll_std_20, 0.0)
 
-    # Reindex extras onto the base frame's index first is unnecessary —
-    # both share `data.index`; the combined dropna() removes any row where
-    # EITHER the baseline or an extra is still warming up, so all columns
-    # are defined on every surviving row.
-    combined = base.join(extras, how='outer')
+    # Calendar/seasonality features from the DatetimeIndex. Each is a
+    # function of the row's OWN timestamp only (no look-ahead), defined on
+    # every row (no warm-up). Day-of-week and month are cyclically encoded
+    # (sin/cos) so the wrap carries no false ordinal gap; turn_of_month is a
+    # binary flag for the first/last few calendar days (a documented equity
+    # seasonal).
+    idx = data.index
+    dow = idx.dayofweek.to_numpy(dtype=float)   # Mon=0 .. Fri=4
+    month = idx.month.to_numpy(dtype=float)     # 1 .. 12
+    seasonal = pd.DataFrame(index=idx)
+    seasonal['dow_sin'] = np.sin(2 * np.pi * dow / 5.0)
+    seasonal['dow_cos'] = np.cos(2 * np.pi * dow / 5.0)
+    seasonal['month_sin'] = np.sin(2 * np.pi * month / 12.0)
+    seasonal['month_cos'] = np.cos(2 * np.pi * month / 12.0)
+    seasonal['turn_of_month'] = (
+        (idx.day <= 3) | (idx.day >= 28)).astype(float)
+
+    # Both extras and seasonal share `data.index`; the combined dropna()
+    # removes any row where the baseline or an extra is still warming up
+    # (seasonal columns are defined on every row), so all columns are
+    # defined on every surviving row.
+    combined = base.join(extras, how='outer').join(seasonal, how='outer')
     combined = combined.reindex(columns=list(FEATURE_COLUMNS))
     combined = combined.replace([np.inf, -np.inf], np.nan)
     return combined.dropna()
