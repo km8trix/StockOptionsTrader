@@ -136,6 +136,16 @@ def test_index_returns_200(client):
     assert response.status_code == 200
 
 
+def test_symbol_universe_datalist_rendered(client):
+    """The shared autocomplete datalist ships curated tickers on every page."""
+    html = client.get('/backtest').get_data(as_text=True)
+    assert 'id="symbolUniverse"' in html
+    assert '<option value="AAPL">' in html
+    assert '<option value="SPY">' in html
+    # Multi-symbol backtest input is wired for chips.
+    assert 'data-symbol-chips' in html
+
+
 # ==================== LIVE BROKER UNAVAILABILITY (503) ====================
 
 

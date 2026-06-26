@@ -87,6 +87,13 @@ def create_app(config: dict | None = None) -> Flask:
         from gui.glossary import GLOSSARY
         return {'GLOSSARY': GLOSSARY}
 
+    @app.context_processor
+    def inject_symbol_universe():
+        """Curated ticker list for the shared <datalist> autocomplete."""
+        from data.universe import CORE_ETFS, SECTOR_ETFS, LARGE_CAP_100
+        return {'symbol_universe': sorted(set(
+            CORE_ETFS + SECTOR_ETFS + LARGE_CAP_100))}
+
     # Import blueprints inside the factory so importing gui.app stays cheap
     # and side-effect free until an app is actually built.
     from gui.routes.views import views_bp

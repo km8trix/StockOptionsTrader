@@ -132,6 +132,13 @@
     <!-- Toast container (top-right); utils.js showToast() appends here -->
     <div id="toastContainer" class="toast-container-app" aria-live="polite" aria-atomic="false"></div>
 
+    <!-- Shared ticker autocomplete: any symbol input uses list="symbolUniverse".
+         Populated from data/universe.py via the inject_symbol_universe context
+         processor. -->
+    <datalist id="symbolUniverse">
+        {% for s in symbol_universe %}<option value="{{ s }}"></option>{% endfor %}
+    </datalist>
+
     <!-- Shared confirm dialog: utils.js confirmModal() sets the title/body/
          confirm button and resolves a Promise<boolean>. Replaces window.confirm()
          so prompts match the app theme and are focus-managed. -->
