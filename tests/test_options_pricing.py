@@ -16,7 +16,6 @@ import pytest
 
 from core.models import Asset, AssetType
 from desks.options_pricing import (HV_WINDOW, IV_FLOOR,
-                                   OpenBBEarningsCalendar,
                                    SyntheticEarningsCalendar,
                                    SyntheticIVModel, american_binomial_price,
                                    black_scholes_greeks,
@@ -243,15 +242,6 @@ class TestEarningsCalendars:
             pd.Timestamp('2023-06-14').date()
         assert calendar.next_earnings('AAA', '2023-07-01') is None
         assert calendar.next_earnings('ZZZ', '2023-01-01') is None
-
-    def test_openbb_stub_degrades_to_none_offline(self, monkeypatch):
-        # Guarded + lazy: the stub must swallow an openbb import failure
-        # and return None instead of raising (live wiring is Phase 9).
-        # The import is FORCED to fail so no network is ever attempted.
-        import sys
-        monkeypatch.setitem(sys.modules, 'openbb', None)
-        assert OpenBBEarningsCalendar().next_earnings(
-            'AAA', '2023-01-01') is None
 
 
 class TestPriceOption:

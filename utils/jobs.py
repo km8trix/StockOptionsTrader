@@ -75,15 +75,6 @@ class JobManager:
             record = self._jobs.get(job_id)
             return dict(record) if record is not None else None
 
-    def list_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Newest-first job snapshots with 'result' omitted (set to None)."""
-        with self._lock:
-            records = [dict(record) for record in
-                       reversed(list(self._jobs.values()))]
-        for record in records[:limit]:
-            record['result'] = None
-        return records[:limit]
-
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -99,7 +90,7 @@ class JobManager:
 
         def progress(value: float) -> None:
             # Clamp to [0, 100] so a misbehaving job body can never expose
-            # an out-of-range percentage via get()/list_jobs().
+            # an out-of-range percentage via get().
             clamped = min(100.0, max(0.0, float(value)))
             with self._lock:
                 rec = self._jobs.get(job_id)
