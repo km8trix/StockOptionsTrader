@@ -136,8 +136,9 @@ class TestProtocolConformance:
 
     @pytest.mark.parametrize('factory', NEW_MODEL_FACTORIES)
     def test_uses_extended_feature_columns(self, factory):
-        # Both models share the extended feature set (10 columns).
-        assert len(FEATURE_COLUMNS) == 10
+        # Both models share the extended feature set (15 columns:
+        # 5 baseline + 5 price extras + 5 seasonal).
+        assert len(FEATURE_COLUMNS) == 15
 
 
 # ----------------------------------------------------------------------
