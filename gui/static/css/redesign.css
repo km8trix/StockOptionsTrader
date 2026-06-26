@@ -463,3 +463,68 @@ body.ui-next .env-badge.env-production {
 
     body.ui-next .status-dot { animation: none; }
 }
+
+/* ==========================================================================
+   Symbol chips (utils.js initSymbolChips)
+   ========================================================================== */
+.symbol-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.symbol-chips-list { display: contents; }
+.symbol-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px 2px 10px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text);
+    background: rgba(212, 175, 55, 0.14);
+    border: 1px solid rgba(212, 175, 55, 0.35);
+    border-radius: 999px;
+}
+.symbol-chip-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    font-size: 1rem;
+    line-height: 1;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: 50%;
+    cursor: pointer;
+}
+.symbol-chip-x:hover { color: var(--accent); background: rgba(255, 255, 255, 0.08); }
+.symbol-chips-entry {
+    flex: 1 1 90px;
+    min-width: 90px;
+    padding: 2px 4px;
+    color: var(--text);
+    background: transparent;
+    border: 0;
+    outline: none;
+    text-transform: uppercase;
+}
+.symbol-chips-entry::placeholder { color: var(--text-muted); text-transform: none; }
+.symbol-chips-clear {
+    padding: 2px 10px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+.symbol-chips-clear:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.symbol-chips-clear:disabled { opacity: 0.4; cursor: default; }

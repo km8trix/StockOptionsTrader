@@ -118,7 +118,8 @@
                     <div class="flex-grow-1">
                         <label class="form-label" for="quoteSymbols">Symbols (comma-separated)</label>
                         <input type="text" class="form-control quote-input" id="quoteSymbols"
-                               maxlength="200" autocomplete="off" placeholder="SPY, AAPL, QQQ">
+                               maxlength="200" autocomplete="off" placeholder="SPY, AAPL, QQQ"
+                               data-symbol-chips>
                     </div>
                     <button type="button" class="btn btn-outline-secondary" id="btnQuotes">
                         <i class="bi bi-search" aria-hidden="true"></i> Look up
@@ -190,7 +191,7 @@
                             <div class="col-sm-3">
                                 <label class="form-label" for="eqSymbol">Symbol</label>
                                 <input type="text" class="form-control ticket-input" id="eqSymbol"
-                                       maxlength="12" placeholder="SPY">
+                                       maxlength="12" placeholder="SPY" list="symbolUniverse">
                             </div>
                             <div class="col-sm-3">
                                 <label class="form-label" for="eqSide">Side</label>
@@ -218,7 +219,7 @@
                             <div class="col-sm-2">
                                 <label class="form-label" for="optSymbol">Underlying</label>
                                 <input type="text" class="form-control ticket-input" id="optSymbol"
-                                       maxlength="12" placeholder="SPY">
+                                       maxlength="12" placeholder="SPY" list="symbolUniverse">
                             </div>
                             <div class="col-sm-2">
                                 <label class="form-label" for="optCallPut">Type</label>
@@ -271,7 +272,7 @@
                             <div class="col-sm-3">
                                 <label class="form-label" for="spSymbol">Underlying</label>
                                 <input type="text" class="form-control ticket-input" id="spSymbol"
-                                       maxlength="12" placeholder="SPY">
+                                       maxlength="12" placeholder="SPY" list="symbolUniverse">
                             </div>
                             <div class="col-sm-3">
                                 <label class="form-label" for="spExpiry">Expiry</label>

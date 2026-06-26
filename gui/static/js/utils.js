@@ -268,8 +268,99 @@ function confirmModal({ title, body, confirmText = 'Confirm', variant = 'primary
     });
 }
 
+/* ==========================================================================
+   Symbol chips — progressive enhancement for comma-separated symbol inputs
+   ========================================================================== */
+
+/**
+ * Turn a comma-separated <input> into a chip picker with autocomplete.
+ *
+ * The original input stays in the DOM (hidden) as the single source of
+ * truth: its .value is kept as the comma-joined symbol list, so existing
+ * page JS (e.g. btSymbols.value) and the backend parser need no changes.
+ * An 'input' event is dispatched on every mutation so listeners still fire.
+ *
+ * @param {string} inputId id of the existing text input
+ */
+function initSymbolChips(inputId) {
+    const src = document.getElementById(inputId);
+    if (!src || src.dataset.chipsReady) return;
+    src.dataset.chipsReady = '1';
+
+    const parse = () => src.value.split(',')
+        .map((s) => s.trim().toUpperCase()).filter(Boolean)
+        .filter((s, i, a) => a.indexOf(s) === i);  // dedupe, keep order
+    const commit = (list) => {
+        src.value = list.join(', ');
+        src.dispatchEvent(new Event('input', { bubbles: true }));
+        render();
+    };
+
+    const wrap = document.createElement('div');
+    wrap.className = 'symbol-chips';
+    const chips = document.createElement('div');
+    chips.className = 'symbol-chips-list';
+
+    const entry = document.createElement('input');
+    entry.type = 'text';
+    entry.className = 'symbol-chips-entry';
+    entry.setAttribute('list', 'symbolUniverse');
+    entry.setAttribute('autocomplete', 'off');
+    entry.spellcheck = false;
+    entry.placeholder = src.placeholder || 'Add symbol…';
+    entry.setAttribute('aria-label', 'Add symbol');
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'symbol-chips-clear';
+    clear.textContent = 'Clear';
+    clear.addEventListener('click', () => { commit([]); entry.focus(); });
+
+    function add(raw) {
+        const sym = (raw || '').trim().toUpperCase();
+        if (!sym) return;
+        const list = parse();
+        if (!list.includes(sym)) list.push(sym);
+        commit(list);
+        entry.value = '';
+    }
+
+    function render() {
+        chips.textContent = '';
+        parse().forEach((sym) => {
+            const chip = document.createElement('span');
+            chip.className = 'symbol-chip';
+            const label = document.createElement('span');
+            label.textContent = sym;
+            const x = document.createElement('button');
+            x.type = 'button';
+            x.className = 'symbol-chip-x';
+            x.innerHTML = '&times;';
+            x.setAttribute('aria-label', `Remove ${sym}`);
+            x.addEventListener('click', () =>
+                commit(parse().filter((s) => s !== sym)));
+            chip.append(label, x);
+            chips.appendChild(chip);
+        });
+        clear.disabled = parse().length === 0;
+    }
+
+    // Comma or Enter commits the typed symbol; datalist pick / blur via change.
+    entry.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); add(entry.value); }
+    });
+    entry.addEventListener('change', () => add(entry.value));
+
+    src.style.display = 'none';
+    src.parentNode.insertBefore(wrap, src.nextSibling);
+    wrap.append(chips, entry, clear);
+    render();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     setDefaultDates();
+    document.querySelectorAll('[data-symbol-chips]').forEach(
+        (el) => initSymbolChips(el.id));
     _pingHealth();
     setInterval(_pingHealth, 60000);
     // Activate any explain() info popovers on the page (Bootstrap bundle is
