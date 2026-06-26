@@ -39,7 +39,7 @@ torch = pytest.importorskip('torch', reason='torch wheel not installed')
 
 from desks.models import available_models, build_model  # noqa: E402
 from desks.models.neural import (FEATURE_COLUMNS, MLPModel,  # noqa: E402
-                                 SequenceModel)
+                                 SequenceModel, _StandardScaler)
 from desks.walk_forward import WalkForwardModel  # noqa: E402
 
 
@@ -439,3 +439,24 @@ class TestRegistry:
     def test_build_returns_fresh_unshared_instances(self):
         assert build_model('mlp') is not build_model('mlp')
         assert build_model('lstm') is not build_model('lstm')
+
+
+class TestStandardScalerClip:
+    """The scaler caps standardized features at +/- clip (default 5 sigma)."""
+
+    def test_transform_clips_outliers_to_default_five_sigma(self):
+        scaler = _StandardScaler()  # default clip=5.0
+        scaler.fit(np.array([[0.0], [1.0], [2.0], [3.0], [4.0]]))
+        out = scaler.transform(np.array([[1e6], [-1e6]]))
+        assert out[0, 0] == 5.0
+        assert out[1, 0] == -5.0
+        # In-window values (|z| < 5) pass through untouched — the clip only
+        # caps the tails, it does not distort the bulk.
+        in_window = scaler.transform(np.array([[2.0]]))  # the train mean -> 0
+        assert in_window[0, 0] == pytest.approx(0.0)
+
+    def test_clip_none_leaves_extreme_values_unclipped(self):
+        scaler = _StandardScaler(clip=None)
+        scaler.fit(np.array([[0.0], [1.0], [2.0], [3.0], [4.0]]))
+        out = scaler.transform(np.array([[1e6]]))
+        assert out[0, 0] > 100.0  # far past the 5-sigma cap, uncapped
