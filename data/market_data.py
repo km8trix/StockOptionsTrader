@@ -321,19 +321,6 @@ class MarketDataHandler:
             index=pd.DatetimeIndex([], name='date'),
         )
     
-    def get_current_price(self, symbol: str, date: datetime) -> Optional[float]:
-        """Get price for a specific date"""
-        if symbol not in self.stock_data:
-            return None
-        
-        data = self.stock_data[symbol]
-        date_str = date.strftime('%Y-%m-%d')
-
-        if date_str in data.index:
-            raw_value = data.at[date_str, 'close']
-            return float(raw_value)
-        return None
-    
     def calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators"""
         data['sma_20'] = data['close'].rolling(window=20).mean()
@@ -373,62 +360,5 @@ class MarketDataHandler:
             )
         data['atr'] = data['tr'].rolling(window=14).mean()
         data['volume_sma'] = data['volume'].rolling(window=20).mean()
-        
+
         return data
-    
-    def estimate_option_price(self, stock_price: float, strike: float,
-                             time_to_expiry: float, volatility: float,
-                             option_type: str = 'call', rate: float = 0.05) -> float:
-        """Estimate option price using Black-Scholes.
-
-        Guards the degenerate inputs that would otherwise divide by zero in
-        d1 — volatility <= 0 or time_to_expiry <= 0 — and a NaN volatility
-        coming from calculate_volatility on a short window. In those cases
-        returns the discounted intrinsic value (clamped >= 0) rather than
-        raising ZeroDivisionError or returning inf/NaN, which would silently
-        poison any pricing/hedging math downstream.
-        """
-        from scipy.stats import norm
-
-        if (not np.isfinite(volatility) or volatility <= 0.0
-                or not np.isfinite(time_to_expiry) or time_to_expiry <= 0.0):
-            discount = np.exp(-rate * max(float(time_to_expiry), 0.0))
-            if option_type.lower() == 'call':
-                intrinsic = stock_price - strike * discount
-            else:
-                intrinsic = strike * discount - stock_price
-            return float(max(intrinsic, 0.0))
-
-        d1 = (np.log(stock_price / strike) + (rate + 0.5 * volatility ** 2) * time_to_expiry) / (volatility * np.sqrt(time_to_expiry))
-        d2 = d1 - volatility * np.sqrt(time_to_expiry)
-        
-        if option_type.lower() == 'call':
-            price = stock_price * norm.cdf(d1) - strike * np.exp(-rate * time_to_expiry) * norm.cdf(d2)
-        else:
-            price = strike * np.exp(-rate * time_to_expiry) * norm.cdf(-d2) - stock_price * norm.cdf(-d1)
-        
-        return max(price, 0)
-    
-    def calculate_volatility(self, data: pd.DataFrame, window: int = 20) -> float:
-        """Annualized historical volatility from the trailing `window` returns.
-
-        Returns NaN — never an IndexError on an empty frame, and never a
-        silent value computed from too little data — when there are fewer
-        than `window` + 1 closes (one is consumed by pct_change, so a full
-        `window`-length return sample needs window + 1 bars). A NaN here is
-        an explicit "undefined" that callers must check; estimate_option_price
-        already treats NaN volatility as degenerate and falls back to
-        intrinsic value rather than dividing by zero.
-
-        Note the two distinct sentinels: NaN means "undefined" (too little
-        data), whereas a genuinely flat price series returns 0.0 — real *zero*
-        realized volatility, not undefined. estimate_option_price treats both
-        vol <= 0 and NaN as degenerate, so either is handled safely there.
-        """
-        if data is None or 'close' not in data.columns or len(data) < window + 1:
-            logger.warning(
-                "calculate_volatility: %d closes < required %d; volatility undefined",
-                0 if data is None else len(data), window + 1)
-            return float('nan')
-        returns = data['close'].pct_change()
-        return float(returns.rolling(window=window).std().iloc[-1] * np.sqrt(252))

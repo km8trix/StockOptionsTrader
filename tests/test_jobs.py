@@ -174,32 +174,6 @@ class TestProgress:
         assert record['progress'] == 100.0
 
 
-class TestListJobs:
-    def test_newest_first_with_result_omitted(self):
-        manager = JobManager()
-        job_ids = []
-        for i in range(3):
-            job_id = manager.submit(lambda progress, i=i: f"result-{i}")
-            wait_for_status(manager, job_id, 'done')
-            job_ids.append(job_id)
-
-        listed = manager.list_jobs()
-        assert [r['job_id'] for r in listed] == list(reversed(job_ids))
-        assert all(r['result'] is None for r in listed)
-        assert all(r['status'] == 'done' for r in listed)
-        # get() still serves the full result.
-        assert manager.get(job_ids[-1])['result'] == 'result-2'
-
-    def test_limit_caps_payload(self):
-        manager = JobManager()
-        for i in range(5):
-            job_id = manager.submit(lambda progress: None)
-            wait_for_status(manager, job_id, 'done')
-
-        assert len(manager.list_jobs(limit=2)) == 2
-        assert len(manager.list_jobs()) == 5
-
-
 class TestEviction:
     def test_finished_jobs_capped_at_50_oldest_evicted(self):
         manager = JobManager()
@@ -216,7 +190,6 @@ class TestEviction:
             assert manager.get(job_id) is None
         for job_id in kept:
             assert manager.get(job_id) is not None
-        assert len(manager.list_jobs(limit=100)) == MAX_FINISHED_JOBS
 
     def test_running_jobs_are_never_evicted(self):
         manager = JobManager()

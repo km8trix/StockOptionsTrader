@@ -4,47 +4,21 @@ Base Strategy Class - Framework for implementing trading strategies
 
 from abc import ABC, abstractmethod
 import pandas as pd
-from typing import Dict
-from core.models import Asset, AssetType
-from data.market_data import MarketDataHandler
+from core.models import Asset
 
 
 class Strategy(ABC):
     """Abstract base class for trading strategies"""
-    
+
     def __init__(self, name: str):
         self.name = name
-        self.market_data = MarketDataHandler()
-        self.signals: Dict[Asset, str] = {}
-        
+
     @abstractmethod
     def generate_signals(self, data: pd.DataFrame, asset: Asset) -> str:
         """
         Generate trading signals: 'BUY', 'SELL', or 'HOLD'
         """
         pass
-    
-    def analyze(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """Analyze data and generate a full historical series of signals safely"""
-        data = self.market_data.fetch_stock_data(symbol, start_date, end_date)
-        if data.empty:
-            return data
-        
-        data = self.market_data.calculate_indicators(data)
-        asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
-        
-        # Initialize signal history column
-        data['signal'] = 'HOLD'
-        
-        for idx in range(1, len(data)):
-            signal = self.generate_signals(data.iloc[:idx+1], asset)
-            data.loc[data.index[idx], 'signal'] = signal
-        
-        # Store latest state to prevent breaks in legacy single-lookup indicators
-        if not data.empty:
-            self.signals[asset] = data['signal'].iloc[-1]
-        
-        return data
 
 
 class MomentumStrategy(Strategy):

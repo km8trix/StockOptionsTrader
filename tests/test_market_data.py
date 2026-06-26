@@ -156,42 +156,6 @@ def test_index_symbol_routes_to_index_endpoint(monkeypatch):
 
 # --- Phase 0: silent-corruption guards -------------------------------------
 
-def test_calculate_volatility_returns_nan_on_short_window(make_ohlcv):
-    """Too few closes for a full window must yield an explicit NaN, never an
-    IndexError or a silently-undersampled value that flows into pricing."""
-    h = MarketDataHandler(cache=False)
-    short = make_ohlcv(n_days=5)          # < window + 1 (= 21)
-    vol = h.calculate_volatility(short, window=20)
-    assert np.isnan(vol)
-
-
-def test_calculate_volatility_valid_when_enough_data(make_ohlcv):
-    h = MarketDataHandler(cache=False)
-    data = make_ohlcv(n_days=60)
-    vol = h.calculate_volatility(data, window=20)
-    assert np.isfinite(vol) and vol > 0
-
-
-def test_estimate_option_price_guards_zero_volatility():
-    """volatility <= 0 (or NaN) must NOT divide by zero in d1; the price falls
-    back to discounted intrinsic, clamped >= 0."""
-    h = MarketDataHandler(cache=False)
-    # ITM call, zero vol -> ~ intrinsic S - K*e^{-rT}
-    price = h.estimate_option_price(stock_price=110.0, strike=100.0,
-                                    time_to_expiry=0.5, volatility=0.0,
-                                    option_type='call', rate=0.05)
-    assert np.isfinite(price)
-    assert price == pytest.approx(110.0 - 100.0 * np.exp(-0.05 * 0.5))
-    # OTM call, zero vol -> intrinsic clamped to 0 (never negative/NaN)
-    otm = h.estimate_option_price(90.0, 100.0, 0.5, 0.0, 'call', 0.05)
-    assert otm == 0.0
-
-
-def test_estimate_option_price_guards_nan_volatility():
-    h = MarketDataHandler(cache=False)
-    price = h.estimate_option_price(100.0, 100.0, 0.5, float('nan'), 'put', 0.05)
-    assert np.isfinite(price)
-
 
 def test_empty_data_is_shaped_not_hollow():
     """The no-data failure frame must carry OHLCV columns so downstream

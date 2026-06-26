@@ -232,33 +232,6 @@ class SyntheticEarningsCalendar:
         return None
 
 
-class OpenBBEarningsCalendar:
-    """STUB: OpenBB-backed earnings calendar for later LIVE use.
-
-    Guarded and lazy: openbb is imported only inside next_earnings, and
-    any import/network failure degrades to None (no upcoming earnings)
-    with a WARNING — backtests and tests must NEVER take this path (no
-    network in tests; inject SyntheticEarningsCalendar instead). Wired
-    for real in Phase 9 alongside E*TRADE chain quotes.
-    """
-
-    def next_earnings(self, symbol: str, date) -> Optional[date_type]:
-        try:  # pragma: no cover — live-only path, never hit offline
-            from openbb import obb  # lazy: never imported at module load
-            current = pd.Timestamp(date).date()
-            results = obb.equity.calendar.earnings(symbol=symbol).results
-            dates = sorted(pd.Timestamp(r.report_date).date()
-                           for r in results if r.report_date is not None)
-            for earnings_date in dates:
-                if earnings_date >= current:
-                    return earnings_date
-            return None
-        except Exception as exc:  # pragma: no cover
-            logger.warning("OpenBB earnings calendar unavailable for %s: %s",
-                           symbol, exc)
-            return None
-
-
 # ----------------------------------------------------------------------
 # Synthetic IV model
 # ----------------------------------------------------------------------
@@ -267,7 +240,7 @@ class SyntheticIVModel:
 
     iv(symbol, underlying_frame, date) =
         HV20 (annualized 20-day realized vol of closes STRICTLY BEFORE
-        `date` — calculate_volatility semantics on the sliced frame:
+        `date` on the sliced frame:
         pct_change().rolling(20).std() * sqrt(252) at the last row)
         x vrp_multiplier (the variance risk premium: options habitually
         trade above realized vol; default 1.10)
