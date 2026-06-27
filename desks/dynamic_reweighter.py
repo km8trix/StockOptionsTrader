@@ -57,7 +57,7 @@ class DynamicReweighter:
     """
 
     #: Supported weighting modes -> the allocator method each invokes.
-    _WEIGHTING_MODES = ('risk_parity', 'performance')
+    _WEIGHTING_MODES = ('risk_parity', 'performance', 'risk_parity_cov')
 
     def __init__(self,
                  allocator: Optional[CrossDeskCapitalAllocator] = None,
@@ -77,7 +77,9 @@ class DynamicReweighter:
         self.rebalance_every = int(rebalance_every)
         self.warmup = int(warmup)
         #: 'risk_parity' (default, byte-identical) -> inverse-vol; 'performance'
-        #: -> opt-in guarded risk-adjusted performance tilt.
+        #: -> opt-in guarded risk-adjusted performance tilt; 'risk_parity_cov'
+        #: -> opt-in full-covariance risk parity (equalizes risk contributions
+        #: over the full covariance matrix, not the inverse-vol diagonal).
         self.weighting = weighting
         self._curves: Dict[str, List[Tuple[pd.Timestamp, float]]] = {}
         #: Append-only audit of every rebalance actually applied.
@@ -140,9 +142,12 @@ class DynamicReweighter:
         degraded = self.allocator.degenerate_desks(returns_by_desk)
         # Mode selection: default 'risk_parity' calls risk_parity_weights
         # EXACTLY as before (byte-identical); 'performance' opts into the
-        # guarded risk-adjusted tilt.
+        # guarded risk-adjusted tilt; 'risk_parity_cov' opts into full-covariance
+        # risk parity. Both opt-in modes degrade to the inverse-vol path.
         if self.weighting == 'performance':
             weights = self.allocator.performance_weights(returns_by_desk)
+        elif self.weighting == 'risk_parity_cov':
+            weights = self.allocator.risk_parity_cov_weights(returns_by_desk)
         else:
             weights = self.allocator.risk_parity_weights(returns_by_desk)
 

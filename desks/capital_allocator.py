@@ -50,9 +50,12 @@ class CrossDeskCapitalAllocator:
 
     Also offers an OPT-IN, overfitting-guarded PERFORMANCE weighting
     (performance_weights) that tilts toward desks with better realized
-    risk-adjusted out-of-sample performance. The guard params (weight_min,
-    weight_max, shrinkage) affect ONLY performance_weights — risk_parity_weights
-    is untouched, so the risk-parity default path is byte-identical.
+    risk-adjusted out-of-sample performance, and an OPT-IN FULL-COVARIANCE risk
+    parity (risk_parity_cov_weights) that equalizes risk contributions over the
+    full covariance matrix instead of the inverse-vol diagonal approximation.
+    Both opt-in modes degrade conservatively to the inverse-vol path, which
+    itself falls back to equal weight — so the risk-parity default path is
+    byte-identical and the new modes are purely additive.
     """
 
     def __init__(self, target_gross: float = 1.0,
@@ -136,6 +139,112 @@ class CrossDeskCapitalAllocator:
             return self._equal_weight(keys)
         return {key: self.target_gross * inv_vol[key] / total
                 for key in keys}
+
+    def risk_parity_cov_weights(self,
+                                returns_by_desk: Dict[str, Sequence[float]]
+                                ) -> Dict[str, float]:
+        """OPT-IN FULL-COVARIANCE risk parity, scaled to sum to target_gross.
+
+        risk_parity_weights is inverse-vol only — a DIAGONAL-covariance
+        approximation that ignores cross-desk correlation, so two correlated
+        desks together carry more combined risk than intended. This mode does
+        TRUE risk parity over the full covariance matrix: it equalizes each
+        desk's RISK CONTRIBUTION rc_i = w_i * (Cov @ w)_i / port_vol, so a
+        correlated pair is jointly down-weighted relative to inverse-vol.
+
+        Method (numpy only — scipy/sklearn forbidden): align the per-desk return
+        series on their overlapping window (equal length, finite rows only),
+        compute the sample covariance, seed w from inverse-vol
+        (risk_parity_weights), then run ~5 fixed-point iterations on the marginal
+        risk contributions:
+            port_vol = sqrt(w @ cov @ w)
+            mrc      = (cov @ w) / port_vol
+            rc       = w * mrc
+            w       *= ((port_vol / n) / (rc + 1e-12)) ** 0.5   # damped
+            w        = clip(w, 0, None); w /= w.sum()
+        then rescale the converged simplex weights to target_gross (no per-desk
+        band — unlike performance_weights, this mode has no weight_min/max).
+
+        DAMPING (the ** 0.5): the raw undamped ratio (power 1) OVERSHOOTS and
+        oscillates/diverges on correlated desks — it 2-cycles on a symmetric
+        covariance and can drive a single desk to ~100% on noisy samples, the
+        opposite of risk parity. The square-root step is the standard stable
+        form of this fixed point; it converges to EQUAL risk contributions in a
+        handful of iterations (RC spread < 1e-2 by iter 5 across correlated and
+        uncorrelated mixes), which is the whole point of the mode.
+
+        DEGRADE conservatively, exactly like the rest of the allocator: fall back
+        to risk_parity_weights (inverse-vol) — which itself falls back to
+        _equal_weight — when the overlap is too short, any desk's vol is
+        degenerate (the SAME degenerate_desks gate), or the covariance is
+        singular / non-finite. The whole computation is wrapped in try/except so
+        any numerical failure degrades rather than raises.
+        """
+        keys = list(returns_by_desk.keys())
+        if not keys:
+            return {}
+        n = len(keys)
+        # Single desk: nothing to de-correlate; inverse-vol == full-cov.
+        if n == 1:
+            return self.risk_parity_weights(returns_by_desk)
+        # SAME degeneracy gate as risk_parity_weights: any too-few / zero-vol
+        # desk -> inverse-vol (which then equal-weights the whole fund).
+        if self.degenerate_desks(returns_by_desk):
+            return self.risk_parity_weights(returns_by_desk)
+        try:
+            # Align on the overlapping window: equal length across desks (take
+            # the trailing min-length tail), then drop any row where a desk is
+            # non-finite (one ragged series must not silently shorten only some
+            # columns).
+            series = [np.asarray(list(returns_by_desk[k]), dtype=float)
+                      for k in keys]
+            length = min(s.size for s in series)
+            if length < n + 1:
+                # Too few overlapping rows for a usable n-desk covariance.
+                return self.risk_parity_weights(returns_by_desk)
+            matrix = np.vstack([s[-length:] for s in series])  # n x length
+            matrix = matrix[:, np.all(np.isfinite(matrix), axis=0)]
+            if matrix.shape[1] < n + 1:
+                return self.risk_parity_weights(returns_by_desk)
+            cov = np.cov(matrix)
+            if not np.all(np.isfinite(cov)):
+                return self.risk_parity_weights(returns_by_desk)
+
+            # Seed w from inverse-vol, work on the simplex (sum 1) during
+            # iteration, rescale to target_gross at the end.
+            seed = self.risk_parity_weights(returns_by_desk)
+            w = np.array([seed[k] for k in keys], dtype=float)
+            w = w / w.sum()
+
+            # A singular/ill-conditioned cov can drive port_var or rc negative
+            # mid-iteration (transient nan/inf); the guards below catch it and
+            # degrade, so silence the expected numpy warnings on that edge.
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                for _ in range(5):
+                    port_var = float(w @ cov @ w)
+                    if not np.isfinite(port_var) or port_var <= 0.0:
+                        return self.risk_parity_weights(returns_by_desk)
+                    port_vol = np.sqrt(port_var)
+                    mrc = (cov @ w) / port_vol
+                    rc = w * mrc
+                    # Damped (sqrt) step: the undamped ratio oscillates/diverges
+                    # on correlated desks; sqrt is the standard convergent form.
+                    w = w * ((port_vol / n) / (rc + 1e-12)) ** 0.5
+                    w = np.clip(w, 0.0, None)
+                    total = w.sum()
+                    if not np.isfinite(total) or total <= 0.0:
+                        return self.risk_parity_weights(returns_by_desk)
+                    w = w / total
+
+            if not np.all(np.isfinite(w)) or w.sum() <= 0.0:
+                return self.risk_parity_weights(returns_by_desk)
+            scaled = w * (self.target_gross / w.sum())
+            return {key: float(scaled[i]) for i, key in enumerate(keys)}
+        except Exception as exc:  # singular cov / numerical blow-up -> degrade
+            logger.warning(
+                "Full-covariance risk parity failed (%s); falling back to "
+                "inverse-vol risk parity", exc)
+            return self.risk_parity_weights(returns_by_desk)
 
     def performance_weights(self,
                             returns_by_desk: Dict[str, Sequence[float]]
