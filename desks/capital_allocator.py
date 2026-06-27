@@ -188,9 +188,25 @@ class CrossDeskCapitalAllocator:
         if n == 1:
             return self.risk_parity_weights(returns_by_desk)
         # SAME degeneracy gate as risk_parity_weights: any too-few / zero-vol
-        # desk -> inverse-vol (which then equal-weights the whole fund).
+        # desk -> inverse-vol (which then equal-weights the whole fund). This
+        # gate logs its OWN reason via risk_parity_weights, so it is not routed
+        # through _degrade below (which is for the cov-specific numerical paths).
         if self.degenerate_desks(returns_by_desk):
             return self.risk_parity_weights(returns_by_desk)
+
+        def _degrade(reason: str) -> Dict[str, float]:
+            # The cov-specific degrades (short overlap, singular/non-finite cov,
+            # non-finite iterate) are NOT caught by the degenerate-desk gate, so
+            # without this they would silently return inverse-vol weights that
+            # the reweighter then logs as fallback=False — indistinguishable from
+            # a genuine full-cov result. Log WHY the mode degraded so the audit
+            # trail is honest. INFO, not WARNING: an expected, recoverable
+            # fallback (e.g. early in a backtest before enough overlap accrues).
+            logger.info(
+                "Full-covariance risk parity degraded to inverse-vol (%s)",
+                reason)
+            return self.risk_parity_weights(returns_by_desk)
+
         try:
             # Align on the overlapping window: equal length across desks (take
             # the trailing min-length tail), then drop any row where a desk is
@@ -201,14 +217,16 @@ class CrossDeskCapitalAllocator:
             length = min(s.size for s in series)
             if length < n + 1:
                 # Too few overlapping rows for a usable n-desk covariance.
-                return self.risk_parity_weights(returns_by_desk)
+                return _degrade(
+                    f'overlap of {length} rows < {n + 1} needed for {n} desks')
             matrix = np.vstack([s[-length:] for s in series])  # n x length
             matrix = matrix[:, np.all(np.isfinite(matrix), axis=0)]
             if matrix.shape[1] < n + 1:
-                return self.risk_parity_weights(returns_by_desk)
+                return _degrade(
+                    f'only {matrix.shape[1]} finite rows < {n + 1} needed')
             cov = np.cov(matrix)
             if not np.all(np.isfinite(cov)):
-                return self.risk_parity_weights(returns_by_desk)
+                return _degrade('non-finite covariance')
 
             # Seed w from inverse-vol, work on the simplex (sum 1) during
             # iteration, rescale to target_gross at the end.
@@ -223,7 +241,8 @@ class CrossDeskCapitalAllocator:
                 for _ in range(5):
                     port_var = float(w @ cov @ w)
                     if not np.isfinite(port_var) or port_var <= 0.0:
-                        return self.risk_parity_weights(returns_by_desk)
+                        return _degrade(
+                            f'non-positive portfolio variance ({port_var:g})')
                     port_vol = np.sqrt(port_var)
                     mrc = (cov @ w) / port_vol
                     rc = w * mrc
@@ -233,11 +252,16 @@ class CrossDeskCapitalAllocator:
                     w = np.clip(w, 0.0, None)
                     total = w.sum()
                     if not np.isfinite(total) or total <= 0.0:
-                        return self.risk_parity_weights(returns_by_desk)
+                        # A negative marginal contribution (e.g. a
+                        # negatively-correlated hedge desk) makes the damped
+                        # step non-finite; risk parity is ill-defined there.
+                        return _degrade(
+                            'non-finite weights mid-iteration '
+                            '(e.g. negatively-correlated desk)')
                     w = w / total
 
             if not np.all(np.isfinite(w)) or w.sum() <= 0.0:
-                return self.risk_parity_weights(returns_by_desk)
+                return _degrade('non-finite converged weights')
             scaled = w * (self.target_gross / w.sum())
             return {key: float(scaled[i]) for i, key in enumerate(keys)}
         except Exception as exc:  # singular cov / numerical blow-up -> degrade

@@ -20,6 +20,8 @@ deterministic (fixed RNG seed), no engine.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -172,6 +174,34 @@ class TestDegradePaths:
         assert all(np.isfinite(v) for v in cov.values())
         assert sum(cov.values()) == pytest.approx(1.0)
         assert cov == a.risk_parity_weights(book)  # graceful inverse-vol degrade
+
+    def test_numerical_degrade_logs_reason_not_silent(self, caplog):
+        # A short-overlap book degrades via a NUMERICAL guard (not the
+        # degenerate-desk gate), the path that previously returned inverse-vol
+        # weights silently. It must now log WHY, so the reweighter's
+        # fallback=False audit entry isn't mistaken for a genuine cov result.
+        a = CrossDeskCapitalAllocator()
+        with caplog.at_level(logging.INFO, logger='desks.capital_allocator'):
+            a.risk_parity_cov_weights({'A': [0.01, 0.03], 'B': [0.01, 0.005]})
+        assert any('degraded to inverse-vol' in r.message
+                   for r in caplog.records)
+
+    def test_hedge_desk_degrade_logs_reason(self, caplog):
+        # A negatively-correlated (hedge) desk makes the damped step non-finite
+        # -> degrade. The reason names the hedge case so it is diagnosable.
+        a = CrossDeskCapitalAllocator()
+        rng = np.random.default_rng(1)
+        f = rng.standard_normal(200)
+        book = {
+            'A': (0.01 * (f + 0.5 * rng.standard_normal(200))).tolist(),
+            'B': (0.01 * (f + 0.5 * rng.standard_normal(200))).tolist(),
+            'C': (0.01 * (-0.8 * f + 0.5 * rng.standard_normal(200))).tolist(),
+        }
+        with caplog.at_level(logging.INFO, logger='desks.capital_allocator'):
+            cov = a.risk_parity_cov_weights(book)
+        assert cov == a.risk_parity_weights(book)  # degraded to inverse-vol
+        assert any('degraded to inverse-vol' in r.message
+                   for r in caplog.records)
 
     def test_never_raises_on_pathological_input(self):
         # The try/except contract: any numerical failure degrades, never raises.
