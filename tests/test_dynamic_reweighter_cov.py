@@ -66,6 +66,21 @@ def correlated_curves(seed: int = 42, n: int = 80, vol: float = 0.01,
             'C': _curve_from_returns(c)}
 
 
+def hedge_curves(seed: int = 7, n: int = 80, vol: float = 0.01,
+                 idio: float = 0.4):
+    """Like correlated_curves but C is a HEDGE: negatively correlated with the
+    A/B common factor. Full-cov risk parity is ill-defined there (negative
+    marginal contribution) and degrades to inverse-vol — a numerical degrade
+    with NO degenerate desk."""
+    rng = np.random.default_rng(seed)
+    f = rng.standard_normal(n)
+    a = vol * (f + idio * rng.standard_normal(n))
+    b = vol * (f + idio * rng.standard_normal(n))
+    c = vol * (-0.8 * f + idio * rng.standard_normal(n))
+    return {'A': _curve_from_returns(a), 'B': _curve_from_returns(b),
+            'C': _curve_from_returns(c)}
+
+
 # ----------------------------------------------------------------------
 # Construction: the new weighting mode
 # ----------------------------------------------------------------------
@@ -175,6 +190,31 @@ class TestCovMode:
         entry = rw.rebalance_log[-1]
         assert entry['mode'] == 'risk_parity_cov'
         assert entry['fallback'] is False
+        assert entry['degrade_reason'] is None  # genuine full-cov result
+
+    def test_numerical_degrade_recorded_as_honest_fallback(self):
+        # A negatively-correlated hedge desk makes full-cov ill-defined, so it
+        # degrades to inverse-vol. NO desk is degenerate, so previously this
+        # logged fallback=False — now the audit records fallback=True WITH a
+        # reason and an empty degraded_desks list.
+        curves = hedge_curves()
+        alloc = CrossDeskCapitalAllocator()
+        rw = DynamicReweighter(allocator=alloc, rebalance_every=60,
+                               weighting='risk_parity_cov')
+        rw.set_curves(curves)
+        desks = [StubDesk('A'), StubDesk('B'), StubDesk('C')]
+        date = curves['A'][60][0]
+        weights = rw.on_day(desks, date, day_number=60)
+
+        as_of = pd.Timestamp(date)
+        sliced = {k: alloc.returns_from_equity(
+            [v for ts, v in curves[k] if ts <= as_of]) for k in curves}
+        assert weights == alloc.risk_parity_weights(sliced)  # inverse-vol
+        entry = rw.rebalance_log[-1]
+        assert entry['fallback'] is True
+        assert entry['degrade_reason'] is not None
+        assert entry['degraded_desks'] == []   # not a degenerate-desk fallback
+        assert entry['mode'] == 'risk_parity_cov'
 
     def test_cov_mode_shares_degenerate_fallback(self):
         # 'C' has no curve -> degenerate -> whole-fund equal weight, recorded as
@@ -190,6 +230,7 @@ class TestCovMode:
         entry = rw.rebalance_log[-1]
         assert entry['fallback'] is True
         assert entry['degraded_desks'] == ['C']
+        assert entry['degrade_reason'] is None  # degenerate gate, not numerical
         assert entry['mode'] == 'risk_parity_cov'
 
     def test_target_gross_below_one_respected(self):

@@ -144,10 +144,17 @@ class DynamicReweighter:
         # EXACTLY as before (byte-identical); 'performance' opts into the
         # guarded risk-adjusted tilt; 'risk_parity_cov' opts into full-covariance
         # risk parity. Both opt-in modes degrade to the inverse-vol path.
+        # cov mode can degrade to inverse-vol for NON-degenerate-desk reasons
+        # (short overlap, singular cov, a negatively-correlated hedge desk);
+        # capture WHY so the audit below records an honest fallback rather than
+        # fallback=False on a rebalance that did not use full-cov risk parity.
+        degrade_reason: Optional[str] = None
         if self.weighting == 'performance':
             weights = self.allocator.performance_weights(returns_by_desk)
         elif self.weighting == 'risk_parity_cov':
-            weights = self.allocator.risk_parity_cov_weights(returns_by_desk)
+            weights, degrade_reason = \
+                self.allocator.risk_parity_cov_weights_with_status(
+                    returns_by_desk)
         else:
             weights = self.allocator.risk_parity_weights(returns_by_desk)
 
@@ -173,12 +180,19 @@ class DynamicReweighter:
             if desk.key in weights:
                 desk.capital_allocation = weights[desk.key]
 
+        # fallback is True for EITHER a degenerate-desk equal-weight fallback OR
+        # a cov-mode numerical degrade to inverse-vol, so the audit never reads
+        # fallback=False on a rebalance that did not use its intended weighting.
+        # degrade_reason names the cov numerical cause (None otherwise); the two
+        # are mutually exclusive (the degenerate gate short-circuits cov).
+        fell_back = bool(degraded) or degrade_reason is not None
         self.rebalance_log.append({
             'date': as_of,
             'day_number': day_number,
             'weights': dict(weights),
-            'fallback': bool(degraded),
+            'fallback': fell_back,
             'degraded_desks': sorted(degraded),
+            'degrade_reason': degrade_reason,
             'mode': self.weighting,
         })
         if degraded:

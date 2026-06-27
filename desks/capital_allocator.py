@@ -32,7 +32,7 @@ equity curve.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -180,21 +180,38 @@ class CrossDeskCapitalAllocator:
         singular / non-finite. The whole computation is wrapped in try/except so
         any numerical failure degrades rather than raises.
         """
+        return self.risk_parity_cov_weights_with_status(returns_by_desk)[0]
+
+    def risk_parity_cov_weights_with_status(
+            self, returns_by_desk: Dict[str, Sequence[float]]
+            ) -> Tuple[Dict[str, float], Optional[str]]:
+        """Same as risk_parity_cov_weights, but also returns WHY it degraded.
+
+        Returns ``(weights, reason)``: ``reason`` is None when full-covariance
+        risk parity was actually computed, else a short string naming the
+        numerical fallback to inverse-vol (short overlap, singular/non-finite
+        covariance, or a non-finite iterate — e.g. a negatively-correlated hedge
+        desk). DynamicReweighter uses this to record an HONEST fallback flag in
+        its audit log. The degenerate-desk gate is NOT reported here (reason
+        stays None) because the reweighter already captures it separately via
+        degenerate_desks().
+        """
         keys = list(returns_by_desk.keys())
         if not keys:
-            return {}
+            return {}, None
         n = len(keys)
         # Single desk: nothing to de-correlate; inverse-vol == full-cov.
         if n == 1:
-            return self.risk_parity_weights(returns_by_desk)
+            return self.risk_parity_weights(returns_by_desk), None
         # SAME degeneracy gate as risk_parity_weights: any too-few / zero-vol
         # desk -> inverse-vol (which then equal-weights the whole fund). This
-        # gate logs its OWN reason via risk_parity_weights, so it is not routed
-        # through _degrade below (which is for the cov-specific numerical paths).
+        # gate logs its OWN reason via risk_parity_weights and the reweighter
+        # captures it via degenerate_desks(), so reason stays None here (this is
+        # a degenerate-desk fallback, not a cov-specific numerical degrade).
         if self.degenerate_desks(returns_by_desk):
-            return self.risk_parity_weights(returns_by_desk)
+            return self.risk_parity_weights(returns_by_desk), None
 
-        def _degrade(reason: str) -> Dict[str, float]:
+        def _degrade(reason: str) -> Tuple[Dict[str, float], str]:
             # The cov-specific degrades (short overlap, singular/non-finite cov,
             # non-finite iterate) are NOT caught by the degenerate-desk gate, so
             # without this they would silently return inverse-vol weights that
@@ -205,7 +222,7 @@ class CrossDeskCapitalAllocator:
             logger.info(
                 "Full-covariance risk parity degraded to inverse-vol (%s)",
                 reason)
-            return self.risk_parity_weights(returns_by_desk)
+            return self.risk_parity_weights(returns_by_desk), reason
 
         try:
             # Align on the overlapping window: equal length across desks (take
@@ -263,12 +280,13 @@ class CrossDeskCapitalAllocator:
             if not np.all(np.isfinite(w)) or w.sum() <= 0.0:
                 return _degrade('non-finite converged weights')
             scaled = w * (self.target_gross / w.sum())
-            return {key: float(scaled[i]) for i, key in enumerate(keys)}
+            return {key: float(scaled[i]) for i, key in enumerate(keys)}, None
         except Exception as exc:  # singular cov / numerical blow-up -> degrade
             logger.warning(
                 "Full-covariance risk parity failed (%s); falling back to "
                 "inverse-vol risk parity", exc)
-            return self.risk_parity_weights(returns_by_desk)
+            return (self.risk_parity_weights(returns_by_desk),
+                    'covariance computation failed')
 
     def performance_weights(self,
                             returns_by_desk: Dict[str, Sequence[float]]

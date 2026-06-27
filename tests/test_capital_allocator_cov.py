@@ -216,6 +216,36 @@ class TestDegradePaths:
 
 
 # ----------------------------------------------------------------------
+# Status variant: (weights, reason) for the reweighter's honest audit
+# ----------------------------------------------------------------------
+class TestStatusVariant:
+    def test_success_reports_no_reason(self):
+        a = CrossDeskCapitalAllocator()
+        book = correlated_book()
+        w, reason = a.risk_parity_cov_weights_with_status(book)
+        assert reason is None
+        assert w == a.risk_parity_cov_weights(book)  # public method delegates
+
+    def test_numerical_degrade_reports_a_reason(self):
+        # Short overlap degrades to inverse-vol via a numerical guard -> reason.
+        a = CrossDeskCapitalAllocator()
+        book = {'A': [0.01, 0.03], 'B': [0.01, 0.005]}
+        w, reason = a.risk_parity_cov_weights_with_status(book)
+        assert reason is not None
+        assert w == a.risk_parity_weights(book)
+
+    def test_degenerate_gate_reports_no_reason(self):
+        # The degenerate-desk gate is captured by the caller via
+        # degenerate_desks(), so the status reason stays None (not double-named).
+        a = CrossDeskCapitalAllocator()
+        book = {'good': [0.01, -0.02, 0.015, -0.01, 0.02],
+                'flat': [0.0, 0.0, 0.0, 0.0, 0.0]}
+        w, reason = a.risk_parity_cov_weights_with_status(book)
+        assert reason is None
+        assert w == a.risk_parity_weights(book)
+
+
+# ----------------------------------------------------------------------
 # (e) The default risk-parity path is UNAFFECTED by the new mode
 # ----------------------------------------------------------------------
 class TestDefaultPathUnaffected:
