@@ -1253,7 +1253,8 @@ class BacktestEngine:
                          'day_number': entry['day_number'],
                          'weights': entry['weights'],
                          'fallback': entry['fallback'],
-                         'degraded_desks': entry['degraded_desks']}
+                         'degraded_desks': entry['degraded_desks'],
+                         'degrade_reason': entry['degrade_reason']}
                         for entry in self.reweighter.rebalance_log]
 
         return report
