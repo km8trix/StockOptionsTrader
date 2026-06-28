@@ -1,5 +1,5 @@
 # gui/routes/views.py
-from flask import Blueprint, render_template, request
+from flask import Blueprint, render_template
 
 views_bp = Blueprint('views', __name__)
 
@@ -9,9 +9,10 @@ def index():
 
 @views_bp.route('/backtest')
 def backtest_page():
-    # ws=production reveals Desk/Fund modes (Production workspace); the default
-    # (Sandbox) shows strategy backtests only.
-    return render_template('backtest.html', ws=request.args.get('ws'))
+    # The Strategy/Desk mode switch and desk picker render in every workspace;
+    # ?ws=production only flips the nav badge (resolved in base.html via
+    # request.args), so the template itself no longer branches on it.
+    return render_template('backtest.html')
 
 @views_bp.route('/paper_trade')
 def paper_trade_page():

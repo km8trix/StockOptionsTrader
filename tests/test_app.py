@@ -1646,10 +1646,11 @@ class TestDeskModeBacktest:
         assert rows[0]['strategy'] == 'momentum'
 
     def test_backtest_page_ships_desk_mode_controls(self, client):
-        """The Production backtest page (ws=production) carries the mode toggle
-        + desk picker for backtest.js; the Sandbox page is strategy-only."""
+        """The backtest page carries the Strategy/Desk mode switch + desk picker
+        for backtest.js in BOTH workspaces (Desk is no longer Production-only),
+        and the dropped Fund mode leaves no input markup behind."""
         html = client.get('/backtest?ws=production').get_data(as_text=True)
-        assert 'id="modeDesk"' in html
+        assert 'id="btModeSwitch"' in html
         assert 'id="btDesk"' in html
         assert 'id="traderNotesCard"' in html
         assert 'id="deskChipRow"' in html
@@ -1661,8 +1662,12 @@ class TestDeskModeBacktest:
         assert 'id="podCards"' in html
         assert 'id="podAllocChart"' in html
         assert 'id="notePodFilters"' in html
-        # Sandbox workspace is strategy-only — the Desk radio is not rendered.
-        assert 'id="modeDesk"' not in client.get('/backtest').get_data(as_text=True)
+        # Fund mode was dropped from the page: no control, no input fields.
+        assert 'id="modeFund"' not in html
+        assert 'id="fundField"' not in html
+        assert 'id="fundDeskList"' not in html
+        # The Sandbox page carries the same switch — Desk is selectable there now.
+        assert 'id="btModeSwitch"' in client.get('/backtest').get_data(as_text=True)
         # Phase 8: structures table + portfolio-Greeks card (contracts
         # C11/C12), painted by backtest.js only for janestreet runs.
         assert 'id="structuresCard"' in html
