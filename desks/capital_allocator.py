@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 #: Float tolerance on the target_gross (<= 1.0) bound.
 _TARGET_TOL = 1e-9
 
+#: Reciprocal-machine-epsilon ceiling on a covariance's condition number, above
+#: which it is treated as singular/ill-conditioned. np.linalg.solve may EITHER
+#: raise LinAlgError OR (depending on the LAPACK build) silently return finite
+#: garbage on a singular matrix, so the optimizer modes guard on this SVD-based
+#: condition number — deterministic across platforms — rather than relying on
+#: solve raising. ~4.5e15 for float64.
+_MAX_COND = 1.0 / np.finfo(float).eps
+
 
 class CrossDeskCapitalAllocator:
     """Risk-parity (inverse-vol) capital weights across desks, summing to a
@@ -374,6 +382,9 @@ class CrossDeskCapitalAllocator:
             cov = np.cov(matrix)
             if not np.all(np.isfinite(cov)):
                 return _degrade('non-finite covariance')
+            cond = np.linalg.cond(cov)
+            if not np.isfinite(cond) or cond > _MAX_COND:
+                return _degrade('singular/ill-conditioned covariance')
             sigma = np.sqrt(np.diag(cov))
             if not np.all(np.isfinite(sigma)) or np.any(sigma <= 0.0):
                 return _degrade('degenerate covariance diagonal')
@@ -449,6 +460,9 @@ class CrossDeskCapitalAllocator:
             cov = np.cov(matrix)
             if not np.all(np.isfinite(cov)):
                 return _degrade('non-finite covariance')
+            cond = np.linalg.cond(cov)
+            if not np.isfinite(cond) or cond > _MAX_COND:
+                return _degrade('singular/ill-conditioned covariance')
             mu = matrix.mean(axis=1)            # per-desk mean return
             if not np.all(np.isfinite(mu)):
                 return _degrade('non-finite mean returns')
