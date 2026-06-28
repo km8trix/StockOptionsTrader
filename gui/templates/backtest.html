@@ -18,22 +18,21 @@
                 <form id="backtestForm" novalidate>
                     <div class="mb-3">
                         <span class="form-label d-block" id="btModeLabel">Mode</span>
-                        <div class="btn-group btn-group-sm w-100" role="group"
-                             aria-labelledby="btModeLabel">
-                            <input type="radio" class="btn-check" name="btMode"
-                                   id="modeStrategy" value="strategy" checked>
-                            <label class="btn btn-outline-secondary" for="modeStrategy">Strategy</label>
-                            {# Desk/Fund backtests belong to the Production workspace
-                               (reached via /backtest?ws=production, e.g. the Trading
-                               Floor's "Run a desk backtest"). Sandbox = strategy only. #}
-                            {% if ws == 'production' %}
-                            <input type="radio" class="btn-check" name="btMode"
-                                   id="modeDesk" value="desk">
-                            <label class="btn btn-outline-secondary" for="modeDesk">Desk</label>
-                            <input type="radio" class="btn-check" name="btMode"
-                                   id="modeFund" value="fund">
-                            <label class="btn btn-outline-secondary" for="modeFund">Fund</label>
-                            {% endif %}
+                        {# Click-to-toggle switch: unchecked = Strategy, checked =
+                           Desk. Rendered in both workspaces (Sandbox + the Floor's
+                           ws=production deep link); ws only drives the nav badge now.
+                           The visible side labels are aria-hidden; the switch's
+                           accessible name is the "Mode" heading + a visually-hidden
+                           state hint, joined via aria-labelledby. #}
+                        <div class="d-flex align-items-center gap-2">
+                            <span class="form-check-label" aria-hidden="true">Strategy</span>
+                            <div class="form-check form-switch m-0">
+                                <input class="form-check-input m-0" type="checkbox"
+                                       role="switch" id="btModeSwitch"
+                                       aria-labelledby="btModeLabel btModeState">
+                                <span id="btModeState" class="visually-hidden">— off: Strategy, on: Desk</span>
+                            </div>
+                            <span class="form-check-label" aria-hidden="true">Desk</span>
                         </div>
                     </div>
                     <div class="mb-3" id="strategyField">
@@ -57,36 +56,6 @@
                         <label class="form-label" for="btDeskModel">Model</label>
                         <select class="form-select" id="btDeskModel"></select>
                         <div class="provenance-caption mt-1" id="deskModelHint"></div>
-                    </div>
-                    <div class="mb-3 d-none" id="fundField">
-                        <span class="form-label d-block">Desks &amp; weights</span>
-                        <div id="fundDeskList" class="fund-desk-list"></div>
-                        <div class="invalid-feedback d-block d-none" id="fundDeskError"></div>
-                        <div class="provenance-caption mt-1">Weights are
-                            fractions of the account; checked desks must sum to
-                            &le; 1.0. Each desk is run solo for its standalone
-                            curve, then the fund reweights in-run by risk
-                            parity.</div>
-                        <div class="row g-2 mt-1">
-                            <div class="col-6">
-                                <label class="form-label" for="fundRebalance">Rebalance (days)</label>
-                                <input type="number" class="form-control num"
-                                       id="fundRebalance" value="21" min="1" step="1">
-                                <div class="invalid-feedback">&ge; 1.</div>
-                            </div>
-                            <div class="col-6">
-                                <label class="form-label" for="fundWarmup">Warmup (days)</label>
-                                <input type="number" class="form-control num"
-                                       id="fundWarmup" value="0" min="0" step="1">
-                                <div class="invalid-feedback">&ge; 0.</div>
-                            </div>
-                            <div class="col-12">
-                                <label class="form-label" for="fundTargetGross">Target gross (%)</label>
-                                <input type="number" class="form-control num"
-                                       id="fundTargetGross" value="100" min="1" max="100" step="1">
-                                <div class="invalid-feedback">1–100.</div>
-                            </div>
-                        </div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label" for="btSymbols">Symbols (comma-separated)</label>
