@@ -66,13 +66,17 @@ class AqrDesk(CrossSectionalLongShortDesk):
                  min_scored: int = 4,
                  exit_quantile: Optional[float] = None,
                  min_holding_days: int = 0,
-                 size_by_signal_strength: bool = False):
+                 size_by_signal_strength: bool = False,
+                 factor_alpha: float = 1.0):
         # A single fixed factor controller. Tests may inject an explicit
         # ``controller=`` (e.g. a stub) exactly like the other desks; the
         # default wraps a fresh FactorModel. AQR is NOT model-selectable —
         # there is deliberately no model_key / models parameter.
+        # ``factor_alpha`` is the Ridge regularization strength: the class
+        # default 1.0 is byte-identical; the registry raises it so momentum
+        # cannot dominate the factor blend and crash in sharp reversals.
         if controller is None:
-            controller = WalkForwardController(FactorModel())
+            controller = WalkForwardController(FactorModel(alpha=factor_alpha))
         committee: List[Tuple[str, WalkForwardController]] = [
             (_MODEL_KEY, controller)]
 

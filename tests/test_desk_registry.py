@@ -228,17 +228,21 @@ class TestTurnoverEnabled:
     """Phase 5: the production cross-sectional desks ship turnover control on
     (mechanism + defaults stay no-op; the registry is the config point)."""
 
-    @pytest.mark.parametrize('key', ['twosigma', 'aqr'])
-    def test_cross_sectional_desks_enable_turnover(self, key):
+    # Backtest tuning R1: twosigma's turnover was tightened (exit 0.4, min hold
+    # 21d) to damp the cost bleed from ~15 trades/day; aqr keeps the Phase-5
+    # values. The registry stays the single config point.
+    @pytest.mark.parametrize('key,exit_q,min_hold',
+                             [('twosigma', 0.4, 21), ('aqr', 0.3, 3)])
+    def test_cross_sectional_desks_enable_turnover(self, key, exit_q, min_hold):
         desk = create_desk(key)
-        assert desk._exit_quantile == 0.3   # hysteresis band wider than entry
-        assert desk.min_holding_days == 3
+        assert desk._exit_quantile == exit_q   # hysteresis band wider than entry
+        assert desk.min_holding_days == min_hold
 
     def test_turnover_enabled_through_model_selection_path(self):
         # twosigma is model-selectable; turnover must apply on that branch too.
         desk = create_desk('twosigma', model_key='gbm')
-        assert desk._exit_quantile == 0.3
-        assert desk.min_holding_days == 3
+        assert desk._exit_quantile == 0.4
+        assert desk.min_holding_days == 21
 
     def test_non_turnover_desk_keeps_defaults(self):
         # A desk without a turnover spec constructs exactly as before.
@@ -281,7 +285,7 @@ class TestSignalStrengthEnabled:
         # too (create_desk merges turnover + config on BOTH paths).
         desk = create_desk('twosigma', model_key='gbm')
         assert desk.size_by_signal_strength is True
-        assert desk._exit_quantile == 0.3  # turnover still applied alongside
+        assert desk._exit_quantile == 0.4  # turnover still applied alongside (R1)
 
     def test_desk_class_defaults_stay_equal_weight(self):
         assert TwoSigmaDesk().size_by_signal_strength is False

@@ -45,7 +45,8 @@ class FoundationDesk(Desk):
                  rsi_entry_low: float = 40.0,
                  rsi_entry_high: float = 70.0,
                  rsi_exit: float = 70.0,
-                 volume_confirmation_mult: float = 1.2):
+                 volume_confirmation_mult: float = 1.2,
+                 gate_threshold: float = 0.0):
         super().__init__(
             key='foundation',
             name='Foundation Desk',
@@ -60,6 +61,12 @@ class FoundationDesk(Desk):
         self.rsi_entry_high = rsi_entry_high
         self.rsi_exit = rsi_exit
         self.volume_confirmation_mult = volume_confirmation_mult
+        # Walk-forward gate: block a momentum long when the model score
+        # (P(up)-0.5, centered) is <= gate_threshold. Default 0.0 keeps the
+        # historical "strictly positive confidence" gate (byte-identical);
+        # the registry lowers it slightly so the desk deploys more of a
+        # presumed-positive-edge model instead of bleeding costs near flat.
+        self.gate_threshold = gate_threshold
         # Controller precedence (documented contract):
         #   1. an explicit ``controller`` wins, untouched (unchanged path);
         #   2. else a ``model_key`` selects the model via the model
@@ -156,12 +163,13 @@ class FoundationDesk(Desk):
                 continue
 
             score = scores.get(symbol) if scores is not None else None
-            if scores is not None and score is not None and score <= 0:
+            if (scores is not None and score is not None
+                    and score <= self.gate_threshold):
                 self.note(
                     'model',
                     f"Blocked momentum long {symbol} @ "
                     f"{current['close']:.2f}: walk-forward score "
-                    f"{score:+.4f} <= 0",
+                    f"{score:+.4f} <= {self.gate_threshold:+.4f}",
                     symbol=symbol, close=current['close'], wf_score=score)
                 continue
 

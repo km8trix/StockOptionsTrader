@@ -275,6 +275,7 @@ class CitadelDesk(Desk):
                  vol_floor: float = 0.05,
                  score_floor: float = 0.05,
                  robust_pod_sharpe: bool = False,
+                 allow_cut_recovery: bool = False,
                  max_factor_exposure: Optional[float] = 0.25,
                  factor_risk_model: Optional[FactorRiskModel] = None):
         super().__init__(
@@ -338,6 +339,13 @@ class CitadelDesk(Desk):
         self.probation_drawdown = probation_drawdown
         self.cut_drawdown = cut_drawdown
         self.recovery_drawdown = recovery_drawdown
+        # Cut pods are normally stopped PERMANENTLY (capital sidelined for the
+        # rest of the run). Over a long multi-regime backtest that bleeds the
+        # desk into dormancy after the first crash. allow_cut_recovery (default
+        # False = byte-identical) lets a cut pod that climbs back above
+        # recovery_drawdown re-enter on PROBATION at the next reallocation, the
+        # same cautious re-admission a probation pod gets.
+        self.allow_cut_recovery = allow_cut_recovery
         self.realloc_every_days = realloc_every_days
         self.sharpe_window_days = sharpe_window_days
         self.min_nav_days = min_nav_days
@@ -852,6 +860,19 @@ class CitadelDesk(Desk):
         if self._days_since_realloc < self.realloc_every_days:
             return
         self._days_since_realloc = 0
+
+        # Opt-in cut-pod recovery: a flattened cut pod's NAV is frozen, so its
+        # drawdown never climbs back on its own and it stays sidelined for the
+        # rest of the run. When enabled, give each cut pod a fresh tranche on
+        # probation here — reset its NAV peak so drawdown reads 0, and let the
+        # probation->active recovery path below redeploy its capital. A pod
+        # that fails again is simply re-cut next cycle under the probation cap,
+        # so the downside is bounded while sidelined capital gets back to work.
+        if self.allow_cut_recovery:
+            for key in sorted(self._pods):
+                if self._statuses[key] == 'cut':
+                    self._statuses[key] = 'probation'
+                    self._nav_max[key] = self._navs[key]
 
         non_cut = [key for key in sorted(self._pods)
                    if self._statuses[key] != 'cut']
