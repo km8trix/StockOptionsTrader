@@ -50,12 +50,15 @@ class CrossDeskCapitalAllocator:
 
     Also offers an OPT-IN, overfitting-guarded PERFORMANCE weighting
     (performance_weights) that tilts toward desks with better realized
-    risk-adjusted out-of-sample performance, and an OPT-IN FULL-COVARIANCE risk
+    risk-adjusted out-of-sample performance, an OPT-IN FULL-COVARIANCE risk
     parity (risk_parity_cov_weights) that equalizes risk contributions over the
-    full covariance matrix instead of the inverse-vol diagonal approximation.
-    Both opt-in modes degrade conservatively to the inverse-vol path, which
-    itself falls back to equal weight — so the risk-parity default path is
-    byte-identical and the new modes are purely additive.
+    full covariance matrix instead of the inverse-vol diagonal approximation,
+    and two OPT-IN portfolio-optimizer modes — MAX DIVERSIFICATION
+    (max_diversification_weights, w ∝ Σ⁻¹σ) and MEAN-VARIANCE
+    (mean_variance_weights, long-only max-Sharpe w ∝ Σ⁻¹μ). Every opt-in mode
+    degrades conservatively to the inverse-vol path, which itself falls back to
+    equal weight — so the risk-parity default path is byte-identical and the new
+    modes are purely additive.
     """
 
     def __init__(self, target_gross: float = 1.0,
@@ -284,6 +287,186 @@ class CrossDeskCapitalAllocator:
         except Exception as exc:  # singular cov / numerical blow-up -> degrade
             logger.warning(
                 "Full-covariance risk parity failed (%s); falling back to "
+                "inverse-vol risk parity", exc)
+            return (self.risk_parity_weights(returns_by_desk),
+                    'covariance computation failed')
+
+    def _aligned_matrix(self, returns_by_desk: Dict[str, Sequence[float]],
+                        keys: Sequence[str]
+                        ) -> Tuple[Optional[np.ndarray], Optional[str]]:
+        """Align the per-desk return series on their overlapping window into an
+        ``n x m`` matrix (rows = desks in ``keys`` order, finite columns only),
+        the shared input both portfolio-optimizer modes build a covariance from.
+
+        Mirrors the alignment risk_parity_cov_weights_with_status does inline:
+        take the trailing min-length tail across desks, then drop any column
+        where a desk is non-finite (one ragged series must not silently shorten
+        only some rows). Returns ``(matrix, None)`` on success, or ``(None,
+        reason)`` when the overlap is too short for an ``n``-desk covariance.
+        """
+        n = len(keys)
+        series = [np.asarray(list(returns_by_desk[k]), dtype=float)
+                  for k in keys]
+        length = min(s.size for s in series)
+        if length < n + 1:
+            return None, (
+                f'overlap of {length} rows < {n + 1} needed for {n} desks')
+        matrix = np.vstack([s[-length:] for s in series])  # n x length
+        matrix = matrix[:, np.all(np.isfinite(matrix), axis=0)]
+        if matrix.shape[1] < n + 1:
+            return None, f'only {matrix.shape[1]} finite rows < {n + 1} needed'
+        return matrix, None
+
+    def max_diversification_weights(self,
+                                    returns_by_desk: Dict[str, Sequence[float]]
+                                    ) -> Dict[str, float]:
+        """OPT-IN MAX-DIVERSIFICATION weighting, scaled to sum to target_gross.
+
+        Maximizes the diversification ratio ``DR(w) = (wᵀσ) / sqrt(wᵀΣw)`` — the
+        ratio of the weighted-average desk vol to the realized portfolio vol — so
+        a desk that is REDUNDANT (highly correlated with the rest) earns LESS
+        weight than its standalone vol alone would justify under inverse-vol,
+        which ignores correlation. The argmax has the closed form
+        ``w ∝ Σ⁻¹σ`` (Choueifaty & Coignard's Most-Diversified Portfolio), made
+        long-only by clipping negatives to 0 and renormalizing to target_gross.
+
+        Method (numpy only — scipy/sklearn forbidden): align the series on the
+        overlapping window, build the sample covariance Σ and per-desk vol vector
+        σ = sqrt(diag Σ), solve ``Σ w = σ``, clip w at 0, rescale to
+        target_gross. DEGRADE conservatively (same discipline as the rest of the
+        allocator) to risk_parity_weights (inverse-vol) — which itself falls back
+        to _equal_weight — on a too-short overlap, any degenerate-vol desk (the
+        SAME degenerate_desks gate), a singular/non-finite covariance, or a
+        long-only solution that clips away to nothing.
+        """
+        return self.max_diversification_weights_with_status(returns_by_desk)[0]
+
+    def max_diversification_weights_with_status(
+            self, returns_by_desk: Dict[str, Sequence[float]]
+            ) -> Tuple[Dict[str, float], Optional[str]]:
+        """Same as max_diversification_weights, but also returns WHY it degraded.
+
+        Returns ``(weights, reason)``: ``reason`` is None when the diversification
+        optimizer actually ran, else a short string naming the numerical fallback
+        to inverse-vol. As with risk_parity_cov, the degenerate-desk gate keeps
+        ``reason`` None (the reweighter captures it separately via
+        degenerate_desks()); only cov-specific numerical degrades name a reason.
+        """
+        keys = list(returns_by_desk.keys())
+        if not keys:
+            return {}, None
+        n = len(keys)
+        if n == 1:
+            return self.risk_parity_weights(returns_by_desk), None
+        if self.degenerate_desks(returns_by_desk):
+            return self.risk_parity_weights(returns_by_desk), None
+
+        def _degrade(reason: str) -> Tuple[Dict[str, float], str]:
+            logger.info(
+                "Max-diversification weighting degraded to inverse-vol (%s)",
+                reason)
+            return self.risk_parity_weights(returns_by_desk), reason
+
+        try:
+            matrix, reason = self._aligned_matrix(returns_by_desk, keys)
+            if matrix is None:
+                return _degrade(reason)
+            cov = np.cov(matrix)
+            if not np.all(np.isfinite(cov)):
+                return _degrade('non-finite covariance')
+            sigma = np.sqrt(np.diag(cov))
+            if not np.all(np.isfinite(sigma)) or np.any(sigma <= 0.0):
+                return _degrade('degenerate covariance diagonal')
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                raw = np.linalg.solve(cov, sigma)   # w ∝ Σ⁻¹σ (MDP)
+            if not np.all(np.isfinite(raw)):
+                return _degrade('non-finite solution')
+            w = np.clip(raw, 0.0, None)             # long-only
+            total = w.sum()
+            if not np.isfinite(total) or total <= 0.0:
+                return _degrade('non-positive long-only weights')
+            scaled = w * (self.target_gross / total)
+            return {key: float(scaled[i]) for i, key in enumerate(keys)}, None
+        except np.linalg.LinAlgError as exc:    # singular covariance
+            return _degrade(f'singular covariance ({exc})')
+        except Exception as exc:                # any other numerical blow-up
+            logger.warning(
+                "Max-diversification weighting failed (%s); falling back to "
+                "inverse-vol risk parity", exc)
+            return (self.risk_parity_weights(returns_by_desk),
+                    'covariance computation failed')
+
+    def mean_variance_weights(self,
+                              returns_by_desk: Dict[str, Sequence[float]]
+                              ) -> Dict[str, float]:
+        """OPT-IN MEAN-VARIANCE weighting, scaled to sum to target_gross.
+
+        Long-only max-Sharpe tangency portfolio: ``w ∝ Σ⁻¹μ`` with μ the per-desk
+        MEAN return over the aligned window and Σ the sample covariance. This
+        tilts capital toward desks with a better risk-adjusted mean (jointly,
+        accounting for correlation), clips negatives to 0 (long-only — a desk
+        with no positive marginal edge is dropped, never shorted), and rescales
+        to target_gross.
+
+        The returns are the SAME walk-forward-honest OOS solo returns the rest of
+        the allocator consumes, so no look-ahead is introduced. Method is numpy
+        only (scipy/sklearn forbidden). DEGRADE conservatively to
+        risk_parity_weights (inverse-vol) — which itself falls back to
+        _equal_weight — on a too-short overlap, any degenerate-vol desk (the SAME
+        degenerate_desks gate), a singular/non-finite covariance, or when no desk
+        has a positive risk-adjusted mean (every weight clips to 0).
+        """
+        return self.mean_variance_weights_with_status(returns_by_desk)[0]
+
+    def mean_variance_weights_with_status(
+            self, returns_by_desk: Dict[str, Sequence[float]]
+            ) -> Tuple[Dict[str, float], Optional[str]]:
+        """Same as mean_variance_weights, but also returns WHY it degraded.
+
+        Returns ``(weights, reason)``: ``reason`` is None when the mean-variance
+        optimizer actually ran, else a short string naming the numerical fallback
+        to inverse-vol. As with risk_parity_cov, the degenerate-desk gate keeps
+        ``reason`` None (captured separately via degenerate_desks()).
+        """
+        keys = list(returns_by_desk.keys())
+        if not keys:
+            return {}, None
+        n = len(keys)
+        if n == 1:
+            return self.risk_parity_weights(returns_by_desk), None
+        if self.degenerate_desks(returns_by_desk):
+            return self.risk_parity_weights(returns_by_desk), None
+
+        def _degrade(reason: str) -> Tuple[Dict[str, float], str]:
+            logger.info(
+                "Mean-variance weighting degraded to inverse-vol (%s)", reason)
+            return self.risk_parity_weights(returns_by_desk), reason
+
+        try:
+            matrix, reason = self._aligned_matrix(returns_by_desk, keys)
+            if matrix is None:
+                return _degrade(reason)
+            cov = np.cov(matrix)
+            if not np.all(np.isfinite(cov)):
+                return _degrade('non-finite covariance')
+            mu = matrix.mean(axis=1)            # per-desk mean return
+            if not np.all(np.isfinite(mu)):
+                return _degrade('non-finite mean returns')
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                raw = np.linalg.solve(cov, mu)  # w ∝ Σ⁻¹μ (max-Sharpe tangency)
+            if not np.all(np.isfinite(raw)):
+                return _degrade('non-finite solution')
+            w = np.clip(raw, 0.0, None)         # long-only
+            total = w.sum()
+            if not np.isfinite(total) or total <= 0.0:
+                return _degrade('no desk with positive risk-adjusted mean')
+            scaled = w * (self.target_gross / total)
+            return {key: float(scaled[i]) for i, key in enumerate(keys)}, None
+        except np.linalg.LinAlgError as exc:    # singular covariance
+            return _degrade(f'singular covariance ({exc})')
+        except Exception as exc:                # any other numerical blow-up
+            logger.warning(
+                "Mean-variance weighting failed (%s); falling back to "
                 "inverse-vol risk parity", exc)
             return (self.risk_parity_weights(returns_by_desk),
                     'covariance computation failed')

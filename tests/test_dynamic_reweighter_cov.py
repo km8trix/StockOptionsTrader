@@ -100,7 +100,8 @@ class TestConstruction:
         # The dispatch tuple must list the new mode alongside the originals.
         assert 'risk_parity_cov' in DynamicReweighter._WEIGHTING_MODES
         assert DynamicReweighter._WEIGHTING_MODES == (
-            'risk_parity', 'performance', 'risk_parity_cov')
+            'risk_parity', 'performance', 'risk_parity_cov',
+            'max_diversification', 'mean_variance')
 
 
 # ----------------------------------------------------------------------
