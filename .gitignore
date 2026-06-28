@@ -48,5 +48,6 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Backtest harness outputs (scripts/desk_backtest.py) — regenerable research artifacts
+# Research harness outputs (scripts/desk_backtest.py, scripts/signal_ic.py) — regenerable
 analysis/backtests/
+analysis/signal_ic/
