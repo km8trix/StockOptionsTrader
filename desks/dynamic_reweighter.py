@@ -57,7 +57,8 @@ class DynamicReweighter:
     """
 
     #: Supported weighting modes -> the allocator method each invokes.
-    _WEIGHTING_MODES = ('risk_parity', 'performance', 'risk_parity_cov')
+    _WEIGHTING_MODES = ('risk_parity', 'performance', 'risk_parity_cov',
+                        'max_diversification', 'mean_variance')
 
     def __init__(self,
                  allocator: Optional[CrossDeskCapitalAllocator] = None,
@@ -79,7 +80,10 @@ class DynamicReweighter:
         #: 'risk_parity' (default, byte-identical) -> inverse-vol; 'performance'
         #: -> opt-in guarded risk-adjusted performance tilt; 'risk_parity_cov'
         #: -> opt-in full-covariance risk parity (equalizes risk contributions
-        #: over the full covariance matrix, not the inverse-vol diagonal).
+        #: over the full covariance matrix, not the inverse-vol diagonal);
+        #: 'max_diversification' -> opt-in max diversification-ratio (w ∝ Σ⁻¹σ);
+        #: 'mean_variance' -> opt-in long-only max-Sharpe (w ∝ Σ⁻¹μ). Every
+        #: opt-in mode degrades to the inverse-vol path.
         self.weighting = weighting
         self._curves: Dict[str, List[Tuple[pd.Timestamp, float]]] = {}
         #: Append-only audit of every rebalance actually applied.
@@ -142,18 +146,27 @@ class DynamicReweighter:
         degraded = self.allocator.degenerate_desks(returns_by_desk)
         # Mode selection: default 'risk_parity' calls risk_parity_weights
         # EXACTLY as before (byte-identical); 'performance' opts into the
-        # guarded risk-adjusted tilt; 'risk_parity_cov' opts into full-covariance
-        # risk parity. Both opt-in modes degrade to the inverse-vol path.
-        # cov mode can degrade to inverse-vol for NON-degenerate-desk reasons
-        # (short overlap, singular cov, a negatively-correlated hedge desk);
-        # capture WHY so the audit below records an honest fallback rather than
-        # fallback=False on a rebalance that did not use full-cov risk parity.
+        # guarded risk-adjusted tilt; 'risk_parity_cov', 'max_diversification'
+        # and 'mean_variance' opt into the covariance-aware optimizer modes. All
+        # opt-in modes degrade to the inverse-vol path. The covariance modes can
+        # degrade for NON-degenerate-desk reasons (short overlap, singular cov, a
+        # negatively-correlated hedge desk); capture WHY via the *_with_status
+        # variants so the audit below records an honest fallback rather than
+        # fallback=False on a rebalance that did not use its intended weighting.
         degrade_reason: Optional[str] = None
         if self.weighting == 'performance':
             weights = self.allocator.performance_weights(returns_by_desk)
         elif self.weighting == 'risk_parity_cov':
             weights, degrade_reason = \
                 self.allocator.risk_parity_cov_weights_with_status(
+                    returns_by_desk)
+        elif self.weighting == 'max_diversification':
+            weights, degrade_reason = \
+                self.allocator.max_diversification_weights_with_status(
+                    returns_by_desk)
+        elif self.weighting == 'mean_variance':
+            weights, degrade_reason = \
+                self.allocator.mean_variance_weights_with_status(
                     returns_by_desk)
         else:
             weights = self.allocator.risk_parity_weights(returns_by_desk)
