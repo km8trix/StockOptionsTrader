@@ -151,6 +151,9 @@ th.num {
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: var(--sp-3) var(--sp-4);
+    /* Fill the (already equal-height) Bootstrap column so cards stay level
+       when a label like "Deflated Sharpe" wraps to two lines. */
+    height: 100%;
 }
 
 .metric-label {
