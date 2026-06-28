@@ -151,6 +151,7 @@ class JaneStreetDesk(Desk):
                  rv_z_window: int = 60,
                  rv_entry_z: float = 2.0,
                  rv_exit_z: float = 0.5,
+                 rv_max_fraction: Optional[float] = None,
                  risk_budget_fraction: float = 0.02,
                  # Per-1.00-vol-point units (the greeks_series
                  # convention): 50,000 per $100k == $500 per 1% vol
@@ -243,6 +244,12 @@ class JaneStreetDesk(Desk):
         self.rv_z_window = rv_z_window
         self.rv_entry_z = rv_entry_z
         self.rv_exit_z = rv_exit_z
+        # The relative-value book trades an UNBOUNDED-loss stock pair (ETF vs
+        # basket), sized by a flat ~10% notional fraction — far hotter than
+        # the defined-risk VRP/earnings option books (risk-budgeted to ~2% of
+        # desk capital). rv_max_fraction (None = byte-identical) hard-caps the
+        # per-leg fraction so the RV book can't spiral the account to ruin.
+        self.rv_max_fraction = rv_max_fraction
         self.risk_budget_fraction = risk_budget_fraction
         self.vega_limit = vega_limit
         self.profit_target_pct = profit_target_pct
@@ -735,6 +742,9 @@ class JaneStreetDesk(Desk):
             if owner is not None:
                 self._leg_trades.setdefault(owner, []).append(trade)
 
+        # Close intents for broken (partially-filled) structures — see the
+        # partial-entry branch below. Returned alongside the RV intents.
+        cleanup_intents: List[DeskIntent] = []
         for structure_id in self.tracker.live_ids():
             structure = self.tracker.get(structure_id)
             book = self._structure_books.get(structure_id, 'vrp')
@@ -760,6 +770,39 @@ class JaneStreetDesk(Desk):
                         structure=structure['type'])
                     self.tracker.remove(structure_id)
                     self._structure_books.pop(structure_id, None)
+                    continue
+                elif 0 < n_open < len(structure['legs']) \
+                        and (self._day_index
+                             - self._entry_days.get(structure_id, 0)
+                             ) >= RECONCILE_GRACE_DAYS:
+                    # Partial entry (RUIN GUARD): some legs never filled —
+                    # typically a protective wing whose BUY was dropped for
+                    # insufficient cash while the short leg (which only credits
+                    # cash) filled — leaving the open legs with UNDEFINED risk.
+                    # A defined-risk desk must never ride a broken structure to
+                    # expiry (that is the path to a naked-short blow-up), so
+                    # flatten every open leg now and drop the bookkeeping.
+                    for leg, pos in zip(structure['legs'], positions):
+                        if pos is not None and pos.quantity != 0:
+                            cleanup_intents.append(DeskIntent(
+                                asset=leg['asset'],
+                                action='SELL' if pos.quantity > 0 else 'COVER',
+                                size_fraction=1.0,
+                                reason=(f"{structure['type']} {structure_id} "
+                                        f"broken-entry cleanup: {n_open}/"
+                                        f"{len(structure['legs'])} legs filled; "
+                                        f"flattening open legs (no defined risk)")))
+                    self.note(
+                        'risk',
+                        f"Broken structure {structure_id} on "
+                        f"{structure['underlying']}: only {n_open}/"
+                        f"{len(structure['legs'])} legs filled — flattening "
+                        f"open legs to avoid naked exposure",
+                        book=book, structure_id=structure_id,
+                        structure=structure['type'], n_open=n_open)
+                    self.tracker.remove(structure_id)
+                    self._structure_books.pop(structure_id, None)
+                    self._earnings_meta.pop(structure_id, None)
                     continue
 
             # --- all legs flat: finalize from the legs' closed trades --
@@ -790,7 +833,7 @@ class JaneStreetDesk(Desk):
                     del self._earnings_meta[structure_id]
 
         # --- relative-value legs: broken spread handling ----------------
-        return self._reconcile_rv(portfolio)
+        return cleanup_intents + self._reconcile_rv(portfolio)
 
     def _restate_from_fills(self, structure_id: str, positions: List,
                             book: str) -> None:
@@ -1250,6 +1293,8 @@ class JaneStreetDesk(Desk):
         cap = (self.risk_manager.max_position_size
                / max(self.capital_allocation, 1e-12))
         etf_fraction = min(weight * 0.5, cap * (1.0 - 1e-6))
+        if self.rv_max_fraction is not None:
+            etf_fraction = min(etf_fraction, self.rv_max_fraction)
         basket_fraction = etf_fraction / len(basket)
         for symbol in sorted(legs):
             direction = legs[symbol]

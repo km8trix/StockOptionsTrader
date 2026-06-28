@@ -34,6 +34,12 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#4493f8',
         'factory': FoundationDesk,
+        # Backtest tuning R1 (2015-2024 multi-regime): the walk-forward gate
+        # default (block score <= 0) was so conservative the desk barely
+        # deployed and bled costs near flat (Sharpe -4.1). Lower the gate to
+        # -0.05 so it trades more of a presumed-positive-edge model. Desk-class
+        # default stays 0.0 (byte-identical).
+        'config': {'gate_threshold': -0.05},
     },
     'renaissance': {
         'name': 'Renaissance Desk',
@@ -52,6 +58,10 @@ _DESK_SPECS: Dict[str, Dict] = {
         # (see below); the desk-class default stays off and an un-ingested
         # cache reads empty, so this is byte-identical until the operator runs
         # `python -m data.earnings_cache`. Exits are never gated.
+        # Backtest tuning R1: tried tightening the MR regime gate
+        # (mr_prob_threshold 0.6 -> 0.75) to lift the low MR win rate, but it
+        # was negligible (-57.1% -> -55.9%) — the loss is not driven by the
+        # regime gate. Reverted; the param stays in the desk (default 0.6).
         'config': {'avoid_earnings_entries': True},
     },
     'citadel': {
@@ -69,6 +79,11 @@ _DESK_SPECS: Dict[str, Dict] = {
         # median / MAD (outlier-resistant) instead of mean / std, so a single
         # blow-up day can't dominate a pod's capital weight. The desk-class
         # default stays mean/std (byte-identical); this is the config point.
+        # Backtest tuning R1: tried allow_cut_recovery (re-admit cut pods) to
+        # fix the post-2020 dormancy — but it made the desk WORSE (+8.8% ->
+        # -22.3%): the pods have no edge, so re-deploying their capital just
+        # churns and loses. The permanent cut was protective. Reverted; the
+        # allow_cut_recovery param stays in the desk (default False, inert).
         'config': {'robust_pod_sharpe': True},
     },
     'janestreet': {
@@ -89,7 +104,13 @@ _DESK_SPECS: Dict[str, Dict] = {
         # up the early-exercise premium the put wings carry. Greeks stay
         # Black-Scholes; the desk-class default stays european (byte-
         # identical). This is the config point.
-        'config': {'exercise_style': 'american'},
+        # Backtest tuning R1: the relative-value book trades an UNBOUNDED-loss
+        # stock pair sized at ~10% notional per leg — far hotter than the
+        # defined-risk option books (~2% risk budget) — and spiraled the
+        # account to -99.96% (total ruin) by 2018. Cap the RV leg fraction at
+        # 0.02 so it can't blow up the desk. Desk-class default stays None
+        # (byte-identical, uncapped).
+        'config': {'exercise_style': 'american', 'rv_max_fraction': 0.02},
     },
     'twosigma': {
         'name': 'Two Sigma Desk',
@@ -107,7 +128,11 @@ _DESK_SPECS: Dict[str, Dict] = {
         # hysteresis band (hold names while they stay in the top/bottom 30%,
         # vs the 20% entry quantile) and a 3-day minimum hold, damping churn.
         # The book mechanics + defaults stay no-op; this is the config point.
-        'turnover': {'exit_quantile': 0.3, 'min_holding_days': 3},
+        # Backtest tuning R1: the ML book churned ~15 trades/day (38,750 total)
+        # and lost in every regime — a daily-horizon signal swamped by turnover
+        # costs. Widen the hold band (exit_quantile 0.4) and raise the minimum
+        # hold to 21 days to cut churn ~7x and let any real edge survive costs.
+        'turnover': {'exit_quantile': 0.4, 'min_holding_days': 21},
         # Signal-strength sizing (Phase 5): production splits each side's
         # budget by |alpha score| (conviction) instead of equal-weight,
         # clamped to the equal-weight cap so the book stays dollar-neutral
@@ -130,6 +155,10 @@ _DESK_SPECS: Dict[str, Dict] = {
         'turnover': {'exit_quantile': 0.3, 'min_holding_days': 3},
         # Signal-strength sizing (Phase 5): same conviction tilt as Two Sigma
         # (per-side |score| budgeting, dollar-neutral, gross-bounded).
+        # Backtest tuning R1: tried raising Ridge alpha 1.0 -> 5.0 to tame the
+        # momentum-crash exposure, but it had ~no effect (-33.7% -> -33.5%) —
+        # the crash isn't a regularization-strength problem. Reverted; the
+        # factor_alpha param stays in the desk (default 1.0).
         'config': {'size_by_signal_strength': True},
     },
 }
