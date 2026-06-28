@@ -18,21 +18,24 @@
                 <form id="backtestForm" novalidate>
                     <div class="mb-3">
                         <span class="form-label d-block" id="btModeLabel">Mode</span>
-                        {# Click-to-toggle switch: unchecked = Strategy, checked =
-                           Desk. Rendered in both workspaces (Sandbox + the Floor's
-                           ws=production deep link); ws only drives the nav badge now.
-                           The visible side labels are aria-hidden; the switch's
-                           accessible name is the "Mode" heading + a visually-hidden
-                           state hint, joined via aria-labelledby. #}
-                        <div class="d-flex align-items-center gap-2">
-                            <span class="form-check-label" aria-hidden="true">Strategy</span>
-                            <div class="form-check form-switch m-0">
-                                <input class="form-check-input m-0" type="checkbox"
-                                       role="switch" id="btModeSwitch"
-                                       aria-labelledby="btModeLabel btModeState">
-                                <span id="btModeState" class="visually-hidden">— off: Strategy, on: Desk</span>
-                            </div>
-                            <span class="form-check-label" aria-hidden="true">Desk</span>
+                        {# Segmented "Mode" pill: both options sit inside one rounded
+                           control with the active one filled (gold). Renders in both
+                           workspaces — Desk is reachable from Sandbox; ws only drives
+                           the nav badge. The group is labeled by the "Mode" heading;
+                           each radio keeps its own visible in-pill label. #}
+                        <div class="mode-pill d-flex w-100" role="group"
+                             aria-labelledby="btModeLabel">
+                            <input type="radio" class="btn-check" name="btMode"
+                                   id="modeStrategy" value="strategy"
+                                   autocomplete="off" checked>
+                            <label class="btn" for="modeStrategy">Strategy</label>
+                            <input type="radio" class="btn-check" name="btMode"
+                                   id="modeDesk" value="desk" autocomplete="off">
+                            <label class="btn" for="modeDesk">Desk</label>
+                            {# Sliding highlight; CSS translates it to the checked
+                               segment (after both radios so the ~ selector reaches
+                               it). Decorative — hidden from the a11y tree. #}
+                            <span class="mode-pill__thumb" aria-hidden="true"></span>
                         </div>
                     </div>
                     <div class="mb-3" id="strategyField">

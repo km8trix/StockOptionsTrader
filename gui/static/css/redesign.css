@@ -401,6 +401,61 @@ body.ui-next .btn-check:checked + .btn-outline-secondary {
     font-weight: 700;
 }
 
+/* Segmented "Mode" pill (Backtest): both options live inside one rounded
+   control. A single gold "thumb" sits behind the labels and SLIDES between the
+   two segments on toggle (transform-animated); the labels stay put and only
+   their text colour crossfades in sync. macOS-style segmented switch. */
+body.ui-next .mode-pill {
+    position: relative;
+    padding: 4px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+}
+/* Sliding highlight: sized to one segment (half the pill minus the padding),
+   translated to the second segment when Desk is checked. Behind the labels. */
+body.ui-next .mode-pill__thumb {
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    left: 4px;
+    width: calc(50% - 4px);
+    z-index: 0;
+    border-radius: 999px;
+    background: var(--gold-grad);
+    box-shadow: var(--shadow-sm);
+    transition: transform 0.25s var(--ease);
+}
+body.ui-next .mode-pill #modeDesk:checked ~ .mode-pill__thumb {
+    transform: translateX(100%);
+}
+body.ui-next .mode-pill .btn {
+    position: relative;
+    z-index: 1;
+    flex: 1 1 0;            /* exact 50/50 segments so the thumb aligns */
+    min-width: 0;           /* let equal segments hold even when the rail is narrow */
+    border: 0;
+    border-radius: 999px;
+    padding: 6px 12px;
+    background: transparent;
+    color: var(--text-muted);
+    font-weight: 600;
+    transition: color 0.25s var(--ease);
+}
+body.ui-next .mode-pill .btn-check:not(:checked) + .btn:hover { color: var(--text); }
+body.ui-next .mode-pill .btn-check:checked + .btn {
+    color: #0f111a;
+    font-weight: 700;
+}
+body.ui-next .mode-pill .btn-check:focus-visible + .btn {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+/* Honor reduced-motion: snap instead of slide. */
+@media (prefers-reduced-motion: reduce) {
+    body.ui-next .mode-pill__thumb { transition: none; }
+}
+
 /* Backtest note chips + progress + paper risk feedback */
 body.ui-next .note-line { border-left-color: var(--accent); background-color: var(--accent-dim); }
 body.ui-next .note-line.note-warn { border-left-color: #e0a030; background-color: rgba(212, 175, 55, 0.10); }

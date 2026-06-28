@@ -270,8 +270,8 @@ function applyDeskModelVisibility() {
    ========================================================================== */
 
 function currentMode() {
-    const sw = document.getElementById('btModeSwitch');
-    return sw && sw.checked ? 'desk' : 'strategy';
+    const checked = document.querySelector('input[name="btMode"]:checked');
+    return checked ? checked.value : 'strategy';
 }
 
 function applyMode() {
@@ -294,7 +294,7 @@ async function loadDesks() {
         ready = (data.desks || []).filter((d) => d.status === 'ready');
     } catch (_) {
         hint.textContent = 'Could not load desk list — reload the page.';
-        document.getElementById('btModeSwitch').disabled = true;
+        document.getElementById('modeDesk').disabled = true;
         return [];
     }
     desksByKey = {};
@@ -307,18 +307,20 @@ async function loadDesks() {
     });
     if (ready.length === 0) {
         hint.textContent = 'No desks are ready yet — they activate in later phases.';
-        document.getElementById('btModeSwitch').disabled = true;
+        document.getElementById('modeDesk').disabled = true;
     }
     return ready;
 }
 
 /** Wire the mode toggle and honor a /backtest?desk=<key> deep link. */
 async function initDeskMode() {
-    // The Strategy/Desk switch renders in every workspace, so desk wiring
-    // always runs — listeners, the desk fetch, and the ?desk= deep link.
-    const modeSwitch = document.getElementById('btModeSwitch');
-    if (!modeSwitch) return;
-    modeSwitch.addEventListener('change', applyMode);
+    // The Strategy/Desk pill renders in every workspace, so desk wiring always
+    // runs — listeners, the desk fetch, and the ?desk= deep link.
+    const deskRadio = document.getElementById('modeDesk');
+    if (!deskRadio) return;
+    document.querySelectorAll('input[name="btMode"]').forEach((radio) => {
+        radio.addEventListener('change', applyMode);
+    });
     // Desk-to-desk switches must toggle the model-selectable Model picker too.
     document.getElementById('btDesk')
         .addEventListener('change', applyDeskModelVisibility);
@@ -326,7 +328,7 @@ async function initDeskMode() {
     const deskParam = new URLSearchParams(window.location.search).get('desk');
     if (!deskParam) return;
     if (ready.some((d) => d.key === deskParam)) {
-        modeSwitch.checked = true;
+        deskRadio.checked = true;
         document.getElementById('btDesk').value = deskParam;
         applyMode();
     } else {
