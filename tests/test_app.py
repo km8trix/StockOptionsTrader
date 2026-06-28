@@ -1646,11 +1646,14 @@ class TestDeskModeBacktest:
         assert rows[0]['strategy'] == 'momentum'
 
     def test_backtest_page_ships_desk_mode_controls(self, client):
-        """The backtest page carries the Strategy/Desk mode switch + desk picker
-        for backtest.js in BOTH workspaces (Desk is no longer Production-only),
-        and the dropped Fund mode leaves no input markup behind."""
+        """The backtest page carries the Strategy/Desk segmented mode pill + desk
+        picker for backtest.js in BOTH workspaces (Desk is no longer
+        Production-only), and the dropped Fund mode leaves no input markup."""
         html = client.get('/backtest?ws=production').get_data(as_text=True)
-        assert 'id="btModeSwitch"' in html
+        assert 'id="modeStrategy"' in html
+        assert 'id="modeDesk"' in html
+        assert 'class="mode-pill' in html
+        assert 'mode-pill__thumb' in html  # sliding highlight element
         assert 'id="btDesk"' in html
         assert 'id="traderNotesCard"' in html
         assert 'id="deskChipRow"' in html
@@ -1666,8 +1669,8 @@ class TestDeskModeBacktest:
         assert 'id="modeFund"' not in html
         assert 'id="fundField"' not in html
         assert 'id="fundDeskList"' not in html
-        # The Sandbox page carries the same switch — Desk is selectable there now.
-        assert 'id="btModeSwitch"' in client.get('/backtest').get_data(as_text=True)
+        # The Sandbox page carries the same pill — Desk is selectable there now.
+        assert 'id="modeDesk"' in client.get('/backtest').get_data(as_text=True)
         # Phase 8: structures table + portfolio-Greeks card (contracts
         # C11/C12), painted by backtest.js only for janestreet runs.
         assert 'id="structuresCard"' in html
