@@ -426,7 +426,10 @@ body.ui-next .mode-pill__thumb {
     box-shadow: var(--shadow-sm);
     transition: transform 0.25s var(--ease);
 }
-body.ui-next .mode-pill #modeDesk:checked ~ .mode-pill__thumb {
+/* Move to the second segment whenever the second radio is checked — generic
+   so every two-segment pill (Mode: Strategy/Desk, Workspace: Sandbox/
+   Production) animates without per-pill ID rules. */
+body.ui-next .mode-pill .btn-check:nth-of-type(2):checked ~ .mode-pill__thumb {
     transform: translateX(100%);
 }
 body.ui-next .mode-pill .btn {
