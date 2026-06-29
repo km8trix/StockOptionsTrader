@@ -66,6 +66,17 @@ A signal earns a Production desk slot only if **both** hold:
 .venv/bin/python -m pytest tests/test_desk_registry.py -q
 ```
 
+## Phase 2 — RESULT (2026-06-29): no promotion (verdict code-verified)
+IC gate ✅ for `mom_12_1` (t +2.66 @1d, 11.7% turnover, monotone) — edge is real but **1d-concentrated, decaying to insignificance by 21d** (t 1.24).
+OOS gate ❌ for the desk built on it:
+- Plain (crash-filter on): +46.04% return, **Sharpe 0.20**, Deflated 0.03, MaxDD −17.9%.
+- Residual (beta-stripped): +24.26%, **Sharpe 0.07**, Deflated 0.01, MaxDD −23.3% (tamed 2018Q4 but gave back more in 2021).
+- Both far below the 0.5 Sharpe gate. `_PROMOTED_DESKS` stays empty.
+
+**Adversarial verification (workflow `wf_f9debbfc-605`, 4 lenses + Opus synthesis):** a Haiku lens claimed a short-book-dropout bug (conviction sizing → net-long tilt). **Refuted by direct code read** — `_conviction_sizes` is per-side and scale-free (`cross_sectional.py:325-327,345-348,462-467`); the `Dropping SHORT intent` log is ~0.2% of trades and symmetric with longs. **No artifact. Sharpe 0.20 is a faithful "edge too thin to be risk-efficient" measurement.** Three lenses + synthesis converge: gate is well-calibrated, signal density (mean IC ≈0.033 @1d) is simply too low.
+
+**Best evidence-motivated next step (if pursued):** `min_holding_days` 3→1 + `exit_quantile` 0.3→0.2 to trade the 1d alpha peak — but honest P(clear 0.5) ≈ 15–20%, leaning low; it's a *diagnostic confirmation* run (in-sample param-mining risk), not a promotion candidate. **Real direction: raise edge DENSITY, not turnover** — hybrid `mom_12_1` + `reversal_5` (with explicit cost modeling), signal-level vol scaling, or a forward-vol crash overlay. Phase 3 = research, not a desk promotion.
+
 ## Risks
 | Risk | Likelihood | Mitigation |
 |---|---|---|

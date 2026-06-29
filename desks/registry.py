@@ -91,7 +91,11 @@ _DESK_SPECS: Dict[str, Dict] = {
         'firm_inspiration': 'Jane Street',
         'description': ('Fair-value engine, market-making simulator '
                         '(simulation-only), and IV-rank-driven defined-risk '
-                        'premium selling with an earnings IV-crush module.'),
+                        'premium selling with an earnings IV-crush module. '
+                        'Research/simulation-only: synthetic IV carries no '
+                        'variance-risk-premium, so its premium-selling is not '
+                        'a promotion candidate until a real options-data feed '
+                        'is wired.'),
         # Contract C15: ready as of Phase 8; accent stays '#d29922'.
         # All four desks are now live.
         'status': 'ready',

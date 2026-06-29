@@ -113,6 +113,31 @@ Mirrors a classical-quant research shop: hand-engineered, economically-signed pr
 
 **Opt-in knobs:** `alpha=1.0` (ridge), `quantile=0.2`, `target_gross=1.0`, `max_name_size=0.10`, `min_scored=4`.
 
+### Evidence gate & desk promotion
+
+No desk is treated as a validated strategy until it earns it. A signal becomes a
+**promoted** desk only after passing two gates, in order:
+
+1. **IC gate** — `scripts/signal_ic.py` measures leakage-free rank-IC vs forward
+   returns (1/5/21d), IC-IR, t-stat, turnover, and quintile spread. A signal
+   must show stable, significant, same-signed IC at tradeable turnover.
+2. **OOS gate** — `scripts/desk_backtest.py` runs the desk standalone over a
+   multi-regime window and requires total return > 0 **and** Sharpe > 0.5
+   **and** Deflated Sharpe > 0 **and** no catastrophic regime.
+
+A desk that clears both is promoted by adding its key to
+`desks.registry._PROMOTED_DESKS` (one line). `list_desks()` then reports
+`gate_status: 'promoted'` and the Trading Floor shows a *Gate-passed* badge;
+everything else stays `'research'`. **"Promoted" is a research-quality status
+only** — it never routes a desk into the live-execution Production workspace
+(which excludes desks by design).
+
+**Current state (2026-06):** `_PROMOTED_DESKS` is empty. The strongest price
+signal — 12-1 momentum (`mom_12_1`) — passes the IC gate (t +2.66 @1d) but the
+desk built on it fails the OOS gate (Sharpe ≈0.20): the edge is real but too
+thin to be risk-efficient after costs and momentum crashes. The six firm-style
+desks below are research/backtesting tools, not validated production strategies.
+
 ### Autonomy layer (Phase F)
 
 Two cooperating layers sit around the fund — both conservative and gated.
