@@ -135,8 +135,11 @@ only** — it never routes a desk into the live-execution Production workspace
 **Current state (2026-06):** `_PROMOTED_DESKS` is empty. The strongest price
 signal — 12-1 momentum (`mom_12_1`) — passes the IC gate (t +2.66 @1d) but the
 desk built on it fails the OOS gate (Sharpe ≈0.20): the edge is real but too
-thin to be risk-efficient after costs and momentum crashes. The six firm-style
-desks below are research/backtesting tools, not validated production strategies.
+thin to be risk-efficient after costs and momentum crashes. A `mom_12_1` +
+`reversal_5` hybrid was also tested (`scripts/proto_hybrid_desk.py`) and rejected
+— `reversal_5` has real edge but ~79% turnover makes it un-tradeable at daily
+cadence (costs win). The six firm-style desks below are research/backtesting
+tools, not validated production strategies.
 
 ### Autonomy layer (Phase F)
 

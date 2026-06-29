@@ -77,6 +77,19 @@ OOS gate ❌ for the desk built on it:
 
 **Best evidence-motivated next step (if pursued):** `min_holding_days` 3→1 + `exit_quantile` 0.3→0.2 to trade the 1d alpha peak — but honest P(clear 0.5) ≈ 15–20%, leaning low; it's a *diagnostic confirmation* run (in-sample param-mining risk), not a promotion candidate. **Real direction: raise edge DENSITY, not turnover** — hybrid `mom_12_1` + `reversal_5` (with explicit cost modeling), signal-level vol scaling, or a forward-vol crash overlay. Phase 3 = research, not a desk promotion.
 
+## Edge-density experiment — RESULT (2026-06-29): REJECTED
+Built `scripts/proto_hybrid_desk.py` — a parameter-free equal-weight z-score blend of `mom_12_1` + `reversal_5` (exact `signal_ic.py` formulas), HybridDesk mirroring MomentumDesk so only the signal changes. Adding reversal **monotonically destroys** the desk (dose-response in `w_rev`):
+
+| `w_rev` | trades | return | Sharpe |
+|---|---|---|---|
+| 0.0 (momentum-only) | 4,236 | +46.0% | 0.20 |
+| 0.5 (reversal-light) | 17,456 | −59.6% | −1.20 |
+| 1.0 (equal-weight) | 25,013 | −75.5% | −2.15 |
+
+`reversal_5` has the strongest IC (t +2.86 @5d) but is **un-tradeable in a daily-rebalanced desk** — ~79% turnover explodes to 17–25k trades and slippage+commission obliterate the alpha. Win rate RISES (24%→45%) yet loses every regime = cost-bleed signature, not a sign error (reversal sign matches `signal_ic.py`; a flip would lower win rate). Self-verifying via the dose-response + correct-sign + prior IC warning — no verification workflow needed.
+
+**Net:** at retail daily cadence on LARGE_CAP_100/2015-2024, NO validated price signal clears the OOS gate. `_PROMOTED_DESKS` stays empty; the gate machinery is ready for future signals. **Only un-tried lever:** capture `reversal_5` at its native 5-day cadence (rebalance every 5d / no-trade band) so turnover isn't amplified — the desk cadence, not the signal, is what failed it.
+
 ## Risks
 | Risk | Likelihood | Mitigation |
 |---|---|---|
