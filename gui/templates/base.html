@@ -14,23 +14,29 @@
     <a href="#main-content" class="skip-link">Skip to main content</a>
     <nav class="navbar navbar-expand-lg app-nav sticky-top" aria-label="Main navigation">
         <div class="container-fluid">
-            {# Two workspaces: Sandbox = Strategy layer (never live), Production
-               = Desk layer (live-capable). The split mirrors the desks-vs-
-               strategies architecture so the nav itself teaches the model. #}
+            {# Two workspaces: Sandbox = research & backtesting (never live),
+               which now includes the firm-style Desks as backtesting tools;
+               Production = live E*TRADE execution only. Desks are backtest-
+               only and are intentionally NOT exposed in Production. #}
             {% set sandbox_items = [
                 ('/analysis', 'Analysis'),
                 ('/backtest', 'Backtest'),
+                ('/floor', 'Desks'),
                 ('/paper_trade', 'Paper Trading'),
             ] %}
             {% set production_items = [
-                ('/floor', 'Trading Floor'),
                 ('/charts', 'Charts'),
                 ('/live', 'Live'),
             ] %}
-            {% set sandbox_paths = sandbox_items | map(attribute=0) | list %}
+            {# /trading_floor is the back-compat alias for /floor (a Sandbox
+               page); list it so the alias still resolves the SANDBOX badge. #}
+            {% set sandbox_paths = (sandbox_items | map(attribute=0) | list)
+                                   + ['/trading_floor'] %}
             {% set production_paths = production_items | map(attribute=0) | list %}
-            {# /backtest is a Sandbox path by default but flips to Production
-               when reached with ?ws=production (desk/fund backtests). #}
+            {# The Backtest page carries a visible Sandbox/Production workspace
+               toggle (backtest.js); ?ws=production sets the INITIAL badge so a
+               deep-link or refresh keeps the choice. Backtests are simulation
+               and never trade live in either workspace. #}
             {% set section = 'production' if (request.path in production_paths
                                  or request.args.get('ws') == 'production')
                              else ('sandbox' if request.path in sandbox_paths

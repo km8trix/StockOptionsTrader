@@ -284,6 +284,44 @@ function applyMode() {
     applyDeskModelVisibility();
 }
 
+/** Swap the nav workspace badge between SANDBOX and PRODUCTION (mirrors the
+ *  base.html server-rendered markup so client + server stay identical). */
+function setWorkspaceBadge(ws) {
+    const badge = document.querySelector('.ws-badge');
+    if (!badge) return;
+    if (ws === 'production') {
+        badge.className = 'ws-badge ws-badge-production';
+        badge.title = 'Live-capable workspace';
+        badge.textContent = 'PRODUCTION';
+    } else {
+        badge.className = 'ws-badge ws-badge-sandbox';
+        badge.title = 'Research & practice — nothing here trades live';
+        badge.innerHTML = 'SANDBOX<span class="d-none d-sm-inline"> · non-live</span>';
+    }
+}
+
+/** Wire the Sandbox/Production workspace toggle. Pure badge/context — backtests
+ *  never trade live in either workspace. Initial state comes from ?ws=production
+ *  (so a deep-link/refresh keeps the choice); flipping syncs the URL param. */
+function initWorkspaceToggle() {
+    const group = document.getElementById('wsToggle');
+    if (!group) return;
+    const ws = new URLSearchParams(window.location.search).get('ws') === 'production'
+        ? 'production' : 'sandbox';
+    document.getElementById(ws === 'production' ? 'wsProduction' : 'wsSandbox')
+        .checked = true;
+    setWorkspaceBadge(ws);
+    group.addEventListener('change', (event) => {
+        if (event.target.name !== 'btWorkspace') return;
+        const value = event.target.value;
+        setWorkspaceBadge(value);
+        const url = new URL(window.location);
+        if (value === 'production') url.searchParams.set('ws', 'production');
+        else url.searchParams.delete('ws');
+        history.replaceState(null, '', url);
+    });
+}
+
 /** Populate #btDesk with READY desks; returns them (empty array on error). */
 async function loadDesks() {
     const select = document.getElementById('btDesk');
@@ -2070,6 +2108,7 @@ function paintInitialEmptyState() {
 
 document.addEventListener('DOMContentLoaded', () => {
     paintInitialEmptyState();
+    initWorkspaceToggle();
     loadStrategies();
     loadModels();
     initDeskMode();

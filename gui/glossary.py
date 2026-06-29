@@ -12,12 +12,14 @@ from __future__ import annotations
 # Insertion order is the display order in the offcanvas.
 GLOSSARY: dict[str, str] = {
     "Sandbox": (
-        "Research & practice workspace — analyze symbols, backtest strategies, "
-        "and paper trade. Nothing here ever places a live order."
+        "Research & practice workspace — analyze symbols, backtest strategies "
+        "and the firm-style desks, and paper trade. Nothing here ever places a "
+        "live order."
     ),
     "Production": (
-        "Live-capable workspace — run the firm-style desks, review the trading "
-        "floor, and connect E*TRADE for live execution."
+        "Live-capable workspace — connect E*TRADE for live execution and watch "
+        "the production market charts. Desks are backtest-only and live in the "
+        "Sandbox, not here."
     ),
     "Strategy": (
         "A single rule set for entering and exiting trades. Strategies live in "
@@ -25,7 +27,8 @@ GLOSSARY: dict[str, str] = {
     ),
     "Desk": (
         "A firm-style trading unit that runs strategies under one risk book. "
-        "Desks live in Production and can trade live."
+        "Desks are backtesting tools in the Sandbox — they are not wired to "
+        "live execution."
     ),
     "Fund": (
         "Several desks run together under one shared risk book, with capital "

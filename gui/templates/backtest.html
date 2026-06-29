@@ -17,6 +17,24 @@
             <div class="card-body">
                 <form id="backtestForm" novalidate>
                     <div class="mb-3">
+                        <span class="form-label d-block" id="btWorkspaceLabel">Workspace</span>
+                        {# Segmented Sandbox/Production toggle (same animated pill
+                           as Mode). Flips ONLY the nav badge/context — backtests
+                           are simulation and never trade live in either workspace.
+                           backtest.js swaps the badge live and syncs ?ws=. #}
+                        <div class="mode-pill d-flex w-100" role="group"
+                             aria-labelledby="btWorkspaceLabel" id="wsToggle">
+                            <input type="radio" class="btn-check" name="btWorkspace"
+                                   id="wsSandbox" value="sandbox"
+                                   autocomplete="off" checked>
+                            <label class="btn" for="wsSandbox">Sandbox</label>
+                            <input type="radio" class="btn-check" name="btWorkspace"
+                                   id="wsProduction" value="production" autocomplete="off">
+                            <label class="btn" for="wsProduction">Production</label>
+                            <span class="mode-pill__thumb" aria-hidden="true"></span>
+                        </div>
+                    </div>
+                    <div class="mb-3">
                         <span class="form-label d-block" id="btModeLabel">Mode</span>
                         {# Segmented "Mode" pill: both options sit inside one rounded
                            control with the active one filled (gold). Renders in both
