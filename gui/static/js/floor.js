@@ -34,6 +34,18 @@ function deskStatusBadge(desk) {
             ? `Activates in Phase ${phase}` : 'Planned'}</span>`;
 }
 
+// Evidence-gate status — a separate axis from Ready/Planned. 'promoted' means
+// the desk cleared the IC + OOS gates; 'research' is the default candidate state.
+function deskGateBadge(desk) {
+    return desk.gate_status === 'promoted'
+        ? '<span class="badge-gate-passed" ' +
+          'title="Passed the IC + OOS evidence gates">' +
+          '<i class="bi bi-patch-check-fill" aria-hidden="true"></i> Gate-passed</span>'
+        : '<span class="badge-gate-research" ' +
+          'title="Research candidate — not yet through the evidence gates">' +
+          'Research</span>';
+}
+
 function deskCard(desk) {
     const ready = desk.status === 'ready';
     return (
@@ -45,7 +57,10 @@ function deskCard(desk) {
         deskStatusBadge(desk) +
         '</div>' +
         '<div class="card-body d-flex flex-column">' +
+        '<div class="d-flex justify-content-between align-items-center gap-2">' +
         `<div class="desk-firm-tag">${escapeHTML(desk.firm_inspiration ?? '')}</div>` +
+        deskGateBadge(desk) +
+        '</div>' +
         `<p class="desk-desc flex-grow-1">${escapeHTML(desk.description ?? '')}</p>` +
         (ready
             ? '<a class="btn btn-outline-secondary btn-sm align-self-start" ' +

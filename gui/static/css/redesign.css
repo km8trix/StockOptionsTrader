@@ -318,6 +318,27 @@ body.ui-next .badge-ready {
     font-weight: 600;
 }
 
+/* Evidence-gate status (distinct axis from Ready/Planned): 'promoted' = passed
+   the IC + OOS gates (accent), 'research' = candidate not yet through (muted). */
+body.ui-next .badge-gate-passed,
+body.ui-next .badge-gate-research {
+    border-radius: 999px;
+    letter-spacing: 0.04em;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+body.ui-next .badge-gate-passed {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+body.ui-next .badge-gate-research {
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+}
+
 /* --------------------------------------------------------------------------
    Ranking table — borderless, white/5 header, white/2 row hover, mono nums
    -------------------------------------------------------------------------- */

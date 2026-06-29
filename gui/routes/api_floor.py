@@ -4,7 +4,11 @@ API routes for the Trading Floor page.
 GET /api/floor/desks proxies :func:`desks.registry.list_desks` — the Phase 5
 shared contract (C1). Each entry carries exactly:
 ``key / name / firm_inspiration / description / status /
-activates_in_phase / accent``.
+activates_in_phase / accent / gate_status``.
+
+``gate_status`` is 'promoted' once a desk has passed both evidence gates
+(IC + OOS backtest), else 'research'. It is a research-quality status only and
+never implies live trading — the Floor is a Sandbox page.
 """
 from __future__ import annotations
 
