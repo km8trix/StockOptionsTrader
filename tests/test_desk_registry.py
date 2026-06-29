@@ -12,13 +12,13 @@ from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.janestreet import JaneStreetDesk
 from desks.orchestrator import FundOrchestrator
-from desks.registry import (_MODEL_SELECTABLE_DESKS, create_desk,
-                            create_fund_orchestrator, list_desks)
+from desks.registry import (_MODEL_SELECTABLE_DESKS, _PROMOTED_DESKS,
+                            create_desk, create_fund_orchestrator, list_desks)
 from desks.renaissance import RenaissanceDesk
 from desks.twosigma import TwoSigmaDesk
 
 EXPECTED_KEYS = {'key', 'name', 'firm_inspiration', 'description', 'status',
-                 'activates_in_phase', 'accent'}
+                 'activates_in_phase', 'accent', 'gate_status'}
 
 
 class TestListDesks:
@@ -33,6 +33,8 @@ class TestListDesks:
             assert isinstance(entry['description'], str) and entry['description']
             assert entry['status'] in ('ready', 'planned')
             assert re.fullmatch(r'#[0-9a-f]{6}', entry['accent'])
+            assert entry['gate_status'] == (
+                'promoted' if entry['key'] in _PROMOTED_DESKS else 'research')
             if entry['status'] == 'planned':
                 assert isinstance(entry['activates_in_phase'], int)
             else:
@@ -167,6 +169,25 @@ class TestCreateDesk:
     def test_no_planned_desks_remain(self):
         # Phase 8 flipped the last planned desk; every entry is ready.
         assert all(entry['status'] == 'ready' for entry in list_desks())
+
+
+class TestGateStatus:
+    """``gate_status`` reflects ``_PROMOTED_DESKS`` membership — the single
+    source of truth for which desks have cleared BOTH evidence gates (IC +
+    OOS backtest). Empty until a desk earns it; promotion is one entry in that
+    frozenset. 'promoted' is a research-quality status only and never means the
+    desk trades live."""
+
+    def test_promoted_keys_are_real_desks(self):
+        # Guards against a typo'd or stale promotion key in _PROMOTED_DESKS.
+        keys = {entry['key'] for entry in list_desks()}
+        assert _PROMOTED_DESKS <= keys
+
+    def test_gate_status_matches_membership(self):
+        for entry in list_desks():
+            expected = ('promoted' if entry['key'] in _PROMOTED_DESKS
+                        else 'research')
+            assert entry['gate_status'] == expected
 
 
 class TestModelSelectableDeskConsistency:

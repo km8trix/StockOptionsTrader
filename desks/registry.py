@@ -167,6 +167,15 @@ _DESK_SPECS: Dict[str, Dict] = {
 #: desks reject a non-None ``model_key`` with a clear ValueError.
 _MODEL_SELECTABLE_DESKS = frozenset({'foundation', 'twosigma'})
 
+#: Desk keys that have PASSED both evidence gates — IC (scripts/signal_ic.py)
+#: AND the OOS backtest gate (scripts/desk_backtest.py: return>0, Sharpe>0.5,
+#: Deflated Sharpe>0, no catastrophic regime). list_desks() surfaces this as
+#: each entry's ``gate_status`` ('promoted' if listed here, else 'research').
+#: Empty until a desk earns it; promotion is a one-line addition here. This is
+#: a research-quality status ONLY — "promoted" never means "trades live" (the
+#: GUI's Production workspace is live-execution-only and excludes desks).
+_PROMOTED_DESKS: frozenset = frozenset()
+
 
 def list_desks() -> List[Dict]:
     """Describe all desks for the Trading Floor (contract C1 shape)."""
@@ -179,6 +188,7 @@ def list_desks() -> List[Dict]:
             'status': spec['status'],
             'activates_in_phase': spec['activates_in_phase'],
             'accent': spec['accent'],
+            'gate_status': 'promoted' if key in _PROMOTED_DESKS else 'research',
         }
         for key, spec in _DESK_SPECS.items()
     ]

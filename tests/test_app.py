@@ -1210,7 +1210,7 @@ class TestFundBacktest:
 # exactly these keys.
 DESK_CONTRACT_KEYS = {
     'key', 'name', 'firm_inspiration', 'description', 'status',
-    'activates_in_phase', 'accent',
+    'activates_in_phase', 'accent', 'gate_status',
 }
 
 
@@ -1224,6 +1224,7 @@ def make_desk_entry(**overrides):
         'status': 'ready',
         'activates_in_phase': None,
         'accent': '#3fb950',
+        'gate_status': 'research',
     }
     entry.update(overrides)
     return entry
