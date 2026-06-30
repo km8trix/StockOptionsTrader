@@ -51,3 +51,7 @@ htmlcov/
 # Research harness outputs (scripts/desk_backtest.py, scripts/signal_ic.py) — regenerable
 analysis/backtests/
 analysis/signal_ic/
+
+# PIT warehouse (large Parquet — operator-ingested, never committed)
+pit_warehouse/
+*.parquet
