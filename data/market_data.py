@@ -325,6 +325,7 @@ class MarketDataHandler:
         """Calculate technical indicators"""
         data['sma_20'] = data['close'].rolling(window=20).mean()
         data['sma_50'] = data['close'].rolling(window=50).mean()
+        data['sma_200'] = data['close'].rolling(window=200).mean()
         
         data['ema_12'] = data['close'].ewm(span=12, adjust=False).mean()
         data['ema_26'] = data['close'].ewm(span=26, adjust=False).mean()
