@@ -115,6 +115,63 @@ def test_prices_returns_total_return_adjusted_series(cache):
     assert cache.prices('SURV', '2015-01-03', '2015-01-04').empty   # gap between bars
 
 
+# --- Insiders (SF2): point-in-time by filingdate -----------------------------
+
+def test_insider_net_buys_is_point_in_time_and_filters_codes(cache):
+    cache.store_sf2([
+        {'ticker': 'SURV', 'filingdate': '2015-02-10', 'transactiondate': '2015-02-08',
+         'transactioncode': 'P', 'transactionshares': 1000, 'transactionvalue': 1_000_000,
+         'ownername': 'CEO'},                                   # open-market BUY
+        {'ticker': 'SURV', 'filingdate': '2015-03-05', 'transactiondate': '2015-03-03',
+         'transactioncode': 'S', 'transactionshares': 400, 'transactionvalue': 400_000,
+         'ownername': 'CFO'},                                   # open-market SELL
+        {'ticker': 'SURV', 'filingdate': '2015-02-20', 'transactiondate': '2015-02-18',
+         'transactioncode': 'A', 'transactionshares': 5000, 'transactionvalue': None,
+         'ownername': 'CEO'},                                   # grant -> IGNORED
+        {'ticker': 'SURV', 'filingdate': '2015-06-01', 'transactiondate': '2015-05-30',
+         'transactioncode': 'P', 'transactionshares': 9999, 'transactionvalue': 9_000_000,
+         'ownername': 'CEO'},                                   # filed AFTER asof -> invisible
+    ])
+    r = cache.insider_net_buys('SURV', '2015-03-31', lookback_days=90)
+    assert r['n_buys'] == 1 and r['n_sells'] == 1              # grant + future buy excluded
+    assert r['net_value'] == 600_000.0                         # 1,000,000 - 400,000
+    assert r['net_shares'] == 600.0
+    # widen past the June filing -> it becomes visible
+    assert cache.insider_net_buys('SURV', '2015-07-01', lookback_days=400)['n_buys'] == 2
+
+
+# --- Institutional (SF3): the 45-day 13F filing lag (PIT) ---------------------
+
+def test_institutional_asof_lags_13f_by_45_days(cache):
+    """13F for the 2015-Q1 (calendardate 2015-03-31) is only public ~45 days
+    later (~2015-05-15). It MUST be invisible on 2015-04-15 and visible on
+    2015-06-01 — skipping the lag is lookahead."""
+    cache.store_sf3([
+        {'ticker': 'SURV', 'calendardate': '2015-03-31', 'investorname': 'FundA',
+         'securitytype': 'SHR', 'value': 1_000_000, 'units': 10_000},
+        {'ticker': 'SURV', 'calendardate': '2015-03-31', 'investorname': 'FundB',
+         'securitytype': 'SHR', 'value': 500_000, 'units': 5_000},
+    ])
+    assert cache.institutional_asof('SURV', '2015-04-15') is None   # lag not elapsed
+    h = cache.institutional_asof('SURV', '2015-06-01')
+    assert h['calendardate'] == '2015-03-31'
+    assert h['total_value'] == 1_500_000                           # summed across investors
+    assert h['n_investors'] == 2
+
+
+# --- DAILY metrics -----------------------------------------------------------
+
+def test_daily_metric(cache):
+    cache.store_daily([
+        {'ticker': 'SURV', 'date': '2015-01-02', 'marketcap': 1000, 'pe': 15.0,
+         'pb': 2.0, 'ps': 3.0, 'ev': 1200, 'evebit': 10, 'evebitda': 8},
+    ])
+    m = cache.daily_metric('SURV', '2015-01-02')
+    assert m['pb'] == 2.0 and m['pe'] == 15.0
+    assert cache.daily_metric('SURV', '2015-01-02', field='pb') == 2.0
+    assert cache.daily_metric('SURV', '2015-01-03') is None        # no row that day
+
+
 # --- Side-effect-free construction (mirror EarningsCache contract) ----------
 
 def test_missing_cache_reads_empty_and_creates_no_file(tmp_path):
@@ -123,4 +180,7 @@ def test_missing_cache_reads_empty_and_creates_no_file(tmp_path):
     assert c.universe_asof('2015-06-30') == []
     assert c.fundamentals_asof('X', '2015-06-30') is None
     assert c.prices('X', '2015-01-01', '2015-12-31').empty
+    assert c.insider_net_buys('X', '2015-06-30')['n_buys'] == 0
+    assert c.institutional_asof('X', '2015-06-30') is None
+    assert c.daily_metric('X', '2015-06-30') is None
     assert not p.exists()                              # reads created no file
