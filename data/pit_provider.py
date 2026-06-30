@@ -266,7 +266,12 @@ class PitCache:
         nv = ns = 0.0
         nb = nsell = 0
         for code, shares, value in rows:
-            v, sh = (value or 0.0), (shares or 0.0)
+            # Sharadar signs transactionshares (negative for dispositions) but
+            # leaves transactionvalue a positive magnitude. Take abs of BOTH and
+            # apply direction from transactioncode, so net_shares and net_value
+            # are consistently signed — otherwise a sell's already-negative
+            # shares get negated again and a SELLER counts as a buyer.
+            v, sh = abs(value or 0.0), abs(shares or 0.0)
             if code == 'P':
                 nv += v
                 ns += sh
@@ -429,9 +434,34 @@ class PitCache:
     # ------------------------------------------------------------------
     # Ingest — OPERATOR-ONLY, network (requests; mirrors EDGAR fetcher)
     # ------------------------------------------------------------------
-    def _get_table(self, table: str, params: Dict) -> List[Dict]:
-        """All rows of a Sharadar datatable for ``params`` (cursor-paginated)."""
+    @staticmethod
+    def _get_json(table: str, params: Dict, *, attempts: int = 5) -> Dict:
+        """GET one datatable page with retry + exponential backoff on TRANSIENT
+        failures (connection reset, timeout, 429, 5xx). A long operator ingest
+        (hundreds of names x several tables) reliably hits the occasional reset;
+        without this one drop kills the whole run."""
+        import time
+
         import requests
+        last: Optional[Exception] = None
+        for i in range(attempts):
+            try:
+                resp = requests.get(_API_BASE.format(table), params=params,
+                                    timeout=120)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise requests.exceptions.RequestException(
+                        f"HTTP {resp.status_code}")
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.RequestException as e:
+                last = e
+                if i < attempts - 1:
+                    time.sleep(2 ** i)   # 1, 2, 4, 8s
+        raise last  # type: ignore[misc]
+
+    def _get_table(self, table: str, params: Dict) -> List[Dict]:
+        """All rows of a Sharadar datatable for ``params`` (cursor-paginated,
+        retry-resilient via _get_json)."""
         out: List[Dict] = []
         cursor = None
         while True:
@@ -440,9 +470,7 @@ class PitCache:
             p['qopts.per_page'] = '10000'
             if cursor:
                 p['qopts.cursor_id'] = cursor
-            resp = requests.get(_API_BASE.format(table), params=p, timeout=60)
-            resp.raise_for_status()
-            body = resp.json()
+            body = self._get_json(table, p)
             dt = body['datatable']
             cols = [c['name'] for c in dt['columns']]
             out.extend(dict(zip(cols, row)) for row in dt['data'])

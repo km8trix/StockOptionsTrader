@@ -140,6 +140,24 @@ def test_insider_net_buys_is_point_in_time_and_filters_codes(cache):
     assert cache.insider_net_buys('SURV', '2015-07-01', lookback_days=400)['n_buys'] == 2
 
 
+def test_insider_net_buys_handles_sharadar_signed_shares(cache):
+    """Sharadar signs transactionshares (negative for sells); transactionvalue is
+    a positive magnitude. net_shares must come out -400 for a sell, not +400 — a
+    double-negative previously made every seller count as a buyer."""
+    cache.store_sf2([
+        {'ticker': 'SURV', 'filingdate': '2015-02-10', 'transactiondate': '2015-02-08',
+         'transactioncode': 'P', 'transactionshares': 1000, 'transactionvalue': 100000,
+         'ownername': 'CEO'},
+        {'ticker': 'SURV', 'filingdate': '2015-02-12', 'transactiondate': '2015-02-10',
+         'transactioncode': 'S', 'transactionshares': -400, 'transactionvalue': 40000,
+         'ownername': 'CFO'},                                  # Sharadar-signed sell
+    ])
+    r = cache.insider_net_buys('SURV', '2015-03-01', lookback_days=90)
+    assert r['n_buys'] == 1 and r['n_sells'] == 1
+    assert r['net_shares'] == 600.0       # 1000 - 400 (NOT 1000 + 400)
+    assert r['net_value'] == 60000.0      # 100000 - 40000
+
+
 # --- Institutional (SF3): the 45-day 13F filing lag (PIT) ---------------------
 
 def test_institutional_asof_lags_13f_by_45_days(cache):
