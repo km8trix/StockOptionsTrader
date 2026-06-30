@@ -246,3 +246,89 @@ def benjamini_hochberg(pvalues: Sequence[Optional[float]],
             flags[idx] = True
     return {'m': m, 'alpha': float(alpha), 'bh_threshold': bh_threshold,
             'n_significant_bh': cutoff_rank, 'rejected_bh': flags}
+
+
+def validate_strategy_oos(
+        returns: Sequence[float],
+        period_labels: Optional[Sequence] = None,
+        *,
+        psr_threshold: float = 0.95,
+        alpha: float = 0.05,
+        min_period_obs: int = 20,
+        risk_free_rate: float = 0.02,
+        periods_per_year: int = 252) -> Dict:
+    """Pass/fail research gate for a strategy's OUT-OF-SAMPLE return series.
+
+    The honest bar for a single, FIXED-rule strategy: no parameter search, so
+    n_trials = 1 and DSR == PSR (no Sharpe deflation). The benchmark is the
+    RISK-FREE rate, NOT zero: ``risk_free_rate`` (annualized) is converted to a
+    per-period hurdle and subtracted from every return, so the gate tests
+    "credibly beats cash", not merely "drifts up". (Benchmark 0 passes ANY
+    upward-drifting series — buy-and-hold SPY included — which defeats the
+    purpose.) Two COMPLEMENTARY lenses, combinable because they do not both
+    penalize the same multiple-testing breadth (unlike DSR-deflation + fold-BH
+    over the SAME folds, which the module docstring forbids):
+
+      1. Overall edge          — PSR(excess) >= ``psr_threshold`` (the
+         probability the true Sharpe beats the risk-free rate).
+      2. Sub-period robustness  — split the EXCESS returns by ``period_labels``
+         (e.g. calendar year), one-sided t-test (mean excess > 0) per period,
+         Benjamini-Hochberg across the family; require >= 1 BH-significant
+         positive period, so the edge is not one lucky stretch.
+
+    ``passed`` is True iff BOTH hold. Periods with fewer than ``min_period_obs``
+    finite returns are untestable (p-value None) and BH drops them. With
+    ``period_labels=None`` the whole series is a single period.
+
+    Returns a dict carrying ``passed`` plus every component for audit/logging.
+    """
+    rf_per_period = risk_free_rate / periods_per_year
+    excess = [r - rf_per_period for r in returns]
+
+    psr = probabilistic_sharpe_ratio(excess, 0.0)  # P(Sharpe > risk-free)
+    psr_pass = psr is not None and psr >= psr_threshold
+
+    # Group EXCESS returns into sub-periods, preserving first-seen label order.
+    if period_labels is None:
+        groups = [(None, excess)]
+    else:
+        if len(period_labels) != len(excess):
+            raise ValueError(
+                f"period_labels length {len(period_labels)} != returns length "
+                f"{len(excess)}")
+        ordered_labels: list = []
+        buckets: Dict = {}
+        for label, r in zip(period_labels, excess):
+            if label not in buckets:
+                buckets[label] = []
+                ordered_labels.append(label)
+            buckets[label].append(r)
+        groups = [(label, buckets[label]) for label in ordered_labels]
+
+    fold_labels: list = []
+    fold_pvalues: list = []
+    for label, grp in groups:
+        finite = [r for r in grp if r is not None and np.isfinite(r)]
+        fold_labels.append(label)
+        if len(finite) < min_period_obs:
+            fold_pvalues.append(None)        # untestable -> BH drops it
+        else:
+            fold_pvalues.append(fold_oos_pvalue(finite))
+
+    bh = benjamini_hochberg(fold_pvalues, alpha=alpha)
+    fold_pass = bh['n_significant_bh'] >= 1
+    passed = bool(psr_pass and fold_pass)
+
+    return {
+        'passed': passed,
+        'psr': psr,
+        'psr_threshold': float(psr_threshold),
+        'psr_pass': psr_pass,
+        'risk_free_rate': float(risk_free_rate),
+        'n_trials': 1,
+        'n_periods_tested': sum(1 for p in fold_pvalues if p is not None),
+        'fold_pass': fold_pass,
+        'fold_labels': fold_labels,
+        'fold_pvalues': fold_pvalues,
+        'bh': bh,
+    }

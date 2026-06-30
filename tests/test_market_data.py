@@ -51,6 +51,23 @@ def test_atr_valid_at_bar_14(make_ohlcv):
     assert result['atr'].iloc[13] == pytest.approx(result['tr'].iloc[:14].mean())
 
 
+def test_sma_200_present_and_warms_up_at_bar_200(make_ohlcv):
+    """The 200-day SMA (the trend-follower regime filter) is NaN until enough
+    history exists: NaN through index 198, first valid value at index 199 (the
+    200th bar), and equal to the trailing 200-close mean thereafter."""
+    data = make_ohlcv(n_days=250)
+    result = MarketDataHandler().calculate_indicators(data.copy())
+
+    assert 'sma_200' in result.columns
+    assert result['sma_200'].iloc[:199].isna().all()
+    assert not np.isnan(result['sma_200'].iloc[199])
+    assert result['sma_200'].iloc[199] == pytest.approx(data['close'].iloc[:200].mean())
+    np.testing.assert_allclose(
+        result['sma_200'].to_numpy(),
+        data['close'].rolling(window=200).mean().to_numpy(),
+    )
+
+
 _KEYED_ENV = ('FMP_API_KEY', 'TIINGO_TOKEN', 'INTRINIO_API_KEY')
 
 
