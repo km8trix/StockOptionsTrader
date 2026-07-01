@@ -50,7 +50,8 @@ def test_spread_recovers_edge_and_is_significant():
 def test_common_market_shock_differences_out():
     # A huge per-date market shock (+/-50%) must NOT change the spread, because
     # buy and sell share it and the long-short cancels it.
-    noise = lambda k: 0.005 * np.sin(k)
+    def noise(k):
+        return 0.005 * np.sin(k)
     base = event_study(_events(spread_noise=noise), [21], cost_bps=0.0)[0][0]
     shocked = event_study(
         _events(spread_noise=noise, shock=lambda k: 0.5 * (-1) ** k),
