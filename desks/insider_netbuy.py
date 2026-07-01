@@ -96,10 +96,12 @@ class InsiderNetBuyDesk(CrossSectionalLongShortDesk):
                 sym, date, lookback_days=self._lookback)
             if (nb['n_buys'] + nb['n_sells']) == 0 or nb['net_shares'] == 0:
                 continue                     # no directional insider activity
-            # Rank by signed net dollar flow (selection); the PREDICTIVE content
-            # is the sign (validated) — buyers rank long, sellers short. Fall
-            # back to the sign when net_value is absent/zero.
-            scores[sym] = float(nb['net_value']) or float(np.sign(nb['net_shares']))
+            # Score = SIGN only. The screen validated that the DIRECTION (net
+            # buyer vs seller) predicts and the dollar MAGNITUDE does not — so
+            # ranking by net_value would concentrate the book on non-predictive
+            # big-dollar extremes. +1 ranks every buyer long, -1 every seller
+            # short; within-side selection (top/bottom quantile) is then a wash.
+            scores[sym] = float(np.sign(nb['net_shares']))
 
         result = scores if len(scores) >= self.min_scored else None
         self._cache_month, self._cache_scores = month, result

@@ -50,10 +50,9 @@ def test_scores_only_the_band_with_correct_signs(warehouse):
     desk = InsiderNetBuyDesk('small', provider=warehouse)
     scores = desk._alpha_scores(_all_data(), pd.Timestamp('2020-06-30'))
     assert set(scores) == {'N4', 'N5', 'N6', 'N7'}   # small tercile only
-    assert scores['N4'] > 0 and scores['N5'] > 0      # buyers -> long
-    assert scores['N6'] < 0 and scores['N7'] < 0      # sellers -> short
-    # strongest buyer / seller rank at the extremes (selection by dollar flow)
-    assert scores['N4'] == 200000.0 and scores['N6'] == -150000.0
+    # score is SIGN only (magnitude doesn't predict): +1 buyers, -1 sellers
+    assert scores['N4'] == 1.0 and scores['N5'] == 1.0
+    assert scores['N6'] == -1.0 and scores['N7'] == -1.0
 
 
 def test_wrong_band_is_empty(warehouse):
