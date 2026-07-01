@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,8 +58,10 @@ def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42):
     wh = PitWarehouse()
     rb = pd.bdate_range(start, end, freq='BMS')
     universe = resolve_universe(wh, rb, SCALE_SMALL_MID)
-    if limit:
-        universe = universe[:limit]
+    if limit and limit < len(universe):
+        # seeded RANDOM sample (not the alphabetical head) so a subset is
+        # representative of the small/mid universe, not a-names only.
+        universe = sorted(random.Random(seed).sample(universe, limit))
     desk = InsiderNetBuyDesk(band, provider=wh)
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
                             market_data=WarehouseMarketData(wh))
