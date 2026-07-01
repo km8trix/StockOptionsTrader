@@ -23,8 +23,14 @@ def size_buckets(marketcaps: Dict[str, float], n: int = 3) -> Dict[str, int]:
     Names with missing / non-finite / non-positive cap are dropped. Returns ``{}``
     if fewer than ``n`` names have a usable cap (can't form n balanced buckets).
     """
-    valid = {k: float(v) for k, v in marketcaps.items()
-             if v is not None and np.isfinite(v) and v > 0}
+    valid: Dict[str, float] = {}
+    for k, v in marketcaps.items():
+        try:
+            fv = float(v)              # coerce first: DuckDB may hand back Decimal
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(fv) and fv > 0:
+            valid[k] = fv
     if len(valid) < n:
         return {}
     order = sorted(valid, key=lambda k: valid[k])
