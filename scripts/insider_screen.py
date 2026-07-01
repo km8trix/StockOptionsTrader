@@ -99,7 +99,12 @@ def collect_events(prov, names, rebal_dates, horizons, lookback,
             entry = vals[pos]
             if not entry or entry <= 0:
                 continue
-            rec = {'date': idx[pos], 'name': name,
+            # cohort key is the REBALANCE date t, not idx[pos] (the entry bar):
+            # the Fama-MacBeth cross-section is "all names rebalanced this month",
+            # and the market factor only differences out within a shared cohort.
+            # Illiquid names whose first bar is after t must still land in t's
+            # cohort, or the per-date spread fragments (n_dates > n_rebalances).
+            rec = {'date': pd.Timestamp(t), 'name': name,
                    'nv': nb['net_value'],
                    'dir': 'buy' if nsh > 0 else 'sell'}
             for h in horizons:
