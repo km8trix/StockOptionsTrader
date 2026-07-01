@@ -218,11 +218,11 @@ class PitWarehouse:
         cutoff = (pd.Timestamp(a) - pd.Timedelta(days=lag_days)).date()
         res = self._query(
             'sf3',
-            "SELECT calendardate, SUM(value), SUM(units), "
+            "SELECT CAST(calendardate AS DATE), SUM(value), SUM(units), "
             "COUNT(DISTINCT investorname) FROM src WHERE ticker = ? "
             "AND CAST(calendardate AS DATE) <= ? AND CAST(calendardate AS DATE) = "
             "(SELECT MAX(CAST(calendardate AS DATE)) FROM src WHERE ticker = ? "
-            "AND CAST(calendardate AS DATE) <= ?) GROUP BY calendardate",
+            "AND CAST(calendardate AS DATE) <= ?) GROUP BY CAST(calendardate AS DATE)",
             [ticker, cutoff, ticker, cutoff])
         row = res.fetchone() if res else None
         if not row or row[0] is None:
@@ -238,6 +238,9 @@ class PitWarehouse:
         d = self._date(date)
         if d is None:
             return None
+        # ponytail: fetchone assumes (ticker,date) is unique, as Sharadar DAILY
+        # is (SQLite enforces it via PK; Parquet does not). If a dup-row source
+        # ever appears, add ORDER BY / dedup-on-ingest for a deterministic pick.
         res = self._query(
             'daily',
             "SELECT marketcap,pe,pb,ps,ev,evebit,evebitda FROM src "

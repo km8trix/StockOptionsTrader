@@ -167,6 +167,19 @@ def test_institutional_lag(wh):
     assert got['n_investors'] == 2
 
 
+def test_institutional_calendardate_is_bare_date_even_if_timestamp(wh):
+    # If calendardate is stored TIMESTAMP (not DATE), the CAST must still return
+    # a bare 'YYYY-MM-DD' to match SQLite PitCache — not '...T00:00:00'.
+    w, tmp = wh
+    cols = [('ticker', 'VARCHAR'), ('calendardate', 'TIMESTAMP'),
+            ('investorname', 'VARCHAR'), ('value', 'DOUBLE'), ('units', 'DOUBLE')]
+    _write(tmp / "sf3.parquet", cols, [
+        ("'AAPL'", "TIMESTAMP '2020-03-31 00:00:00'", "'Fund A'", "1000.0", "10.0"),
+    ])
+    got = w.institutional_asof('AAPL', '2020-05-20')
+    assert got['calendardate'] == '2020-03-31'
+
+
 # ---------------------------------------------------------------------------
 # daily_metric — exact-date row + field selection
 # ---------------------------------------------------------------------------
