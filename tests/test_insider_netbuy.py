@@ -67,3 +67,16 @@ def test_scores_cached_within_month(warehouse):
     # a different day in the SAME month returns the identical cached object
     again = desk._alpha_scores(_all_data(), pd.Timestamp('2020-06-05'))
     assert again is first
+
+
+def test_long_only_suppresses_shorts(warehouse):
+    from portfolio.manager import PortfolioManager
+    day = pd.Timestamp('2020-06-30')
+    lo = InsiderNetBuyDesk('small', provider=warehouse, long_only=True)
+    lo_intents = lo.generate_intents(_all_data(), day, PortfolioManager(100_000))
+    assert 'SHORT' not in {i.action for i in lo_intents}
+    assert any(i.action == 'BUY' for i in lo_intents)
+    # the default L/S desk DOES open a short on the same book (control)
+    ls = InsiderNetBuyDesk('small', provider=warehouse)
+    ls_intents = ls.generate_intents(_all_data(), day, PortfolioManager(100_000))
+    assert any(i.action == 'SHORT' for i in ls_intents)

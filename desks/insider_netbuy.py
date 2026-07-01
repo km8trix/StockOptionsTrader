@@ -48,7 +48,7 @@ class InsiderNetBuyDesk(CrossSectionalLongShortDesk):
                  capital_allocation: float = 1.0,
                  risk_manager: Optional[RiskManager] = None,
                  lookback_days: int = 90, quantile: float = 0.2,
-                 n_bands: int = 3):
+                 n_bands: int = 3, long_only: bool = False):
         if band not in _BANDS:
             raise ValueError(f"band {band!r} must be one of {list(_BANDS)}")
         if provider is None:
@@ -70,6 +70,7 @@ class InsiderNetBuyDesk(CrossSectionalLongShortDesk):
             capital_allocation=capital_allocation,
             risk_manager=risk_manager,
             quantile=quantile,
+            long_only=long_only,
         )
         self._provider = provider
         self._band_idx = _BANDS[band]

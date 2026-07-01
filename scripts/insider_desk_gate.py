@@ -54,7 +54,8 @@ def _daily_returns_with_years(history):
     return returns, years
 
 
-def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42):
+def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
+             long_only=False):
     wh = PitWarehouse()
     rb = pd.bdate_range(start, end, freq='BMS')
     universe = resolve_universe(wh, rb, SCALE_SMALL_MID)
@@ -62,7 +63,7 @@ def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42):
         # seeded RANDOM sample (not the alphabetical head) so a subset is
         # representative of the small/mid universe, not a-names only.
         universe = sorted(random.Random(seed).sample(universe, limit))
-    desk = InsiderNetBuyDesk(band, provider=wh)
+    desk = InsiderNetBuyDesk(band, provider=wh, long_only=long_only)
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
                             market_data=WarehouseMarketData(wh))
     report = engine.run(universe, start, end)
@@ -114,13 +115,16 @@ def main():
     ap.add_argument('--start', default=FULL_START)
     ap.add_argument('--end', default=FULL_END)
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--long-only', action='store_true',
+                    help='drop the short leg (long insider-buyers only)')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
     summary, gate, n_trades, n_names = run_gate(
-        args.band, args.start, args.end, limit=args.limit, seed=args.seed)
+        args.band, args.start, args.end, limit=args.limit, seed=args.seed,
+        long_only=args.long_only)
     print_report(summary, gate, n_trades, n_names, args.band, args.start, args.end)
 
 
