@@ -9,7 +9,36 @@ and the cost-netting must charge both legs. Each has a test.
 import numpy as np
 import pandas as pd
 
-from scripts.insider_screen import event_study
+from scripts.insider_screen import collect_events, event_study
+
+
+class _StubProvider:
+    """Minimal PIT provider: a fixed price series + a constant insider buy."""
+
+    def __init__(self, px):
+        self._px = px
+
+    def prices(self, name, start, end, field='closeadj'):
+        return self._px
+
+    def insider_net_buys(self, name, asof, lookback_days=90):
+        return {'net_value': 100.0, 'net_shares': 100.0, 'n_buys': 1,
+                'n_sells': 0, 'window_start': None}
+
+
+def test_collect_events_cohort_key_is_rebalance_date():
+    # Price series whose FIRST bar (2020-06-03) is after the rebalance date
+    # (2020-06-01, no bar). The recorded cohort date must be the rebalance date,
+    # not the later entry bar — otherwise Fama-MacBeth cohorts fragment.
+    idx = pd.bdate_range('2020-06-03', periods=120)
+    px = pd.Series(np.arange(10.0, 130.0), index=idx, name='X')
+    t = pd.Timestamp('2020-06-01')
+    ev, n = collect_events(_StubProvider(px), ['X'], [t], horizons=[2],
+                           lookback=90, price_start='2020-01-01',
+                           price_end='2020-12-31')
+    assert n == 1 and len(ev) == 1
+    assert ev.iloc[0]['date'] == t          # NOT idx[0] == 2020-06-03
+    assert ev.iloc[0]['dir'] == 'buy'
 
 
 def _events(n_dates=24, buy_ab=0.03, sell_ab=-0.03, n=30,
