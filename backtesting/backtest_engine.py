@@ -106,7 +106,8 @@ class BacktestEngine:
                  enable_realistic_fills: bool = False,
                  impact_coef: float = 0.1,
                  participation_cap: float = 0.1,
-                 adv_window: int = 20):
+                 adv_window: int = 20,
+                 market_data: Optional[MarketDataHandler] = None):
         if sum(driver is not None
                for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
@@ -154,7 +155,10 @@ class BacktestEngine:
         self.impact_coef = impact_coef
         self.participation_cap = participation_cap
         self.adv_window = adv_window
-        self.market_data = MarketDataHandler()
+        # Injectable price source. Default = live MarketDataHandler (OpenBB).
+        # Pass a WarehouseMarketData to run a SURVIVORSHIP-FREE backtest that can
+        # hold delisted names (the live feed silently drops them).
+        self.market_data = market_data or MarketDataHandler()
         self.trades_log: List[Dict] = []
         self.signals_log: List[Dict] = []
         # Pending intents keyed by Asset. Each value is a dict with keys:
