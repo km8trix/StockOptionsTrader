@@ -5,6 +5,25 @@
 > Every reuse claim below is grounded against the code (file:line). Engineering plan,
 > not investment advice.
 
+## STATUS: tested — DOCUMENTED NEGATIVE (2026-07-01)
+
+The desk was built and gated. **It fails in every tradeable form**, so it ships as
+a documented-negative research desk (not promoted, not live), and the reusable
+infrastructure below (warehouse feed, PIT size buckets, engine `market_data`
+injection, `long_only` mode, the desk + gate) is the lasting value.
+
+| Form | 600-name small-cap gate (2015–2024) | Verdict |
+|---|---|---|
+| Long/short (both legs) | −34% return, Sharpe −0.51, PSR 0.055, 0/10 yrs | FAIL |
+| Long-only (short leg dropped) | −18% return, Sharpe −0.21, PSR 0.25, 0/10 yrs | FAIL |
+
+The screen's +2% cross-sectional spread is **paper alpha that does not survive
+implementation**: the short leg bleeds (shorting illiquid small-caps), and
+long-only eats small-cap beta (the signal is relative, not directional). This is
+the graduation gate working as intended — it caught a signal that looked
+deployable and would have lost money live. The build plan below is retained as
+the (correct) record of how it was done.
+
 ## 0. Why this desk
 
 The full-universe insider screen (`scripts/insider_screen.py`, PR #68/#69) found the
