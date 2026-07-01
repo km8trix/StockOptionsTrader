@@ -40,13 +40,14 @@ def test_ohlcv_is_adjusted_and_shaped(tmp_path):
     df = w.ohlcv('AAPL', '2020-01-01', '2020-01-31')
     assert list(df.columns) == ['open', 'high', 'low', 'close', 'volume']
     assert isinstance(df.index, pd.DatetimeIndex)
-    # day1 O/H/L scaled by 0.5, close = closeadj, volume untouched
+    # REBASED to raw at the window start (close[0]=100): day1 == raw O/H/L/C,
+    # volume untouched. (factor 0.5 * scale 2.0 = 1.0)
     r0 = df.iloc[0]
     assert (r0['open'], r0['high'], r0['low'], r0['close'], r0['volume']) == \
-        (50.0, 55.0, 45.0, 50.0, 1000.0)
-    # day2 factor 1.0 -> unchanged
+        (100.0, 110.0, 90.0, 100.0, 1000.0)
+    # day2: +20% total return preserved (raw closeadj 50->60), rebased to 120
     r1 = df.iloc[1]
-    assert (r1['open'], r1['close']) == (60.0, 60.0)
+    assert (r1['open'], r1['close']) == (120.0, 120.0)
 
 
 def test_ohlcv_empty_for_unknown_or_uningested(tmp_path):
@@ -59,7 +60,7 @@ def test_adapter_delegates_to_warehouse(tmp_path):
     feed = WarehouseMarketData(warehouse=_fixture(tmp_path))
     df = feed.fetch_stock_data('AAPL', '2020-01-01', '2020-01-31')
     assert list(df.columns) == ['open', 'high', 'low', 'close', 'volume']
-    assert df.iloc[0]['close'] == 50.0
+    assert df.iloc[0]['close'] == 100.0        # rebased to raw at window start
     assert feed.get_last_fetch_info('AAPL')['provider'] == 'pit_warehouse'
     # unknown name -> empty frame (matches MarketDataHandler's _empty_data)
     assert feed.fetch_stock_data('ZZZZ', '2020-01-01', '2020-01-31').empty

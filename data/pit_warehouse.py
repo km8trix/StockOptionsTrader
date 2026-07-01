@@ -203,11 +203,17 @@ class PitWarehouse:
         close = raw['close'].to_numpy(dtype=float)
         closeadj = raw['closeadj'].to_numpy(dtype=float)
         factor = np.where(close > 0, closeadj / np.where(close > 0, close, 1.0), 1.0)
+        # REBASE the adjusted series to the raw price at the window start: returns
+        # are preserved (a constant rescale), but magnitudes stay realistic. Serial
+        # reverse-split names have raw-consistent adjusted prices in the thousands,
+        # which the engine's integer-share sizing silently drops to 0 shares.
+        scale = (close[0] / closeadj[0]) if closeadj[0] > 0 else 1.0
+        adj = factor * scale
         out = pd.DataFrame({
-            'open': raw['open'].to_numpy(dtype=float) * factor,
-            'high': raw['high'].to_numpy(dtype=float) * factor,
-            'low': raw['low'].to_numpy(dtype=float) * factor,
-            'close': closeadj,
+            'open': raw['open'].to_numpy(dtype=float) * adj,
+            'high': raw['high'].to_numpy(dtype=float) * adj,
+            'low': raw['low'].to_numpy(dtype=float) * adj,
+            'close': closeadj * scale,
             'volume': raw['volume'].to_numpy(dtype=float),
         }, index=idx)
         out.index.name = 'date'
