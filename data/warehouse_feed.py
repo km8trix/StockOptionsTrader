@@ -1,0 +1,45 @@
+"""Survivorship-free price feed for the backtest engine.
+
+``BacktestEngine`` fetches OHLCV through a ``MarketDataHandler`` (live OpenBB
+providers), which only serves names that still trade today — so a small/mid
+backtest silently drops delisted names and reintroduces survivorship bias.
+``WarehouseMarketData`` swaps the fetch to the point-in-time Sharadar warehouse
+(``PitWarehouse.ohlcv``), which keeps delisted names for their live span. It
+subclasses ``MarketDataHandler`` so ``calculate_indicators`` and everything else
+the engine calls are inherited unchanged; only the fetch is overridden.
+
+Usage:  BacktestEngine(desk=..., market_data=WarehouseMarketData())
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import pandas as pd
+
+from data.market_data import MarketDataHandler
+from data.pit_warehouse import PitWarehouse
+
+logger = logging.getLogger(__name__)
+
+
+class WarehouseMarketData(MarketDataHandler):
+    """MarketDataHandler backed by the PIT warehouse (adjusted, survivorship-free)."""
+
+    def __init__(self, warehouse: Optional[PitWarehouse] = None):
+        super().__init__()
+        self._wh = warehouse or PitWarehouse()
+
+    def fetch_stock_data(self, symbol: str, start_date: str,
+                         end_date: str) -> pd.DataFrame:
+        df = self._wh.ohlcv(symbol, start_date, end_date)
+        self._last_fetch_info[symbol] = {
+            'provider': 'pit_warehouse', 'from_cache': True, 'failures': [],
+            'start_date': start_date, 'end_date': end_date,
+        }
+        if df is None or df.empty:
+            return self._empty_data(symbol)
+        self.cache[f"{symbol}_{start_date}_{end_date}"] = df
+        self.stock_data[symbol] = df
+        return df

@@ -33,6 +33,7 @@ import os
 from typing import Dict, List, Optional, Sequence
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,52 @@ class PitWarehouse:
             return pd.Series(dtype=float, name=ticker)
         idx = pd.DatetimeIndex([pd.Timestamp(r[0]) for r in rows])
         return pd.Series([r[1] for r in rows], index=idx, name=ticker)
+
+    def ohlcv(self, ticker: str, start, end) -> pd.DataFrame:
+        """Split/dividend-ADJUSTED OHLCV frame (DatetimeIndex, 'us' unit) over
+        [start, end] — survivorship-free, so a backtest can hold delisted names.
+
+        Sharadar SEP carries raw open/high/low/close plus the adjusted closeadj
+        (total return). We adjust O/H/L by the daily closeadj/close factor and set
+        close = closeadj, so every traded price is total-return-consistent (no
+        spurious split jumps). Columns match MarketDataHandler.fetch_stock_data
+        (lowercase open/high/low/close/volume); empty frame if un-ingested."""
+        cols = ['open', 'high', 'low', 'close', 'volume']
+        s, e = self._date(start), self._date(end)
+        if s is None or e is None:
+            return pd.DataFrame(columns=cols)
+        res = self._query(
+            'sep',
+            "SELECT CAST(date AS DATE), open, high, low, close, volume, closeadj "
+            "FROM src WHERE ticker = ? AND CAST(date AS DATE) >= ? "
+            "AND CAST(date AS DATE) <= ? ORDER BY CAST(date AS DATE)",
+            [ticker, s, e])
+        rows = res.fetchall() if res else []
+        if not rows:
+            return pd.DataFrame(columns=cols)
+        raw = pd.DataFrame(rows, columns=['date', 'open', 'high', 'low', 'close',
+                                          'volume', 'closeadj'])
+        idx = pd.DatetimeIndex(pd.to_datetime(raw['date'])).as_unit('us')
+        # numpy math + explicit arrays: a Series*Series here would align on the
+        # default RangeIndex and then mismatch the DatetimeIndex -> all-NaN.
+        close = raw['close'].to_numpy(dtype=float)
+        closeadj = raw['closeadj'].to_numpy(dtype=float)
+        factor = np.where(close > 0, closeadj / np.where(close > 0, close, 1.0), 1.0)
+        # REBASE the adjusted series to the raw price at the window start: returns
+        # are preserved (a constant rescale), but magnitudes stay realistic. Serial
+        # reverse-split names have raw-consistent adjusted prices in the thousands,
+        # which the engine's integer-share sizing silently drops to 0 shares.
+        scale = (close[0] / closeadj[0]) if closeadj[0] > 0 else 1.0
+        adj = factor * scale
+        out = pd.DataFrame({
+            'open': raw['open'].to_numpy(dtype=float) * adj,
+            'high': raw['high'].to_numpy(dtype=float) * adj,
+            'low': raw['low'].to_numpy(dtype=float) * adj,
+            'close': closeadj * scale,
+            'volume': raw['volume'].to_numpy(dtype=float),
+        }, index=idx)
+        out.index.name = 'date'
+        return out
 
     def insider_net_buys(self, ticker: str, asof, *,
                          lookback_days: int = 90) -> Dict:

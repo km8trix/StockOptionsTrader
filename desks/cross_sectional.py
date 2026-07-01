@@ -93,7 +93,8 @@ class CrossSectionalLongShortDesk(Desk):
                  min_holding_days: int = 0,
                  size_by_signal_strength: bool = False,
                  shrink_by_disagreement: bool = False,
-                 disagreement_lambda: float = 1.0):
+                 disagreement_lambda: float = 1.0,
+                 long_only: bool = False):
         super().__init__(
             key=key,
             name=name,
@@ -120,6 +121,10 @@ class CrossSectionalLongShortDesk(Desk):
         self.target_gross = target_gross
         self.max_name_size = max_name_size
         self.min_scored = min_scored
+        # Long-only mode: suppress the short leg entirely (opt-in, default off
+        # keeps every existing desk byte-identical). Sizing is unchanged, so the
+        # book runs ~half gross; the gate is Sharpe/PSR-based (scale-invariant).
+        self._long_only = long_only
 
         # Turnover control (opt-in; the defaults below are a strict no-op, so
         # an un-configured desk's book is byte-identical to before). Two knobs:
@@ -278,7 +283,8 @@ class CrossSectionalLongShortDesk(Desk):
         longs = [symbol for symbol, _ in ranked[:k]]
         # Bottom-k, excluding anything already designated long (tiny
         # universes can overlap; the top ranking wins).
-        shorts = [symbol for symbol, _ in ranked[-k:] if symbol not in longs]
+        shorts = ([] if self._long_only
+                  else [symbol for symbol, _ in ranked[-k:] if symbol not in longs])
         rank_of = {symbol: idx for idx, (symbol, _) in enumerate(ranked)}
 
         desired: Dict[str, str] = {symbol: 'long' for symbol in longs}
