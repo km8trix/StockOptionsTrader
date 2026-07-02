@@ -13,6 +13,12 @@ Value ratios (all from daily_metric; lower = cheaper = the value bet):
 
 Deterministic; reads the warehouse (tickers + sep + daily ingested). Quality
 factors (ROE, margins, accruals) need SF1 and are a follow-on.
+
+CAVEAT — the raw screen (10/10 clear BH + cost) OVERSTATES the tradeable edge.
+The validation battery in scripts/value_validate.py shows it is (1) OOS-only (a
+2020+ regime phenomenon, nothing 2015-2019), (2) micro-concentrated (the tradeable
+small/mid ex-micro slice is only t~1.7), and (3) ~2 independent bets, not 5. Read
+that verdict before graduating value to a desk.
 """
 
 from __future__ import annotations

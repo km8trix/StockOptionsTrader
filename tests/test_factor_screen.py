@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.factor_screen import factor_study
+from scripts.value_validate import _date_spreads
 
 
 def _events(n_dates=24, k_per=20, edge=0.02, seed=0):
@@ -53,3 +54,14 @@ def test_cost_nets_both_legs():
 def test_too_few_dates_flagged():
     s = factor_study(_events(n_dates=6), 'pb', [21], cost_bps=0.0)[0]
     assert s['insufficient'] is True
+
+
+def test_date_spreads_series_matches_factor_study_mean():
+    # _date_spreads keeps the per-date spread series; its mean must equal the
+    # gross spread factor_study collapses to (same book, same horizon).
+    ev = _events()
+    ev = ev.rename(columns={'fwd_21': 'fwd_63'})     # _date_spreads defaults h=63
+    series = _date_spreads(ev, 'pb', h=63)
+    assert len(series) == 24
+    gross = factor_study(ev, 'pb', [63], cost_bps=0.0)[0]['gross_spread']
+    assert abs(series.mean() - gross) < 1e-12
