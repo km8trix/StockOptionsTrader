@@ -12,13 +12,19 @@ Value ratios (all from daily_metric; lower = cheaper = the value bet):
   negative-earnings noise are not a clean "cheap").
 
 Deterministic; reads the warehouse (tickers + sep + daily ingested). Quality
-factors (ROE, margins, accruals) need SF1 and are a follow-on.
+factors live in SF1 — see scripts/quality_screen.py.
 
-CAVEAT — the raw screen (10/10 clear BH + cost) OVERSTATES the tradeable edge.
-The validation battery in scripts/value_validate.py shows it is (1) OOS-only (a
-2020+ regime phenomenon, nothing 2015-2019), (2) micro-concentrated (the tradeable
-small/mid ex-micro slice is only t~1.7), and (3) ~2 independent bets, not 5. Read
-that verdict before graduating value to a desk.
+Forward returns are WINSORIZED per date (--winsor 0.01 default): this universe's
+raw forward returns reach +2000x (micro-cap / split artifacts) and one such name
+dominates a leg. The screen's ORIGINAL headline was computed WITHOUT this and is
+inflated ~40% — winsorized, pb 63d net is ~+1.6% (t~2.2), not the +2.52% first
+reported. Pass --winsor 0 to reproduce the old (contaminated) numbers.
+
+CAVEAT — even winsorized, the screen OVERSTATES the tradeable edge. The validation
+battery in scripts/value_validate.py shows it is (1) OOS-only (a 2020+ regime
+phenomenon, nothing 2015-2019), (2) micro-concentrated (the tradeable small/mid
+ex-micro slice is only t~1.7), and (3) ~2 independent bets, not 5. Read that
+verdict before graduating value to a desk.
 """
 
 from __future__ import annotations
@@ -76,20 +82,28 @@ def collect_factor_events(prov, names, rebal_dates, horizons, factors,
 
 
 def factor_study(events, factor, horizons, cost_bps, *, quantile=0.2,
-                 cheap_is_long=True, min_dates=12):
+                 cheap_is_long=True, min_dates=12, drop_nonpositive=True,
+                 winsor_returns=None):
     """PURE Fama-MacBeth long-short by one cross-sectional factor.
 
     Per rebalance date, rank names by ``factor`` (dropping non-positive values),
     long the cheap quantile / short the expensive, spread = mean(long fwd) -
     mean(short fwd); test the monthly spread series with a Newey-West (HAC) t.
     Returns a list of per-horizon dicts. (cheap_is_long: for value ratios the LOW
-    end is the long.)
+    end is the long. drop_nonpositive: True for value ratios where a non-positive
+    value is a trap, not a "cheap"; set False for profitability factors where a
+    negative value — an unprofitable firm — is a legitimate short-leg member.
+    winsor_returns: if set (e.g. 0.01), clip EACH DATE's forward returns to the
+    [w, 1-w] quantiles before averaging — essential on this survivorship-free
+    micro-cap universe where raw forward returns reach +2000x and one name would
+    otherwise dominate a leg. Default None = no clipping.)
     """
     out = []
     for h in horizons:
         col = f'fwd_{h}'
         df = events.dropna(subset=[factor, col])
-        df = df[df[factor] > 0]                       # drop value traps / neg
+        if drop_nonpositive:
+            df = df[df[factor] > 0]                    # drop value traps / neg
         if len(df) < 20:
             out.append({'factor': factor, 'h': h, 'insufficient': True})
             continue
@@ -99,9 +113,13 @@ def factor_study(events, factor, horizons, cost_bps, *, quantile=0.2,
             k = max(1, int(quantile * n))
             if n < 2 * k:
                 continue                              # can't form both legs
-            ranked = g.sort_values(factor)            # ascending: cheap first
-            cheap = ranked.iloc[:k][col].mean()
-            rich = ranked.iloc[-k:][col].mean()
+            g = g.sort_values(factor)                 # ascending: cheap first
+            r = g[col]
+            if winsor_returns:                        # tame micro-cap return tails
+                r = r.clip(r.quantile(winsor_returns),
+                           r.quantile(1.0 - winsor_returns))
+            cheap = r.iloc[:k].mean()
+            rich = r.iloc[-k:].mean()
             spreads.append((cheap - rich) if cheap_is_long else (rich - cheap))
         n_dates = len(spreads)
         if n_dates < min_dates:
@@ -120,8 +138,8 @@ def factor_study(events, factor, horizons, cost_bps, *, quantile=0.2,
     return out
 
 
-def _print_report(all_stats, bh, cost_bps, n_names, n_events):
-    print(f"\nfactor screen: {n_names} names, {n_events} events, "
+def _print_report(all_stats, bh, cost_bps, n_names, n_events, label='value'):
+    print(f"\n{label} factor screen: {n_names} names, {n_events} events, "
           f"cost {cost_bps:.0f}bp/leg (Fama-MacBeth spread, Newey-West t)\n")
     print(f"  {'factor':>9}{'h':>4}{'dates':>7}{'gross%':>9}{'net%':>9}"
           f"{'t':>7}{'p':>9}{'BH*':>5}")
@@ -147,7 +165,7 @@ def _print_report(all_stats, bh, cost_bps, n_names, n_events):
                   + ", ".join(f"{s['factor']}@{s['h']}d (net "
                               f"{s['net_spread']*100:+.2f}%)" for s in survivors))
         else:
-            print("VERDICT: no value factor clears BH + cost (honest negative).")
+            print(f"VERDICT: no {label} factor clears BH + cost (honest negative).")
 
 
 def main(argv=None):
@@ -161,6 +179,8 @@ def main(argv=None):
     ap.add_argument('--limit', type=int, default=None,
                     help='cap the universe for a faster smoke')
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--winsor', type=float, default=0.01,
+                    help='per-date forward-return winsorization (0 = off)')
     cli = ap.parse_args(argv)
 
     import random
@@ -178,7 +198,8 @@ def main(argv=None):
                                             cli.factors, pstart, pend)
     all_stats, pvals = [], []
     for f in cli.factors:
-        stats = factor_study(events, f, cli.horizons, cli.cost_bps)
+        stats = factor_study(events, f, cli.horizons, cli.cost_bps,
+                             winsor_returns=cli.winsor or None)
         all_stats.extend(stats)
         pvals.extend(s['p'] for s in stats if not s.get('insufficient'))
     bh = benjamini_hochberg(pvals) if pvals else None

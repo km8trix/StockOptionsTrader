@@ -56,6 +56,17 @@ def test_too_few_dates_flagged():
     assert s['insufficient'] is True
 
 
+def test_winsor_returns_tames_outlier_leg():
+    # one +100x name in the cheap (long) leg blows up the raw spread; per-date
+    # winsorization clips it back to the leg's bulk, shrinking the spread.
+    ev = _events()
+    ev.loc[ev['name'] == 'N0', 'fwd_21'] = 100.0          # N0 = cheapest -> long
+    raw = factor_study(ev, 'pb', [21], 0.0)[0]['gross_spread']
+    wins = factor_study(ev, 'pb', [21], 0.0,
+                        winsor_returns=0.1)[0]['gross_spread']
+    assert raw > 5 * wins
+
+
 def test_date_spreads_series_matches_factor_study_mean():
     # _date_spreads keeps the per-date spread series; its mean must equal the
     # gross spread factor_study collapses to (same book, same horizon).
