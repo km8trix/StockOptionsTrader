@@ -138,7 +138,9 @@ def place_order(trader_id):
             
         data = request.get_json(silent=True) or {}
         symbol = str(data.get('symbol') or '').strip().upper()
-        action = data.get('action', 'BUY').upper()
+        action = str(data.get('action') or 'BUY').strip().upper()
+        if action not in ('BUY', 'SELL'):
+            return jsonify({'error': "'action' must be BUY or SELL"}), 400
 
         # Robust parsing (mirrors api_live's _to_int/_to_float): reject a
         # fractional quantity instead of silently truncating int(1.9)->1, and

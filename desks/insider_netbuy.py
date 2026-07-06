@@ -89,12 +89,16 @@ class InsiderNetBuyDesk(CrossSectionalLongShortDesk):
         symbols = list(all_data.keys())
         caps = pit_marketcaps(self._provider, symbols, date)   # PIT market cap
         buckets = size_buckets(caps, self._n_bands)            # tercile per name
+        band = [sym for sym, b in buckets.items() if b == self._band_idx]
+        bulk = getattr(self._provider, 'insider_net_buys_bulk', None)
+        if bulk is not None:                 # one GROUP BY scan, not N queries
+            nbs = bulk(band, date, lookback_days=self._lookback)
+        else:
+            nbs = {sym: self._provider.insider_net_buys(
+                sym, date, lookback_days=self._lookback) for sym in band}
         scores: Dict[str, float] = {}
-        for sym, b in buckets.items():
-            if b != self._band_idx:
-                continue
-            nb = self._provider.insider_net_buys(
-                sym, date, lookback_days=self._lookback)
+        for sym in band:
+            nb = nbs[sym]
             if (nb['n_buys'] + nb['n_sells']) == 0 or nb['net_shares'] == 0:
                 continue                     # no directional insider activity
             # Score = SIGN only. The screen validated that the DIRECTION (net

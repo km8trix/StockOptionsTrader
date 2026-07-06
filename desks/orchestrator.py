@@ -170,7 +170,7 @@ class FundOrchestrator:
                 self._note('info',
                            f"Desk '{desk.key}' has capital_allocation "
                            f"{desk.capital_allocation:g} (<= 0): it deploys "
-                           f"nothing and is skipped every step",
+                           f"nothing new (only closing intents pass)",
                            desk_key=desk.key,
                            capital_allocation=desk.capital_allocation)
 
@@ -203,10 +203,17 @@ class FundOrchestrator:
         size_fraction; option `quantity` preserved)."""
         tagged: List[_Tagged] = []
         for desk in self.desks:
-            if desk.capital_allocation <= 0:
-                continue  # a zero-allocation desk deploys nothing
+            zero_weight = desk.capital_allocation <= 0
             intents = desk.generate_intents(all_data, date, portfolio)
             for intent in intents:
+                # A zero-allocation desk deploys nothing NEW, but must still
+                # be able to exit positions it opened while it had capital —
+                # DynamicReweighter's mean_variance/max_diversification modes
+                # clip weights to exactly 0.0 mid-run, and dropping the desk
+                # entirely orphans its open book (closes are full-size, so
+                # account_fraction is irrelevant for them).
+                if zero_weight and intent.action not in _CLOSING:
+                    continue
                 account_fraction = (desk.capital_allocation
                                     * intent.size_fraction)
                 tagged.append(_Tagged(intent, desk, account_fraction))

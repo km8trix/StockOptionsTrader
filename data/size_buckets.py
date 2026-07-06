@@ -40,9 +40,16 @@ def size_buckets(marketcaps: Dict[str, float], n: int = 3) -> Dict[str, int]:
 
 
 def pit_marketcaps(provider, names: Sequence[str], date) -> Dict[str, float]:
-    """Point-in-time market cap per name on ``date`` via ``daily_metric`` — the
-    PIT size source (NOT ``scalemarketcap``, which is current-not-PIT). Names with
-    no daily row on ``date`` are omitted."""
+    """Point-in-time market cap per name on ``date`` — the PIT size source
+    (NOT ``scalemarketcap``, which is current-not-PIT). Names with no daily row
+    on ``date`` are omitted.
+
+    Uses the provider's bulk ``daily_marketcaps`` (one query for all names)
+    when available; falls back to per-name ``daily_metric`` for any other
+    provider. Same rows either way."""
+    bulk = getattr(provider, 'daily_marketcaps', None)
+    if bulk is not None:
+        return dict(bulk(names, date))
     out: Dict[str, float] = {}
     for s in names:
         mc = provider.daily_metric(s, date, 'marketcap')

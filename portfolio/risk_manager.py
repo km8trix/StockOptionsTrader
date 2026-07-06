@@ -294,8 +294,13 @@ class RiskManager:
         # Check daily loss limit
         self.check_daily_loss_limit(daily_pnl, portfolio_value)
 
-        # Check leverage
-        total_notional = sum(pos.current_price * pos.quantity for pos in positions.values())
+        # Check leverage — GROSS notional (abs), multiplier-aware: signed net
+        # would let a 100% long / 100% short book measure ~0x, and omitting
+        # asset.multiplier undercounts an options book 100x. Matches
+        # PortfolioRiskAggregator._current_gross.
+        total_notional = sum(
+            abs(pos.current_price * pos.quantity * pos.asset.multiplier)
+            for pos in positions.values())
         self.check_leverage(total_notional, portfolio_value)
 
         # Sector concentration across the CURRENT book — only meaningful with

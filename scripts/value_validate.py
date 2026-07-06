@@ -16,6 +16,11 @@ RECORDED VERDICT (2026-07-01, survivorship-free small/mid universe, pb/ps focus)
 the headline is real but heavily QUALIFIED — the tradeable edge is MARGINAL and
 regime-dependent, very likely to fail a desk gate the way insider did.
 
+NOTE: the verdict numbers below were recorded UN-winsorized (before --winsor
+existed here; factor_screen's docstring calls such numbers contaminated/~40%
+inflated). The battery now defaults to --winsor 0.01, matching factor_screen /
+quality_screen; pass --winsor 0 to reproduce the recorded numbers.
+
   1. OOS — entirely a back-half phenomenon (the real "value comeback"):
        IS  2015-2019  pb 63d net +0.32%  t=0.87  p=0.39   (nothing)
        OOS 2020-2024  pb 63d net +4.75%  t=3.52  p=0.0004 (very strong)
@@ -54,10 +59,12 @@ FACTORS = ['pb', 'pe', 'ps', 'evebit', 'evebitda']
 HZ = [21, 63]
 
 
-def _date_spreads(df, factor, h=63, q=0.2):
+def _date_spreads(df, factor, h=63, q=0.2, winsor=None):
     """Per-date cheap-minus-rich spread series for a factor — the raw material for
     the correlation cut (factor_study collapses this to one HAC t; here we keep the
-    series so we can correlate factors against each other)."""
+    series so we can correlate factors against each other). ``winsor`` clips each
+    date-group's forward returns to its [w, 1-w] quantiles, mirroring
+    factor_study's winsor_returns."""
     col = f'fwd_{h}'
     d = df.dropna(subset=[factor, col])
     d = d[d[factor] > 0]
@@ -67,16 +74,18 @@ def _date_spreads(df, factor, h=63, q=0.2):
         k = max(1, int(q * n))
         if n < 2 * k:
             continue
-        r = g.sort_values(factor)
-        out[date] = r.iloc[:k][col].mean() - r.iloc[-k:][col].mean()
+        r = g.sort_values(factor)[col]
+        if winsor:
+            r = r.clip(r.quantile(winsor), r.quantile(1.0 - winsor))
+        out[date] = r.iloc[:k].mean() - r.iloc[-k:].mean()
     return pd.Series(out)
 
 
-def _rep(df, label, factors=FACTORS):
+def _rep(df, label, factors=FACTORS, winsor=None):
     print(f"\n=== {label}: {len(df)} events ===")
     print(f"  {'factor':>9}{'h':>4}{'net%':>9}{'t':>7}{'p':>9}")
     for f in factors:
-        for s in factor_study(df, f, HZ, 30.0):
+        for s in factor_study(df, f, HZ, 30.0, winsor_returns=winsor):
             if s.get('insufficient'):
                 continue
             print(f"  {s['factor']:>9}{s['h']:>4}{s['net_spread']*100:>+9.3f}"
@@ -109,15 +118,22 @@ def main(argv=None):
                                  description=__doc__.splitlines()[0])
     ap.add_argument('--cache', default=None,
                     help='pkl path to collect events once and reuse')
+    ap.add_argument('--winsor', type=float, default=0.01,
+                    help='per-date forward-return winsorization, matching '
+                         'factor_screen (0 = off, reproducing the original '
+                         'un-winsorized/contaminated recorded verdict)')
     cli = ap.parse_args(argv)
+    w = cli.winsor or None
 
     ev = load_events(cli.cache)
     ev['yr'] = ev['date'].dt.year
 
-    _rep(ev, "FULL 2015-2024")
-    _rep(ev[ev['yr'] < 2020], "IN-SAMPLE 2015-2019", factors=['pb', 'ps'])
-    _rep(ev[ev['yr'] >= 2020], "OUT-OF-SAMPLE 2020-2024", factors=['pb', 'ps'])
-    _rep(ev[ev['yr'] != 2020], "EX-2020", factors=['pb', 'ps'])
+    _rep(ev, "FULL 2015-2024", winsor=w)
+    _rep(ev[ev['yr'] < 2020], "IN-SAMPLE 2015-2019", factors=['pb', 'ps'],
+         winsor=w)
+    _rep(ev[ev['yr'] >= 2020], "OUT-OF-SAMPLE 2020-2024", factors=['pb', 'ps'],
+         winsor=w)
+    _rep(ev[ev['yr'] != 2020], "EX-2020", factors=['pb', 'ps'], winsor=w)
 
     # scale breakdown: per-date PIT market-cap tercile (0=micro,1=small,2=mid)
     print("\n=== scale breakdown (pb, 63d) — per-date marketcap tercile ===")
@@ -127,7 +143,7 @@ def main(argv=None):
         ev.loc[g.index, 'bucket'] = g['name'].map(b).fillna(-1).astype(int).values
     for bk, lbl in [(0, 'micro'), (1, 'small'), (2, 'mid')]:
         sub = ev[ev['bucket'] == bk]
-        s = [x for x in factor_study(sub, 'pb', [63], 30.0)
+        s = [x for x in factor_study(sub, 'pb', [63], 30.0, winsor_returns=w)
              if not x.get('insufficient')]
         if s:
             s = s[0]
@@ -135,7 +151,7 @@ def main(argv=None):
                   f"t={s['t']:+.2f} p={s['p']:.4f}")
 
     print("\n=== factor correlation (63d per-date spread series) ===")
-    sp = pd.DataFrame({f: _date_spreads(ev, f) for f in FACTORS}).dropna()
+    sp = pd.DataFrame({f: _date_spreads(ev, f, winsor=w) for f in FACTORS}).dropna()
     corr = sp.corr()
     print(corr.round(2).to_string())
     iu = np.triu_indices(len(FACTORS), k=1)

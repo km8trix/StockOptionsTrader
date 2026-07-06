@@ -524,7 +524,41 @@ class FactorModel(WalkForwardModel):
         raw_panel = _raw_factor_panel(data)
         if not raw_panel:
             return {}
-        standardized = _standardized_panel(raw_panel)
+        # PERF: only each symbol's LATEST standardized row is consumed below,
+        # and the cross-sectional z-score is strictly PER-DATE (row-wise
+        # across symbols — desks.features.cross_sectional_rank), so
+        # standardizing the panel's FULL history every call is pure waste
+        # (O(dates x symbols) per predict, O(dates^2 x symbols) over a
+        # growing backtest). Restrict the raw panel to the union of needed
+        # dates — each symbol's own latest formable date. Usually that is one
+        # shared date; a stale symbol contributes its own last date, and
+        # every OTHER symbol's row at that date is kept too, so each needed
+        # date's cross-section is COMPLETE. Identical row values in identical
+        # column order through the unchanged standardization machinery yield
+        # byte-identical scores (golden test: TestPredictLatestSliceGolden).
+        needed_dates = {frame.index[-1] for frame in raw_panel.values()}
+        if len(needed_dates) == 1:
+            # BYTE-IDENTITY GUARD: a lone needed date would make the
+            # standardization panel ONE row, and numpy reduces a 1-row
+            # (contiguous) cross-section with PAIRWISE summation while a
+            # multi-row (strided) panel accumulates each row SEQUENTIALLY —
+            # at >= 8 symbols the two orders can round 1 ULP apart from the
+            # full-history panel. Pad with one earlier date (any symbol's
+            # second-to-last) so the sliced panel keeps the multi-row
+            # layout; the pad row's z-scores are computed and discarded
+            # (each symbol's scored row is still its own last raw row —
+            # boolean masking preserves position order, so ``iloc[-1]``
+            # below is unchanged). If no symbol has a second date, the full
+            # panel is single-row too and the slice is already identical.
+            for frame in raw_panel.values():
+                if len(frame.index) >= 2:
+                    needed_dates.add(frame.index[-2])
+                    if len(needed_dates) > 1:
+                        break
+        latest_panel = {
+            symbol: frame.loc[frame.index.isin(needed_dates)]
+            for symbol, frame in raw_panel.items()}
+        standardized = _standardized_panel(latest_panel)
         weights = np.array([self._weights[c] for c in FACTOR_COLUMNS],
                            dtype=float)
         scores: Dict[str, float] = {}

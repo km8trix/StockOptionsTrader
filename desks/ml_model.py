@@ -156,22 +156,99 @@ class GradientBoostingModel(WalkForwardModel):
         logger.debug("GradientBoostingModel fitted on %d pooled samples",
                      len(x_matrix))
 
+    def _fast_last_row(self, frame: pd.DataFrame) -> np.ndarray | None:
+        """O(1) feature vector for the frame's FINAL row, or None when the
+        full _feature_frame path must be used instead.
+
+        predict() only ever consumes the last feature row, so recomputing
+        _feature_frame over the whole history every simulated day is
+        O(history) per symbol per day. When the engine-enriched indicator
+        columns are already on the frame, the last row is plain column
+        reads plus scalar arithmetic that is bit-identical to the
+        vectorized ops (pct_change's last value is close[-1]/close[-2]-1).
+
+        Returns None — demanding the full path — unless ALL of:
+        - every fast-path column is present with a plain numpy float64 or
+          integer dtype (float32 would round differently; pandas
+          extension dtypes can hold pd.NA);
+        - the frame has >= 2 rows (ret_1 needs a prior close);
+        - close[-2] != 0 and volume_sma[-1] != 0 (the full path turns the
+          resulting inf into NaN);
+        - every computed feature value is finite. _feature_frame's
+          dropna() makes predict() silently back off to the last VALID
+          row (or skip the symbol) when the final row has a NaN/inf
+          feature, and only the full path reproduces that back-off.
+        The bb_position quirk is replicated: np.where(bb_width > 0, ...,
+        0.5) yields 0.5 for NaN or non-positive width, so a NaN band does
+        NOT invalidate the row.
+        """
+        if len(frame.index) < 2:
+            return None
+        for name in ('close', 'volume', 'rsi', 'macd',
+                     'bb_upper', 'bb_lower', 'volume_sma'):
+            if name not in frame.columns:
+                return None
+            dtype = frame.dtypes[name]
+            if not isinstance(dtype, np.dtype):
+                return None
+            if dtype != np.float64 and dtype.kind not in 'iu':
+                return None
+
+        close_prev = frame['close'].iloc[-2]
+        if close_prev == 0:
+            return None
+        close = frame['close'].iloc[-1]
+        ret_1 = close / close_prev - 1
+
+        bb_upper = frame['bb_upper'].iloc[-1]
+        bb_lower = frame['bb_lower'].iloc[-1]
+        bb_width = bb_upper - bb_lower
+        if bb_width > 0:  # NaN width compares False -> 0.5, as np.where does
+            bb_position = (close - bb_lower) / bb_width
+        else:
+            bb_position = 0.5
+
+        volume_sma = frame['volume_sma'].iloc[-1]
+        if volume_sma == 0:
+            return None
+        volume_ratio = frame['volume'].iloc[-1] / volume_sma
+
+        vector = np.array(
+            [ret_1, frame['rsi'].iloc[-1], frame['macd'].iloc[-1],
+             bb_position, volume_ratio], dtype=float)
+        if not np.isfinite(vector).all():
+            return None
+        return vector
+
     def predict(self, data: Dict[str, pd.DataFrame], date) -> Dict[str, float]:
         """Per-symbol centered score: P(up tomorrow) - 0.5.
 
         Symbols with insufficient/NaN feature rows are skipped; if the
         model never trained successfully, returns {}.
+
+        Feature vectors come from the O(1) fast path when a frame
+        qualifies (see _fast_last_row) and the full _feature_frame path
+        otherwise; all rows are then scored with a SINGLE predict_proba
+        call (GBM decision values are per-row independent, so batching is
+        bit-identical to per-symbol calls).
         """
         if not self._fitted:
             return {}
-        scores: Dict[str, float] = {}
+        symbols = []
+        rows = []
         for symbol, frame in data.items():
             if frame is None or frame.empty or 'close' not in frame.columns:
                 continue
-            features = self._feature_frame(frame)
-            if features.empty:
-                continue
-            latest = features.iloc[[-1]].to_numpy(dtype=float)
-            prob_up = float(self._classifier.predict_proba(latest)[0, 1])
-            scores[symbol] = prob_up - 0.5
-        return scores
+            vector = self._fast_last_row(frame)
+            if vector is None:
+                features = self._feature_frame(frame)
+                if features.empty:
+                    continue
+                vector = features.iloc[[-1]].to_numpy(dtype=float)[0]
+            symbols.append(symbol)
+            rows.append(vector)
+        if not rows:
+            return {}
+        probs = self._classifier.predict_proba(np.vstack(rows))[:, 1]
+        return {symbol: float(prob_up) - 0.5
+                for symbol, prob_up in zip(symbols, probs)}

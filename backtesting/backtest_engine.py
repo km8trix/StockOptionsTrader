@@ -235,13 +235,22 @@ class BacktestEngine:
         for symbol in symbols:
             data = self.market_data.fetch_stock_data(symbol, start_date, end_date)
             if not data.empty:
-                # Indicators are computed on expanding slices inside the loop
-                # below, so no global indicator state can leak future context.
                 all_data[symbol] = data
 
         if not all_data:
             logger.warning("Backtest aborted: no data available for %s", symbols)
             return {'error': 'No data available'}
+
+        # Indicators are prefix-stable (rolling/ewm/diff/shift are forward-
+        # only), so computing them ONCE on the full frame and slicing through
+        # the simulated date is byte-identical to recomputing on each
+        # expanding window — and removes the O(days^2) indicator recompute
+        # from the daily loop. Slicing through `date` still guarantees no
+        # future context reaches a strategy or desk.
+        self._enriched_all = {
+            symbol: self.market_data.calculate_indicators(data.copy())
+            for symbol, data in all_data.items()
+        }
 
         # Align trading dates across all downloaded symbols
         all_dates = set()
@@ -297,12 +306,9 @@ class BacktestEngine:
                     if date not in data.index:
                         continue
 
-                    # Slice historical data strictly up to the current simulated date
-                    historical_data = data[data.index <= date]
-
-                    # Run indicator calculations purely on the known past data window
-                    historical_data_with_indicators = self.market_data.calculate_indicators(
-                        historical_data.copy())
+                    # Precomputed indicators sliced through today only
+                    historical_data_with_indicators = self._enriched_through(
+                        symbol, date)
 
                     asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
                     signal = self.strategy.generate_signals(historical_data_with_indicators, asset)
@@ -343,6 +349,19 @@ class BacktestEngine:
         return self._generate_report(benchmark_symbol=benchmark_symbol,
                                      start_date=start_date, end_date=end_date)
 
+    def _enriched_through(self, symbol: str, date) -> pd.DataFrame:
+        """Slice the precomputed indicator frame through `date` (inclusive).
+
+        Equivalent to masking `index <= date` — the searchsorted fast path
+        needs a sorted index; unsorted frames take the mask path so the
+        no-future-leakage guarantee never depends on sortedness.
+        """
+        frame = self._enriched_all[symbol]
+        if frame.index.is_monotonic_increasing:
+            pos = frame.index.searchsorted(date, side='right')
+            return frame.iloc[:pos]
+        return frame[frame.index <= date]
+
     def _queue_desk_intents(self, all_data: Dict[str, pd.DataFrame],
                             date) -> None:
         """Desk-mode PHASE 3: ask the desk for intents, risk-check, queue.
@@ -357,14 +376,12 @@ class BacktestEngine:
         self.desk.set_clock(date)
 
         enriched: Dict[str, pd.DataFrame] = {}
-        for symbol, data in all_data.items():
-            # Slice historical data strictly up to the current simulated date
-            historical_data = data[data.index <= date]
+        for symbol in all_data:
+            # Precomputed indicators sliced through today only
+            historical_data = self._enriched_through(symbol, date)
             if historical_data.empty:
                 continue
-            # Run indicator calculations purely on the known past data window
-            enriched[symbol] = self.market_data.calculate_indicators(
-                historical_data.copy())
+            enriched[symbol] = historical_data
 
         if not enriched:
             return
@@ -400,12 +417,11 @@ class BacktestEngine:
         self.orchestrator.set_clock(date)
 
         enriched: Dict[str, pd.DataFrame] = {}
-        for symbol, data in all_data.items():
-            historical_data = data[data.index <= date]
+        for symbol in all_data:
+            historical_data = self._enriched_through(symbol, date)
             if historical_data.empty:
                 continue
-            enriched[symbol] = self.market_data.calculate_indicators(
-                historical_data.copy())
+            enriched[symbol] = historical_data
 
         if not enriched:
             return
@@ -594,10 +610,14 @@ class BacktestEngine:
                 and (not existing_pos or existing_pos.quantity == 0):
             buying = signal == 'BUY'
             fill_price = self._option_traded_price(model_price, buying=buying)
-            if buying and fill_price <= 0:
-                logger.warning("Skipping BUY fill for %s on %s: non-positive "
-                               "traded price %.4f", str(asset), fill_date,
-                               fill_price)
+            if fill_price <= 0:
+                # Guards BOTH open directions: an unguarded SHORT open at the
+                # 0.0 sell floor would collect zero premium, pay commission,
+                # and book unbounded risk (sizing at the haircut floor can
+                # short thousands of contracts for $0 credit).
+                logger.warning("Skipping %s fill for %s on %s: non-positive "
+                               "traded price %.4f", signal, str(asset),
+                               fill_date, fill_price)
                 return
             quantity = intent.get('quantity')
             if quantity is None:

@@ -32,8 +32,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from desks.factor_risk import FactorRiskModel
-from desks.models.factor import FACTOR_COLUMNS
+from desks import features as feature_lib
+from desks.factor_risk import FactorRiskModel, _MAX_FAST_ASOF_DATES
+from desks.models.factor import FACTOR_COLUMNS, _raw_factor_panel
 
 
 # ----------------------------------------------------------------------
@@ -321,3 +322,84 @@ class TestGracefulDegrade:
         exposure = model.book_exposure(
             {'AAA': 30_000.0, 'BBB': -10_000.0}, {}, 100_000.0)
         assert exposure == {'momentum': 0.0}
+
+
+# ----------------------------------------------------------------------
+# FAST PATH == FULL-HISTORY PATH — the as-of restricted standardization
+# must be byte-identical to the full-panel pipeline it replaced.
+# ----------------------------------------------------------------------
+class TestFastPathMatchesFullHistoryPath:
+    """loadings() standardizes only the as-of date cross-sections; this pins
+    it against the ORIGINAL full-history semantics, rebuilt here from the
+    same public building blocks (_raw_factor_panel + cross_sectional_rank
+    over ALL dates, then each symbol's last formable row)."""
+
+    @staticmethod
+    def _full_history_loadings(data, date, factors=FACTOR_COLUMNS):
+        """Reference: standardize the FULL history, then read each symbol's
+        last formable row — the pre-optimization path."""
+        cutoff = pd.Timestamp(date)
+        sliced = {}
+        for symbol, df in data.items():
+            if df is None or df.empty or 'close' not in df.columns:
+                continue
+            past = df[df.index <= cutoff]
+            if not past.empty:
+                sliced[symbol] = past
+        raw_panel = _raw_factor_panel(sliced)
+        z = {factor: feature_lib.cross_sectional_rank(
+                 raw_panel, column=factor, method='zscore')
+             for factor in factors}
+        expected = {}
+        for symbol, frm in raw_panel.items():
+            if frm.empty:
+                continue
+            last_date = frm.index[-1]
+            per = {}
+            for factor in factors:
+                zf = z[factor]
+                value = 0.0
+                if symbol in zf.columns and last_date in zf.index:
+                    cell = zf.at[last_date, symbol]
+                    if pd.notna(cell):
+                        value = float(cell)
+                per[factor] = value
+            expected[symbol] = per
+        return expected
+
+    def test_nonformable_tail_and_mixed_last_dates(self):
+        # BAD: close[90]=0.0 makes the row-91 return inf (poisoning every
+        # trailing-60 vol window after it -> vol NaN) and the NaN tail from
+        # row 92 (>= skip+1 rows) kills momentum's and reversal's end
+        # prices — so BAD's last rows form NO factor and its as-of row is
+        # EARLIER than its frame's last row. MED ends earlier than GOOD, so
+        # the as-of dates are mixed and each needed date's cross-section
+        # must still include every symbol formable there.
+        bad = frame(99, n=120)
+        close = bad['close'].to_numpy().copy()
+        close[90] = 0.0
+        close[91] = 5.0
+        close[92:] = np.nan
+        bad['close'] = close
+        data = {'GOOD': frame(7, n=120), 'BAD': bad, 'MED': frame(8, n=100)}
+        date = data['GOOD'].index[-1]
+
+        # Fixture self-check: the keep-mask really dropped BAD's tail (its
+        # last FORMABLE row precedes the frame's last row).
+        raw_bad = _raw_factor_panel({'BAD': bad})['BAD']
+        assert raw_bad.index[-1] < bad.index[-1]
+
+        result = FactorRiskModel().loadings(data, date)
+        assert set(result) == {'GOOD', 'BAD', 'MED'}
+        assert result == self._full_history_loadings(data, date)
+
+    def test_many_distinct_asof_dates_fallback_matches(self):
+        # More distinct as-of dates than _MAX_FAST_ASOF_DATES exercises the
+        # full-build-then-restrict fallback; still identical to the
+        # full-history reference.
+        data = {f'S{i}': frame(70 + i, n=140 - i) for i in range(10)}
+        last_dates = {df.index[-1] for df in data.values()}
+        assert len(last_dates) > _MAX_FAST_ASOF_DATES
+        date = max(last_dates)
+        result = FactorRiskModel().loadings(data, date)
+        assert result == self._full_history_loadings(data, date)

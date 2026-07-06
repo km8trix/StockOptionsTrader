@@ -28,6 +28,7 @@ Dep: ``duckdb`` (reads/writes Parquet natively — no pyarrow). Ingest also need
 
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 from typing import Dict, List, Optional, Sequence
@@ -89,6 +90,10 @@ class PitWarehouse:
         # CREATE VIEW per table if repeated full scans ever dominate.
         if self._conn is None:
             self._conn = duckdb.connect(database=':memory:')
+            # Cache Parquet metadata across queries — without this every
+            # read_parquet re-parses the file's footer, which dominates
+            # per-name point queries in the full-universe screens.
+            self._conn.execute("SET enable_object_cache=true")
         return self._conn
 
     def _query(self, table: str, sql: str, params: list):
@@ -153,6 +158,38 @@ class PitWarehouse:
         cols = [c[0] for c in res.description]
         row = res.fetchone()
         return dict(zip(cols, row)) if row else None
+
+    def fundamentals_asof_series(self, ticker: str, dates, *,
+                                 dimension: str = 'ARQ'
+                                 ) -> List[Optional[Dict]]:
+        """Batched twin of ``fundamentals_asof``: ONE SF1 scan for the ticker,
+        then per-date as-of resolution (latest datekey <= date) in memory.
+        Returns a list aligned with ``dates``."""
+        ds = [self._date(d) for d in dates]
+        valid = [d for d in ds if d is not None]
+        if not valid:
+            return [None] * len(ds)
+        res = self._query(
+            'sf1',
+            "SELECT * FROM src WHERE ticker = ? AND dimension = ? "
+            "AND CAST(datekey AS DATE) <= ? ORDER BY CAST(datekey AS DATE)",
+            [ticker, dimension, max(valid)])
+        if not res:
+            return [None] * len(ds)
+        cols = [c[0] for c in res.description]
+        rows = res.fetchall()
+        if not rows:
+            return [None] * len(ds)
+        ki = cols.index('datekey')
+        keys = [self._date(r[ki]) for r in rows]     # ascending (ORDER BY)
+        out: List[Optional[Dict]] = []
+        for d in ds:
+            if d is None:
+                out.append(None)
+                continue
+            i = bisect.bisect_right(keys, d)
+            out.append(dict(zip(cols, rows[i - 1])) if i else None)
+        return out
 
     def prices(self, ticker: str, start, end, *,
                field: str = 'closeadj') -> pd.Series:
@@ -253,6 +290,75 @@ class PitWarehouse:
                 'n_buys': int(nb or 0), 'n_sells': int(nsell or 0),
                 'window_start': start.isoformat()}
 
+    def insider_net_buys_bulk(self, tickers: Sequence[str], asof, *,
+                              lookback_days: int = 90) -> Dict[str, Dict]:
+        """Bulk twin of ``insider_net_buys`` for MANY tickers at ONE asof:
+        one GROUP BY scan instead of a query per name (the insider desk's
+        monthly rescore path). Same aggregate expressions as the per-call
+        SQL, so values are identical; names with no rows get the same
+        zero dict the per-call path returns."""
+        a = self._date(asof)
+        names = list(tickers)
+        if a is None or not names:
+            return {}
+        start = (pd.Timestamp(a) - pd.Timedelta(days=lookback_days)).date()
+        empty = {'net_value': 0.0, 'net_shares': 0.0, 'n_buys': 0,
+                 'n_sells': 0, 'window_start': start.isoformat()}
+        res = self._query(
+            'sf2',
+            "SELECT ticker, "
+            "COALESCE(SUM(CASE WHEN transactioncode='P' THEN abs(transactionvalue) "
+            "  WHEN transactioncode='S' THEN -abs(transactionvalue) END), 0), "
+            "COALESCE(SUM(CASE WHEN transactioncode='P' THEN abs(transactionshares) "
+            "  WHEN transactioncode='S' THEN -abs(transactionshares) END), 0), "
+            "COUNT(*) FILTER (WHERE transactioncode='P'), "
+            "COUNT(*) FILTER (WHERE transactioncode='S') "
+            "FROM src WHERE CAST(filingdate AS DATE) <= ? "
+            "AND CAST(filingdate AS DATE) >= ? AND ticker IN (%s) "
+            "GROUP BY ticker" % ",".join("?" * len(names)),
+            [a, start, *names])
+        rows = res.fetchall() if res else []
+        found = {r[0]: {'net_value': float(r[1] or 0.0),
+                        'net_shares': float(r[2] or 0.0),
+                        'n_buys': int(r[3] or 0), 'n_sells': int(r[4] or 0),
+                        'window_start': start.isoformat()} for r in rows}
+        return {t: found.get(t, dict(empty)) for t in names}
+
+    def insider_net_buys_series(self, ticker: str, asofs, *,
+                                lookback_days: int = 90) -> List[Dict]:
+        """Batched twin of ``insider_net_buys``: ONE SF2 scan spanning all
+        ``asofs`` windows, aggregated per window in memory (same PR #67 sign
+        convention via the shared helper). Aligned with ``asofs``."""
+        from data.pit_provider import _aggregate_insider_rows
+        empty = {'net_value': 0.0, 'net_shares': 0.0, 'n_buys': 0,
+                 'n_sells': 0, 'window_start': None}
+        ds = [self._date(a) for a in asofs]
+        windows = [
+            (a, (pd.Timestamp(a) - pd.Timedelta(days=lookback_days)).date())
+            if a is not None else None for a in ds]
+        valid = [w for w in windows if w is not None]
+        if not valid:
+            return [dict(empty) for _ in windows]
+        hi = max(a for a, _ in valid)
+        lo = min(s for _, s in valid)
+        res = self._query(
+            'sf2',
+            "SELECT CAST(filingdate AS DATE), transactioncode, "
+            "transactionshares, transactionvalue FROM src WHERE ticker = ? "
+            "AND CAST(filingdate AS DATE) <= ? AND CAST(filingdate AS DATE) >= ?",
+            [ticker, hi, lo])
+        rows = res.fetchall() if res else []
+        out = []
+        for w in windows:
+            if w is None:
+                out.append(dict(empty))
+                continue
+            a, start = w
+            nv, ns, nb, nsell = _aggregate_insider_rows(rows, start, a)
+            out.append({'net_value': nv, 'net_shares': ns, 'n_buys': nb,
+                        'n_sells': nsell, 'window_start': start.isoformat()})
+        return out
+
     def institutional_asof(self, ticker: str, asof, *,
                            lag_days: int = 45) -> Optional[Dict]:
         """Total 13F holding KNOWN by ``asof``. 13F is filed up to ``lag_days``
@@ -297,6 +403,40 @@ class PitWarehouse:
             return None
         rec = dict(zip(_DAILY_FIELDS, row))
         return rec if field is None else rec.get(field)
+
+    def daily_metrics(self, ticker: str, dates) -> List[Optional[Dict]]:
+        """Batched twin of ``daily_metric``: ONE DAILY scan for all ``dates``
+        instead of one per date. Returns full metric dicts (or None for dates
+        with no row), aligned with ``dates``."""
+        ds = [self._date(d) for d in dates]
+        valid = sorted({d for d in ds if d is not None})
+        if not valid:
+            return [None] * len(ds)
+        res = self._query(
+            'daily',
+            "SELECT CAST(date AS DATE), marketcap,pe,pb,ps,ev,evebit,evebitda "
+            "FROM src WHERE ticker = ? AND CAST(date AS DATE) IN (%s)"
+            % ",".join("?" * len(valid)), [ticker, *valid])
+        rows = res.fetchall() if res else []
+        by_date = {r[0]: dict(zip(_DAILY_FIELDS, r[1:])) for r in rows}
+        return [by_date.get(d) if d is not None else None for d in ds]
+
+    def daily_marketcaps(self, tickers: Sequence[str], date) -> Dict[str, float]:
+        """Bulk twin of ``daily_metric(..., 'marketcap')``: ONE Parquet scan
+        for all names on ``date`` instead of one scan per name. Names with no
+        daily row (or NULL marketcap) are omitted."""
+        d = self._date(date)
+        if d is None or not tickers:
+            return {}
+        names = list(tickers)
+        res = self._query(
+            'daily',
+            "SELECT ticker, marketcap FROM src WHERE CAST(date AS DATE) = ? "
+            "AND ticker IN (%s)" % ",".join("?" * len(names)),
+            [d, *names])
+        if not res:
+            return {}
+        return {t: mc for t, mc in res.fetchall() if mc is not None}
 
     # ------------------------------------------------------------------
     # Ingest — OPERATOR-ONLY, network: bulk-export -> zip -> Parquet

@@ -75,6 +75,12 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS daily (
         ticker TEXT, date TEXT, marketcap REAL, pe REAL, pb REAL, ps REAL,
         ev REAL, evebit REAL, evebitda REAL, PRIMARY KEY(ticker, date))""",
+    # sf2/sf3 have no PRIMARY KEY (no natural unique key), so without these
+    # every insider/institutional read is a full table scan.
+    """CREATE INDEX IF NOT EXISTS idx_sf2_ticker_filing
+        ON sf2(ticker, filingdate)""",
+    """CREATE INDEX IF NOT EXISTS idx_sf3_ticker_cal
+        ON sf3(ticker, calendardate)""",
 )
 
 
@@ -91,6 +97,32 @@ def _default_db_path() -> str:
     if trading and trading != ':memory:':
         return os.path.join(os.path.dirname(trading) or '.', 'pit_data.db')
     return 'pit_data.db'
+
+
+def _aggregate_insider_rows(rows, lo, hi):
+    """Aggregate (filingdate, transactioncode, transactionshares,
+    transactionvalue) rows falling in [lo, hi] into (net_value, net_shares,
+    n_buys, n_sells) with the PR #67 sign fix (abs magnitude + direction from
+    transactioncode). Shared by the per-call and batched paths of BOTH PIT
+    backends so the sign convention lives in exactly one place. ``lo``/``hi``
+    must be the same comparable type as the rows' filingdate (ISO strings for
+    SQLite, dates for DuckDB)."""
+    nv = ns = 0.0
+    nb = nsell = 0
+    for fd, code, shares, value in rows:
+        if fd is None or fd < lo or fd > hi:
+            continue
+        v = abs(float(value)) if value is not None else 0.0
+        sh = abs(float(shares)) if shares is not None else 0.0
+        if code == 'P':
+            nv += v
+            ns += sh
+            nb += 1
+        elif code == 'S':
+            nv -= v
+            ns -= sh
+            nsell += 1
+    return nv, ns, nb, nsell
 
 
 def _api_key() -> str:
@@ -256,32 +288,61 @@ class PitCache:
         start = (pd.Timestamp(a) - pd.Timedelta(days=lookback_days)).date().isoformat()
         try:
             rows = conn.execute(
-                "SELECT transactioncode, transactionshares, transactionvalue "
-                "FROM sf2 WHERE ticker = ? AND filingdate <= ? AND filingdate >= ?",
+                "SELECT filingdate, transactioncode, transactionshares, "
+                "transactionvalue FROM sf2 WHERE ticker = ? AND "
+                "filingdate <= ? AND filingdate >= ?",
                 (ticker, a, start)).fetchall()
         except sqlite3.OperationalError:
             rows = []
         finally:
             self._close(conn)
-        nv = ns = 0.0
-        nb = nsell = 0
-        for code, shares, value in rows:
-            # Sharadar signs transactionshares (negative for dispositions) but
-            # leaves transactionvalue a positive magnitude. Take abs of BOTH and
-            # apply direction from transactioncode, so net_shares and net_value
-            # are consistently signed — otherwise a sell's already-negative
-            # shares get negated again and a SELLER counts as a buyer.
-            v, sh = abs(value or 0.0), abs(shares or 0.0)
-            if code == 'P':
-                nv += v
-                ns += sh
-                nb += 1
-            elif code == 'S':
-                nv -= v
-                ns -= sh
-                nsell += 1
+        # Sharadar signs transactionshares (negative for dispositions) but
+        # leaves transactionvalue a positive magnitude — the shared helper
+        # takes abs of BOTH and applies direction from transactioncode, so a
+        # SELLER never counts as a buyer.
+        nv, ns, nb, nsell = _aggregate_insider_rows(rows, start, a)
         return {'net_value': nv, 'net_shares': ns, 'n_buys': nb,
                 'n_sells': nsell, 'window_start': start}
+
+    def insider_net_buys_series(self, ticker: str, asofs, *,
+                                lookback_days: int = 90) -> List[Dict]:
+        """Batched twin of ``insider_net_buys``: ONE sf2 fetch spanning all
+        ``asofs`` windows, aggregated per window in memory. Returns a list
+        aligned with ``asofs`` (same dicts as the per-call path)."""
+        empty = {'net_value': 0.0, 'net_shares': 0.0, 'n_buys': 0,
+                 'n_sells': 0, 'window_start': None}
+        isos = [self._iso(a) for a in asofs]
+        windows = [
+            (a, (pd.Timestamp(a) - pd.Timedelta(days=lookback_days))
+                .date().isoformat()) if a is not None else None
+            for a in isos]
+        valid = [w for w in windows if w is not None]
+        conn = self._readable_conn()
+        if conn is None or not valid:
+            self._close(conn)
+            return [dict(empty) for _ in windows]
+        hi = max(a for a, _ in valid)
+        lo = min(s for _, s in valid)
+        try:
+            rows = conn.execute(
+                "SELECT filingdate, transactioncode, transactionshares, "
+                "transactionvalue FROM sf2 WHERE ticker = ? AND "
+                "filingdate <= ? AND filingdate >= ?",
+                (ticker, hi, lo)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        finally:
+            self._close(conn)
+        out = []
+        for w in windows:
+            if w is None:
+                out.append(dict(empty))
+                continue
+            a, start = w
+            nv, ns, nb, nsell = _aggregate_insider_rows(rows, start, a)
+            out.append({'net_value': nv, 'net_shares': ns, 'n_buys': nb,
+                        'n_sells': nsell, 'window_start': start})
+        return out
 
     def institutional_asof(self, ticker: str, asof, *,
                            lag_days: int = 45) -> Optional[Dict]:
@@ -336,6 +397,27 @@ class PitCache:
         rec = dict(zip(('marketcap', 'pe', 'pb', 'ps', 'ev', 'evebit',
                         'evebitda'), row))
         return rec if field is None else rec.get(field)
+
+    def daily_marketcaps(self, tickers: Sequence[str], date) -> Dict[str, float]:
+        """Bulk twin of ``daily_metric(..., 'marketcap')``: one query for all
+        names on ``date`` instead of one connection+query per name. Names with
+        no daily row (or NULL marketcap) are omitted."""
+        d = self._iso(date)
+        conn = self._readable_conn()
+        if d is None or conn is None or not tickers:
+            self._close(conn)
+            return {}
+        names = list(tickers)
+        try:
+            rows = conn.execute(
+                "SELECT ticker, marketcap FROM daily WHERE date = ? AND "
+                "ticker IN (%s)" % ",".join("?" * len(names)),
+                (d, *names)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        finally:
+            self._close(conn)
+        return {t: mc for t, mc in rows if mc is not None}
 
     # ------------------------------------------------------------------
     # Writes — store (used by ingest AND tests)
