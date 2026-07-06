@@ -26,6 +26,13 @@ ALGORITHM (tested step-for-step in tests/test_patient_executor.py):
        it. The reprice is a cancel-and-replace for the remaining
        quantity; partial fills already banked keep working.
 
+  CANCEL IS ONLY A REQUEST: every cancel polls order_status until the
+  broker reports the order terminal (CANCELLED/EXECUTED/...), banking
+  any fill that raced the cancel, BEFORE anything else happens — sizing
+  a replacement off a pre-confirmation fill count double-executes the
+  racing quantity. A cancel that never confirms is a mid-work failure
+  (terminal 'error' report), never a blind replacement.
+
   NO MARKET-ORDER FALLBACK, deliberately: every desk here trades
   patient-edge strategies — paying the spread to force a fill erases the
   edge being captured. A desk would rather MISS than pay up; 'timeout'
@@ -88,6 +95,18 @@ from utils.kill_switch import KillSwitch
 logger = logging.getLogger(__name__)
 
 TICK = 0.01
+
+#: Cancel-confirmation polling: cancel_order is a REQUEST, not a state
+#: change. PaperTrader confirms on the next poll (None / terminal);
+#: live E*TRADE sits in CANCEL_REQUESTED briefly. 20 x 0.5s bounds the
+#: wait at ~10s before the executor declares the order state unknown.
+CANCEL_POLL_S = 0.5
+CANCEL_CONFIRM_ATTEMPTS = 20
+#: Statuses after which the order can no longer fill (both the E*TRADE
+#: vocabulary and PaperTrader's); CANCEL_REQUESTED is deliberately NOT
+#: here — that is exactly the window where a fill can race the cancel.
+_TERMINAL_STATUSES = frozenset({
+    "CANCELLED", "CANCELED", "EXECUTED", "FILLED", "REJECTED", "EXPIRED"})
 
 
 def round_tick(price: float) -> float:
@@ -186,16 +205,18 @@ class PatientExecutor:
         order_filled = 0.0
         order_avg: Optional[float] = None
 
-        def _poll() -> None:
-            """Bank any new fills on the current order into `fills`."""
+        def _poll() -> Optional[Dict]:
+            """Bank any new fills on the current order into `fills`.
+            Returns the raw status dict (None when the broker no longer
+            knows the id) so callers can check for a terminal state."""
             nonlocal remaining, order_filled, order_avg
             status = self.broker.order_status(order_id)
             if not status:
-                return
+                return None
             cum_qty = float(status.get("filled_quantity", 0) or 0)
             cum_avg = status.get("avg_fill_price")
             if cum_qty <= order_filled:
-                return
+                return status
             delta_qty = cum_qty - order_filled
             # Back out the marginal price of THIS delta from the moving
             # average so the fills list carries true per-slice prices.
@@ -211,10 +232,32 @@ class PatientExecutor:
             order_filled = cum_qty
             order_avg = float(cum_avg) if cum_avg is not None else limit
             remaining = quantity - int(round(sum(f["qty"] for f in fills)))
+            return status
 
         def _finish(status: str) -> Dict:
             return self._report(status, side, arrival_mid, fills, steps,
                                 quantity)
+
+        def _cancel_confirmed() -> None:
+            """Cancel the working order and wait until the broker says it
+            is DEAD. cancel_order is only a request — a live fill can land
+            between the request and the broker killing the order, so each
+            confirmation poll banks racing fills (updating `remaining`)
+            before any replacement is sized. A cancel that never confirms
+            raises, and the mid-work-failure handler turns that into a
+            terminal 'error' report: working a replacement while the old
+            order may still be live is how quantity double-executes."""
+            self.broker.cancel_order(order_id)
+            for _ in range(CANCEL_CONFIRM_ATTEMPTS):
+                status = _poll()
+                if status is None or (str(status.get("status") or "").upper()
+                                      in _TERMINAL_STATUSES):
+                    return
+                self._sleep(CANCEL_POLL_S)
+            raise RuntimeError(
+                f"cancel of order {order_id} not confirmed after "
+                f"{CANCEL_CONFIRM_ATTEMPTS} polls — order state unknown, "
+                "standing down")
 
         try:
             order_id = self._place(side, instrument, remaining, limit)
@@ -230,8 +273,7 @@ class PatientExecutor:
                 self._sleep(step_interval_s)
                 # 1. operator stop / kill switch — cancel and stand down.
                 if self._halted():
-                    self.broker.cancel_order(order_id)
-                    _poll()  # capture any race-the-cancel fills
+                    _cancel_confirmed()
                     logger.warning("Patient execution killed mid-work")
                     return _finish("killed")
                 # 2. fills.
@@ -240,16 +282,14 @@ class PatientExecutor:
                     return _finish("filled")
                 # 3. edge gone? the desk's reason to trade no longer holds.
                 if edge_check is not None and not edge_check():
-                    self.broker.cancel_order(order_id)
-                    _poll()
+                    _cancel_confirmed()
                     logger.info("Edge decayed; cancelled with %d remaining",
                                 remaining)
                     return _finish("edge_decayed")
                 # 4. deadline. NO market-order fallback (module docstring).
                 elapsed = (self._clock() - start).total_seconds()
                 if elapsed >= deadline_s:
-                    self.broker.cancel_order(order_id)
-                    _poll()
+                    _cancel_confirmed()
                     logger.info("Patient window expired; cancelled with %d "
                                 "remaining", remaining)
                     return _finish("partial" if fills else "timeout")
@@ -264,8 +304,7 @@ class PatientExecutor:
                     target = round_tick(limit - 0.25 * (limit - touch))
                     new_limit = max(target, touch)
                 if new_limit != limit:
-                    self.broker.cancel_order(order_id)
-                    _poll()  # fills that raced the cancel still count
+                    _cancel_confirmed()  # banks racing fills before sizing
                     if remaining <= 0:
                         return _finish("filled")
                     limit = new_limit

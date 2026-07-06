@@ -1,7 +1,10 @@
 """PatientExecutor (E4): scripted quote/fill sequences over virtual time —
 immediate mid fill, the exact 25%-of-remaining repricing path, the
 far-touch cap under a moving quote, edge-decay, timeout, partial fills,
-kill-switch mid-work, and the shortfall sign convention on both sides."""
+kill-switch mid-work, the cancel-confirm race (a fill landing between
+the cancel request and confirmation must be banked before the
+replacement is sized), and the shortfall sign convention on both
+sides."""
 
 from __future__ import annotations
 
@@ -10,7 +13,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.models import Asset, AssetType, OrderType
-from execution.patient_executor import PatientExecutor, round_tick
+from execution.patient_executor import (CANCEL_CONFIRM_ATTEMPTS,
+                                        CANCEL_POLL_S, PatientExecutor,
+                                        round_tick)
 from utils.kill_switch import KillSwitch
 
 SPY = Asset("SPY", AssetType.STOCK)
@@ -73,9 +78,15 @@ class FakeBroker:
     def order_status(self, order_id):
         index = int(order_id.split("-")[1]) - 1
         if index >= len(self.scripts) or not self.scripts[index]:
-            return S()
-        queue = self.scripts[index]
-        return queue.pop(0) if len(queue) > 1 else queue[0]
+            status = S()
+        else:
+            queue = self.scripts[index]
+            status = queue.pop(0) if len(queue) > 1 else queue[0]
+        if order_id in self.cancels and status["status"] == "OPEN":
+            # Cancel is synchronous on the fake: a still-working order
+            # confirms CANCELLED on the first post-cancel poll.
+            status = dict(status, status="CANCELLED")
+        return status
 
 
 def make_executor(broker, quotes, vt, kill_switch=None):
@@ -219,6 +230,85 @@ class TestPartialFills:
         report = executor.execute("BUY", SPY, 10, max_minutes=1,
                                   step_interval_s=30)
         assert report["status"] == "timeout"
+
+
+class TestCancelRace:
+    """cancel_order is only a REQUEST: a fill can land between the
+    request and the broker confirming CANCELLED. The replacement must
+    be sized only AFTER confirmation, with the racing fill banked."""
+
+    def test_fill_racing_cancel_is_banked_before_replacement_is_sized(self):
+        vt = VirtualTime()
+
+        class RacingBroker(FakeBroker):
+            """Cancel does not confirm immediately: the first poll after
+            the cancel request shows 4 lots having filled while the
+            cancel works (CANCEL_REQUESTED); the next poll confirms
+            CANCELLED. The replacement then fills in full."""
+
+            def order_status(self, order_id):
+                if order_id == "ORD-2":
+                    return S(6, 1.13, "EXECUTED")
+                if "ORD-1" not in self.cancels:
+                    return S()
+                self.post_cancel_polls = getattr(
+                    self, "post_cancel_polls", 0) + 1
+                if self.post_cancel_polls == 1:
+                    return S(4, 1.10, "CANCEL_REQUESTED")
+                return S(4, 1.10, "CANCELLED")
+
+        broker = RacingBroker()
+        executor = make_executor(broker, {"bid": 1.00, "ask": 1.20}, vt)
+        report = executor.execute("BUY", SPY, 10, max_minutes=10,
+                                  step_interval_s=30)
+        assert report["status"] == "filled"
+        # The racing 4 lots were banked BEFORE the replacement was
+        # sized: it works 6, not the stale 10 (= double-execution).
+        assert [p["qty"] for p in broker.placements] == [10, 6]
+        assert [(f["qty"], f["price"]) for f in report["fills"]] == [
+            (4.0, 1.10), (6.0, 1.13)]
+        assert report["avg_fill"] == pytest.approx(1.118)
+        # One step wait, then exactly one confirmation wait.
+        assert vt.sleeps == [30, CANCEL_POLL_S]
+        assert broker.cancels == ["ORD-1"]
+
+    def test_full_fill_racing_cancel_places_no_replacement(self):
+        vt = VirtualTime()
+
+        class FillsOnCancel(FakeBroker):
+            def order_status(self, order_id):
+                if order_id in self.cancels:
+                    # The whole order filled before the cancel landed.
+                    return S(10, 1.10, "EXECUTED")
+                return S()
+
+        broker = FillsOnCancel()
+        executor = make_executor(broker, {"bid": 1.00, "ask": 1.20}, vt)
+        report = executor.execute("BUY", SPY, 10, max_minutes=10,
+                                  step_interval_s=30)
+        assert report["status"] == "filled"
+        assert len(broker.placements) == 1  # nothing was replaced
+        assert [(f["qty"], f["price"]) for f in report["fills"]] == [
+            (10.0, 1.10)]
+
+    def test_unconfirmable_cancel_errors_instead_of_replacing(self):
+        vt = VirtualTime()
+
+        class StuckBroker(FakeBroker):
+            def order_status(self, order_id):
+                return S()  # forever OPEN, even after the cancel request
+
+        broker = StuckBroker()
+        executor = make_executor(broker, {"bid": 1.00, "ask": 1.20}, vt)
+        report = executor.execute("BUY", SPY, 10, max_minutes=10,
+                                  step_interval_s=30)
+        assert report["status"] == "error"
+        assert report["error_type"] == "RuntimeError"
+        assert "not confirmed" in report["error"]
+        # NEVER a blind replacement over an order of unknown state.
+        assert len(broker.placements) == 1
+        # The confirm loop spent its full poll budget standing down.
+        assert vt.sleeps == [30] + [CANCEL_POLL_S] * CANCEL_CONFIRM_ATTEMPTS
 
 
 class TestKillSwitchAndStop:
