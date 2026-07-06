@@ -127,11 +127,21 @@ class WalkForwardController:
                        cap_window: bool) -> Dict[str, pd.DataFrame]:
         """Slice each frame to index <= date; optionally cap to the
         trailing train_window_days rows. Empty results are dropped."""
+        cutoff = pd.Timestamp(date)
         sliced: Dict[str, pd.DataFrame] = {}
         for symbol, data in all_data.items():
             if data is None or data.empty:
                 continue
-            window = data[data.index <= pd.Timestamp(date)]
+            # Engine-driven callers pass frames already bounded through the
+            # simulation date, making the mask an all-True full-frame copy;
+            # share the frame instead (models are pure readers). The
+            # monotonic guard is MANDATORY: index[-1] <= cutoff only implies
+            # all-rows-bounded for a sorted index, and the mask path is the
+            # leakage guarantee for anything unsorted.
+            if data.index.is_monotonic_increasing and data.index[-1] <= cutoff:
+                window = data
+            else:
+                window = data[data.index <= cutoff]
             if cap_window:
                 window = window.tail(self.train_window_days)
             if not window.empty:
@@ -155,6 +165,12 @@ class WalkForwardController:
             self._days_since_fit += 1
         self._last_seen_date = current
 
+        # Fitted and not yet due: return before slicing — on this path the
+        # sliced history is discarded regardless of its contents, and this
+        # runs every simulated day per controller.
+        if self.is_fitted and self._days_since_fit < self.refit_every_days:
+            return False
+
         history = self._slice_through(all_data, date, cap_window=False)
         if not history:
             return False
@@ -166,8 +182,6 @@ class WalkForwardController:
             depth = max(len(frame) for frame in history.values())
             if depth < self.min_train_days:
                 return False
-        elif self._days_since_fit < self.refit_every_days:
-            return False
 
         train_data = {symbol: frame.tail(self.train_window_days)
                       for symbol, frame in history.items()}

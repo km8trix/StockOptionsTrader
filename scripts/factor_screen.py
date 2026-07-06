@@ -54,21 +54,33 @@ def collect_factor_events(prov, names, rebal_dates, horizons, factors,
     maxh = max(horizons)
     recs = []
     n_names = 0
+    batch = getattr(prov, 'daily_metrics', None)
     for name in names:
         px = prov.prices(name, price_start, price_end)
         if len(px) < 100:
             continue
         n_names += 1
         idx, vals = px.index, px.values
+        # Cheap bounds/entry checks FIRST so out-of-range dates never pay a
+        # DAILY query; then ONE batched fetch per name instead of one
+        # point query per rebalance date.
+        live = []
         for t in rebal_dates:
-            metrics = prov.daily_metric(name, t)     # PIT valuation row or None
-            if not metrics:
-                continue
             pos = int(idx.searchsorted(pd.Timestamp(t)))
             if pos + maxh >= len(px) or pos >= len(px):
                 continue
             entry = vals[pos]
             if not entry or entry <= 0:
+                continue
+            live.append((t, pos, entry))
+        if not live:
+            continue
+        if batch is not None:
+            rows = batch(name, [t for t, _, _ in live])
+        else:
+            rows = [prov.daily_metric(name, t) for t, _, _ in live]
+        for (t, pos, entry), metrics in zip(live, rows):
+            if not metrics:                          # PIT valuation row or None
                 continue
             rec = {'date': pd.Timestamp(t), 'name': name}
             for f in factors:

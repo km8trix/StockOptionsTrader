@@ -133,8 +133,13 @@ class LiveScheduler:
                 logger.error("Scheduler thread did not stop within %.1fs",
                              join_timeout)
         with self._lock:
-            self._running = False
-            self._next_run_estimate = None
+            # Only clear shared state if a concurrent start() hasn't already
+            # installed a NEWER generation — otherwise we'd report
+            # running=False while that fresh loop is live (same guard as
+            # TokenKeepAliveScheduler.stop).
+            if self._thread is thread:
+                self._running = False
+                self._next_run_estimate = None
         logger.info("Scheduler stopped")
         self._audit("scheduler_stopped", {})
         return True

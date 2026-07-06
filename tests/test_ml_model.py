@@ -99,6 +99,50 @@ class TestLabelAlignment:
         assert len(y) == len(x_matrix)
 
 
+class TestFastPathEquivalence:
+    """predict()'s O(1) last-row fast path must be EXACTLY equivalent to
+    the original full _feature_frame path (which remains as the
+    fallback), including the dropna() back-off to an earlier valid row
+    when the final row has a non-finite feature."""
+
+    @staticmethod
+    def _full_path_score(model, frame):
+        """Score via the pre-optimization code path, verbatim."""
+        features = model._feature_frame(frame)
+        latest = features.iloc[[-1]].to_numpy(dtype=float)
+        return float(model._classifier.predict_proba(latest)[0, 1]) - 0.5
+
+    def test_fast_path_matches_full_path_on_enriched_frames(self):
+        df_a = hand_frame()
+        df_b = hand_frame(closes=[50.0, 51.0, 49.5, 52.0, 53.0,
+                                  51.0, 54.0, 50.0, 55.0, 56.0])
+        model = GradientBoostingModel(n_estimators=5)
+        model.fit({'A': df_a, 'B': df_b})
+
+        # Sanity: enriched frames actually take the fast path.
+        assert model._fast_last_row(df_a) is not None
+
+        # Two symbols -> also pins batched predict_proba == per-symbol.
+        scores = model.predict({'A': df_a, 'B': df_b}, df_a.index[-1])
+        assert scores['A'] == self._full_path_score(model, df_a)
+        assert scores['B'] == self._full_path_score(model, df_b)
+
+    def test_nan_last_row_falls_back_to_previous_valid_row(self):
+        df = hand_frame()
+        # volume_sma == 0 -> volume_ratio inf -> NaN -> the final row is
+        # dropped and the LAST VALID row must be scored instead.
+        df.iloc[-1, df.columns.get_loc('volume_sma')] = 0.0
+        model = GradientBoostingModel(n_estimators=5)
+        model.fit({'SYM': hand_frame()})
+
+        assert model._fast_last_row(df) is None  # fast path must refuse
+        features = model._feature_frame(df)
+        assert features.index[-1] == df.index[-2]  # back-off row
+
+        scores = model.predict({'SYM': df}, df.index[-1])
+        assert scores['SYM'] == self._full_path_score(model, df)
+
+
 class TestInsufficientData:
     def test_too_few_rows_yields_empty_dict_not_exception(self):
         df = hand_frame().iloc[:2]

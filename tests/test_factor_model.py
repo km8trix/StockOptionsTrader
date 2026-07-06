@@ -41,7 +41,8 @@ import pytest
 from desks.features import cross_sectional_rank
 from desks.models.factor import (_MIN_ROWS, FACTOR_COLUMNS, FactorModel,
                                   _factor_exposures, _raw_factor_panel,
-                                  _trailing_return, _trailing_vol)
+                                  _standardized_panel, _trailing_return,
+                                  _trailing_vol)
 from desks.walk_forward import WalkForwardModel
 
 
@@ -553,3 +554,128 @@ class TestRawFactorPanelGolden:
         assert prod_scores.keys() == loop_scores.keys()
         for symbol in loop_scores:
             assert prod_scores[symbol] == loop_scores[symbol]  # byte-identical
+
+
+# ----------------------------------------------------------------------
+# Golden equivalence: predict()'s latest-date SLICED standardization is
+# BYTE-IDENTICAL to the original FULL-history standardization it replaced.
+# ----------------------------------------------------------------------
+def _full_history_predict(model: FactorModel, data):
+    """The ORIGINAL predict path, frozen here verbatim as the golden oracle.
+
+    Standardizes the FULL raw factor panel (every historical date) before
+    reading each symbol's latest standardized row — exactly the
+    pre-optimization algorithm — so any divergence introduced by predict's
+    needed-dates slicing (which restricts the raw panel to each symbol's
+    latest formable date plus the other symbols' rows at those dates) is
+    caught. The z-score is strictly per-date, so the two must agree exactly.
+    """
+    if not model.is_fitted or not model.factor_weights:
+        return {}
+    raw_panel = _raw_factor_panel(data)
+    if not raw_panel:
+        return {}
+    standardized = _standardized_panel(raw_panel)
+    weights = np.array([model.factor_weights[c] for c in FACTOR_COLUMNS],
+                       dtype=float)
+    scores = {}
+    for symbol, std_frame in standardized.items():
+        if std_frame.empty:
+            continue
+        latest = std_frame.iloc[-1]
+        exposure = latest.reindex(FACTOR_COLUMNS).fillna(0.0).to_numpy(
+            dtype=float)
+        if not np.all(np.isfinite(exposure)):
+            continue
+        scores[symbol] = float(np.dot(weights, exposure))
+    return scores
+
+
+def _predict_golden_cases():
+    """Panels spanning the predict-path edge cases: one shared last date;
+    MIXED last dates (stale symbols, so the needed-date union has several
+    dates and every other symbol's row at a stale date must enter that
+    date's cross-section); a NaN tail whose last rows form NO factor; dense
+    NaN holes; tiny frames straddling _MIN_ROWS; a single-symbol
+    (degenerate) cross-section."""
+    cases = {}
+    # >= 8 symbols on ONE shared date is the numpy pairwise-summation edge:
+    # a 1-row sliced panel would sum its cross-section in a different order
+    # than the multi-row full panel and round 1 ULP away (this exact case
+    # caught it), which is why predict pads the slice to two dates.
+    cases['shared_last_date'] = panel(n_symbols=8, n=260)
+    cases['shared_last_date_wide'] = panel(n_symbols=12, n=260)
+
+    # Exactly TWO needed dates (one stale symbol) -> a 2-row sliced panel,
+    # pinning the unpadded multi-row reduction path against the oracle.
+    two = panel(n_symbols=12, n=260)
+    two['S03'] = two['S03'].iloc[:248]
+    cases['two_needed_dates'] = two
+
+    stale = panel(n_symbols=8, n=260)
+    stale['S02'] = stale['S02'].iloc[:240]
+    stale['S05'] = stale['S05'].iloc[:225]
+    cases['mixed_last_dates'] = stale
+
+    # NaN tail: the zero price puts an inf return into the trailing vol
+    # windows (vol -> NaN there) and the NaN closes kill momentum/reversal,
+    # so the frame's LAST rows form no factor at all — the symbol's latest
+    # FORMABLE date precedes its last bar (a raw-panel-level stale symbol).
+    tail = _walk(40, seed=7)
+    tail[30] = 0.0
+    tail[32:] = np.nan
+    cases['nan_tail_nonformable'] = {
+        'GOOD0': _close_frame(_walk(40, seed=8)),
+        'STALE': _close_frame(tail),
+        'GOOD1': _close_frame(_walk(40, seed=9))}
+
+    # Dense NaN holes (the raw-panel 'nan_holes' case, cross-sectionally,
+    # with the holes at different rows per symbol).
+    holes = {}
+    for i in range(4):
+        v = _walk(130, seed=20 + i)
+        v[60 + i] = np.nan
+        v[61 + i] = np.nan
+        v[100 - i] = np.nan
+        holes[f'H{i}'] = _close_frame(v)
+    cases['nan_holes_dense'] = holes
+
+    # Tiny frames straddling _MIN_ROWS (=5): T3/T4 drop out of the panel
+    # entirely, the rest barely form factors.
+    cases['tiny_frames'] = {
+        f'T{n}': _close_frame(_walk(n, seed=40 + n)) for n in (3, 4, 5, 6, 8)}
+
+    cases['single_symbol'] = {'ONLY': _close_frame(_walk(120, seed=46))}
+    return cases
+
+
+class TestPredictLatestSliceGolden:
+    """predict()'s needed-dates slicing must reproduce the frozen
+    full-history oracle exactly — same symbols, same order, byte-identical
+    scores."""
+
+    @pytest.mark.parametrize('name', sorted(_predict_golden_cases()))
+    def test_predict_scores_byte_identical(self, name):
+        data = _predict_golden_cases()[name]
+        model = FactorModel()
+        model.fit(data)
+        first = next(iter(data.values()))
+        prod = model.predict(data, first.index[-1])
+        ref = _full_history_predict(model, data)
+        assert list(prod) == list(ref)  # same symbols, same insertion order
+        for symbol in ref:
+            assert prod[symbol] == ref[symbol]  # byte-identical
+
+    def test_equal_weight_model_also_byte_identical(self):
+        # The degraded (equal-weight) model runs the same predict machinery;
+        # pin it against the oracle on the stale-symbol panel too.
+        data = _predict_golden_cases()['mixed_last_dates']
+        model = FactorModel()
+        model.fit({})  # degrade to the documented equal-weight prior
+        assert model.is_degraded
+        prod = model.predict(data, data['S00'].index[-1])
+        ref = _full_history_predict(model, data)
+        assert prod  # non-trivial coverage
+        assert list(prod) == list(ref)
+        for symbol in ref:
+            assert prod[symbol] == ref[symbol]

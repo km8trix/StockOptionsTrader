@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional, List
-from core.models import Asset, Order, OrderStatus, OrderType, Position
+from core.models import Asset, AssetType, Order, OrderStatus, OrderType, Position
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
 from brokers.base import ExecutionBroker
@@ -60,6 +60,20 @@ class PaperTrader(ExecutionBroker):
                 timestamp=datetime.now(),
                 order_id=order_id
             )
+
+            # Only STOCK is priceable here: get_current_price() returns the
+            # UNDERLYING equity close, so an option order would limit-check
+            # and "fill" at the stock price with no x100 multiplier —
+            # silently corrupting the paper book. Reject until a real option
+            # quote source exists (LiveEtradeBroker handles options).
+            if asset.asset_type != AssetType.STOCK:
+                logger.warning(
+                    "PaperTrader rejects non-stock order %s (%s %s): no "
+                    "option pricing in paper mode", order_id,
+                    asset.asset_type.value, asset.symbol)
+                order.status = OrderStatus.REJECTED
+                self.filled_orders[order_id] = order
+                return order_id
 
             self.pending_orders.append(order)
             return order_id
@@ -110,11 +124,13 @@ class PaperTrader(ExecutionBroker):
                     return {"status": "OPEN",
                             "filled_quantity": order.filled_quantity,
                             "avg_fill_price": order.filled_price}
-            filled = self.filled_orders.get(order_id)
-            if filled is not None:
-                return {"status": "FILLED",
-                        "filled_quantity": filled.filled_quantity,
-                        "avg_fill_price": filled.filled_price}
+            done = self.filled_orders.get(order_id)
+            if done is not None:
+                status = ("REJECTED" if done.status == OrderStatus.REJECTED
+                          else "FILLED")
+                return {"status": status,
+                        "filled_quantity": done.filled_quantity,
+                        "avg_fill_price": done.filled_price}
         return None
 
     def get_current_price(self, symbol: str) -> Optional[float]:
@@ -183,27 +199,39 @@ class PaperTrader(ExecutionBroker):
                     filled = True
 
                 if filled:
-                    self._execute_order(order, current_price)
-                    # Record the fill on the order and keep it queryable via
-                    # order_status() (paper fills fully or not at all).
-                    order.filled_quantity = order.quantity
-                    order.filled_price = current_price
-                    order.status = OrderStatus.FILLED
+                    executed = self._execute_order(order, current_price)
+                    if executed:
+                        # Record the fill on the order and keep it queryable
+                        # via order_status() (paper fills fully or not at all).
+                        order.filled_quantity = order.quantity
+                        order.filled_price = current_price
+                        order.status = OrderStatus.FILLED
+                    else:
+                        # Marketable but declined (insufficient cash / no
+                        # position): REJECTED, never a phantom fill — the
+                        # portfolio did not change, so order_status must not
+                        # report a fill PatientExecutor would bank.
+                        order.status = OrderStatus.REJECTED
                     self.filled_orders[order.order_id] = order
                     self.pending_orders.remove(order)
     
-    def _execute_order(self, order: Order, execution_price: float):
-        """Execute an order"""
+    def _execute_order(self, order: Order, execution_price: float) -> bool:
+        """Execute an order against the portfolio.
+
+        Returns True only when the portfolio was actually mutated; False when
+        the order was declined (insufficient cash / no position), so the
+        caller never reports a phantom fill.
+        """
         cost = order.quantity * execution_price * 1.001  # Add small slippage
-        
+
         if order.order_type == OrderType.BUY:
             if self.portfolio.cash >= cost:
                 self.portfolio.cash -= cost
                 existing_pos = self.portfolio.get_position(order.asset)
-                
+
                 if existing_pos:
                     # Average up
-                    new_avg = (existing_pos.avg_entry_price * existing_pos.quantity + 
+                    new_avg = (existing_pos.avg_entry_price * existing_pos.quantity +
                               execution_price * order.quantity) / (existing_pos.quantity + order.quantity)
                     existing_pos.quantity += order.quantity
                     existing_pos.avg_entry_price = new_avg
@@ -216,17 +244,29 @@ class PaperTrader(ExecutionBroker):
                         timestamp=datetime.now()
                     )
                     self.portfolio.add_position(position)
-        
-        elif order.order_type == OrderType.SELL:
+                return True
+            logger.warning(
+                "Paper BUY %s x%d rejected: cost %.2f exceeds cash %.2f",
+                order.asset.symbol, order.quantity, cost, self.portfolio.cash)
+            return False
+
+        if order.order_type == OrderType.SELL:
             existing_pos = self.portfolio.get_position(order.asset)
             if existing_pos and existing_pos.quantity >= order.quantity:
                 proceeds = order.quantity * execution_price * 0.999
                 self.portfolio.cash += proceeds
-                
+
                 if existing_pos.quantity == order.quantity:
                     self.portfolio.remove_position(order.asset)
                 else:
                     existing_pos.quantity -= order.quantity
+                return True
+            logger.warning(
+                "Paper SELL %s x%d rejected: position %s insufficient",
+                order.asset.symbol, order.quantity,
+                existing_pos.quantity if existing_pos else "missing")
+            return False
+        return False
     
     def get_portfolio_status(self) -> Dict:
         """Get current portfolio status"""

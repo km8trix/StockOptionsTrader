@@ -82,22 +82,35 @@ def collect_events(prov, names, rebal_dates, horizons, lookback,
     maxh = max(horizons)
     recs = []
     n_names = 0
+    batch = getattr(prov, 'insider_net_buys_series', None)
     for name in names:
         px = prov.prices(name, price_start, price_end)
         if len(px) < 100:
             continue
         n_names += 1
         idx, vals = px.index, px.values
+        # Cheap bounds/entry checks FIRST so out-of-range dates (delisted
+        # names, tail rebalances) never pay an SF2 query; then ONE batched
+        # fetch per name instead of one query per rebalance date.
+        live = []
         for t in rebal_dates:
-            nb = prov.insider_net_buys(name, t, lookback_days=lookback)
-            nsh = nb['net_shares']
-            if (nb['n_buys'] + nb['n_sells']) == 0 or nsh == 0:
-                continue
             pos = int(idx.searchsorted(pd.Timestamp(t)))
             if pos + maxh >= len(px) or pos >= len(px):
                 continue
             entry = vals[pos]
             if not entry or entry <= 0:
+                continue
+            live.append((t, pos, entry))
+        if not live:
+            continue
+        if batch is not None:
+            nbs = batch(name, [t for t, _, _ in live], lookback_days=lookback)
+        else:
+            nbs = [prov.insider_net_buys(name, t, lookback_days=lookback)
+                   for t, _, _ in live]
+        for (t, pos, entry), nb in zip(live, nbs):
+            nsh = nb['net_shares']
+            if (nb['n_buys'] + nb['n_sells']) == 0 or nsh == 0:
                 continue
             # cohort key is the REBALANCE date t, not idx[pos] (the entry bar):
             # the Fama-MacBeth cross-section is "all names rebalanced this month",

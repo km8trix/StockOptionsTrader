@@ -238,16 +238,26 @@ class TradingDatabase:
         return None
     
     def get_backtests(self, limit: int = 50) -> List[Dict]:
-        """Get recent backtests"""
+        """Get recent backtests — summary columns only.
+
+        Excludes the `results` JSON blob (full equity/drawdown curves,
+        easily 50-200KB per row): every consumer of the LIST endpoint reads
+        only the flat summary fields; the detail path (get_backtest) is the
+        one that returns the blob.
+        """
         conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM backtests ORDER BY timestamp DESC LIMIT ?', (limit,))
+
+        cursor.execute(
+            'SELECT id, name, timestamp, start_date, end_date, symbols, '
+            'initial_capital, strategy, parameters, total_return, '
+            'sharpe_ratio, max_drawdown, win_rate, total_trades '
+            'FROM backtests ORDER BY timestamp DESC LIMIT ?', (limit,))
         results = [dict(row) for row in cursor.fetchall()]
-        
+
         conn.close()
-        
+
         return results
     
     def get_backtest_trades(self, backtest_id: int) -> List[Dict]:

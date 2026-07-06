@@ -619,14 +619,34 @@ class EtradeClient:
                 continue
             details = order.get("OrderDetail", [])
             status = details[0].get("status") if details else None
-            filled = 0.0
-            avg_price = None
-            for detail in details:
-                for instrument in detail.get("Instrument", []):
-                    filled += float(instrument.get("filledQuantity", 0) or 0)
-                    if instrument.get("averageExecutionPrice") is not None:
-                        avg_price = float(
-                            instrument["averageExecutionPrice"])
+            instruments = [inst for detail in details
+                           for inst in detail.get("Instrument", [])]
+            if len(instruments) <= 1:
+                inst = instruments[0] if instruments else {}
+                filled = float(inst.get("filledQuantity", 0) or 0)
+                avg_price = (float(inst["averageExecutionPrice"])
+                             if inst.get("averageExecutionPrice") is not None
+                             else None)
+                return {"status": status, "filled_quantity": filled,
+                        "avg_fill_price": avg_price}
+            # Multi-leg (SPREADS): legs fill as a PACKAGE. Summing leg
+            # quantities would report n*q for q package contracts (a partial
+            # fill then looks complete to PatientExecutor), and one leg's
+            # price is meaningless — report package contracts (min across
+            # legs) and the signed NET price (+ for BUY_*, - for SELL_*,
+            # matching build_spread_order's credit/debit convention).
+            filled = min(float(inst.get("filledQuantity", 0) or 0)
+                         for inst in instruments)
+            net = 0.0
+            have_price = False
+            for inst in instruments:
+                px = inst.get("averageExecutionPrice")
+                if px is None:
+                    continue
+                have_price = True
+                sign = 1.0 if str(inst.get("orderAction", "")).startswith(
+                    "BUY") else -1.0
+                net += sign * float(px)
             return {"status": status, "filled_quantity": filled,
-                    "avg_fill_price": avg_price}
+                    "avg_fill_price": net if have_price else None}
         return None

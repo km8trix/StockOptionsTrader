@@ -62,12 +62,112 @@ from __future__ import annotations
 import logging
 from typing import Dict, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
-from desks.models.factor import FACTOR_COLUMNS, _raw_factor_panel
+from desks.models.factor import (
+    FACTOR_COLUMNS, _factor_exposures, _raw_factor_panel)
 from desks import features as feature_lib
 
 logger = logging.getLogger(__name__)
+
+#: Fast-path guard for :func:`_asof_factor_panel`: with more than this many
+#: DISTINCT as-of dates in the universe, the per-prefix evaluation would run
+#: O(symbols x dates) full-series passes, so one full vectorized panel build
+#: (restricted to the as-of dates before standardization) is cheaper. Purely
+#: a performance switch — both paths return byte-identical rows.
+_MAX_FAST_ASOF_DATES = 8
+
+
+def _asof_factor_panel(
+        sliced: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """Raw factor rows restricted to the symbols' AS-OF dates only.
+
+    Returns, per symbol, the SAME rows ``_raw_factor_panel(sliced)`` would
+    return RESTRICTED to the union of the symbols' last FORMABLE dates. A
+    symbol's as-of date is its last raw-panel row — NOT necessarily the
+    frame's last row, since a tail row where no factor is finite is dropped
+    by the panel keep-mask; such a symbol falls back to the full builder to
+    resolve its last formable row. Only these as-of rows are consumed by
+    :meth:`FactorRiskModel.loadings`, and the per-date cross-sectional
+    z-score depends on that date's row alone, so standardizing just these
+    rows is byte-identical to standardizing the full history — while
+    skipping the O(history) panel rebuild ``loadings()`` used to pay on
+    every simulated day.
+
+    BYTE-IDENTITY: every returned cell is produced either by
+    :func:`_factor_exposures` on the exact prefix ``close[index <= d]``
+    (bit-for-bit equal to the vectorized panel row — the golden equivalence
+    ``tests/test_factor_model.py`` pins) or by :func:`_raw_factor_panel`
+    itself (the non-formable-tail and many-dates fallbacks). The cross-
+    section at each needed date keeps EVERY symbol with a formable row at
+    that date, not just the symbol whose as-of date it is.
+    """
+    # symbol -> (as-of date, raw factor row at that date).
+    asof: Dict[str, tuple] = {}
+    # Symbols whose LAST row is not formable: their kept rows, from the
+    # existing full builder (rare; single-symbol cost).
+    fallback_frames: Dict[str, pd.DataFrame] = {}
+    for symbol, past in sliced.items():
+        # A non-finite return in the vol window (e.g. an inf from a zero
+        # price) surfaces as an arithmetic RuntimeWarning inside the scalar
+        # std before being squashed to NaN by the finite guard — exactly
+        # the warning the vectorized builder silences too (see
+        # _trailing_vol_series); it carries no information.
+        with np.errstate(invalid='ignore', divide='ignore'):
+            exposures = _factor_exposures(past['close'])
+        if exposures is not None:
+            asof[symbol] = (past.index[-1], exposures)
+            continue
+        sub = _raw_factor_panel({symbol: past}).get(symbol)
+        if sub is not None and not sub.empty:
+            fallback_frames[symbol] = sub
+        # else: the symbol forms no factors at all -> omitted, as before.
+
+    needed = {date for date, _ in asof.values()}
+    needed.update(frame.index[-1] for frame in fallback_frames.values())
+    if not needed:
+        return {}
+
+    if len(needed) > _MAX_FAST_ASOF_DATES:
+        # Degenerate mixed-calendar universe: one full vectorized build is
+        # cheaper than symbols x dates prefix evaluations. Restricting the
+        # rows BEFORE standardization still skips the full-history
+        # z-scoring.
+        full = _raw_factor_panel(sliced)
+        return {symbol: frame.loc[frame.index.isin(needed)]
+                for symbol, frame in full.items()}
+
+    needed_sorted = sorted(needed)
+    panel: Dict[str, pd.DataFrame] = {}
+    for symbol, past in sliced.items():
+        if symbol in fallback_frames:
+            frame = fallback_frames[symbol]
+            panel[symbol] = frame.loc[frame.index.isin(needed)]
+            continue
+        if symbol not in asof:
+            continue
+        asof_date, asof_exposures = asof[symbol]
+        dates = []
+        rows = []
+        for date in needed_sorted:
+            if date == asof_date:
+                dates.append(date)
+                rows.append(asof_exposures)
+            elif date < asof_date and date in past.index:
+                # Another symbol's as-of date: this symbol is part of that
+                # date's cross-section iff it has a FORMABLE row there.
+                # (Same uninformative-warning silencing as above.)
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    exposures = _factor_exposures(
+                        past.loc[past.index <= date, 'close'])
+                if exposures is not None:
+                    dates.append(date)
+                    rows.append(exposures)
+        panel[symbol] = pd.DataFrame(
+            [[row[c] for c in FACTOR_COLUMNS] for row in rows],
+            index=pd.Index(dates), columns=list(FACTOR_COLUMNS))
+    return panel
 
 
 class FactorRiskModel:
@@ -144,12 +244,18 @@ class FactorRiskModel:
                 continue
             sliced[symbol] = past
 
-        raw_panel = _raw_factor_panel(sliced)
+        # Only each symbol's as-of row is consumed below, so build (or
+        # restrict to) just the as-of date rows — byte-identical to the
+        # former full-history build + standardization, because the per-date
+        # z-score depends on that date's cross-section alone (see
+        # _asof_factor_panel for the equivalence argument).
+        raw_panel = _asof_factor_panel(sliced)
         if not raw_panel:
             return {}
 
         # Cross-sectional z-score per factor across symbols (no-lookahead,
-        # row-wise across symbols), then take each symbol's LATEST row.
+        # row-wise across symbols) on the as-of rows only, then take each
+        # symbol's LATEST row.
         z_by_factor: Dict[str, pd.DataFrame] = {}
         for factor in self.factors:
             z_by_factor[factor] = feature_lib.cross_sectional_rank(

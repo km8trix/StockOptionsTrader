@@ -396,3 +396,34 @@ class TestPriceSanityGuard:
         with caplog.at_level(logging.WARNING, logger="brokers.base"):
             t.place_order(_stock(), OrderType.BUY, 1, limit_price=99.0)
         assert not any("fat-finger" in r.message for r in caplog.records)
+
+
+class TestRejectedOrders:
+    """Declined executions must report REJECTED, never a phantom FILLED."""
+
+    def test_insufficient_cash_buy_is_rejected(self, trader):
+        # 100k cash, 2000 shares @ 100 * 1.001 slippage > 100k
+        oid = trader.place_order(_stock(), OrderType.BUY, 2000, limit_price=None)
+        trader.process_orders()
+        st = trader.order_status(oid)
+        assert st["status"] == "REJECTED"
+        assert st["filled_quantity"] == 0
+        assert trader.portfolio.cash == 100_000
+        assert trader.portfolio.get_position(_stock()) is None
+        assert oid not in [o.order_id for o in trader.pending_orders]
+
+    def test_sell_without_position_is_rejected(self, trader):
+        oid = trader.place_order(_stock(), OrderType.SELL, 5, limit_price=None)
+        trader.process_orders()
+        st = trader.order_status(oid)
+        assert st["status"] == "REJECTED"
+        assert st["filled_quantity"] == 0
+        assert trader.portfolio.cash == 100_000
+
+    def test_option_order_rejected_upfront(self, trader):
+        opt = Asset(symbol="AAPL", asset_type=AssetType.CALL,
+                    strike_price=100.0, expiration_date="2030-01-17")
+        oid = trader.place_order(opt, OrderType.BUY, 1, limit_price=2.5)
+        st = trader.order_status(oid)
+        assert st["status"] == "REJECTED"
+        assert trader.pending_orders == []

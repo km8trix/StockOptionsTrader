@@ -178,6 +178,31 @@ class TestEndpoints:
                           "avg_fill_price": 190.01}
         assert client.order_status(ACCOUNT, 999) is None
 
+    def test_order_status_spread_partial_package_fill(self, harness):
+        """4-leg condor, contracts=2, only 1 package contract filled: the
+        old per-leg SUM reported 4 (>= 2 -> phantom 'complete'); the fix
+        reports min across legs (1) and the signed net package price."""
+        client, transport, _ = harness
+        legs = [
+            {"filledQuantity": 1, "averageExecutionPrice": 1.20,
+             "orderAction": "SELL_OPEN"},
+            {"filledQuantity": 1, "averageExecutionPrice": 0.80,
+             "orderAction": "BUY_OPEN"},
+            {"filledQuantity": 1, "averageExecutionPrice": 1.10,
+             "orderAction": "SELL_OPEN"},
+            {"filledQuantity": 1, "averageExecutionPrice": 0.70,
+             "orderAction": "BUY_OPEN"},
+        ]
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(200, {"OrdersResponse": {"Order": [
+                            {"orderId": 640, "orderType": "SPREADS",
+                             "OrderDetail": [{"status": "OPEN",
+                                              "Instrument": legs}]}]}}))
+        status = client.order_status(ACCOUNT, 640)
+        assert status["filled_quantity"] == 1.0          # package contracts
+        # net = -1.20 + 0.80 - 1.10 + 0.70 = -0.80 (credit received)
+        assert abs(status["avg_fill_price"] - (-0.80)) < 1e-9
+
     def test_get_retry_backoff_on_5xx_then_success(self, harness):
         client, transport, _ = harness
         sleeps = []

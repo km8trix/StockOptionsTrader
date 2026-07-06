@@ -78,16 +78,25 @@ class MachineLearningStrategy(Strategy):
         if not self.is_trained:
             return 'HOLD'
         
-        # Generate signal for current data
-        result = self._create_features(data.iloc[:-1])
-        if result is None:
+        # Generate signal for current data. Only the LAST feature row is
+        # consumed, so build that one window directly instead of recomputing
+        # features for the entire history on every bar (same window rows and
+        # values as _create_features(data.iloc[:-1])'s final row).
+        d = data.iloc[:-1]
+        i = len(d) - 2
+        if i < self.lookback:
             return 'HOLD'
-        X, _ = result
-        if len(X) == 0:
-            return 'HOLD'
-        
-        X_scaled = self.scaler.transform(X)
-        prediction = self.model.predict(X_scaled[-1:])
+        window = d.iloc[i - self.lookback:i]
+        feature_row = [
+            window['close'].pct_change().mean(),          # mean return
+            window['close'].std(),                        # volatility
+            (window['high'] - window['low']).mean(),      # avg range
+            window['volume'].mean(),                      # avg volume
+            window['close'].iloc[-1] / window['close'].mean(),  # price/avg
+        ]
+
+        X_scaled = self.scaler.transform(np.array([feature_row]))
+        prediction = self.model.predict(X_scaled)
         
         if prediction[0] == 1:
             return 'BUY'
