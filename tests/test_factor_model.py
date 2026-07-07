@@ -924,3 +924,60 @@ class TestPredictTruncationGolden:
         assert calls  # fit built at least one panel
         full = {s: len(f) for s, f in data.items()}
         assert all(c == full for c in calls)
+
+    def test_safe_tail_constant_pins_momentum_reach(self):
+        # TEETH for trap #4, part 1: pin _SAFE_TAIL to its derived value so a
+        # helper edit that SHRINKS it FAILS in CI (platform-independent),
+        # rather than only being absorbed at runtime by the calibration probe
+        # (which disables the fast path and turns the engaged goldens into
+        # SKIPs — indistinguishable from a legitimate platform miss). The
+        # deepest CONSUMED row is the single-shared-date pad row at truncated
+        # position len-2; its 12-1 momentum reaches _MOM_LOOKBACK+_MOM_SKIP
+        # (=273) rows back, so it needs len-2 >= 273 -> len >= 275. The
+        # most-stale symbol keeps exactly 1+_SAFE_TAIL rows, so the shipped
+        # +2 (=275) leaves one row of margin.
+        from desks.models.factor import _MOM_LOOKBACK, _MOM_SKIP
+        assert _SAFE_TAIL == _MOM_LOOKBACK + _MOM_SKIP + 2
+
+    def test_consumed_rows_never_clamp_momentum(self):
+        # TEETH for trap #4, part 2: a PLATFORM-INDEPENDENT (integer position
+        # only, no float compare -> no false-CI-red risk) check that every
+        # row predict will CONSUME sits at a truncated position >= the 12-1
+        # momentum reach, so its start index never clamps to the truncation
+        # boundary. Catches a k_sym FORMULA bug even if the constant above is
+        # untouched: shrinking _SAFE_TAIL or mis-computing k_sym FAILS here
+        # (via the most-stale symbol), it does not skip.
+        reach = factor_mod._MOM_LOOKBACK + factor_mod._MOM_SKIP
+        checked = 0
+        for name in ('stale_5_35_100', 'clean_800_8sym'):
+            data, _ = _truncation_cases()[name]
+            trunc = _truncated_predict_data(data)
+            assert trunc is not None
+            raw = _raw_factor_panel(trunc)
+            # needed dates EXACTLY as _score_from_raw_panel derives them.
+            needed = {f.index[-1] for f in raw.values()}
+            if len(needed) == 1:
+                for f in raw.values():
+                    if len(f.index) >= 2:
+                        needed.add(f.index[-2])
+                        break
+            for sym, frame in trunc.items():
+                if sym not in raw:
+                    continue
+                pos = {d: i for i, d in enumerate(frame.index)}
+                for d in needed:
+                    if d in pos:
+                        assert pos[d] >= reach, (name, sym, d, pos[d], reach)
+                        checked += 1
+        assert checked >= 10  # non-vacuous: real consumed rows were checked
+
+    def test_truncation_refuses_incomparable_index_types(self):
+        # Coverage for the defensive `except Exception -> None` whole-call
+        # fallback (mixed index types raise inside min(last_dates)). Such
+        # universes never occur in real desk data (one shared DatetimeIndex),
+        # but the guard must bail to the full build, not crash.
+        a = _shared_end_frame(700, 800)                 # DatetimeIndex
+        b = _shared_end_frame(701, 800).reset_index(drop=True)  # RangeIndex
+        assert a.index.is_monotonic_increasing and a.index.is_unique
+        assert b.index.is_monotonic_increasing and b.index.is_unique
+        assert _truncated_predict_data({'A': a, 'B': b}) is None
