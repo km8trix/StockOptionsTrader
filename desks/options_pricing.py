@@ -42,6 +42,8 @@ import numpy as np
 import pandas as pd
 from scipy.special import ndtr
 
+from core.models import Asset, AssetType
+
 
 class _Norm:
     """Standard-normal cdf/pdf without scipy.stats' per-call distribution
@@ -58,8 +60,6 @@ class _Norm:
 
 
 norm = _Norm()
-
-from core.models import Asset, AssetType
 
 logger = logging.getLogger(__name__)
 
