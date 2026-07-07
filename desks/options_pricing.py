@@ -292,6 +292,11 @@ class SyntheticIVModel:
         self.vrp_multiplier = vrp_multiplier
         self.earnings_calendar = earnings_calendar
         self.earnings_bump = earnings_bump
+        #: (symbol, pricing ts) -> (n_closes, last_ts, last_close,
+        #: closes_bytes_hash, raw_hv20). In-run memo only — the hash is
+        #: PYTHONHASHSEED-salted per process, so entries must NEVER be
+        #: persisted or compared across processes.
+        self._hv20_cache: Dict[tuple, tuple] = {}
 
     def iv(self, symbol: str, underlying_frame: pd.DataFrame,
            date) -> Optional[float]:
@@ -306,9 +311,31 @@ class SyntheticIVModel:
             underlying_frame.index < pd.Timestamp(date), 'close'].dropna()
         if len(closes) < HV_WINDOW + 1:
             return None
-        hv20 = float(closes.pct_change()
-                     .rolling(window=HV_WINDOW).std().iloc[-1]
-                     * np.sqrt(252))
+        # Per-(symbol, date) memo of the EXACT slow-path hv20. An
+        # option-active day prices the same (symbol, date) 5-9x (IV
+        # series, per-leg fills, per-leg close marks), each call seeing a
+        # fresh prefix slice of the same immutable per-symbol frame. The
+        # validators (length, last timestamp, last close, bytes hash)
+        # make a stale hit require a full hash collision on identical
+        # endpoints — any mismatch silently recomputes and overwrites.
+        # Only the RAW hv20 is cached, never the post-multiplier/bump/
+        # floor IV, so attribute mutation and earnings-calendar lookups
+        # stay live; the isfinite -> None check re-runs on every call.
+        key = (symbol, pd.Timestamp(date))
+        validators = (len(closes), closes.index[-1], float(closes.iloc[-1]),
+                      hash(closes.to_numpy().tobytes()))
+        entry = self._hv20_cache.get(key)
+        if entry is not None and entry[:4] == validators:
+            hv20 = entry[4]
+        else:
+            # Expression preserved VERBATIM on a miss: restarting the
+            # rolling window on a trailing slice changes pandas' Kahan
+            # accumulator bits (measured 276/300 ULP-level mismatches) —
+            # only the full-prefix recompute is bit-identical.
+            hv20 = float(closes.pct_change()
+                         .rolling(window=HV_WINDOW).std().iloc[-1]
+                         * np.sqrt(252))
+            self._hv20_cache[key] = validators + (hv20,)
         if not np.isfinite(hv20):
             return None
 
