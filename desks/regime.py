@@ -83,6 +83,14 @@ from hmmlearn.hmm import GaussianHMM
 
 from desks.walk_forward import WalkForwardModel
 
+try:  # private hmmlearn internals power the incremental predict fast
+    # path; absent or renamed -> permanent verbatim-path fallback.
+    from hmmlearn import _hmmc
+    from hmmlearn.utils import log_normalize
+except ImportError:  # pragma: no cover - depends on hmmlearn build
+    _hmmc = None
+    log_normalize = None
+
 logger = logging.getLogger(__name__)
 
 #: The three regime labels (contract C5).
@@ -130,6 +138,17 @@ class RegimeHMMModel(WalkForwardModel):
         # every matrix the fitted HMM sees (fit and predict alike).
         self._scaler: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self._fitted = False
+        # --- incremental-predict cache (bit-identical fast path) ------
+        # Bumped ONLY when a NEW fit is installed; a failed refit that
+        # retains the previous model keeps the cache valid.
+        self._fit_generation = 0
+        # Generation whose z-matrix contains a non-finite row: the
+        # verbatim path raises/warns/returns {} on EVERY call for the
+        # rest of that generation, so the fast path stands aside for it.
+        self._fast_disabled_gen: Optional[int] = None
+        # Derived-state cache validated as an exact extension of the
+        # controller-handed data on every call (see predict docstring).
+        self._predict_cache: Optional[Dict] = None
 
     # ------------------------------------------------------------------
     # Feature engineering
@@ -137,6 +156,18 @@ class RegimeHMMModel(WalkForwardModel):
     def _market_features(self, data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """Market-level feature frame (FEATURE_COLUMNS order), NaN warm-up
         rows dropped. Empty frame when no usable inputs exist."""
+        return self._market_features_parts(data)[0]
+
+    def _market_features_parts(
+            self, data: Dict[str, pd.DataFrame]
+    ) -> Tuple[pd.DataFrame, Optional[pd.Series], Tuple[str, ...],
+               Tuple[str, ...]]:
+        """The _market_features construction — ONE construction shared by
+        both predict paths — additionally exposing the raw (PRE-dropna)
+        cross-sectional mean-return series and the exact symbol
+        classification, which the fast-path cache needs (the rolling-std
+        kernel is path-dependent, so it must always be fed the same full
+        raw series the verbatim path feeds it)."""
         returns: Dict[str, pd.Series] = {}
         volume_ratios: Dict[str, pd.Series] = {}
         for symbol, frame in data.items():
@@ -148,7 +179,8 @@ class RegimeHMMModel(WalkForwardModel):
                 volume_ratios[symbol] = frame['volume'] / volume_avg
 
         if not returns:
-            return pd.DataFrame(columns=list(FEATURE_COLUMNS))
+            return (pd.DataFrame(columns=list(FEATURE_COLUMNS)), None,
+                    (), ())
 
         mkt_ret = pd.DataFrame(returns).mean(axis=1)
         features = pd.DataFrame({'mkt_ret': mkt_ret})
@@ -159,7 +191,8 @@ class RegimeHMMModel(WalkForwardModel):
             features['volume_ratio'] = np.nan
 
         features = features.replace([np.inf, -np.inf], np.nan)
-        return features.dropna()
+        return (features.dropna(), mkt_ret, tuple(returns),
+                tuple(volume_ratios))
 
     @staticmethod
     def _design_matrix(features: pd.DataFrame) -> np.ndarray:
@@ -334,6 +367,11 @@ class RegimeHMMModel(WalkForwardModel):
         self._scaler = (col_mean, col_std)
         self._model = model
         self._fitted = True
+        # New model/scaler: the predict cache belongs to the previous
+        # generation. Failed refits above RETAIN model+scaler and must
+        # not reach this line, so their cache stays valid.
+        self._fit_generation += 1
+        self._predict_cache = None
         logger.debug("RegimeHMMModel fitted on %d rows (log-likelihood "
                      "%.2f over %d restarts)",
                      len(features), best_score, N_FIT_RESTARTS)
@@ -344,7 +382,42 @@ class RegimeHMMModel(WalkForwardModel):
         Returns {'state': label, 'probs': {label: float}} or {} when the
         model is unfitted or the data cannot produce a feature row
         (insufficient history — the desk treats {} as no-regime).
-        """
+
+        Served through an incremental forward-recursion cache when the
+        handed frames are validated as an exact extension of the frames
+        already consumed (append-only, the engine's access pattern).
+        BIT-IDENTICAL to the verbatim path by construction: the smoothed
+        posterior of the LAST row equals the normalized forward (filter)
+        posterior exactly (the backward lattice's final row is exactly
+        zero), the C++ forward lattice is bitwise prefix-stable under
+        append, and the single new alpha step reuses hmmlearn's own
+        _hmmc.forward_log via a 2-row call with a ones startprob
+        (log(1.0) == 0.0, so row 0 IS the cached alpha) — NEVER a
+        hand-rolled logaddexp replica (measured ~1-ulp wrong) and NEVER
+        a trailing-window rolling recompute (path-dependent Kahan
+        state); every new rolling value comes from a full-series pandas
+        pass. Any validation failure rebuilds from scratch (cheaper than
+        the verbatim path — no backward pass); any surprise falls back
+        to the verbatim path, which is preserved as _predict_full."""
+        if not self._fitted or self._model is None or self._scaler is None:
+            return {}
+        if (_hmmc is None or log_normalize is None
+                or getattr(self._model, 'implementation', None) != 'log'
+                or self._fast_disabled_gen == self._fit_generation):
+            return self._predict_full(data, date)
+        try:
+            result = self._predict_fast(data)
+        except Exception:
+            self._predict_cache = None
+            result = None
+        if result is None:  # refused ({} is a real answer, not a refusal)
+            return self._predict_full(data, date)
+        return result
+
+    def _predict_full(self, data: Dict[str, pd.DataFrame], date) -> Dict:
+        """The original predict body, preserved VERBATIM: the fallback
+        for anything the fast path refuses and the oracle the
+        equivalence tests compare against."""
         if not self._fitted or self._model is None or self._scaler is None:
             return {}
         features = self._market_features(data)
@@ -358,6 +431,228 @@ class RegimeHMMModel(WalkForwardModel):
             logger.warning("RegimeHMMModel.predict failed (%s)", exc)
             return {}
         last = posteriors[-1]
+        probs = {self._state_labels[state]: float(last[state])
+                 for state in range(self.n_components)}
+        state = self._state_labels[int(np.argmax(last))]
+        return {'state': state, 'probs': probs}
+
+    # ------------------------------------------------------------------
+    # Incremental predict fast path
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _classify(data: Dict[str, pd.DataFrame]):
+        """Symbol classification exactly as the feature construction
+        sees it: ordered tuples of close-bearing and volume-bearing
+        symbols (dict iteration order is load-bearing — it fixes the
+        cross-sectional column order and therefore the mean bits)."""
+        close_syms = []
+        vol_syms = []
+        for symbol, frame in data.items():
+            if frame is None or frame.empty or 'close' not in frame.columns:
+                continue
+            close_syms.append(symbol)
+            if 'volume' in frame.columns:
+                vol_syms.append(symbol)
+        return tuple(close_syms), tuple(vol_syms)
+
+    @staticmethod
+    def _same_value(a: float, b: float) -> bool:
+        """NaN-aware scalar equality for the endpoint spot checks."""
+        return a == b or (a != a and b != b)
+
+    def _predict_fast(self, data: Dict[str, pd.DataFrame]) -> Optional[Dict]:
+        """Cache-validated incremental predict. Returns the result dict
+        ({} included) or None to refuse to the verbatim path."""
+        cache = self._predict_cache
+        if cache is None or cache['gen'] != self._fit_generation:
+            return self._rebuild_cache(data)
+        close_syms, vol_syms = self._classify(data)
+        if (close_syms != cache['close_syms']
+                or vol_syms != cache['vol_syms']):
+            return self._rebuild_cache(data)
+        # Uniform-growth validation: every close symbol grew by the same
+        # n_new rows on top of a verified endpoint, and for n_new == 1
+        # all new tail dates are identical (one new union row). Arrays
+        # are fetched ONCE per symbol here and reused below — the
+        # accessors, not the checks, are the validation cost.
+        vol_set = set(vol_syms)
+        closes_np: Dict[str, np.ndarray] = {}
+        volume_ser: Dict[str, pd.Series] = {}
+        n_new = None
+        new_tail = None
+        for symbol in close_syms:
+            frame = data[symbol]
+            meta = cache['meta'][symbol]
+            n_prev, first_ts, last_ts, last_close, last_vol = meta
+            n = len(frame)
+            if n < n_prev or frame.index[0] != first_ts:
+                return self._rebuild_cache(data)
+            grew = n - n_prev
+            if n_new is None:
+                n_new = grew
+            elif grew != n_new:
+                return self._rebuild_cache(data)
+            if frame.index[n_prev - 1] != last_ts:
+                return self._rebuild_cache(data)
+            closes = frame['close'].to_numpy()
+            closes_np[symbol] = closes
+            if not self._same_value(float(closes[n_prev - 1]), last_close):
+                return self._rebuild_cache(data)
+            if symbol in vol_set:
+                volume = frame['volume']
+                volume_ser[symbol] = volume
+                if last_vol is not None and not self._same_value(
+                        float(volume.to_numpy()[n_prev - 1]), last_vol):
+                    return self._rebuild_cache(data)
+            if grew:
+                if new_tail is None:
+                    new_tail = frame.index[-1]
+                elif frame.index[-1] != new_tail:
+                    return self._rebuild_cache(data)
+        if n_new == 0:
+            if cache['n_feat'] == 0:
+                return {}
+            return self._posterior_from_alpha(cache['alpha'])
+        if n_new != 1:
+            return self._rebuild_cache(data)
+
+        # ---- one new row per symbol: extend features incrementally ----
+        col_mean, col_std = self._scaler
+        ret_last: Dict[str, np.float64] = {}
+        vr_last: Dict[str, np.float64] = {}
+        vol_np: Dict[str, np.ndarray] = {}
+        with np.errstate(all='ignore'):  # exactly pandas' wrap
+            for symbol in close_syms:
+                closes = closes_np[symbol]
+                ret_last[symbol] = (
+                    np.float64(closes[-1] / closes[-2] - 1.0)
+                    if len(closes) >= 2 else np.float64(np.nan))
+            for symbol in vol_syms:
+                volume = volume_ser[symbol]
+                # FULL-series pandas pass: the rolling kernel's Kahan
+                # state is path-dependent, a trailing window is ~1 ulp
+                # wrong — only the full pass is bit-identical.
+                vol_avg = volume.rolling(ROLLING_WINDOW).mean().to_numpy()
+                vals = volume.to_numpy()
+                vol_np[symbol] = vals
+                vr_last[symbol] = np.float64(vals[-1] / vol_avg[-1])
+        mkt_new = np.float64(
+            pd.DataFrame(ret_last, index=[0]).mean(axis=1).iloc[0])
+        vr_new = (np.float64(
+            pd.DataFrame(vr_last, index=[0]).mean(axis=1).iloc[0])
+            if vol_syms else np.float64(np.nan))
+        mkt_raw = np.concatenate([cache['mkt_raw'], [mkt_new]])
+        ret_std_new = np.float64(pd.Series(mkt_raw)
+                                 .rolling(ROLLING_WINDOW).std()
+                                 .to_numpy()[-1])
+
+        alpha = cache['alpha']
+        n_feat = cache['n_feat']
+        # replace(±inf -> NaN) + dropna: the row survives iff every
+        # feature is finite; a dropped row leaves the design matrix —
+        # and therefore alpha — untouched.
+        if np.isfinite([mkt_new, ret_std_new, vr_new]).all():
+            frow = pd.DataFrame({'mkt_ret': [mkt_new],
+                                 'ret_std_20': [ret_std_new],
+                                 'volume_ratio': [vr_new]})
+            z_row = (self._design_matrix(frow) - col_mean) / col_std
+            if not np.isfinite(z_row).all():
+                # The verbatim path's full matrix now contains this row
+                # and raises/warns/{} on every later call this
+                # generation — stand aside for the whole generation.
+                self._fast_disabled_gen = self._fit_generation
+                self._predict_cache = None
+                return None
+            frame_logprob = self._model._compute_log_likelihood(z_row)
+            if n_feat == 0:
+                _, fwd = _hmmc.forward_log(
+                    self._model.startprob_, self._model.transmat_,
+                    frame_logprob)
+                alpha = fwd[-1]
+            else:
+                # ones startprob: log(1.0) == 0.0 exactly, so row 0 of
+                # this 2-row lattice IS the cached alpha and row 1 is
+                # produced by the same C++ recursion as the full pass.
+                _, fwd = _hmmc.forward_log(
+                    np.ones(self._model.n_components),
+                    self._model.transmat_,
+                    np.vstack([alpha, frame_logprob[0]]))
+                alpha = fwd[1]
+            n_feat += 1
+
+        # Commit only after every step succeeded.
+        for symbol in close_syms:
+            frame = data[symbol]
+            closes = closes_np[symbol]
+            vols = vol_np.get(symbol)
+            cache['meta'][symbol] = (
+                len(frame), frame.index[0], frame.index[-1],
+                float(closes[-1]),
+                float(vols[-1]) if vols is not None else None)
+        cache['mkt_raw'] = mkt_raw
+        cache['alpha'] = alpha
+        cache['n_feat'] = n_feat
+        if n_feat == 0:
+            return {}
+        return self._posterior_from_alpha(alpha)
+
+    def _rebuild_cache(self, data: Dict[str, pd.DataFrame]
+                       ) -> Optional[Dict]:
+        """Cold start or any validation failure: rebuild from the full
+        construction (one forward-only pass — cheaper than the verbatim
+        path's forward+backward), then answer from the cache."""
+        self._predict_cache = None
+        features, mkt_raw, close_syms, vol_syms = \
+            self._market_features_parts(data)
+        col_mean, col_std = self._scaler
+        alpha = None
+        n_feat = len(features)
+        if n_feat:
+            z_matrix = (self._design_matrix(features) - col_mean) / col_std
+            if not np.isfinite(z_matrix).all():
+                # The verbatim path raises/warns/{} on this generation's
+                # every call from now on — stand aside entirely.
+                self._fast_disabled_gen = self._fit_generation
+                return None
+            frame_logprob = self._model._compute_log_likelihood(z_matrix)
+            _, fwd = _hmmc.forward_log(
+                self._model.startprob_, self._model.transmat_,
+                frame_logprob)
+            alpha = fwd[-1]
+        meta = {}
+        for symbol in close_syms:
+            frame = data[symbol]
+            closes = frame['close'].to_numpy()
+            vols = (data[symbol]['volume'].to_numpy()
+                    if symbol in set(vol_syms) else None)
+            meta[symbol] = (
+                len(frame), frame.index[0], frame.index[-1],
+                float(closes[-1]),
+                float(vols[-1]) if vols is not None else None)
+        self._predict_cache = {
+            'gen': self._fit_generation,
+            'close_syms': close_syms,
+            'vol_syms': vol_syms,
+            'meta': meta,
+            'mkt_raw': (mkt_raw.to_numpy(dtype=np.float64, copy=True)
+                        if mkt_raw is not None
+                        else np.empty(0, dtype=np.float64)),
+            'alpha': alpha,
+            'n_feat': n_feat,
+        }
+        if n_feat == 0:
+            return {}
+        return self._posterior_from_alpha(alpha)
+
+    def _posterior_from_alpha(self, alpha: np.ndarray) -> Dict:
+        """{'state','probs'} from the cached forward log-alphas — the
+        backward lattice's final row is exactly zero, so this equals
+        predict_proba's last smoothed row bitwise (hmmlearn's own
+        log_normalize does the normalization)."""
+        log_gamma = alpha[None, :] + 0.0  # + backward row of exact zeros
+        log_normalize(log_gamma, axis=1)
+        with np.errstate(under='ignore'):
+            last = np.exp(log_gamma)[0]
         probs = {self._state_labels[state]: float(last[state])
                  for state in range(self.n_components)}
         state = self._state_labels[int(np.argmax(last))]

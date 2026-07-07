@@ -184,3 +184,114 @@ class TestDegenerateData:
 
         assert model._fitted is True
         assert model.predict({'MKT': market}, market.index[-1]) == before
+
+
+class TestPredictFastPathEquivalence:
+    """predict()'s incremental forward-recursion cache must be
+    bit-indistinguishable from the preserved verbatim path
+    (_predict_full). Plain == on the result dicts throughout — dict
+    equality compares the prob floats exactly, so a 1-ulp drift fails."""
+
+    @staticmethod
+    def _universe(n_sym=8, n_days=300, seed=9):
+        rng = np.random.default_rng(seed)
+        idx = pd.bdate_range('2019-01-02', periods=n_days)
+        frames = {}
+        for i in range(n_sym):
+            close = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, n_days)))
+            volume = rng.lognormal(12, 0.6, n_days)  # fractional volumes
+            close[rng.random(n_days) < 0.01] = np.nan  # data holes
+            if i == 2:
+                volume[150] = 0.0            # zero volume
+                volume[200] = np.nan         # NaN volume
+            if i == 3:
+                close[220] = 0.0             # zero close -> inf return
+            frame = pd.DataFrame({'close': close, 'volume': volume},
+                                 index=idx)
+            if i == 5:
+                frame = frame.drop(columns=['volume'])  # no volume at all
+            if i == 7:
+                frame = frame.iloc[30:]      # ragged listing
+            frames[f'S{i:02d}'] = frame
+        return frames, idx
+
+    def test_walkforward_drive_matches_verbatim(self):
+        # Two identical models through two identical real controllers,
+        # day by day over a hostile market (NaN/zero closes and volumes,
+        # a volume-less symbol, a ragged listing) across several refit
+        # cycles; the oracle instance is pinned to the verbatim path.
+        # Also weaves in same-day repeat calls and out-of-order
+        # (shrunken-window) calls — the non-append access patterns.
+        from desks.walk_forward import WalkForwardController
+
+        frames, idx = self._universe()
+        fast = RegimeHMMModel()
+        fast_ctrl = WalkForwardController(fast, train_window_days=252,
+                                          refit_every_days=21,
+                                          min_train_days=120)
+        oracle = RegimeHMMModel()
+        oracle.predict = oracle._predict_full  # pin the verbatim path
+        oracle_ctrl = WalkForwardController(oracle, train_window_days=252,
+                                            refit_every_days=21,
+                                            min_train_days=120)
+        real = 0
+        for i in range(100, len(idx)):
+            date = idx[i]
+            all_data = {s: f.loc[:date] for s, f in frames.items()}
+            all_data = {s: f for s, f in all_data.items() if len(f)}
+            fast_ctrl.maybe_refit(all_data, date)
+            oracle_ctrl.maybe_refit(all_data, date)
+            a = fast_ctrl.predict(all_data, date) or {}
+            b = oracle_ctrl.predict(all_data, date) or {}
+            assert a == b, date
+            real += bool(a)
+            if i % 41 == 0:  # same-day repeat call
+                assert (fast_ctrl.predict(all_data, date) or {}) == b
+            if i % 67 == 0 and i > 150:  # out-of-order shrunken call
+                old = idx[i - 7]
+                old_data = {s: f.loc[:old] for s, f in frames.items()}
+                old_data = {s: f for s, f in old_data.items() if len(f)}
+                assert ((fast_ctrl.predict(old_data, old) or {})
+                        == oracle._predict_full(old_data, old))
+                fast_ctrl.predict(all_data, date)  # re-advance
+        assert real >= 100  # the drive really produced posteriors
+        assert fast._predict_cache is not None  # fast path engaged
+
+    def test_poisoned_scaler_stands_aside_for_the_generation(self, market):
+        # A z-matrix with non-finite values makes the verbatim path
+        # raise/warn/{} on EVERY call for the rest of the generation;
+        # the fast path must detect it and stand aside entirely
+        # (returning a cached-alpha posterior here would be a
+        # divergence).
+        model = RegimeHMMModel()
+        model.fit({'MKT': market})
+        col_mean, col_std = model._scaler
+        model._scaler = (col_mean, np.zeros_like(col_std))  # z -> inf
+        for _ in range(3):
+            assert model.predict({'MKT': market}, market.index[-1]) == {}
+        assert model._fast_disabled_gen == model._fit_generation
+
+    def test_failed_refit_keeps_the_cache_generation(self, market):
+        # A refit that is abandoned (model retained) must NOT bump the
+        # fit generation: the cache stays valid and keeps serving.
+        model = RegimeHMMModel()
+        model.fit({'MKT': market})
+        generation = model._fit_generation
+        first = model.predict({'MKT': market}, market.index[-1])
+        assert model._predict_cache is not None
+        index = pd.bdate_range('2020-01-02', periods=200)
+        constant = pd.DataFrame({'close': 100.0, 'volume': 500_000.0},
+                                index=index)
+        model.fit({'FLAT': constant})  # degenerate: abandoned, retained
+        assert model._fit_generation == generation
+        assert model.predict({'MKT': market}, market.index[-1]) == first
+
+    def test_hmmc_unavailable_falls_back_to_verbatim(self, market,
+                                                     monkeypatch):
+        import desks.regime as regime_mod
+        model = RegimeHMMModel()
+        model.fit({'MKT': market})
+        want = model._predict_full({'MKT': market}, market.index[-1])
+        monkeypatch.setattr(regime_mod, '_hmmc', None)
+        assert model.predict({'MKT': market}, market.index[-1]) == want
+        assert model._predict_cache is None  # fast path never engaged
