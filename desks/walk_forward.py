@@ -59,6 +59,14 @@ class WalkForwardModel(ABC):
     Implementations must be stateless apart from fitted parameters: they
     hold NO market data outside what fit()/predict() receive, so the
     controller's slicing is the single source of temporal truth.
+
+    One sanctioned exception: a predict-side DERIVED cache is permitted
+    when every read is validated as an exact prefix/extension of the
+    data the controller just handed in and every output is bit-identical
+    to a stateless recompute on that handed slice (RegimeHMMModel's
+    incremental forward recursion). The leakage invariant is preserved
+    because the cache can never contribute information beyond the
+    controller-sliced input that produced it.
     """
 
     @abstractmethod
