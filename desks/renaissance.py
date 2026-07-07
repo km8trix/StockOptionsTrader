@@ -96,6 +96,10 @@ DEFAULT_BOOK_WEIGHTS = {
 #: bookkeeping is dropped (intent emitted day T fills day T+1).
 RECONCILE_GRACE_DAYS = 2
 
+#: `_mr_zscore_cached` refusal sentinel: fall through to the verbatim
+#: pandas path (distinct from None, which is a real "no z" answer).
+_MR_REFUSE = object()
+
 
 @dataclass
 class TaggedWalkForwardFit:
@@ -246,6 +250,11 @@ class RenaissanceDesk(Desk):
         self._open_pairs: Dict[Tuple[str, str], Dict] = {}
         self._day_index = 0
         self._last_seen_date: Optional[date_type] = None
+        #: symbol -> {'closes','ret','mean','std'} float64 buffers for the
+        #: byte-validated mean-reversion z-score cache (_mr_zscore). In-run
+        #: state only; every read is prefix-validated against the incoming
+        #: frame's close bytes, so it can never serve stale values.
+        self._mr_z_cache: Dict[str, Dict] = {}
 
     # ------------------------------------------------------------------
     # Introspection (C3+ / C5)
@@ -467,13 +476,31 @@ class RenaissanceDesk(Desk):
     # ------------------------------------------------------------------
     # Mean-reversion book
     # ------------------------------------------------------------------
-    def _mr_zscore(self, frame: pd.DataFrame) -> Optional[float]:
+    def _mr_zscore(self, frame: pd.DataFrame,
+                   symbol: Optional[str] = None) -> Optional[float]:
         """z of today's `mr_return_days`-day return against its
-        `mr_z_window`-day rolling mean/std (pandas std, ddof=1)."""
+        `mr_z_window`-day rolling mean/std (pandas std, ddof=1).
+
+        With a `symbol`, serves from a per-symbol cache of the closes/
+        return buffers and the FULL-LENGTH rolling outputs. Bit-identical
+        to the uncached path: the return series is elementwise IEEE
+        division (close[i]/close[i-k] - 1, exactly pct_change with
+        fill_method=None), the rolling mean/std always run over the FULL
+        buffer (never a trailing slice — restarting pandas' Kahan
+        accumulator on a tail is ~1-ulp wrong on most days), and reads at
+        earlier positions of a longer compute are covered by rolling
+        prefix-stability. A cached frame prefix is validated BYTE-FOR-BYTE
+        against the incoming closes on every call, so a stale hit is
+        impossible without an exact value collision; any mismatch rebuilds
+        from the incoming frame (same cost as the uncached path)."""
         if frame is None or 'close' not in frame.columns:
             return None
         if len(frame) < self.mr_z_window + self.mr_return_days + 1:
             return None
+        if symbol is not None:
+            z = self._mr_zscore_cached(symbol, frame)
+            if z is not _MR_REFUSE:
+                return z
         ret = frame['close'].pct_change(self.mr_return_days)
         mean = ret.rolling(self.mr_z_window).mean().iloc[-1]
         std = ret.rolling(self.mr_z_window).std().iloc[-1]
@@ -481,6 +508,70 @@ class RenaissanceDesk(Desk):
         if pd.isna(latest) or pd.isna(mean) or pd.isna(std) or std <= 0:
             return None
         return float((latest - mean) / std)
+
+    def _mr_zscore_cached(self, symbol: str, frame: pd.DataFrame):
+        """Cache-backed `_mr_zscore` body. Returns the z (float or None)
+        or the `_MR_REFUSE` sentinel when the input shape is one the
+        cache does not model (non-float64 closes, duplicate 'close'
+        columns) — the caller then falls through to the verbatim pandas
+        path."""
+        closes = frame['close']
+        if not isinstance(closes, pd.Series):
+            return _MR_REFUSE  # duplicate 'close' columns
+        vals = closes.to_numpy()
+        if vals.dtype != np.float64 or vals.ndim != 1:
+            return _MR_REFUSE
+        vals = np.ascontiguousarray(vals)
+        n = len(vals)
+        k = self.mr_return_days
+        w = self.mr_z_window
+        entry = self._mr_z_cache.get(symbol)
+        if entry is not None:
+            cached = entry['closes']
+            c = len(cached)
+            if n <= c:
+                if not np.array_equal(vals.view(np.int64),
+                                      cached[:n].view(np.int64)):
+                    entry = None  # revision: rebuild below
+            elif np.array_equal(vals[:c].view(np.int64),
+                                cached.view(np.int64)):
+                # Prefix-verified growth: extend the return buffer
+                # elementwise, then re-run the rolling over the FULL
+                # buffer (positions >= c are all >= k because the length
+                # guard already passed at the cached size).
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    new_ret = vals[c:] / vals[c - k:n - k] - 1.0
+                entry['closes'] = np.concatenate([cached, vals[c:]])
+                entry['ret'] = np.concatenate([entry['ret'], new_ret])
+                self._mr_roll(entry, w)
+            else:
+                entry = None  # not a prefix: rebuild below
+        if entry is None:
+            ret = np.full(n, np.nan)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ret[k:] = vals[k:] / vals[:n - k] - 1.0
+            entry = {'closes': vals.copy(), 'ret': ret}
+            self._mr_roll(entry, w)
+            self._mr_z_cache[symbol] = entry
+        p = n - 1
+        latest = entry['ret'][p]
+        mean = entry['mean'][p]
+        std = entry['std'][p]
+        if pd.isna(latest) or pd.isna(mean) or pd.isna(std) or std <= 0:
+            return None
+        return float((latest - mean) / std)
+
+    @staticmethod
+    def _mr_roll(entry: Dict, window: int) -> None:
+        """Full-length rolling mean/std over the cached return buffer.
+        pandas masks ±inf internally on a copy (verified: the buffer is
+        never mutated), and a fixed integer window ignores the index, so
+        a RangeIndex Series over the same float64 values is bit-identical
+        to the DatetimeIndex original."""
+        s = pd.Series(entry['ret'])
+        r = s.rolling(window)
+        entry['mean'] = r.mean().to_numpy()
+        entry['std'] = r.std().to_numpy()
 
     def _mean_reversion_intents(self, all_data: Dict[str, pd.DataFrame],
                                 date, portfolio: PortfolioManager
@@ -524,7 +615,7 @@ class RenaissanceDesk(Desk):
         for asset in sorted(book_assets, key=lambda a: a.symbol):
             state = book_assets[asset]
             frame = all_data.get(asset.symbol)
-            z_score = (self._mr_zscore(frame)
+            z_score = (self._mr_zscore(frame, asset.symbol)
                        if self._has_bar_today(frame, date) else None)
             age = self._day_index - state['entry_day']
             crossed = (z_score is not None
@@ -555,7 +646,7 @@ class RenaissanceDesk(Desk):
                 continue
             if not self._symbol_is_free(symbol, portfolio):
                 continue
-            z_score = self._mr_zscore(frame)
+            z_score = self._mr_zscore(frame, symbol)
             if z_score is None:
                 continue
             if z_score < -self.mr_entry_z:

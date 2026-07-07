@@ -126,6 +126,12 @@ DEFAULT_BOOK_WEIGHTS = {
 #: bookkeeping is dropped (engine fills at the next bar's open).
 RECONCILE_GRACE_DAYS = 2
 
+#: `_rv_zscore_cached` refusal sentinel: fall through to the verbatim
+#: pandas path (distinct from None, which is a real "no z" answer).
+_RV_REFUSE = object()
+#: "No aligned rows yet" frontier for the relative-value spread cache.
+_RV_TS_MIN = np.iinfo(np.int64).min
+
 
 def _stock(symbol: str) -> Asset:
     return Asset(symbol=symbol, asset_type=AssetType.STOCK)
@@ -303,6 +309,10 @@ class JaneStreetDesk(Desk):
         self._today_iv: Dict[str, float] = {}
         #: relative-value spread position (None when flat)
         self._rv_position: Optional[Dict] = None
+        #: byte-validated aligned-closes-block cache for _rv_zscore.
+        #: In-run state only; every read prefix-validates all symbols'
+        #: raw closes/index bytes, so it can never serve stale values.
+        self._rv_cache: Optional[Dict] = None
         #: C5-style regime series + C12 greeks series
         self._regime_series: List[Dict] = []
         self._current_regime: Optional[Dict] = None
@@ -1173,6 +1183,34 @@ class JaneStreetDesk(Desk):
 
     def _rv_zscore(self, all_data: Dict[str, pd.DataFrame], date,
                    etf: str, basket: List[str]) -> Optional[float]:
+        """ETF-vs-basket log-spread z at `date` (None when the spread is
+        not computable today).
+
+        Served through a byte-validated cache of the ALIGNED CLOSES BLOCK
+        (the `pd.DataFrame(closes).dropna()` output — the O(N*T) join
+        that dominated this call at full-universe widths). The cache
+        appends newly-aligned rows incrementally; everything downstream
+        (np.log, basket row-mean, FULL-LENGTH rolling mean/std) re-runs
+        the full path's own expressions each day over a block that is
+        bit-identical, C-contiguous and column-ordered exactly like the
+        full path's — so no floating-point op is ever hand-replicated
+        (log/row-mean reductions are memory-layout-sensitive; rolling on
+        a trailing slice is ~1-ulp wrong). Every symbol's cached raw
+        prefix is byte-compared against the incoming frame on every
+        call; any mismatch rebuilds through the full path's own
+        construction. Inputs the cache does not model (non-float64
+        closes, non-DatetimeIndex/tz/duplicate/unsorted indexes) fall
+        through to the verbatim full path."""
+        z = self._rv_zscore_cached(all_data, date, etf, basket)
+        if z is not _RV_REFUSE:
+            return z
+        return self._rv_zscore_full(all_data, date, etf, basket)
+
+    def _rv_zscore_full(self, all_data: Dict[str, pd.DataFrame], date,
+                        etf: str, basket: List[str]) -> Optional[float]:
+        """The original uncached body, preserved VERBATIM: both the
+        fallback for inputs the cache refuses and the oracle the
+        equivalence tests compare against."""
         closes = {}
         for symbol in [etf] + basket:
             frame = all_data.get(symbol)
@@ -1183,6 +1221,170 @@ class JaneStreetDesk(Desk):
         if len(aligned) < self.rv_z_window + 1 \
                 or aligned.index[-1] != pd.Timestamp(date):
             return None
+        log_px = np.log(aligned)
+        spread = log_px[etf] - log_px[basket].mean(axis=1)
+        mean = spread.rolling(self.rv_z_window).mean().iloc[-1]
+        std = spread.rolling(self.rv_z_window).std().iloc[-1]
+        if pd.isna(mean) or pd.isna(std) or std <= 0:
+            return None
+        return float((spread.iloc[-1] - mean) / std)
+
+    @staticmethod
+    def _rv_frame_arrays(frame: pd.DataFrame):
+        """(closes float64 array, int64 index array, index dtype) of a
+        raw symbol frame, or None when the shape is one the cache does
+        not model. The int64 timestamps are in the INDEX'S OWN datetime64
+        unit (pandas 3 indexes are not always nanoseconds), so the cache
+        also carries the dtype and requires every symbol to share it —
+        otherwise the integer keys would not be comparable."""
+        index = frame.index
+        if not isinstance(index, pd.DatetimeIndex) or index.tz is not None:
+            return None
+        closes = frame['close']
+        if not isinstance(closes, pd.Series):
+            return None  # duplicate 'close' columns
+        vals = closes.to_numpy()
+        if vals.dtype != np.float64 or vals.ndim != 1:
+            return None
+        return (np.ascontiguousarray(vals),
+                np.ascontiguousarray(index.asi8), index.dtype)
+
+    def _rv_zscore_cached(self, all_data: Dict[str, pd.DataFrame], date,
+                          etf: str, basket: List[str]):
+        """Cache-backed `_rv_zscore` body: validate + consume each
+        symbol's new rows, emit newly-common timestamps into the aligned
+        block, then compute over the whole cached block. Returns the z
+        (float or None) or `_RV_REFUSE` to fall through."""
+        cols = [etf] + basket
+        frames = {}
+        for symbol in cols:  # the full path's early gate, same order
+            frame = all_data.get(symbol)
+            if frame is None or frame.empty or 'close' not in frame.columns:
+                return None
+            frames[symbol] = frame
+        cache = self._rv_cache
+        if cache is None or cache['cols'] != tuple(cols):
+            return self._rv_rebuild(frames, cols, date)
+        for symbol in cols:
+            arrs = self._rv_frame_arrays(frames[symbol])
+            if arrs is None:
+                return _RV_REFUSE
+            vals, ts, dt_dtype = arrs
+            if dt_dtype != cache['dt_dtype']:
+                return self._rv_rebuild(frames, cols, date)
+            c = cache['consumed'][symbol]
+            n = len(vals)
+            if n < c:
+                return self._rv_rebuild(frames, cols, date)
+            if not (np.array_equal(vals[:c].view(np.int64),
+                                   cache['raw_vals'][symbol].view(np.int64))
+                    and np.array_equal(ts[:c], cache['raw_ts'][symbol])):
+                return self._rv_rebuild(frames, cols, date)
+            if n > c:
+                new_vals, new_ts = vals[c:], ts[c:]
+                if (c and new_ts[0] <= cache['raw_ts'][symbol][-1]) \
+                        or (len(new_ts) > 1
+                            and (np.diff(new_ts) <= 0).any()):
+                    return _RV_REFUSE  # non-increasing raw index
+                cache['raw_vals'][symbol] = np.concatenate(
+                    [cache['raw_vals'][symbol], new_vals])
+                cache['raw_ts'][symbol] = np.concatenate(
+                    [cache['raw_ts'][symbol], new_ts])
+                cache['consumed'][symbol] = n
+                keep = new_vals == new_vals  # drops NaN, keeps ±inf
+                pend = cache['pending'][symbol]
+                for t, v in zip(new_ts[keep].tolist(),
+                                new_vals[keep].tolist()):
+                    pend[t] = v
+        # A timestamp joins the aligned block once EVERY symbol has a
+        # non-NaN close for it (exactly `dropna` on the outer join).
+        pending = cache['pending']
+        common = set(pending[cols[0]])
+        for symbol in cols[1:]:
+            if not common:
+                break
+            common &= pending[symbol].keys()
+        if common:
+            order = sorted(common)
+            if order[0] <= cache['last_aligned_ts']:
+                # would land out of aligned order: restatement — rebuild
+                return self._rv_rebuild(frames, cols, date)
+            add = np.empty((len(cols), len(order)))
+            for j, symbol in enumerate(cols):
+                pend = pending[symbol]
+                add[j] = [pend.pop(t) for t in order]
+            cache['block'] = np.concatenate([cache['block'], add], axis=1)
+            cache['ts'] = np.concatenate(
+                [cache['ts'], np.asarray(order, dtype=np.int64)])
+            cache['last_aligned_ts'] = int(cache['ts'][-1])
+        return self._rv_compute(cache, date, etf, basket)
+
+    def _rv_rebuild(self, frames: Dict[str, pd.DataFrame], cols: List[str],
+                    date):
+        """Cold start or any validation failure: rebuild the cache
+        through the FULL PATH's own construction (`pd.DataFrame(dict)
+        .dropna()`), so the cached rows are the full path's rows by
+        construction, then answer from the cache."""
+        self._rv_cache = None  # never leave a half-primed cache behind
+        per = {}
+        dt_dtype = None
+        for symbol in cols:
+            arrs = self._rv_frame_arrays(frames[symbol])
+            if arrs is None:
+                return _RV_REFUSE
+            vals, ts, dtype = arrs
+            if dt_dtype is None:
+                dt_dtype = dtype
+            elif dtype != dt_dtype:
+                return _RV_REFUSE  # mixed datetime64 units across symbols
+            if len(ts) > 1 and (np.diff(ts) <= 0).any():
+                return _RV_REFUSE
+            per[symbol] = (vals, ts)
+        closes = {symbol: frames[symbol]['close'] for symbol in cols}
+        aligned = pd.DataFrame(closes).dropna()
+        if aligned.index.dtype != dt_dtype:
+            return _RV_REFUSE  # join changed the unit: keys incomparable
+        block = np.ascontiguousarray(aligned.values.T)
+        ts_aligned = np.ascontiguousarray(aligned.index.asi8)
+        last = int(ts_aligned[-1]) if len(ts_aligned) else _RV_TS_MIN
+        pending = {}
+        for symbol in cols:
+            vals, ts = per[symbol]
+            # rows above the aligned frontier can become common later;
+            # rows at/below it only via a restatement, which the prefix
+            # byte-check catches and turns into another rebuild
+            sel = (vals == vals) & (ts > last)
+            pending[symbol] = dict(zip(ts[sel].tolist(),
+                                       vals[sel].tolist()))
+        cache = {
+            'cols': tuple(cols),
+            'dt_dtype': dt_dtype,
+            'consumed': {s: len(per[s][0]) for s in cols},
+            'raw_vals': {s: per[s][0].copy() for s in cols},
+            'raw_ts': {s: per[s][1].copy() for s in cols},
+            'pending': pending,
+            'block': block,
+            'ts': ts_aligned,
+            'last_aligned_ts': last,
+        }
+        self._rv_cache = cache
+        return self._rv_compute(cache, date, cols[0], cols[1:])
+
+    def _rv_compute(self, cache: Dict, date, etf: str,
+                    basket: List[str]) -> Optional[float]:
+        """Gates + spread/rolling over the cached aligned block — the
+        full path's expressions verbatim on a zero-copy DataFrame wrap
+        of the block (same values, dtype, C-layout and column order, so
+        every downstream kernel sees exactly what the full path's fresh
+        `aligned` frame would give it)."""
+        ts = cache['ts']
+        if len(ts) < self.rv_z_window + 1:
+            return None
+        index = pd.DatetimeIndex(ts.view(cache['dt_dtype']))
+        if index[-1] != pd.Timestamp(date):
+            return None
+        aligned = pd.DataFrame(cache['block'].T, index=index,
+                               columns=list(cache['cols']), copy=False)
         log_px = np.log(aligned)
         spread = log_px[etf] - log_px[basket].mean(axis=1)
         mean = spread.rolling(self.rv_z_window).mean().iloc[-1]
