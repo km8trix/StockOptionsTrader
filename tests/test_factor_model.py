@@ -38,11 +38,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import desks.models.factor as factor_mod
 from desks.features import cross_sectional_rank
-from desks.models.factor import (_MIN_ROWS, FACTOR_COLUMNS, FactorModel,
-                                  _factor_exposures, _raw_factor_panel,
-                                  _standardized_panel, _trailing_return,
-                                  _trailing_vol)
+from desks.models.factor import (_MIN_ROWS, _SAFE_TAIL, FACTOR_COLUMNS,
+                                  FactorModel, _factor_exposures,
+                                  _raw_factor_panel, _standardized_panel,
+                                  _trailing_return, _trailing_vol,
+                                  _truncated_predict_data)
 from desks.walk_forward import WalkForwardModel
 
 
@@ -679,3 +681,246 @@ class TestPredictLatestSliceGolden:
         assert list(prod) == list(ref)
         for symbol in ref:
             assert prod[symbol] == ref[symbol]
+
+
+# ----------------------------------------------------------------------
+# Golden equivalence: predict()'s TAIL-TRUNCATED raw build (Fix 5) is
+# BYTE-IDENTICAL to the verbatim full-history build, engages only when
+# every guard holds, and falls back for the WHOLE call otherwise.
+#
+# CRITICAL: every case here uses n >> _SAFE_TAIL (277) — the pre-existing
+# predict goldens all sit below the truncation threshold, so a green run
+# of those alone proves NOTHING about this path.
+# ----------------------------------------------------------------------
+def _shared_end_frame(seed: int, n: int, end: str = '2024-12-31',
+                      drift: float = 0.0005) -> pd.DataFrame:
+    """Long seeded frame whose calendar ENDS at a shared date, so staleness
+    can be produced by iloc-slicing without splitting the calendar."""
+    rng = np.random.default_rng(seed)
+    close = 100.0 * np.cumprod(1.0 + rng.normal(drift, 0.012, n))
+    index = pd.bdate_range(end=end, periods=n)
+    return pd.DataFrame(
+        {'close': close, 'volume': np.full(n, 500_000.0)}, index=index)
+
+
+def _long_panel(n_symbols: int, n: int):
+    mid = n_symbols / 2
+    return {f'S{i:02d}': _shared_end_frame(300 + i, n,
+                                           drift=0.0006 * (i - mid))
+            for i in range(n_symbols)}
+
+
+def _truncation_cases():
+    """(data, expect_engaged) per case. ``expect_engaged`` is whether the
+    calibrated fast path must hand the builder at least one SHORTER frame;
+    fallback cases must hand it the original frames verbatim."""
+    cases = {}
+    # Clean shared-last-date panels: the single-needed-date PAD path, at
+    # widths >= 8 and >= 12 (arms the pairwise-summation ULP edge).
+    cases['clean_800_8sym'] = (_long_panel(8, 800), True)
+    cases['clean_1500_12sym'] = (_long_panel(12, 1500), True)
+
+    # Mixed last dates, staleness 5 / 35 / 100 rows: the per-symbol
+    # searchsorted k_sym extension (fresh symbols must keep staleness + tail
+    # rows so the stale symbols' dates stay complete cross-sections).
+    stale = _long_panel(10, 900)
+    stale['S02'] = stale['S02'].iloc[:-5]
+    stale['S05'] = stale['S05'].iloc[:-35]
+    stale['S07'] = stale['S07'].iloc[:-100]
+    cases['stale_5_35_100'] = (stale, True)
+
+    # NaN exactly AT the truncation boundary (tail is the last
+    # 2 + _SAFE_TAIL rows on a shared-date panel): guard must refuse.
+    k = 2 + _SAFE_TAIL
+    nan_at = _long_panel(8, 800)
+    v = nan_at['S03']['close'].to_numpy().copy()
+    v[800 - k] = np.nan
+    nan_at['S03'] = nan_at['S03'].assign(close=v)
+    cases['nan_at_boundary'] = (nan_at, False)
+
+    # NaN deep INSIDE the tail: guard must refuse.
+    nan_in = _long_panel(8, 800)
+    v = nan_in['S05']['close'].to_numpy().copy()
+    v[800 - 50] = np.nan
+    nan_in['S05'] = nan_in['S05'].assign(close=v)
+    cases['nan_inside_tail'] = (nan_in, False)
+
+    # NaN just OUTSIDE the tail (in the truncated-away region): engages,
+    # and the discarded region's differing clean-return stream must not
+    # leak into any consumed row.
+    nan_out = _long_panel(8, 800)
+    v = nan_out['S05']['close'].to_numpy().copy()
+    v[800 - k - 5] = np.nan
+    nan_out['S05'] = nan_out['S05'].assign(close=v)
+    cases['nan_outside_tail'] = (nan_out, True)
+
+    # Zero close inside the tail: guard must refuse (zero start prices flip
+    # factor finiteness and put an inf into the vol return stream).
+    zero = _long_panel(8, 800)
+    v = zero['S01']['close'].to_numpy().copy()
+    v[800 - 60] = 0.0
+    zero['S01'] = zero['S01'].assign(close=v)
+    cases['zero_price_in_tail'] = (zero, False)
+
+    # All-NaN tail on a LONG frame — the needed-oldest trap: the stale
+    # symbol's last FORMABLE date is far behind its frame end, so a naive
+    # pre-build needed-date estimate would corrupt every other symbol's
+    # cross-section at that date. Guard must refuse.
+    trap = _long_panel(8, 800)
+    v = trap['S04']['close'].to_numpy().copy()
+    v[-40:] = np.nan
+    trap['S04'] = trap['S04'].assign(close=v)
+    cases['nan_tail_nonformable_long'] = (trap, False)
+
+    # Long frames on a RangeIndex: searchsorted/min on ints must work and
+    # stay byte-identical.
+    rng_panel = {}
+    for i in range(6):
+        fr = _shared_end_frame(340 + i, 900, drift=0.0004 * (i - 3))
+        rng_panel[f'R{i}'] = fr.reset_index(drop=True)
+    cases['rangeindex_long'] = (rng_panel, True)
+
+    # Non-monotonic index: guard must refuse.
+    unsorted = _long_panel(6, 800)
+    idx = list(unsorted['S01'].index)
+    idx[-1], idx[-10] = idx[-10], idx[-1]
+    unsorted['S01'] = unsorted['S01'].set_axis(pd.Index(idx))
+    cases['unsorted_index'] = (unsorted, False)
+
+    # Tiny frames (incl. sub-_MIN_ROWS passthroughs) sharing the long
+    # frames' last date: ineligible frames pass through untouched while the
+    # long frames still truncate.
+    mixed = _long_panel(6, 800)
+    mixed['T4'] = _shared_end_frame(390, 4)     # under _MIN_ROWS: passthrough
+    mixed['T6'] = _shared_end_frame(391, 6)     # tiny but eligible
+    cases['tiny_plus_long'] = (mixed, True)
+
+    # Single long symbol: width-1 (degenerate) cross-section, engaged
+    # truncation, pad row from the only frame.
+    cases['single_symbol_long'] = ({'ONLY': _shared_end_frame(395, 900)},
+                                   True)
+
+    return cases
+
+
+class TestPredictTruncationGolden:
+    """predict()'s guarded tail truncation must reproduce the frozen
+    full-history oracle exactly — same symbols, same insertion order,
+    byte-identical scores — AND take the intended path (engaged vs
+    whole-call fallback), observed via a builder spy."""
+
+    @staticmethod
+    def _spy_builder(monkeypatch):
+        """Record the frame lengths every _raw_factor_panel call receives."""
+        # The lazy once-per-process calibration probe itself drives the
+        # builder; run it BEFORE installing the spy so the recorded calls
+        # are exactly the production predict's, in any test order.
+        FactorModel.fast_path_calibrated()
+        calls = []
+        real = factor_mod._raw_factor_panel
+
+        def spy(data):
+            calls.append({s: (None if f is None else len(f))
+                          for s, f in data.items()})
+            return real(data)
+
+        monkeypatch.setattr(factor_mod, '_raw_factor_panel', spy)
+        return calls
+
+    @pytest.mark.parametrize('name', sorted(_truncation_cases()))
+    def test_truncated_predict_byte_identical_and_routed(
+            self, name, monkeypatch):
+        data, expect_engaged = _truncation_cases()[name]
+        model = FactorModel()
+        model.fit(data)
+        ref = _full_history_predict(model, data)
+
+        calls = self._spy_builder(monkeypatch)
+        prod = model.predict(data, next(iter(data.values())).index[-1])
+
+        # Byte identity + insertion order, unconditionally (engaged or not).
+        assert list(prod) == list(ref)
+        for symbol in ref:
+            assert prod[symbol] == ref[symbol]
+        # Non-vacuousness: nearly the whole universe must actually score.
+        eligible = sum(1 for f in data.values() if len(f) >= _MIN_ROWS)
+        assert len(prod) >= max(1, eligible - 1)
+
+        # Routing: predict calls the builder exactly once; the fast path
+        # hands it a shorter frame, the fallback the originals verbatim.
+        assert len(calls) == 1
+        got = calls[0]
+        assert set(got) == set(data)
+        engaged = any(got[s] < len(f) for s, f in data.items()
+                      if f is not None)
+        if expect_engaged and not FactorModel.fast_path_calibrated():
+            pytest.skip('platform failed truncation calibration; '
+                        'fast path stood aside (results still verified)')
+        assert engaged == expect_engaged
+        if not expect_engaged:
+            assert got == {s: len(f) for s, f in data.items()}
+
+    def test_truncation_k_sym_math_per_symbol(self):
+        # Fresh symbols must keep (staleness span + _SAFE_TAIL) rows; the
+        # most-stale symbol keeps 1 + _SAFE_TAIL.
+        data, _ = _truncation_cases()['stale_5_35_100']
+        trunc = _truncated_predict_data(data)
+        assert trunc is not None
+        assert list(trunc) == list(data)  # key order preserved
+        # needed_oldest = S07's last date (100 rows stale). Fresh symbols
+        # have 900 rows; rows back to needed_oldest = 101.
+        assert len(trunc['S00']) == 101 + _SAFE_TAIL
+        assert len(trunc['S07']) == 1 + _SAFE_TAIL
+        assert len(trunc['S02']) == (101 - 5) + _SAFE_TAIL
+        # Truncated frames are tail slices of the originals, not copies of
+        # something else.
+        pd.testing.assert_frame_equal(
+            trunc['S00'], data['S00'].iloc[-(101 + _SAFE_TAIL):])
+
+    def test_truncation_shared_date_uses_pad_row(self):
+        # All last dates equal: needed_oldest is the min second-to-last
+        # date, so every symbol keeps 2 + _SAFE_TAIL rows.
+        data, _ = _truncation_cases()['clean_800_8sym']
+        trunc = _truncated_predict_data(data)
+        assert trunc is not None
+        assert all(len(f) == 2 + _SAFE_TAIL for f in trunc.values())
+
+    def test_truncation_returns_none_when_nothing_to_cut(self):
+        # n at/below the threshold: no truncation possible -> None (full
+        # path), never a pointless copy. Threshold on a shared-date panel
+        # is 2 + _SAFE_TAIL.
+        at = _long_panel(6, 2 + _SAFE_TAIL)
+        assert _truncated_predict_data(at) is None
+        below = _long_panel(6, 200)
+        assert _truncated_predict_data(below) is None
+        # One row above: exactly one row is cut from every symbol.
+        above = _long_panel(6, 3 + _SAFE_TAIL)
+        trunc = _truncated_predict_data(above)
+        assert trunc is not None
+        assert all(len(f) == 2 + _SAFE_TAIL for f in trunc.values())
+        assert _truncated_predict_data({}) is None
+
+    def test_truncation_refuses_duplicate_timestamps(self):
+        # Monotonic but non-unique index: guard must refuse. (No end-to-end
+        # case: the UNCHANGED standardization machinery itself rejects
+        # duplicate labels — 'cannot reindex on an axis with duplicate
+        # labels' — identically before and after this fix, so parity is a
+        # crash either way; the guard just must never engage.)
+        dup = _long_panel(6, 800)
+        idx = list(dup['S02'].index)
+        idx[-3] = idx[-2]
+        dup['S02'] = dup['S02'].set_axis(pd.Index(idx))
+        assert dup['S02'].index.is_monotonic_increasing  # dup, still sorted
+        assert not dup['S02'].index.is_unique
+        assert _truncated_predict_data(dup) is None
+
+    def test_fit_never_truncates(self, monkeypatch):
+        # fit() must keep full-history semantics — the truncation lives at
+        # the predict call site only.
+        data = _long_panel(6, 800)
+        calls = self._spy_builder(monkeypatch)
+        model = FactorModel()
+        model.fit(data)
+        assert calls  # fit built at least one panel
+        full = {s: len(f) for s, f in data.items()}
+        assert all(c == full for c in calls)

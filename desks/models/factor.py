@@ -73,6 +73,7 @@ scores across runs.
 from __future__ import annotations
 
 import logging
+import struct
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -368,6 +369,172 @@ def _standardized_panel(
     return standardized
 
 
+#: Safe tail length (rows) beyond each symbol's needed-date span for the
+#: predict-site truncation fast path. Momentum's full positional reach at a
+#: consumed row is ``lookback + skip`` = 273 rows; +2 covers the pad row and
+#: one row of margin. A consumed row at truncated position >= _SAFE_TAIL
+#: therefore reads every input it reads in the full frame at IDENTICAL
+#: relative offsets (its ``start = end - lookback`` index never clamps to
+#: the truncation boundary), and its 60-return vol window (61 rows,
+#: far below _SAFE_TAIL) sits wholly inside the guarded finite tail.
+_SAFE_TAIL = _MOM_LOOKBACK + _MOM_SKIP + 2
+
+
+def _truncated_predict_data(
+        data: Dict[str, pd.DataFrame]) -> Optional[Dict[str, pd.DataFrame]]:
+    """Tail-truncated copy of ``data`` for predict, or ``None`` = full build.
+
+    ``FactorModel.predict`` consumes ONLY each symbol's rows at the needed
+    dates (every symbol's last panel date, plus one pad date when they all
+    coincide — see ``_score_from_raw_panel``), yet ``_raw_factor_panel``
+    costs O(history) per symbol. Truncating each frame to its last
+    ``k_sym = (rows back to the oldest needed date) + _SAFE_TAIL`` rows
+    keeps every consumed row's factor inputs at identical relative offsets,
+    so the sliced build is byte-identical to the full one — PROVIDED the
+    guards below hold. Any guard failing anywhere returns ``None`` and
+    predict runs the verbatim full-history build for the WHOLE call
+    (cross-sectional coupling makes per-symbol mixing unsafe: one wrong
+    mid-tail row would shift a needed date's z-scores for every symbol).
+
+    Guards (all per call — the helper is stateless):
+
+      * every eligible frame's index is monotonic increasing and unique
+        (duplicate/unsorted timestamps -> full build);
+      * every eligible frame's closes over its last ``min(n, k_sym)`` rows
+        are finite and non-zero. This both keeps each consumed row's vol
+        window 60 contiguous clean returns wholly inside the tail AND makes
+        every frame's LAST rows formable, so the needed dates computed here
+        from ``frame.index`` provably equal the panel's post-build last
+        dates (a NaN tail would move a symbol's last FORMABLE date
+        arbitrarily far back — the trap this guard exists for);
+      * mixed index types, tz mismatches, or any other surprise raise
+        inside and are swallowed into the full-build fallback.
+
+    Ineligible frames (None/empty/no close/under ``_MIN_ROWS``) pass through
+    untouched — ``_raw_factor_panel`` skips them identically either way.
+    Returns ``None`` too when no frame is long enough to truncate (no win).
+    """
+    try:
+        eligible: Dict[str, pd.DataFrame] = {}
+        for symbol, frame in data.items():
+            if frame is None or frame.empty \
+                    or 'close' not in frame.columns \
+                    or len(frame) < _MIN_ROWS:
+                continue
+            index = frame.index
+            if not (index.is_monotonic_increasing and index.is_unique):
+                return None
+            eligible[symbol] = frame
+        if not eligible:
+            return None
+
+        last_dates = [f.index[-1] for f in eligible.values()]
+        first = last_dates[0]
+        if all(d == first for d in last_dates[1:]):
+            # One shared needed date: _score_from_raw_panel pads the slice
+            # with one symbol's second-to-last panel row; the min over ALL
+            # candidates over-covers whichever symbol supplies the pad.
+            needed_oldest = min(f.index[-2] for f in eligible.values())
+        else:
+            needed_oldest = min(last_dates)
+
+        out: Dict[str, pd.DataFrame] = {}
+        truncated = False
+        for symbol, frame in data.items():
+            fr = eligible.get(symbol)
+            if fr is None:
+                out[symbol] = frame
+                continue
+            n = len(fr)
+            pos = int(fr.index.searchsorted(needed_oldest, side='left'))
+            k = (n - pos) + _SAFE_TAIL
+            tail = fr['close'].iloc[-min(n, k):].to_numpy(dtype=float)
+            if not np.isfinite(tail).all() or (tail == 0.0).any():
+                return None
+            if n > k:
+                out[symbol] = fr.iloc[-k:]
+                truncated = True
+            else:
+                out[symbol] = fr
+        return out if truncated else None
+    except Exception:  # any surprise -> verbatim full build, never a crash
+        return None
+
+
+# ----------------------------------------------------------------------
+# Once-per-process platform calibration of the truncation fast path.
+#
+# The bit-identity argument above is positional (identical window contents
+# at identical relative offsets through the UNCHANGED builder), but numpy
+# reduction kernels have been observed to differ across platforms for
+# layout/shape changes that look equivalent on paper. So the fast path is
+# probed against the verbatim path once per process on deterministic
+# synthetic data and stands aside entirely on any bitwise mismatch.
+# Platform drift becomes a logged, perf-only regression, never a silent
+# number change.
+# ----------------------------------------------------------------------
+_FAST_PATH_OK: Optional[bool] = None
+
+
+def _calibration_universe():
+    """Two deterministic panels exercising both engaged-truncation shapes:
+    a shared-last-date panel (single needed date -> pad path) and a
+    mixed-last-dates panel (stale symbols -> multi-date path)."""
+    rng = np.random.default_rng(11)
+    idx = pd.bdate_range('2016-01-04', periods=700)
+    shared = {}
+    for i in range(10):
+        close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.02, 700)))
+        shared[f'F{i}'] = pd.DataFrame(
+            {'close': close, 'volume': np.full(700, 1e6)}, index=idx)
+    stale = dict(shared)
+    stale['F3'] = shared['F3'].iloc[:660]
+    stale['F7'] = shared['F7'].iloc[:590]
+    return shared, stale
+
+
+def _run_calibration() -> bool:
+    """Drive the truncated build against the verbatim full build through
+    the same scoring machinery on a hand-weighted model. Requires the fast
+    path to actually engage, and every score to match bit-for-bit."""
+    model = FactorModel()
+    model._weights = dict(zip(FACTOR_COLUMNS, (0.7, -0.3, 0.2, 0.05)))
+    model._fitted = True
+    for data in _calibration_universe():
+        trunc = _truncated_predict_data(data)
+        if trunc is None:
+            return False
+        if not any(len(trunc[s]) < len(f) for s, f in data.items()):
+            return False
+        fast = model._score_from_raw_panel(_raw_factor_panel(trunc))
+        full = model._score_from_raw_panel(_raw_factor_panel(data))
+        if list(fast) != list(full):
+            return False
+        for symbol in full:
+            if struct.pack('<d', fast[symbol]) \
+                    != struct.pack('<d', full[symbol]):
+                return False
+    return True
+
+
+def _calibrated_fast_path() -> bool:
+    """Lazy once-per-process probe; any failure or exception disables the
+    truncation fast path for the process with a WARNING."""
+    global _FAST_PATH_OK
+    if _FAST_PATH_OK is None:
+        try:
+            _FAST_PATH_OK = bool(_run_calibration())
+        except Exception:  # calibration must never break predict
+            _FAST_PATH_OK = False
+        if not _FAST_PATH_OK:
+            logger.warning(
+                "FactorModel predict truncation fast path disabled: "
+                "platform calibration found a bitwise mismatch against the "
+                "verbatim full-history build; using the full build "
+                "(results unaffected)")
+    return _FAST_PATH_OK
+
+
 class FactorModel(WalkForwardModel):
     """Transparent price-based cross-sectional factor model (module docstring).
 
@@ -509,6 +676,13 @@ class FactorModel(WalkForwardModel):
         logger.debug("FactorModel fitted: weights %s (n=%d)",
                      self._weights, x_matrix.shape[0])
 
+    @staticmethod
+    def fast_path_calibrated() -> bool:
+        """Whether this platform passed the once-per-process bitwise
+        calibration of the predict truncation fast path (tests use this
+        to decide whether fast-path-engagement assertions apply)."""
+        return _calibrated_fast_path()
+
     def predict(self, data: Dict[str, pd.DataFrame], date) -> Dict[str, float]:
         """Per-symbol composite = weighted sum of CURRENT standardized factors.
 
@@ -518,12 +692,33 @@ class FactorModel(WalkForwardModel):
         are omitted; ``{}`` when somehow unfitted (the equal-weight fallback
         normally guarantees a usable model, so this only fires if ``fit`` was
         never called).
+
+        PERF: the raw panel build is O(history) per symbol yet only the
+        needed-date rows are consumed, so when the calibrated guards hold
+        the frames are tail-truncated first (``_truncated_predict_data``,
+        byte-identical by construction and by the golden tests); any guard
+        failure falls back to the verbatim full-history build for the whole
+        call. ``fit`` and ``desks.factor_risk`` keep full-history semantics
+        — the truncation lives at this call site only.
         """
         if not self._fitted or not self._weights:
             return {}
-        raw_panel = _raw_factor_panel(data)
+        raw_panel = None
+        if _calibrated_fast_path():
+            trunc = _truncated_predict_data(data)
+            if trunc is not None:
+                raw_panel = _raw_factor_panel(trunc)
+        if raw_panel is None:
+            raw_panel = _raw_factor_panel(data)
         if not raw_panel:
             return {}
+        return self._score_from_raw_panel(raw_panel)
+
+    def _score_from_raw_panel(
+            self, raw_panel: Dict[str, pd.DataFrame]) -> Dict[str, float]:
+        """Needed-date slicing + standardization + weighted scoring of a
+        NON-EMPTY raw factor panel (the tail of ``predict``, shared verbatim
+        by the full and truncated builds and by the calibration probe)."""
         # PERF: only each symbol's LATEST standardized row is consumed below,
         # and the cross-sectional z-score is strictly PER-DATE (row-wise
         # across symbols — desks.features.cross_sectional_rank), so
