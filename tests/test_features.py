@@ -22,10 +22,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from desks.features import (BASE_FEATURE_COLUMNS, EXTRA_FEATURE_COLUMNS,
-                            FEATURE_COLUMNS, SEASONAL_FEATURE_COLUMNS,
-                            base_feature_frame, cross_sectional_rank,
-                            extended_feature_frame)
+from data.market_data import MarketDataHandler
+from desks.features import (BASE_FEATURE_COLUMNS, ENRICHED_EXTRA_COLUMNS,
+                            EXTRA_FEATURE_COLUMNS, FEATURE_COLUMNS,
+                            SEASONAL_FEATURE_COLUMNS, base_feature_frame,
+                            cross_sectional_rank, enrich_extended,
+                            extended_feature_frame, fast_last_extended_row,
+                            fast_tail_extended_window)
 from desks.ml_model import GradientBoostingModel
 
 # C1 FIX (landed): the zero-spread fallbacks in
@@ -322,3 +325,122 @@ class TestCrossSectionalRank:
         a = cross_sectional_rank(self._panel(n=60), column='close')
         b = cross_sectional_rank(self._panel(n=60), column='close')
         pd.testing.assert_frame_equal(a, b)
+
+
+# ----------------------------------------------------------------------
+# Enrichment + predict-time fast paths (enriched-column reads)
+# ----------------------------------------------------------------------
+def enriched_frame(seed: int = 0, n: int = 260) -> pd.DataFrame:
+    """Engine-shaped frame: calculate_indicators + enrich_extended, the
+    exact pipeline BacktestEngine.run builds for desks."""
+    frame = MarketDataHandler().calculate_indicators(synth(seed=seed, n=n))
+    return enrich_extended(frame)
+
+
+class TestEnrichExtended:
+    def test_adds_the_enriched_columns_in_place(self):
+        frame = MarketDataHandler().calculate_indicators(synth(seed=3))
+        out = enrich_extended(frame)
+        assert out is frame  # calculate_indicators-style in-place contract
+        assert set(ENRICHED_EXTRA_COLUMNS) <= set(out.columns)
+
+    def test_columns_equal_full_path_recompute_bit_for_bit(self):
+        """Every surviving feature row's enriched-column value must equal
+        extended_feature_frame's recompute EXACTLY (==, no tolerance)."""
+        frame = enriched_frame(seed=4)
+        features = extended_feature_frame(frame)
+        assert not features.empty
+        for name in ENRICHED_EXTRA_COLUMNS:
+            col = frame.loc[features.index, name].to_numpy(dtype=float)
+            ref = features[name].to_numpy(dtype=float)
+            assert (col == ref).all(), name
+
+    def test_zscore20_warmup_is_zero_not_nan(self):
+        """The np.where(std > 0, ..., 0.0) quirk: warm-up rows are 0.0."""
+        frame = enriched_frame(seed=5)
+        head = frame['zscore_20'].iloc[:19]
+        assert (head == 0.0).all()
+        assert not head.isna().any()
+
+    def test_prefix_stability_exact(self):
+        """Row t of a full-frame enriched column == the value a prefix
+        recompute produces — the property the fast paths rest on."""
+        ind = MarketDataHandler().calculate_indicators(synth(seed=6, n=240))
+        full = enrich_extended(ind.copy())
+        for cut in (60, 121, 239):
+            prefix = enrich_extended(ind.iloc[:cut + 1].copy())
+            for name in ENRICHED_EXTRA_COLUMNS:
+                assert prefix[name].iloc[-1] == full[name].iloc[cut], (
+                    name, cut)
+
+    def test_empty_and_closeless_frames_pass_through(self):
+        empty = pd.DataFrame()
+        assert enrich_extended(empty) is empty
+        closeless = pd.DataFrame(
+            {'volume': [1.0]}, index=pd.bdate_range('2024-01-01', periods=1))
+        assert 'ret_5' not in enrich_extended(closeless).columns
+
+
+class TestFastLastExtendedRow:
+    def test_fires_and_equals_full_path_exactly(self):
+        frame = enriched_frame(seed=7)
+        vector = fast_last_extended_row(frame)
+        assert vector is not None
+        ref = extended_feature_frame(frame).iloc[-1].to_numpy(dtype=float)
+        assert vector.shape == ref.shape == (len(FEATURE_COLUMNS),)
+        assert (vector == ref).all()
+
+    def test_refuses_unenriched_raw_ohlcv(self):
+        assert fast_last_extended_row(synth(seed=8)) is None
+
+    def test_refuses_short_zero_denominator_and_nan_frames(self):
+        frame = enriched_frame(seed=9)
+        assert fast_last_extended_row(frame.iloc[:1]) is None
+        zero_close = frame.copy()
+        zero_close.iloc[-2, zero_close.columns.get_loc('close')] = 0.0
+        assert fast_last_extended_row(zero_close) is None
+        zero_vsma = frame.copy()
+        zero_vsma.iloc[-1, zero_vsma.columns.get_loc('volume_sma')] = 0.0
+        assert fast_last_extended_row(zero_vsma) is None
+        nan_last = frame.copy()
+        nan_last.iloc[-1, nan_last.columns.get_loc('rsi')] = np.nan
+        assert fast_last_extended_row(nan_last) is None
+
+    def test_refuses_non_float64_column(self):
+        frame = enriched_frame(seed=10)
+        frame['vol_20'] = frame['vol_20'].astype(np.float32)
+        assert fast_last_extended_row(frame) is None
+
+
+class TestFastTailExtendedWindow:
+    LOOKBACK = 20
+
+    def test_fires_equals_full_path_and_is_fortran_ordered(self):
+        frame = enriched_frame(seed=11)
+        window = fast_tail_extended_window(frame, self.LOOKBACK)
+        assert window is not None
+        ref = extended_feature_frame(frame).to_numpy(
+            dtype=float)[-self.LOOKBACK:]
+        assert np.array_equal(window, ref)
+        # Layout is part of the contract: torch's LSTM CPU kernels give
+        # ULP-different logits for C- vs F-ordered inputs of the same
+        # values, and the full path's window is F-ordered (DataFrame
+        # .to_numpy() is column-major).
+        assert window.flags['F_CONTIGUOUS']
+
+    def test_refuses_when_a_tail_row_would_be_dropped(self):
+        """A NaN inside the window means the full path SPLICES an earlier
+        row in via dropna; only the full path reproduces that."""
+        frame = enriched_frame(seed=12)
+        frame.iloc[-5, frame.columns.get_loc('rsi')] = np.nan
+        assert fast_tail_extended_window(frame, self.LOOKBACK) is None
+
+    def test_refuses_short_unenriched_and_zero_denominators(self):
+        frame = enriched_frame(seed=13)
+        too_short = frame.iloc[:self.LOOKBACK]  # needs lookback+1 rows
+        assert fast_tail_extended_window(too_short, self.LOOKBACK) is None
+        assert fast_tail_extended_window(synth(seed=13),
+                                         self.LOOKBACK) is None
+        zero_close = frame.copy()
+        zero_close.iloc[-10, zero_close.columns.get_loc('close')] = 0.0
+        assert fast_tail_extended_window(zero_close, self.LOOKBACK) is None

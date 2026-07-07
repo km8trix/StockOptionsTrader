@@ -37,7 +37,7 @@ GradientBoostingModel.
 
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -66,6 +66,16 @@ SEASONAL_FEATURE_COLUMNS: Sequence[str] = (
 FEATURE_COLUMNS: Sequence[str] = (
     tuple(BASE_FEATURE_COLUMNS) + tuple(EXTRA_FEATURE_COLUMNS)
     + tuple(SEASONAL_FEATURE_COLUMNS))
+
+#: Columns :func:`enrich_extended` adds to a frame (extras + seasonal).
+ENRICHED_EXTRA_COLUMNS: Sequence[str] = (
+    tuple(EXTRA_FEATURE_COLUMNS) + tuple(SEASONAL_FEATURE_COLUMNS))
+
+#: Raw/indicator columns the predict-time fast paths read. The engine's
+#: calculate_indicators provides the first seven; enrich_extended the rest.
+_FAST_PATH_COLUMNS: Sequence[str] = (
+    ('close', 'volume', 'rsi', 'macd', 'bb_upper', 'bb_lower',
+     'volume_sma') + tuple(ENRICHED_EXTRA_COLUMNS))
 
 
 # ----------------------------------------------------------------------
@@ -237,6 +247,188 @@ def extended_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
     combined = combined.reindex(columns=list(FEATURE_COLUMNS))
     combined = combined.replace([np.inf, -np.inf], np.nan)
     return combined.dropna()
+
+
+# ----------------------------------------------------------------------
+# Predict-time fast path (enriched-column reads)
+# ----------------------------------------------------------------------
+def enrich_extended(data: pd.DataFrame) -> pd.DataFrame:
+    """Precompute the extras + seasonal columns ONCE on a full frame.
+
+    Adds :data:`ENRICHED_EXTRA_COLUMNS` in place (and returns the frame,
+    matching ``calculate_indicators``'s style) with formulas byte-copied
+    from :func:`extended_feature_frame` — including the ``zscore_20``
+    ``np.where(std > 0, ..., 0.0)`` quirk, which makes that column 0.0
+    (NOT NaN) through its warm-up. Because rolling/shift/pct_change are
+    forward-only streaming passes, row ``t`` of a full-frame column is
+    bit-identical to the value a prefix ``[:t+1]`` recompute produces —
+    the same prefix-stability the engine's indicator precompute and the
+    stacking OOF fast path already rely on. The predict-time fast paths
+    below READ these columns; the full :func:`extended_feature_frame`
+    path deliberately never prefers them, so fit-time numerics and every
+    fallback recompute stay byte-for-byte unchanged.
+
+    Empty/close-less frames are returned untouched.
+    """
+    if data is None or data.empty or 'close' not in data.columns:
+        return data
+
+    close = data['close']
+    data['ret_5'] = close / close.shift(5) - 1.0
+    data['ret_10'] = close / close.shift(10) - 1.0
+    data['vol_20'] = close.pct_change().rolling(window=20).std()
+    data['momentum_10'] = close / close.rolling(window=10).mean() - 1.0
+    roll_mean_20 = close.rolling(window=20).mean()
+    roll_std_20 = close.rolling(window=20).std()
+    data['zscore_20'] = np.where(
+        roll_std_20 > 0, (close - roll_mean_20) / roll_std_20, 0.0)
+    dollar_vol = close * data['volume']
+    data['dollar_vol_ratio'] = dollar_vol / dollar_vol.rolling(20).mean()
+
+    idx = data.index
+    dow = idx.dayofweek.to_numpy(dtype=float)   # Mon=0 .. Fri=4
+    month = idx.month.to_numpy(dtype=float)     # 1 .. 12
+    data['dow_sin'] = np.sin(2 * np.pi * dow / 5.0)
+    data['dow_cos'] = np.cos(2 * np.pi * dow / 5.0)
+    data['month_sin'] = np.sin(2 * np.pi * month / 12.0)
+    data['month_cos'] = np.cos(2 * np.pi * month / 12.0)
+    data['turn_of_month'] = (
+        (idx.day <= 3) | (idx.day >= 28)).astype(float)
+    return data
+
+
+def _fast_columns_ok(frame: pd.DataFrame) -> bool:
+    """All fast-path columns present with plain float64/integer dtypes.
+
+    Mirrors ml_model._fast_last_row's dtype discipline: float32 would
+    round differently and pandas extension dtypes can hold pd.NA, so
+    anything but a plain numpy float64/int dtype demands the full path.
+    """
+    for name in _FAST_PATH_COLUMNS:
+        if name not in frame.columns:
+            return False
+        dtype = frame.dtypes[name]
+        if not isinstance(dtype, np.dtype):
+            return False
+        if dtype != np.float64 and dtype.kind not in 'iu':
+            return False
+    return True
+
+
+def fast_last_extended_row(frame: pd.DataFrame) -> Optional[np.ndarray]:
+    """O(1) extended feature vector for the frame's FINAL row, or None.
+
+    The 16-wide twin of ``ml_model._fast_last_row`` for
+    :data:`FEATURE_COLUMNS`: when the engine has enriched the frame
+    (indicators + :func:`enrich_extended`), the last row is plain column
+    reads plus the three scalar computations (ret_1, bb_position,
+    volume_ratio) whose formulas are bit-identical to the vectorized
+    ops. Returns None — demanding the full
+    :func:`extended_feature_frame` path — unless ALL of:
+
+    - every fast-path column is present with a plain float64/int dtype;
+    - the frame has >= 2 rows (ret_1 needs a prior close);
+    - close[-2] != 0 and volume_sma[-1] != 0 (the full path sweeps the
+      resulting inf to NaN and backs off to an earlier row);
+    - every one of the 16 values is finite — a NaN/inf feature means the
+      full path would drop this row, and only the full path reproduces
+      that back-off.
+
+    The bb_position quirk is replicated: ``np.where(width > 0, ..., 0.5)``
+    yields 0.5 for a NaN or non-positive band width, so a NaN band does
+    NOT invalidate the row.
+    """
+    if len(frame.index) < 2 or not _fast_columns_ok(frame):
+        return None
+
+    close_prev = frame['close'].iloc[-2]
+    if close_prev == 0:
+        return None
+    close = frame['close'].iloc[-1]
+    ret_1 = close / close_prev - 1
+
+    bb_upper = frame['bb_upper'].iloc[-1]
+    bb_lower = frame['bb_lower'].iloc[-1]
+    bb_width = bb_upper - bb_lower
+    if bb_width > 0:  # NaN width compares False -> 0.5, as np.where does
+        bb_position = (close - bb_lower) / bb_width
+    else:
+        bb_position = 0.5
+
+    volume_sma = frame['volume_sma'].iloc[-1]
+    if volume_sma == 0:
+        return None
+    volume_ratio = frame['volume'].iloc[-1] / volume_sma
+
+    vector = np.array(
+        [ret_1, frame['rsi'].iloc[-1], frame['macd'].iloc[-1],
+         bb_position, volume_ratio]
+        + [frame[name].iloc[-1] for name in ENRICHED_EXTRA_COLUMNS],
+        dtype=float)
+    if not np.isfinite(vector).all():
+        return None
+    return vector
+
+
+def fast_tail_extended_window(frame: pd.DataFrame,
+                              lookback: int) -> Optional[np.ndarray]:
+    """The last ``lookback`` extended feature rows as a ``(lookback, 16)``
+    matrix, or None when the full path must be used.
+
+    For sequence models the predict-time window is the feature frame's
+    last ``lookback`` rows. Those equal the DATA frame's last ``lookback``
+    rows exactly when every one of them survives the full path's
+    ``dropna()`` — which the all-finite gate below guarantees. Any
+    non-finite cell in the candidate window means the full path would
+    SPLICE earlier rows into the window (dropna removes the bad row), and
+    only the full path reproduces that composition — so refuse.
+
+    ret_1/bb_position/volume_ratio are recomputed per row with the same
+    scalar-exact elementwise formulas as the vectorized ops (division and
+    the np.where quirk are per-element, so a tail recompute is exact for
+    THESE — unlike rolling ops, which is why the rolling-derived columns
+    are read from the enriched frame instead). Requires ``lookback + 1``
+    rows (the window's oldest ret_1 needs its prior close) and refuses on
+    any zero close/volume_sma denominator inside the window.
+    """
+    if lookback < 1 or len(frame.index) < lookback + 1:
+        return None
+    if not _fast_columns_ok(frame):
+        return None
+
+    tail = frame.iloc[-(lookback + 1):]
+    close = tail['close'].to_numpy(dtype=float)
+    if (close[:-1] == 0).any():
+        return None
+    ret_1 = close[1:] / close[:-1] - 1
+
+    bb_upper = tail['bb_upper'].to_numpy(dtype=float)[1:]
+    bb_lower = tail['bb_lower'].to_numpy(dtype=float)[1:]
+    bb_width = bb_upper - bb_lower
+    bb_position = np.where(
+        bb_width > 0, (close[1:] - bb_lower) / bb_width, 0.5)
+
+    volume_sma = tail['volume_sma'].to_numpy(dtype=float)[1:]
+    if (volume_sma == 0).any():
+        return None
+    volume_ratio = tail['volume'].to_numpy(dtype=float)[1:] / volume_sma
+
+    columns = [ret_1, tail['rsi'].to_numpy(dtype=float)[1:],
+               tail['macd'].to_numpy(dtype=float)[1:],
+               bb_position, volume_ratio]
+    columns += [tail[name].to_numpy(dtype=float)[1:]
+                for name in ENRICHED_EXTRA_COLUMNS]
+    window = np.column_stack(columns)
+    if not np.isfinite(window).all():
+        return None
+    # LAYOUT IS PART OF THE CONTRACT, not an optimization: torch's LSTM
+    # CPU kernels produce ULP-different logits for C- vs F-ordered inputs
+    # of the SAME values (measured: one float32 ULP at 0.5 flips the
+    # score). The full path's window is F-ordered because DataFrame
+    # .to_numpy() yields column-major data, so the fast window must
+    # reproduce that layout — value equality alone is NOT bit-identity
+    # downstream. The fast-vs-full score-equality tests pin this.
+    return np.asfortranarray(window)
 
 
 # ----------------------------------------------------------------------

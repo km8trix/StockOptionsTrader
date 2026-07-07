@@ -58,6 +58,7 @@ import threading
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from core.models import Asset, AssetType, Position
 from desks.base import Desk
+from desks.features import enrich_extended
 from portfolio.manager import PortfolioManager
 from data.market_data import MarketDataHandler
 from strategies.base import Strategy
@@ -246,9 +247,14 @@ class BacktestEngine:
         # the simulated date is byte-identical to recomputing on each
         # expanding window — and removes the O(days^2) indicator recompute
         # from the daily loop. Slicing through `date` still guarantees no
-        # future context reaches a strategy or desk.
+        # future context reaches a strategy or desk. enrich_extended layers
+        # the extended-feature extras/seasonal columns on by the same
+        # prefix-stability argument; they are inert for every consumer that
+        # selects named columns and let the ML models' predict fast paths
+        # read the last row instead of rebuilding O(history) features daily.
         self._enriched_all = {
-            symbol: self.market_data.calculate_indicators(data.copy())
+            symbol: enrich_extended(
+                self.market_data.calculate_indicators(data.copy()))
             for symbol, data in all_data.items()
         }
 

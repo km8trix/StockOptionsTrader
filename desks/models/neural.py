@@ -320,10 +320,22 @@ class MLPModel(WalkForwardModel):
             for symbol, frame in data.items():
                 if frame is None or frame.empty or 'close' not in frame.columns:
                     continue
-                features = _feature_frame(frame)
-                if features.empty:
-                    continue
-                latest = features.iloc[[-1]].to_numpy(dtype=float)
+                # O(1) enriched-column read when the frame qualifies; the
+                # full O(history) rebuild otherwise. The scaler is fitted
+                # at train time only, so the standardization of a single
+                # row is identical either way. The torch forward stays
+                # strictly per-symbol single-row: batching rows into one
+                # forward is NOT provably bit-identical (gemm vs gemv
+                # kernel summation order) and the pandas rebuild, not
+                # torch, was the cost.
+                vector = feature_lib.fast_last_extended_row(frame)
+                if vector is None:
+                    features = _feature_frame(frame)
+                    if features.empty:
+                        continue
+                    latest = features.iloc[[-1]].to_numpy(dtype=float)
+                else:
+                    latest = vector.reshape(1, -1)
                 x_std = self._scaler.transform(latest)
                 x_tensor = torch.tensor(x_std, dtype=torch.float32,
                                         device=device)
@@ -430,9 +442,19 @@ class SequenceModel(WalkForwardModel):
 
     def _latest_window(self, data: pd.DataFrame) -> Optional[np.ndarray]:
         """The most recent complete ``lookback`` feature window for predict,
-        shape ``(lookback, n_features)``; ``None`` if too short."""
+        shape ``(lookback, n_features)``; ``None`` if too short.
+
+        Tries the O(lookback) enriched-column fast window first
+        (features.fast_tail_extended_window — refuses whenever the full
+        path's dropna would splice earlier rows into the window, so the
+        two compositions can never differ); falls back to the full
+        O(history) rebuild otherwise.
+        """
         if data is None or data.empty or 'close' not in data.columns:
             return None
+        window = feature_lib.fast_tail_extended_window(data, self.lookback)
+        if window is not None:
+            return window
         frame = _feature_frame(data)
         if len(frame) < self.lookback:
             return None

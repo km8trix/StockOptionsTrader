@@ -460,3 +460,71 @@ class TestStandardScalerClip:
         scaler.fit(np.array([[0.0], [1.0], [2.0], [3.0], [4.0]]))
         out = scaler.transform(np.array([[1e6]]))
         assert out[0, 0] > 100.0  # far past the 5-sigma cap, uncapped
+
+
+class TestFastPathEquivalence:
+    """On enriched engine-shaped frames the predict fast paths must equal
+    the full-path recompute EXACTLY (==, no tolerance) and actually fire.
+    Torch forwards stay per-symbol single-row/single-window — the window's
+    MEMORY LAYOUT is part of the contract (LSTM CPU kernels give ULP-
+    different logits for C- vs F-ordered inputs of identical values)."""
+
+    @staticmethod
+    def _enriched_panel() -> dict:
+        from data.market_data import MarketDataHandler
+        from desks.features import enrich_extended
+        handler = MarketDataHandler()
+        return {s: enrich_extended(handler.calculate_indicators(f.copy()))
+                for s, f in two_symbol_panel().items()}
+
+    def test_mlp_fast_equals_full_and_fires(self, monkeypatch):
+        import desks.features as feature_lib
+        panel = self._enriched_panel()
+        model = fast_mlp()
+        model.fit(panel)
+        date = panel['A'].index[-1]
+
+        fired = {'n': 0}
+        original = feature_lib.fast_last_extended_row
+
+        def counting(frame):
+            vector = original(frame)
+            if vector is not None:
+                fired['n'] += 1
+            return vector
+
+        monkeypatch.setattr(feature_lib, 'fast_last_extended_row', counting)
+        fast_scores = model.predict(panel, date)
+        monkeypatch.setattr(feature_lib, 'fast_last_extended_row',
+                            lambda frame: None)
+        slow_scores = model.predict(panel, date)
+
+        assert fired['n'] > 0
+        assert fast_scores == slow_scores  # exact ==, no tolerance
+
+    def test_sequence_window_and_scores_equal_exactly(self, monkeypatch):
+        import desks.features as feature_lib
+        panel = self._enriched_panel()
+        model = SequenceModel(lookback=20, hidden_size=8, epochs=5)
+        model.fit(panel)
+        date = panel['A'].index[-1]
+
+        fast_window = model._latest_window(panel['A'])
+        fast_scores = model.predict(panel, date)
+
+        monkeypatch.setattr(feature_lib, 'fast_tail_extended_window',
+                            lambda frame, lookback: None)
+        slow_window = model._latest_window(panel['A'])
+        slow_scores = model.predict(panel, date)
+
+        assert fast_window is not None and slow_window is not None
+        assert np.array_equal(fast_window, slow_window)
+        assert fast_window.flags['F_CONTIGUOUS']  # layout contract
+        assert fast_scores == slow_scores  # exact ==, no tolerance
+
+    def test_sequence_fast_window_refuses_nan_in_tail(self):
+        from desks.features import fast_tail_extended_window
+        panel = self._enriched_panel()
+        frame = panel['A'].copy()
+        frame.iloc[-3, frame.columns.get_loc('rsi')] = np.nan
+        assert fast_tail_extended_window(frame, 20) is None

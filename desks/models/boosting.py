@@ -192,20 +192,35 @@ class LightGBMModel(WalkForwardModel):
 
         Symbols with insufficient/NaN feature rows are skipped; ``{}`` when
         the model never trained successfully.
+
+        Feature vectors come from the O(1) enriched-column fast path when
+        a frame qualifies (features.fast_last_extended_row) and the full
+        O(history) _feature_frame rebuild otherwise; all rows are then
+        scored with a SINGLE predict_proba call (the booster is built with
+        deterministic=True / num_threads=1, and tree traversal is per-row
+        independent, so batching is bit-identical to per-symbol calls —
+        the same argument as ml_model.GradientBoostingModel.predict).
         """
         if not self._fitted or self._booster is None:
             return {}
-        scores: Dict[str, float] = {}
+        symbols = []
+        rows = []
         for symbol, frame in data.items():
             if frame is None or frame.empty or 'close' not in frame.columns:
                 continue
-            features = _feature_frame(frame)
-            if features.empty:
-                continue
-            latest = features.iloc[[-1]].to_numpy(dtype=float)
-            prob_up = float(self._booster.predict_proba(latest)[0, 1])
-            scores[symbol] = prob_up - 0.5
-        return scores
+            vector = feature_lib.fast_last_extended_row(frame)
+            if vector is None:
+                features = _feature_frame(frame)
+                if features.empty:
+                    continue
+                vector = features.iloc[[-1]].to_numpy(dtype=float)[0]
+            symbols.append(symbol)
+            rows.append(vector)
+        if not rows:
+            return {}
+        probs = self._booster.predict_proba(np.vstack(rows))[:, 1]
+        return {symbol: float(prob_up) - 0.5
+                for symbol, prob_up in zip(symbols, probs)}
 
 
 class StackingMetaModel(WalkForwardModel):
