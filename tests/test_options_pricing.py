@@ -351,3 +351,65 @@ class TestAmericanBinomial:
         coarse = american_binomial_price(95, 100, 1.0, 0.3, 0.05, 'put', steps=100)
         fine = american_binomial_price(95, 100, 1.0, 0.3, 0.05, 'put', steps=400)
         assert coarse == pytest.approx(fine, abs=0.05)
+
+
+class TestHV20Memo:
+    """iv() memoizes the RAW hv20 per (symbol, pricing date). The memo
+    must serve only true hits (validated by length, endpoint, and bytes
+    hash), and a long-lived cached model must be bit-indistinguishable
+    from a fresh model on every call."""
+
+    def test_repeat_call_serves_from_cache_bit_identically(self):
+        frame = frame_with_jump()
+        date = frame.index[30]
+        model = SyntheticIVModel()
+        first = model.iv('XYZ', frame, date)
+        assert len(model._hv20_cache) == 1
+        # Sentinel-poison the cached raw hv20: the second call must read
+        # THIS value (proving the hit) and pass it through the live
+        # multiplier — the memo caches hv20, never the finished IV.
+        key, entry = next(iter(model._hv20_cache.items()))
+        model._hv20_cache[key] = entry[:4] + (999.0,)
+        assert model.iv('XYZ', frame, date) == pytest.approx(
+            999.0 * 1.10, rel=1e-12)
+        # Restored, the cached value reproduces the first call exactly.
+        model._hv20_cache[key] = entry
+        assert model.iv('XYZ', frame, date) == first
+
+    def test_enriched_frame_hits_the_same_value(self):
+        # Engine frames carry indicator/extra columns; iv() reads only
+        # 'close', so raw and enriched slices must agree exactly.
+        frame = frame_with_jump()
+        date = frame.index[30]
+        enriched = frame.copy()
+        enriched['rsi'] = 50.0
+        model = SyntheticIVModel()
+        assert model.iv('XYZ', frame, date) == model.iv(
+            'XYZ', enriched, date)
+
+    def test_interior_close_change_never_serves_stale(self):
+        # Same (symbol, date), same length, same LAST close — only the
+        # bytes-hash validator can catch an interior mutation. It must
+        # recompute, matching a fresh model, never the stale entry.
+        frame = frame_with_jump()
+        date = frame.index[30]
+        model = SyntheticIVModel()
+        stale = model.iv('XYZ', frame, date)  # warm the cache
+        mutated = frame.copy()
+        mutated.iloc[10, mutated.columns.get_loc('close')] *= 1.5
+        fresh = SyntheticIVModel().iv('XYZ', mutated, date)
+        assert model.iv('XYZ', mutated, date) == fresh
+        assert fresh != stale  # the mutation is detectable
+
+    def test_cached_model_equals_fresh_model_across_expanding_dates(self):
+        """Cross-date staleness net: one long-lived (cached) model driven
+        day-by-day over expanding prefixes equals a fresh (uncached)
+        model at EVERY date with exact == — catches any key/validator bug
+        serving date d's hv20 on d+1."""
+        frame = frame_with_jump(n=60)
+        cached = SyntheticIVModel()
+        for i in range(HV_WINDOW + 1, len(frame)):
+            date = frame.index[i]
+            prefix = frame.iloc[:i + 1]
+            assert (cached.iv('XYZ', prefix, date)
+                    == SyntheticIVModel().iv('XYZ', prefix, date)), date
