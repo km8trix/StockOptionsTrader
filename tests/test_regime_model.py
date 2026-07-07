@@ -255,7 +255,8 @@ class TestPredictFastPathEquivalence:
                         == oracle._predict_full(old_data, old))
                 fast_ctrl.predict(all_data, date)  # re-advance
         assert real >= 100  # the drive really produced posteriors
-        assert fast._predict_cache is not None  # fast path engaged
+        if self._fast_on():
+            assert fast._predict_cache is not None  # fast path engaged
 
     def test_poisoned_scaler_stands_aside_for_the_generation(self, market):
         # A z-matrix with non-finite values makes the verbatim path
@@ -269,7 +270,8 @@ class TestPredictFastPathEquivalence:
         model._scaler = (col_mean, np.zeros_like(col_std))  # z -> inf
         for _ in range(3):
             assert model.predict({'MKT': market}, market.index[-1]) == {}
-        assert model._fast_disabled_gen == model._fit_generation
+        if self._fast_on():
+            assert model._fast_disabled_gen == model._fit_generation
 
     def test_failed_refit_keeps_the_cache_generation(self, market):
         # A refit that is abandoned (model retained) must NOT bump the
@@ -278,7 +280,8 @@ class TestPredictFastPathEquivalence:
         model.fit({'MKT': market})
         generation = model._fit_generation
         first = model.predict({'MKT': market}, market.index[-1])
-        assert model._predict_cache is not None
+        if self._fast_on():
+            assert model._predict_cache is not None
         index = pd.bdate_range('2020-01-02', periods=200)
         constant = pd.DataFrame({'close': 100.0, 'volume': 500_000.0},
                                 index=index)
@@ -308,6 +311,13 @@ class TestPredictFastPathEquivalence:
             for i in range(n_sym)}, idx
 
     @staticmethod
+    def _fast_on() -> bool:
+        # cache-engagement assertions only apply where the platform
+        # passed the bitwise calibration probe; equality assertions
+        # are unconditional (fast==verbatim holds either way)
+        return RegimeHMMModel.fast_path_calibrated()
+
+    @staticmethod
     def _fitted_on(frames):
         model = RegimeHMMModel()
         model.fit(frames)
@@ -317,7 +327,8 @@ class TestPredictFastPathEquivalence:
     def _warm(self, model, frames, idx, upto):
         data = {s: f.iloc[:upto] for s, f in frames.items()}
         model.predict(data, idx[upto - 1])
-        assert model._predict_cache is not None
+        if self._fast_on():
+            assert model._predict_cache is not None
         return data
 
     def test_interior_close_restatement_never_serves_stale(self, market):
@@ -391,8 +402,9 @@ class TestPredictFastPathEquivalence:
             data = {s: f.iloc[:upto] for s, f in frames.items()}
             assert (model.predict(data, idx[upto - 1])
                     == model._predict_full(data, idx[upto - 1])), upto
-        assert model._predict_cache['n_feat'] >= 1
-        assert model._rebuild_streak == 0  # growth stayed incremental
+        if self._fast_on():
+            assert model._predict_cache['n_feat'] >= 1
+            assert model._rebuild_streak == 0  # growth stayed incremental
 
     def test_incremental_poisoned_row_stands_aside(self, market):
         # Poison the scaler AFTER the cache is warm: the very next
@@ -405,7 +417,8 @@ class TestPredictFastPathEquivalence:
         model._scaler = (col_mean, np.zeros_like(col_std))
         data = {s: f.iloc[:86] for s, f in frames.items()}
         assert model.predict(data, idx[85]) == {}
-        assert model._fast_disabled_gen == model._fit_generation
+        if self._fast_on():
+            assert model._fast_disabled_gen == model._fit_generation
         assert model.predict(data, idx[85]) == {}
 
     def test_exception_in_fast_path_falls_back(self, market, monkeypatch):
@@ -440,7 +453,8 @@ class TestPredictFastPathEquivalence:
             window = {s: f.iloc[i - 60:i + 1] for s, f in frames.items()}
             assert (model.predict(window, idx[i])
                     == model._predict_full(window, idx[i])), i
-        assert model._rebuild_streak == 3  # capped: churn has stopped
+        if self._fast_on():
+            assert model._rebuild_streak == 3  # capped: churn stopped
 
     def test_symbol_set_change_rebuilds(self, market):
         frames, idx = self._clean_universe()

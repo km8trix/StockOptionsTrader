@@ -122,9 +122,94 @@ MIN_AR1_SAME_STATE_PAIRS = 10
 #: wins); deterministic protection against local optima.
 N_FIT_RESTARTS = 3
 
+#: Platform calibration verdict for the incremental predict fast path:
+#: None = not yet probed this process; True/False = probe outcome.
+#: The scalar/1-row feature replicas are bit-identical to the pandas
+#: full path only where reduction/SIMD behavior matches (verified on
+#: macOS arm64; x86 BLAS differs) — so the fast path self-checks
+#: against the verbatim path once per process and stands aside
+#: entirely on any mismatch. Platform drift becomes a logged,
+#: perf-only regression, never a silent number change.
+_FAST_PATH_OK: Optional[bool] = None
+
+
+def _calibration_universe():
+    """Small deterministic universe exercising every fast-path replica:
+    NaN closes/volumes, a volume-less symbol, warm-up boundaries."""
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range('2018-01-02', periods=55)
+    data = {}
+    for i in range(6):
+        close = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, 55)))
+        volume = rng.lognormal(12, 0.5, 55)
+        if i == 1:
+            close[7] = np.nan
+        if i == 2:
+            volume[40] = np.nan
+        frame = pd.DataFrame({'close': close, 'volume': volume}, index=idx)
+        if i == 4:
+            frame = frame.drop(columns=['volume'])
+        data[f'C{i}'] = frame
+    return data, idx
+
+
+def _run_calibration() -> bool:
+    """Drive the fast path against the verbatim path over expanding
+    prefixes of the calibration universe on a hand-parameterized HMM
+    (no EM — deterministic and fast). Exact dict equality at every cut,
+    covering the first-feature-row branch and steady-state increments."""
+    model = RegimeHMMModel()
+    hmm = GaussianHMM(n_components=3, covariance_type='full')
+    hmm.startprob_ = np.array([0.5, 0.3, 0.2])
+    hmm.transmat_ = np.array([[0.80, 0.15, 0.05],
+                              [0.20, 0.70, 0.10],
+                              [0.10, 0.20, 0.70]])
+    hmm.means_ = np.array([[0.000, -4.0, 1.0],
+                           [0.002, -4.5, 1.1],
+                           [-0.001, -3.5, 0.9]])
+    hmm.covars_ = np.array([np.eye(3) * s for s in (0.05, 0.08, 0.2)])
+    model._model = hmm
+    model._state_labels = dict(enumerate(REGIME_LABELS))
+    model._scaler = (np.zeros(3), np.ones(3))
+    model._fitted = True
+    model._fit_generation = 1
+    data, idx = _calibration_universe()
+    for cut in range(25, 56):
+        sliced = {s: f.iloc[:cut] for s, f in data.items()}
+        fast = model._predict_fast(sliced)  # direct: dispatcher bypassed
+        full = model._predict_full(sliced, idx[cut - 1])
+        if fast is None or fast != full:
+            return False
+    return True
+
+
+def _calibrated_fast_path() -> bool:
+    """Lazy once-per-process probe; any failure or exception disables
+    the fast path for the process with a WARNING."""
+    global _FAST_PATH_OK
+    if _FAST_PATH_OK is None:
+        try:
+            _FAST_PATH_OK = bool(_hmmc is not None and log_normalize
+                                 is not None and _run_calibration())
+        except Exception:  # calibration must never break predict
+            _FAST_PATH_OK = False
+        if not _FAST_PATH_OK:
+            logger.warning(
+                "RegimeHMMModel incremental fast path disabled: platform "
+                "calibration found a bitwise mismatch against the verbatim "
+                "path; using the verbatim path (results unaffected)")
+    return _FAST_PATH_OK
+
 
 class RegimeHMMModel(WalkForwardModel):
     """3-state Gaussian HMM over market-level features, seeded."""
+
+    @staticmethod
+    def fast_path_calibrated() -> bool:
+        """Whether this platform passed the once-per-process bitwise
+        calibration of the incremental predict fast path (tests use
+        this to decide whether cache-engagement assertions apply)."""
+        return _calibrated_fast_path()
 
     def __init__(self, n_components: int = 3, n_iter: int = 100,
                  random_state: int = 42):
@@ -413,7 +498,8 @@ class RegimeHMMModel(WalkForwardModel):
         if (_hmmc is None or log_normalize is None
                 or getattr(self._model, 'implementation', None) != 'log'
                 or self._fast_disabled_gen == self._fit_generation
-                or self._rebuild_streak >= 3):
+                or self._rebuild_streak >= 3
+                or not _calibrated_fast_path()):
             return self._predict_full(data, date)
         try:
             result = self._predict_fast(data)
