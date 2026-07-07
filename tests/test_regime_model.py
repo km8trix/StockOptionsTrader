@@ -459,3 +459,53 @@ class TestPredictFastPathEquivalence:
         date = idx[85]
         assert (model.predict(ragged, date)
                 == model._predict_full(ragged, date))
+
+    def test_close_dtype_change_after_warm_cache(self, market):
+        # A symbol turning float32 AFTER the cache is warm must hit the
+        # IN-LOOP dtype guard (not just the rebuild modelability scan)
+        # and still match the verbatim path exactly.
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        mutated = {s: (f.iloc[:86].astype(np.float32) if s == 'S1'
+                       else f.iloc[:86]) for s, f in frames.items()}
+        assert (model.predict(mutated, idx[85])
+                == model._predict_full(mutated, idx[85]))
+
+    def test_volume_dtype_change_after_warm_cache(self, market):
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        mutated = {s: f.iloc[:86].copy() for s, f in frames.items()}
+        mutated['S2']['volume'] = mutated['S2']['volume'].astype(np.int64)
+        assert (model.predict(mutated, idx[85])
+                == model._predict_full(mutated, idx[85]))
+
+    def test_disagreeing_new_tail_dates_rebuild(self, market):
+        # Every symbol grew by one row but on DIFFERENT dates: not one
+        # new union row — must rebuild and match verbatim.
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        skewed = {}
+        for s, f in frames.items():
+            grown = f.iloc[:86].copy()
+            if s == 'S0':
+                shifted = grown.index.to_numpy().copy()
+                shifted[-1] += np.timedelta64(12, 'h')
+                grown.index = pd.DatetimeIndex(shifted)
+            skewed[s] = grown
+        assert (model.predict(skewed, idx[85])
+                == model._predict_full(skewed, idx[85]))
+
+    def test_volume_only_interior_restatement_rebuilds(self, market):
+        # Closes and every endpoint untouched — only an interior VOLUME
+        # value restated. Only the volume byte-prefix check can see it.
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        mutated = {s: f.copy() for s, f in frames.items()}
+        mutated['S1'].iloc[-10, 1] *= 3.0  # volume column, inside window
+        data = {s: f.iloc[:86] for s, f in mutated.items()}
+        assert (model.predict(data, idx[85])
+                == model._predict_full(data, idx[85]))

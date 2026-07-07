@@ -546,7 +546,11 @@ class RegimeHMMModel(WalkForwardModel):
                     return self._rebuild_cache(data, unexpected=True)
                 volume_ser[symbol] = volume
                 vol_np[symbol] = vvals
-        if n_new == 0:
+        if not n_new:
+            # no growth anywhere — including n_new is None (a cached
+            # EMPTY universe polled again), which must not count as a
+            # ragged-growth rebuild or an empty-data transient would
+            # trip the sticky fallback for the rest of the session
             self._rebuild_streak = 0  # a clean byte-validated pass
             if cache['n_feat'] == 0:
                 return {}
@@ -660,8 +664,15 @@ class RegimeHMMModel(WalkForwardModel):
                 continue
             index = frame.index
             closes = frame['close']
+            # Sorted + unique is load-bearing: the union alignment in
+            # the verbatim path SORTS the index, so with sorted cached
+            # histories the strict-progression check guarantees an
+            # appended row is the union's LAST row; unsorted histories
+            # could pass every byte check yet answer for the wrong row.
             modelable = (isinstance(index, pd.DatetimeIndex)
                          and index.tz is None
+                         and index.is_monotonic_increasing
+                         and index.is_unique
                          and isinstance(closes, pd.Series)
                          and closes.to_numpy().dtype == np.float64
                          and closes.to_numpy().ndim == 1)
