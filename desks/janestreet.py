@@ -313,6 +313,11 @@ class JaneStreetDesk(Desk):
         #: In-run state only; every read prefix-validates all symbols'
         #: raw closes/index bytes, so it can never serve stale values.
         self._rv_cache: Optional[Dict] = None
+        #: consecutive UNEXPECTED cache rebuilds (history changed under
+        #: the cache). At 3 the cached path stands aside permanently and
+        #: _rv_zscore runs the verbatim full path — protects live
+        #: sessions that feed sliding windows from rebuild churn.
+        self._rv_rebuild_streak = 0
         #: C5-style regime series + C12 greeks series
         self._regime_series: List[Dict] = []
         self._current_regime: Optional[Dict] = None
@@ -1256,6 +1261,13 @@ class JaneStreetDesk(Desk):
         block, then compute over the whole cached block. Returns the z
         (float or None) or `_RV_REFUSE` to fall through."""
         cols = [etf] + basket
+        # A repeated symbol would desync the deduplicating dict join from
+        # the cols list; live sessions feeding SLIDING (non-expanding)
+        # windows would rebuild every call, paying MORE than the old
+        # path — after 3 consecutive unexpected rebuilds the cache stands
+        # aside permanently, which is exactly the pre-change behavior.
+        if len(set(cols)) != len(cols) or self._rv_rebuild_streak >= 3:
+            return _RV_REFUSE
         frames = {}
         for symbol in cols:  # the full path's early gate, same order
             frame = all_data.get(symbol)
@@ -1264,6 +1276,7 @@ class JaneStreetDesk(Desk):
             frames[symbol] = frame
         cache = self._rv_cache
         if cache is None or cache['cols'] != tuple(cols):
+            # cold start / universe change: an expected rebuild
             return self._rv_rebuild(frames, cols, date)
         for symbol in cols:
             arrs = self._rv_frame_arrays(frames[symbol])
@@ -1271,15 +1284,15 @@ class JaneStreetDesk(Desk):
                 return _RV_REFUSE
             vals, ts, dt_dtype = arrs
             if dt_dtype != cache['dt_dtype']:
-                return self._rv_rebuild(frames, cols, date)
+                return self._rv_rebuild(frames, cols, date, unexpected=True)
             c = cache['consumed'][symbol]
             n = len(vals)
             if n < c:
-                return self._rv_rebuild(frames, cols, date)
+                return self._rv_rebuild(frames, cols, date, unexpected=True)
             if not (np.array_equal(vals[:c].view(np.int64),
                                    cache['raw_vals'][symbol].view(np.int64))
                     and np.array_equal(ts[:c], cache['raw_ts'][symbol])):
-                return self._rv_rebuild(frames, cols, date)
+                return self._rv_rebuild(frames, cols, date, unexpected=True)
             if n > c:
                 new_vals, new_ts = vals[c:], ts[c:]
                 if (c and new_ts[0] <= cache['raw_ts'][symbol][-1]) \
@@ -1308,7 +1321,7 @@ class JaneStreetDesk(Desk):
             order = sorted(common)
             if order[0] <= cache['last_aligned_ts']:
                 # would land out of aligned order: restatement — rebuild
-                return self._rv_rebuild(frames, cols, date)
+                return self._rv_rebuild(frames, cols, date, unexpected=True)
             add = np.empty((len(cols), len(order)))
             for j, symbol in enumerate(cols):
                 pend = pending[symbol]
@@ -1317,14 +1330,20 @@ class JaneStreetDesk(Desk):
             cache['ts'] = np.concatenate(
                 [cache['ts'], np.asarray(order, dtype=np.int64)])
             cache['last_aligned_ts'] = int(cache['ts'][-1])
+        self._rv_rebuild_streak = 0  # a clean validated pass
         return self._rv_compute(cache, date, etf, basket)
 
     def _rv_rebuild(self, frames: Dict[str, pd.DataFrame], cols: List[str],
-                    date):
+                    date, unexpected: bool = False):
         """Cold start or any validation failure: rebuild the cache
         through the FULL PATH's own construction (`pd.DataFrame(dict)
         .dropna()`), so the cached rows are the full path's rows by
-        construction, then answer from the cache."""
+        construction, then answer from the cache. `unexpected` marks
+        rebuilds caused by history that changed under the cache (sliding
+        windows, restatements) — these feed the sticky-fallback streak;
+        cold starts and universe changes do not."""
+        if unexpected:
+            self._rv_rebuild_streak += 1
         self._rv_cache = None  # never leave a half-primed cache behind
         per = {}
         dt_dtype = None

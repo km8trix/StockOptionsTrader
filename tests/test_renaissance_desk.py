@@ -1335,13 +1335,20 @@ class TestMrZscoreCache:
     plain `==` (never approx): a 1-ulp drift must fail loudly."""
 
     @staticmethod
-    def _adversarial_frame(n=240, seed=3):
+    def _adversarial_frame(n=260, seed=3):
+        # Segmented so every hazard is exercised through the REAL-VALUE
+        # channel, not just the None channel: NaN holes early (None via
+        # warm-up/NaN windows), a 70-day constant run (None via std==0),
+        # then a clean region where a 1e9 outlier passes INTO and OUT OF
+        # live rolling windows (real z values before/during/after), and
+        # a zero close whose inf return poisons later windows (None
+        # again). Default config: k=3, w=60 -> length gate at 64.
         rng = np.random.default_rng(seed)
         px = rng.lognormal(4, 0.3, n)
-        px[rng.random(n) < 0.04] = np.nan      # data holes
-        px[rng.random(n) < 0.015] = 0.0        # zero close -> inf return
+        px[:40][rng.random(40) < 0.2] = np.nan  # data holes (early only)
         px[40:110] = 123.456                   # constant run -> std == 0
-        px[20] = 1e9                           # outlier in AND out of window
+        px[150] = 1e9                          # outlier through live windows
+        px[230] = 0.0                          # zero close -> inf return
         return pd.DataFrame({'close': px},
                             index=pd.bdate_range('2015-01-02', periods=n))
 
@@ -1354,16 +1361,36 @@ class TestMrZscoreCache:
     def test_cached_equals_uncached_across_expanding_prefixes(self):
         # One long-lived (cached) desk against a fresh desk at EVERY
         # prefix cut — the cross-date staleness net that catches any
-        # validator bug serving day d's z on day d+1, driven over NaN
-        # holes, an inf return, a 70-day constant window (std == 0) and
-        # a 1e9 outlier entering AND leaving the rolling window.
+        # validator bug serving day d's z on day d+1. Requires BOTH
+        # channels to be genuinely exercised: enough real z values
+        # (outlier entering/leaving live windows) AND enough None days
+        # (warm-up, NaN/inf-poisoned windows, std==0 constant run).
         frame = self._adversarial_frame()
         cached = RenaissanceDesk()
+        real = nones = 0
         for cut in range(1, len(frame) + 1):
             prefix = frame.iloc[:cut]
             fast = cached._mr_zscore(prefix, 'MRX')
             slow = RenaissanceDesk()._mr_zscore(prefix)
             assert (fast is None and slow is None) or fast == slow, cut
+            real += fast is not None
+            nones += fast is None
+        assert real >= 60, f"only {real} real-z comparisons"
+        assert nones >= 60, f"only {nones} None comparisons"
+
+    def test_multi_row_growth_matches_uncached(self):
+        # Live catch-ups can append several rows between calls; every
+        # growth batch size must extend the buffers exactly.
+        frame = self._clean_frame(200, 7)
+        cached = RenaissanceDesk()
+        real = 0
+        for cut in range(64, len(frame) + 1, 3):
+            prefix = frame.iloc[:cut]
+            fast = cached._mr_zscore(prefix, 'MRX')
+            slow = RenaissanceDesk()._mr_zscore(prefix)
+            assert (fast is None and slow is None) or fast == slow, cut
+            real += fast is not None
+        assert real >= 40
 
     def test_interior_close_change_never_serves_stale(self):
         # Same length, same endpoints — only the byte-for-byte prefix

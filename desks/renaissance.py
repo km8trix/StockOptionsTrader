@@ -539,7 +539,7 @@ class RenaissanceDesk(Desk):
                 # elementwise, then re-run the rolling over the FULL
                 # buffer (positions >= c are all >= k because the length
                 # guard already passed at the cached size).
-                with np.errstate(divide='ignore', invalid='ignore'):
+                with np.errstate(all='ignore'):  # exactly pandas' wrap
                     new_ret = vals[c:] / vals[c - k:n - k] - 1.0
                 entry['closes'] = np.concatenate([cached, vals[c:]])
                 entry['ret'] = np.concatenate([entry['ret'], new_ret])
@@ -548,7 +548,7 @@ class RenaissanceDesk(Desk):
                 entry = None  # not a prefix: rebuild below
         if entry is None:
             ret = np.full(n, np.nan)
-            with np.errstate(divide='ignore', invalid='ignore'):
+            with np.errstate(all='ignore'):  # exactly pandas' wrap
                 ret[k:] = vals[k:] / vals[:n - k] - 1.0
             entry = {'closes': vals.copy(), 'ret': ret}
             self._mr_roll(entry, w)
