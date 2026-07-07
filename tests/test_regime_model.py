@@ -295,3 +295,167 @@ class TestPredictFastPathEquivalence:
         monkeypatch.setattr(regime_mod, '_hmmc', None)
         assert model.predict({'MKT': market}, market.index[-1]) == want
         assert model._predict_cache is None  # fast path never engaged
+
+    # ---- validator-branch and staleness coverage ---------------------
+
+    @staticmethod
+    def _clean_universe(n_sym=3, n_days=90, seed=17):
+        rng = np.random.default_rng(seed)
+        idx = pd.bdate_range('2021-01-04', periods=n_days)
+        return {f'S{i}': pd.DataFrame(
+            {'close': 100 * np.exp(np.cumsum(rng.normal(0, 0.02, n_days))),
+             'volume': rng.lognormal(12, 0.5, n_days)}, index=idx)
+            for i in range(n_sym)}, idx
+
+    @staticmethod
+    def _fitted_on(frames):
+        model = RegimeHMMModel()
+        model.fit(frames)
+        assert model._fitted
+        return model
+
+    def _warm(self, model, frames, idx, upto):
+        data = {s: f.iloc[:upto] for s, f in frames.items()}
+        model.predict(data, idx[upto - 1])
+        assert model._predict_cache is not None
+        return data
+
+    def test_interior_close_restatement_never_serves_stale(self, market):
+        # A vendor correction with UNCHANGED endpoints: the byte-prefix
+        # validators must catch it and recompute — a stale cached-alpha
+        # answer here silently mis-gates the renaissance MR book in
+        # live sessions.
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        stale = model.predict({s: f.iloc[:86] for s, f in frames.items()},
+                              idx[85])
+        mutated = {s: f.copy() for s, f in frames.items()}
+        mutated['S1'].iloc[-10, 0] *= 2.0  # inside the rolling window
+        data = {s: f.iloc[:86] for s, f in mutated.items()}
+        want = model._predict_full(data, idx[85])
+        assert model.predict(data, idx[85]) == want
+        assert want != stale  # the restatement is detectable
+
+    def test_interior_timestamp_restatement_rebuilds(self, market):
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        mutated = {s: f.copy() for s, f in frames.items()}
+        shifted = mutated['S2'].index.to_numpy().copy()
+        # a calendar restatement that keeps the index sorted and unique
+        shifted[40] += np.timedelta64(12, 'h')
+        mutated['S2'].index = pd.DatetimeIndex(shifted)
+        data = {s: f.iloc[:86] for s, f in mutated.items()}
+        want = model._predict_full(data, idx[85])
+        assert model.predict(data, idx[85]) == want
+
+    def test_duplicate_tail_date_matches_verbatim(self, market):
+        # A laggard symbol plus a duplicate-date bar on the others
+        # passes uniform growth but NOT strict tail progression; the
+        # rebuild must reproduce the union-aligned frame exactly.
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        lag = {s: (f.iloc[:84] if s == 'S0' else f.iloc[:85])
+               for s, f in frames.items()}
+        model.predict(lag, idx[84])
+        glitch = {}
+        for s, f in frames.items():
+            if s == 'S0':
+                glitch[s] = f.iloc[:85]  # laggard catches up to d84
+            else:
+                extra = f.iloc[84:85]    # duplicate d84 bar appended
+                glitch[s] = pd.concat([f.iloc[:85], extra])
+        want = model._predict_full(glitch, idx[84])
+        assert model.predict(glitch, idx[84]) == want
+
+    def test_float32_closes_match_verbatim(self, market):
+        # float32 inputs: the scalar float64 replicas would diverge
+        # multi-ulp — the cache must refuse them (rebuild/verbatim are
+        # dtype-faithful) on every single day.
+        frames, idx = self._clean_universe()
+        frames = {s: f.astype(np.float32) for s, f in frames.items()}
+        model = self._fitted_on({'MKT': market})
+        for upto in range(80, 90):
+            data = {s: f.iloc[:upto] for s, f in frames.items()}
+            assert (model.predict(data, idx[upto - 1])
+                    == model._predict_full(data, idx[upto - 1])), upto
+
+    def test_first_feature_row_arrives_incrementally(self, market):
+        # Growing a fresh short universe past the rolling warm-up makes
+        # the FIRST surviving feature row arrive on the incremental
+        # path (the startprob_ forward branch, n_feat 0 -> 1).
+        frames, idx = self._clean_universe(n_days=40, seed=23)
+        model = self._fitted_on({'MKT': market})
+        for upto in range(5, 41):
+            data = {s: f.iloc[:upto] for s, f in frames.items()}
+            assert (model.predict(data, idx[upto - 1])
+                    == model._predict_full(data, idx[upto - 1])), upto
+        assert model._predict_cache['n_feat'] >= 1
+        assert model._rebuild_streak == 0  # growth stayed incremental
+
+    def test_incremental_poisoned_row_stands_aside(self, market):
+        # Poison the scaler AFTER the cache is warm: the very next
+        # incremental row z-scores to inf — the fast path must disable
+        # itself for the generation, matching the verbatim {} forever.
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        col_mean, col_std = model._scaler
+        model._scaler = (col_mean, np.zeros_like(col_std))
+        data = {s: f.iloc[:86] for s, f in frames.items()}
+        assert model.predict(data, idx[85]) == {}
+        assert model._fast_disabled_gen == model._fit_generation
+        assert model.predict(data, idx[85]) == {}
+
+    def test_exception_in_fast_path_falls_back(self, market, monkeypatch):
+        # The dispatcher's except -> verbatim net: a fast-path crash
+        # must produce the verbatim answer and clear the cache.
+        import desks.regime as regime_mod
+
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        data = {s: f.iloc[:86] for s, f in frames.items()}
+        want = model._predict_full(data, idx[85])
+
+        class Boom:
+            @staticmethod
+            def forward_log(*args):
+                raise RuntimeError('boom')
+
+        monkeypatch.setattr(regime_mod, '_hmmc', Boom)
+        assert model.predict(data, idx[85]) == want
+        assert model._predict_cache is None
+
+    def test_sliding_windows_go_sticky_after_three_rebuilds(self, market):
+        # Live feeds may hand SLIDING windows; every one fails the
+        # prefix check. After 3 consecutive unexpected rebuilds the
+        # fast path stands aside permanently (rebuild-per-call is
+        # slightly slower than the verbatim path) while every answer
+        # still equals the verbatim path exactly.
+        frames, idx = self._clean_universe(n_days=120, seed=29)
+        model = self._fitted_on({'MKT': market})
+        for i in range(80, 92):
+            window = {s: f.iloc[i - 60:i + 1] for s, f in frames.items()}
+            assert (model.predict(window, idx[i])
+                    == model._predict_full(window, idx[i])), i
+        assert model._rebuild_streak == 3  # capped: churn has stopped
+
+    def test_symbol_set_change_rebuilds(self, market):
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 85)
+        smaller = {s: f.iloc[:86] for s, f in frames.items() if s != 'S1'}
+        assert (model.predict(smaller, idx[85])
+                == model._predict_full(smaller, idx[85]))
+
+    def test_non_uniform_growth_rebuilds(self, market):
+        frames, idx = self._clean_universe()
+        model = self._fitted_on({'MKT': market})
+        self._warm(model, frames, idx, 84)
+        ragged = {s: f.iloc[:86 if s == 'S0' else 85]
+                  for s, f in frames.items()}
+        date = idx[85]
+        assert (model.predict(ragged, date)
+                == model._predict_full(ragged, date))

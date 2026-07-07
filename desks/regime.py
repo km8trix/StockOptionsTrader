@@ -149,6 +149,12 @@ class RegimeHMMModel(WalkForwardModel):
         # Derived-state cache validated as an exact extension of the
         # controller-handed data on every call (see predict docstring).
         self._predict_cache: Optional[Dict] = None
+        # Consecutive UNEXPECTED rebuilds (history changed under the
+        # cache: sliding windows, restatements, unmodeled inputs). At 3
+        # the fast path stands aside permanently — rebuild-per-call is
+        # slightly SLOWER than the verbatim path, so churning feeds must
+        # get exactly the pre-change behavior.
+        self._rebuild_streak = 0
 
     # ------------------------------------------------------------------
     # Feature engineering
@@ -396,14 +402,18 @@ class RegimeHMMModel(WalkForwardModel):
         hand-rolled logaddexp replica (measured ~1-ulp wrong) and NEVER
         a trailing-window rolling recompute (path-dependent Kahan
         state); every new rolling value comes from a full-series pandas
-        pass. Any validation failure rebuilds from scratch (cheaper than
-        the verbatim path — no backward pass); any surprise falls back
-        to the verbatim path, which is preserved as _predict_full."""
+        pass. Any validation failure rebuilds from scratch (a
+        forward-only pass, roughly the verbatim path's cost); after 3
+        consecutive unexpected rebuilds — a sliding-window or restating
+        feed — the fast path stands aside permanently, restoring exactly
+        the pre-change behavior. Any surprise falls back to the verbatim
+        path, which is preserved as _predict_full."""
         if not self._fitted or self._model is None or self._scaler is None:
             return {}
         if (_hmmc is None or log_normalize is None
                 or getattr(self._model, 'implementation', None) != 'log'
-                or self._fast_disabled_gen == self._fit_generation):
+                or self._fast_disabled_gen == self._fit_generation
+                or self._rebuild_streak >= 3):
             return self._predict_full(data, date)
         try:
             result = self._predict_fast(data)
@@ -455,14 +465,17 @@ class RegimeHMMModel(WalkForwardModel):
                 vol_syms.append(symbol)
         return tuple(close_syms), tuple(vol_syms)
 
-    @staticmethod
-    def _same_value(a: float, b: float) -> bool:
-        """NaN-aware scalar equality for the endpoint spot checks."""
-        return a == b or (a != a and b != b)
-
     def _predict_fast(self, data: Dict[str, pd.DataFrame]) -> Optional[Dict]:
         """Cache-validated incremental predict. Returns the result dict
-        ({} included) or None to refuse to the verbatim path."""
+        ({} included) or None to refuse to the verbatim path.
+
+        Validation is BYTE-FOR-BYTE: every symbol's full consumed
+        close/volume/timestamp prefix is compared against the cached
+        copies on every call, so a stale hit requires an exact value
+        collision — interior restatements (live-session vendor
+        corrections) force a rebuild, never a silently stale posterior.
+        The accessors and prefix compares are the validation cost
+        (~O(history) memcmp per symbol; trivial next to the kernels)."""
         cache = self._predict_cache
         if cache is None or cache['gen'] != self._fit_generation:
             return self._rebuild_cache(data)
@@ -471,56 +484,82 @@ class RegimeHMMModel(WalkForwardModel):
                 or vol_syms != cache['vol_syms']):
             return self._rebuild_cache(data)
         # Uniform-growth validation: every close symbol grew by the same
-        # n_new rows on top of a verified endpoint, and for n_new == 1
-        # all new tail dates are identical (one new union row). Arrays
-        # are fetched ONCE per symbol here and reused below — the
-        # accessors, not the checks, are the validation cost.
+        # n_new rows on a byte-verified prefix, new timestamps strictly
+        # progress past the consumed tail, and for n_new == 1 all new
+        # tail dates are identical (exactly one new union row).
         vol_set = set(vol_syms)
         closes_np: Dict[str, np.ndarray] = {}
         volume_ser: Dict[str, pd.Series] = {}
+        ts_np: Dict[str, np.ndarray] = {}
+        vol_np: Dict[str, np.ndarray] = {}
         n_new = None
         new_tail = None
         for symbol in close_syms:
             frame = data[symbol]
             meta = cache['meta'][symbol]
-            n_prev, first_ts, last_ts, last_close, last_vol = meta
+            n_prev = meta['n']
             n = len(frame)
-            if n < n_prev or frame.index[0] != first_ts:
-                return self._rebuild_cache(data)
+            index = frame.index
+            if (n < n_prev or not isinstance(index, pd.DatetimeIndex)
+                    or index.tz is not None
+                    or index.dtype != meta['dtype']):
+                return self._rebuild_cache(data, unexpected=True)
+            closes = frame['close'].to_numpy()
+            if closes.dtype != np.float64 or closes.ndim != 1:
+                # Non-float64 inputs: the scalar float64 replicas below
+                # would diverge multi-ulp from the verbatim pandas ops;
+                # only the rebuild/verbatim constructions are faithful.
+                return self._rebuild_cache(data, unexpected=True)
+            closes = np.ascontiguousarray(closes)
+            ts = np.ascontiguousarray(index.asi8)
+            if not (np.array_equal(closes[:n_prev].view(np.int64),
+                                   meta['closes'].view(np.int64))
+                    and np.array_equal(ts[:n_prev], meta['ts'])):
+                return self._rebuild_cache(data, unexpected=True)
             grew = n - n_prev
             if n_new is None:
                 n_new = grew
             elif grew != n_new:
-                return self._rebuild_cache(data)
-            if frame.index[n_prev - 1] != last_ts:
-                return self._rebuild_cache(data)
-            closes = frame['close'].to_numpy()
-            closes_np[symbol] = closes
-            if not self._same_value(float(closes[n_prev - 1]), last_close):
-                return self._rebuild_cache(data)
-            if symbol in vol_set:
-                volume = frame['volume']
-                volume_ser[symbol] = volume
-                if last_vol is not None and not self._same_value(
-                        float(volume.to_numpy()[n_prev - 1]), last_vol):
-                    return self._rebuild_cache(data)
+                return self._rebuild_cache(data, unexpected=True)
             if grew:
+                new_ts = ts[n_prev:]
+                if (new_ts[0] <= meta['ts'][-1]
+                        or (len(new_ts) > 1
+                            and (np.diff(new_ts) <= 0).any())):
+                    # duplicate/backfilled dates: the union frame would
+                    # differ from one synthetic appended row
+                    return self._rebuild_cache(data, unexpected=True)
                 if new_tail is None:
                     new_tail = frame.index[-1]
                 elif frame.index[-1] != new_tail:
-                    return self._rebuild_cache(data)
+                    return self._rebuild_cache(data, unexpected=True)
+            closes_np[symbol] = closes
+            ts_np[symbol] = ts
+            if symbol in vol_set:
+                volume = frame['volume']
+                vvals = volume.to_numpy()
+                if vvals.dtype != np.float64 or vvals.ndim != 1:
+                    return self._rebuild_cache(data, unexpected=True)
+                vvals = np.ascontiguousarray(vvals)
+                if not np.array_equal(vvals[:n_prev].view(np.int64),
+                                      meta['vols'].view(np.int64)):
+                    return self._rebuild_cache(data, unexpected=True)
+                volume_ser[symbol] = volume
+                vol_np[symbol] = vvals
         if n_new == 0:
+            self._rebuild_streak = 0  # a clean byte-validated pass
             if cache['n_feat'] == 0:
                 return {}
             return self._posterior_from_alpha(cache['alpha'])
         if n_new != 1:
-            return self._rebuild_cache(data)
+            # ragged growth (a stale symbol): rebuild reproduces the
+            # union alignment exactly
+            return self._rebuild_cache(data, unexpected=True)
 
         # ---- one new row per symbol: extend features incrementally ----
         col_mean, col_std = self._scaler
         ret_last: Dict[str, np.float64] = {}
         vr_last: Dict[str, np.float64] = {}
-        vol_np: Dict[str, np.ndarray] = {}
         with np.errstate(all='ignore'):  # exactly pandas' wrap
             for symbol in close_syms:
                 closes = closes_np[symbol]
@@ -533,9 +572,8 @@ class RegimeHMMModel(WalkForwardModel):
                 # state is path-dependent, a trailing window is ~1 ulp
                 # wrong — only the full pass is bit-identical.
                 vol_avg = volume.rolling(ROLLING_WINDOW).mean().to_numpy()
-                vals = volume.to_numpy()
-                vol_np[symbol] = vals
-                vr_last[symbol] = np.float64(vals[-1] / vol_avg[-1])
+                vr_last[symbol] = np.float64(
+                    vol_np[symbol][-1] / vol_avg[-1])
         mkt_new = np.float64(
             pd.DataFrame(ret_last, index=[0]).mean(axis=1).iloc[0])
         vr_new = (np.float64(
@@ -582,26 +620,59 @@ class RegimeHMMModel(WalkForwardModel):
 
         # Commit only after every step succeeded.
         for symbol in close_syms:
-            frame = data[symbol]
-            closes = closes_np[symbol]
+            meta = cache['meta'][symbol]
+            n_prev = meta['n']
+            meta['n'] = len(closes_np[symbol])
+            meta['closes'] = np.concatenate(
+                [meta['closes'], closes_np[symbol][n_prev:]])
+            meta['ts'] = np.concatenate(
+                [meta['ts'], ts_np[symbol][n_prev:]])
             vols = vol_np.get(symbol)
-            cache['meta'][symbol] = (
-                len(frame), frame.index[0], frame.index[-1],
-                float(closes[-1]),
-                float(vols[-1]) if vols is not None else None)
+            if vols is not None:
+                meta['vols'] = np.concatenate(
+                    [meta['vols'], vols[n_prev:]])
         cache['mkt_raw'] = mkt_raw
         cache['alpha'] = alpha
         cache['n_feat'] = n_feat
+        self._rebuild_streak = 0  # a clean byte-validated pass
         if n_feat == 0:
             return {}
         return self._posterior_from_alpha(alpha)
 
-    def _rebuild_cache(self, data: Dict[str, pd.DataFrame]
-                       ) -> Optional[Dict]:
+    def _rebuild_cache(self, data: Dict[str, pd.DataFrame],
+                       unexpected: bool = False) -> Optional[Dict]:
         """Cold start or any validation failure: rebuild from the full
-        construction (one forward-only pass — cheaper than the verbatim
-        path's forward+backward), then answer from the cache."""
+        construction (one forward-only pass; roughly the verbatim
+        path's cost), then answer from the cache. `unexpected` marks
+        rebuilds caused by history that changed under the cache
+        (sliding windows, restatements, ragged/duplicated feeds) —
+        these feed the sticky-fallback streak; cold starts, refits and
+        universe changes do not."""
+        if unexpected:
+            self._rebuild_streak += 1
         self._predict_cache = None
+        # Modelability scan: inputs the byte-validated cache cannot
+        # represent (non-float64 values, non-DatetimeIndex/tz indexes)
+        # refuse to the verbatim path — and count toward the sticky
+        # streak so persistent unmodeled feeds stop paying for scans.
+        for symbol, frame in data.items():
+            if frame is None or frame.empty or 'close' not in frame.columns:
+                continue
+            index = frame.index
+            closes = frame['close']
+            modelable = (isinstance(index, pd.DatetimeIndex)
+                         and index.tz is None
+                         and isinstance(closes, pd.Series)
+                         and closes.to_numpy().dtype == np.float64
+                         and closes.to_numpy().ndim == 1)
+            if modelable and 'volume' in frame.columns:
+                volume = frame['volume']
+                modelable = (isinstance(volume, pd.Series)
+                             and volume.to_numpy().dtype == np.float64
+                             and volume.to_numpy().ndim == 1)
+            if not modelable:
+                self._rebuild_streak += 1
+                return None
         features, mkt_raw, close_syms, vol_syms = \
             self._market_features_parts(data)
         col_mean, col_std = self._scaler
@@ -619,16 +690,20 @@ class RegimeHMMModel(WalkForwardModel):
                 self._model.startprob_, self._model.transmat_,
                 frame_logprob)
             alpha = fwd[-1]
+        vol_set = set(vol_syms)
         meta = {}
         for symbol in close_syms:
             frame = data[symbol]
-            closes = frame['close'].to_numpy()
-            vols = (data[symbol]['volume'].to_numpy()
-                    if symbol in set(vol_syms) else None)
-            meta[symbol] = (
-                len(frame), frame.index[0], frame.index[-1],
-                float(closes[-1]),
-                float(vols[-1]) if vols is not None else None)
+            meta[symbol] = {
+                'n': len(frame),
+                'dtype': frame.index.dtype,
+                'closes': np.ascontiguousarray(
+                    frame['close'].to_numpy()).copy(),
+                'ts': np.ascontiguousarray(frame.index.asi8).copy(),
+                'vols': (np.ascontiguousarray(
+                    frame['volume'].to_numpy()).copy()
+                    if symbol in vol_set else None),
+            }
         self._predict_cache = {
             'gen': self._fit_generation,
             'close_syms': close_syms,
