@@ -382,3 +382,20 @@ class TestFastPathEquivalence:
 
         assert fired['n'] > 0  # the fast path genuinely ran
         assert fast_scores == slow_scores  # exact ==, no tolerance
+
+    def test_batched_predict_proba_equals_per_row(self):
+        """Pins the batching assumption predict now rests on: per-row tree
+        traversal makes one (n, k) predict_proba call bit-identical to n
+        separate single-row calls (deterministic=True, num_threads=1)."""
+        panel = self._enriched_panel()
+        model = LightGBMModel()
+        model.fit(panel)
+        from desks.features import extended_feature_frame
+        rows = np.vstack([
+            extended_feature_frame(f).iloc[[-1]].to_numpy(dtype=float)
+            for f in panel.values()])
+        batched = model._booster.predict_proba(rows)[:, 1]
+        per_row = np.array([
+            model._booster.predict_proba(rows[[i]])[0, 1]
+            for i in range(len(rows))])
+        assert (batched == per_row).all()
