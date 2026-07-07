@@ -1326,3 +1326,110 @@ class TestEarningsEntryGate:
         skips = [n for n in desk.notes
                  if n.data.get('skipped') == ['S00']]
         assert len(skips) == 1 and skips[0].data['book'] == 'stat_arb'
+
+
+class TestMrZscoreCache:
+    """_mr_zscore's byte-validated per-symbol cache (the `symbol` arg)
+    must be bit-indistinguishable from the uncached pandas path — the
+    repo's exact-equality determinism contract. All comparisons use
+    plain `==` (never approx): a 1-ulp drift must fail loudly."""
+
+    @staticmethod
+    def _adversarial_frame(n=260, seed=3):
+        # Segmented so every hazard is exercised through the REAL-VALUE
+        # channel, not just the None channel: NaN holes early (None via
+        # warm-up/NaN windows), a 70-day constant run (None via std==0),
+        # then a clean region where a 1e9 outlier passes INTO and OUT OF
+        # live rolling windows (real z values before/during/after), and
+        # a zero close whose inf return poisons later windows (None
+        # again). Default config: k=3, w=60 -> length gate at 64.
+        rng = np.random.default_rng(seed)
+        px = rng.lognormal(4, 0.3, n)
+        px[:40][rng.random(40) < 0.2] = np.nan  # data holes (early only)
+        px[40:110] = 123.456                   # constant run -> std == 0
+        px[150] = 1e9                          # outlier through live windows
+        px[230] = 0.0                          # zero close -> inf return
+        return pd.DataFrame({'close': px},
+                            index=pd.bdate_range('2015-01-02', periods=n))
+
+    @staticmethod
+    def _clean_frame(n, seed):
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame({'close': rng.lognormal(4, 0.2, n)},
+                            index=pd.bdate_range('2015-01-02', periods=n))
+
+    def test_cached_equals_uncached_across_expanding_prefixes(self):
+        # One long-lived (cached) desk against a fresh desk at EVERY
+        # prefix cut — the cross-date staleness net that catches any
+        # validator bug serving day d's z on day d+1. Requires BOTH
+        # channels to be genuinely exercised: enough real z values
+        # (outlier entering/leaving live windows) AND enough None days
+        # (warm-up, NaN/inf-poisoned windows, std==0 constant run).
+        frame = self._adversarial_frame()
+        cached = RenaissanceDesk()
+        real = nones = 0
+        for cut in range(1, len(frame) + 1):
+            prefix = frame.iloc[:cut]
+            fast = cached._mr_zscore(prefix, 'MRX')
+            slow = RenaissanceDesk()._mr_zscore(prefix)
+            assert (fast is None and slow is None) or fast == slow, cut
+            real += fast is not None
+            nones += fast is None
+        assert real >= 60, f"only {real} real-z comparisons"
+        assert nones >= 60, f"only {nones} None comparisons"
+
+    def test_multi_row_growth_matches_uncached(self):
+        # Live catch-ups can append several rows between calls; every
+        # growth batch size must extend the buffers exactly.
+        frame = self._clean_frame(200, 7)
+        cached = RenaissanceDesk()
+        real = 0
+        for cut in range(64, len(frame) + 1, 3):
+            prefix = frame.iloc[:cut]
+            fast = cached._mr_zscore(prefix, 'MRX')
+            slow = RenaissanceDesk()._mr_zscore(prefix)
+            assert (fast is None and slow is None) or fast == slow, cut
+            real += fast is not None
+        assert real >= 40
+
+    def test_interior_close_change_never_serves_stale(self):
+        # Same length, same endpoints — only the byte-for-byte prefix
+        # check can catch the interior mutation. It must recompute,
+        # matching a fresh desk, never the stale entry.
+        frame = self._clean_frame(120, 9)
+        desk = RenaissanceDesk()
+        stale = desk._mr_zscore(frame, 'MRX')
+        mutated = frame.copy()
+        # The row sits INSIDE the final rolling window so the mutation
+        # must move the z (outside it, only accumulator residue shifts).
+        mutated.iloc[-10, mutated.columns.get_loc('close')] = 999.0
+        fresh = RenaissanceDesk()._mr_zscore(mutated)
+        assert desk._mr_zscore(mutated, 'MRX') == fresh
+        assert fresh != stale  # the mutation is detectable
+
+    def test_shorter_prefix_reads_from_longer_compute(self):
+        # Rolling prefix-stability: after warming on the full frame, an
+        # earlier date's query serves the exact uncached value.
+        frame = self._clean_frame(150, 4)
+        desk = RenaissanceDesk()
+        desk._mr_zscore(frame, 'MRX')  # warm at full length
+        prefix = frame.iloc[:100]
+        assert (desk._mr_zscore(prefix, 'MRX')
+                == RenaissanceDesk()._mr_zscore(prefix))
+
+    def test_non_float64_closes_refuse_the_cache(self):
+        n = 90
+        frame = pd.DataFrame(
+            {'close': np.arange(100, 100 + n, dtype=np.int64)},
+            index=pd.bdate_range('2015-01-02', periods=n))
+        desk = RenaissanceDesk()
+        assert (desk._mr_zscore(frame, 'MRX')
+                == RenaissanceDesk()._mr_zscore(frame))
+        assert 'MRX' not in desk._mr_z_cache  # refused, not mis-cached
+
+    def test_symbolless_call_stays_uncached_and_agrees(self):
+        frame = self._clean_frame(110, 8)
+        desk = RenaissanceDesk()
+        z_plain = desk._mr_zscore(frame)
+        assert desk._mr_z_cache == {}
+        assert z_plain == RenaissanceDesk()._mr_zscore(frame, 'MRX')

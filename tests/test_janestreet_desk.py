@@ -796,3 +796,149 @@ class TestExerciseStyle:
         am_c = am._price_leg(100.0, 95.0, 0.5, 0.30, 'call')
         eu_c = eu._price_leg(100.0, 95.0, 0.5, 0.30, 'call')
         assert am_c == pytest.approx(eu_c, rel=1e-3)
+
+
+class TestRvZscoreCache:
+    """_rv_zscore's aligned-closes-block cache must be
+    bit-indistinguishable from _rv_zscore_full (the preserved verbatim
+    body) — including None-day agreement — over the engine's
+    expanding-prefix pattern, interior restatements, universe changes,
+    shrunken histories and refused input shapes. All comparisons use
+    plain `==` (never approx): a 1-ulp drift must fail loudly."""
+
+    @staticmethod
+    def _universe(m, n, seed, ragged=True, holes=True):
+        rng = np.random.default_rng(seed)
+        idx = pd.bdate_range('2015-01-02', periods=n)
+        frames = {}
+        for i in range(m):
+            px = rng.lognormal(4, 0.25, n)
+            if holes:
+                px[rng.random(n) < 0.03] = np.nan  # per-symbol data holes
+            start = int(rng.integers(0, 4)) if ragged else 0
+            frames[f'S{i:03d}'] = pd.DataFrame(
+                {'close': px[start:]}, index=idx[start:])
+        return frames, idx
+
+    def _sweep(self, m, n, seed, holes=True, step=1, min_real=40):
+        # One long-lived (cached) desk against a FRESH full-path call
+        # at every day of an expanding-window drive (the engine's
+        # pattern), with ragged calendars so alignment does real work.
+        # Asserts exact equality including None days, and that at least
+        # `min_real` comparisons were REAL z values — a sweep whose
+        # every day is None==None certifies nothing about the compute.
+        frames, idx = self._universe(m, n, seed, holes=holes)
+        syms = sorted(frames)
+        etf, basket = syms[0], syms[1:]
+        cached = JaneStreetDesk()
+        real = 0
+        for cut in range(1, n + 1, step):
+            date = idx[cut - 1]
+            all_data = {s: f.loc[:date] for s, f in frames.items()}
+            all_data = {s: f for s, f in all_data.items() if len(f)}
+            if set(all_data) != set(syms):
+                continue
+            fast = cached._rv_zscore(all_data, date, etf, basket)
+            slow = JaneStreetDesk()._rv_zscore_full(
+                all_data, date, etf, basket)
+            assert (fast is None and slow is None) or fast == slow, cut
+            real += fast is not None
+        assert real >= min_real, f"only {real} non-None comparisons"
+
+    def test_pair_universe_tracks_full_path(self):
+        self._sweep(2, 170, 11)
+
+    def test_wide_basket_tracks_full_path(self):
+        # Full-universe width (99-name basket): row-mean reductions are
+        # memory-layout-sensitive at this width, so the narrow sweeps
+        # alone cannot certify the cached block compute. No NaN holes:
+        # at 100 symbols a 3%-hole row survives alignment with p~0.05
+        # and the window would never fill — the sweep would be vacuous.
+        self._sweep(100, 130, 12, holes=False)
+
+    def test_multi_row_growth_tracks_full_path(self):
+        # Engine days advance one row at a time; live catch-ups can
+        # append several — every growth batch size must stay exact.
+        self._sweep(5, 170, 13, holes=False, step=3, min_real=25)
+
+    def test_interior_restatement_never_serves_stale(self):
+        frames, idx = self._universe(4, 130, 5, ragged=False)
+        syms = sorted(frames)
+        etf, basket = syms[0], syms[1:]
+        date = idx[-1]
+        desk = JaneStreetDesk()
+        stale = desk._rv_zscore(frames, date, etf, basket)
+        mutated = {s: f.copy() for s, f in frames.items()}
+        # Same length, same endpoints; the row sits INSIDE the final
+        # rolling window so the restatement must move the z.
+        mutated['S002'].iloc[-10, 0] = 999.0
+        fresh = JaneStreetDesk()._rv_zscore_full(mutated, date, etf, basket)
+        assert desk._rv_zscore(mutated, date, etf, basket) == fresh
+        assert fresh != stale  # the restatement is detectable
+
+    def test_universe_change_rebuilds_cleanly(self):
+        frames, idx = self._universe(4, 130, 7, ragged=False)
+        syms = sorted(frames)
+        date = idx[-1]
+        desk = JaneStreetDesk()
+        desk._rv_zscore(frames, date, syms[0], syms[1:])
+        etf2, basket2 = syms[1], [syms[0]] + syms[2:]
+        assert (desk._rv_zscore(frames, date, etf2, basket2)
+                == JaneStreetDesk()._rv_zscore_full(
+                    frames, date, etf2, basket2))
+
+    def test_shrunken_history_rebuilds(self):
+        frames, idx = self._universe(3, 140, 8, ragged=False)
+        syms = sorted(frames)
+        etf, basket = syms[0], syms[1:]
+        desk = JaneStreetDesk()
+        desk._rv_zscore(frames, idx[-1], etf, basket)  # warm at full
+        short = {s: f.iloc[:120] for s, f in frames.items()}
+        date = idx[119]
+        assert (desk._rv_zscore(short, date, etf, basket)
+                == JaneStreetDesk()._rv_zscore_full(
+                    short, date, etf, basket))
+
+    def test_non_datetime_index_refuses_the_cache(self):
+        n = 130
+        rng = np.random.default_rng(3)
+        frames = {s: pd.DataFrame({'close': rng.lognormal(4, 0.2, n)})
+                  for s in ('A', 'B')}  # RangeIndex: cache refuses
+        desk = JaneStreetDesk()
+        got = desk._rv_zscore(frames, n - 1, 'A', ['B'])
+        assert desk._rv_cache is None  # refused, never half-primed
+        assert got == JaneStreetDesk()._rv_zscore_full(
+            frames, n - 1, 'A', ['B'])
+
+    def test_duplicate_symbol_refuses_and_matches_full_path(self):
+        # A repeated symbol in [etf]+basket must fall through to the
+        # verbatim full path (the dict join dedupes columns, so the
+        # cached block cannot represent the duplicate-label selection),
+        # never crash, never diverge.
+        frames, idx = self._universe(3, 130, 9, ragged=False, holes=False)
+        date = idx[-1]
+        for etf, basket in (('S000', ['S000', 'S001', 'S002']),
+                            ('S000', ['S001', 'S001', 'S002'])):
+            desk = JaneStreetDesk()
+            assert (desk._rv_zscore(frames, date, etf, basket)
+                    == JaneStreetDesk()._rv_zscore_full(
+                        frames, date, etf, basket))
+            assert desk._rv_cache is None  # refused outright
+
+    def test_sliding_windows_go_sticky_after_three_rebuilds(self):
+        # Live sessions may feed SLIDING windows; every one fails the
+        # prefix check. After 3 consecutive unexpected rebuilds the
+        # cached path must stand aside permanently (pre-change behavior,
+        # no rebuild churn) while every answer still equals the full
+        # path exactly.
+        frames, idx = self._universe(3, 200, 10, ragged=False, holes=False)
+        syms = sorted(frames)
+        etf, basket = syms[0], syms[1:]
+        desk = JaneStreetDesk()
+        for i in range(120, 130):  # 80-day sliding tail windows
+            window = {s: f.iloc[i - 80:i + 1] for s, f in frames.items()}
+            date = idx[i]
+            assert (desk._rv_zscore(window, date, etf, basket)
+                    == JaneStreetDesk()._rv_zscore_full(
+                        window, date, etf, basket)), i
+        assert desk._rv_rebuild_streak == 3  # capped: churn has stopped
