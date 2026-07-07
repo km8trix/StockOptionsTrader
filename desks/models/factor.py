@@ -464,39 +464,79 @@ def _truncated_predict_data(
 # ----------------------------------------------------------------------
 # Once-per-process platform calibration of the truncation fast path.
 #
-# The bit-identity argument above is positional (identical window contents
-# at identical relative offsets through the UNCHANGED builder), but numpy
-# reduction kernels have been observed to differ across platforms for
-# layout/shape changes that look equivalent on paper. So the fast path is
-# probed against the verbatim path once per process on deterministic
-# synthetic data and stands aside entirely on any bitwise mismatch.
-# Platform drift becomes a logged, perf-only regression, never a silent
-# number change.
+# The bit-identity argument above is positional at the FACTOR level, but the
+# low-vol / risk-adjusted-momentum factors run a two-pass std over a
+# sliding-window view whose reduction blocking depends on the FULL clean-
+# return array shape, not just each 60-element window's contents. Truncation
+# changes that array's length, and x86 SIMD reduction kernels have been
+# observed (Linux CI, PR #81) to round the SAME window 1 ULP apart at
+# different array heights — so truncated-vs-full is NOT bit-identical on
+# every platform. The fast path is therefore probed against the verbatim
+# path once per process over a DIVERSE sweep of long, variously-stale panel
+# shapes (the shapes real backtests hit, incl. the exact shape that first
+# exposed the drift) and stands aside entirely on the process on any bitwise
+# mismatch. On a shape-sensitive platform the whole fast path disables (a
+# logged, perf-only regression); a silent number change is impossible.
 # ----------------------------------------------------------------------
 _FAST_PATH_OK: Optional[bool] = None
 
 
 def _calibration_universe():
-    """Two deterministic panels exercising both engaged-truncation shapes:
-    a shared-last-date panel (single needed date -> pad path) and a
-    mixed-last-dates panel (stale symbols -> multi-date path)."""
-    rng = np.random.default_rng(11)
-    idx = pd.bdate_range('2016-01-04', periods=700)
-    shared = {}
-    for i in range(10):
-        close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.02, 700)))
-        shared[f'F{i}'] = pd.DataFrame(
-            {'close': close, 'volume': np.full(700, 1e6)}, index=idx)
-    stale = dict(shared)
-    stale['F3'] = shared['F3'].iloc[:660]
-    stale['F7'] = shared['F7'].iloc[:590]
-    return shared, stale
+    """Deterministic panels exercising the engaged-truncation shapes that
+    stress the shape-sensitive vol reduction: shared-last-date (pad path)
+    and mixed-last-date (stale symbols) panels across a range of history
+    lengths (up to real-backtest depth) and staleness patterns, at wide
+    symbol counts. Each panel MUST engage truncation (n well over the
+    275-row tail) so the probe compares the fast path, not a no-op."""
+    def _panel(n, n_sym, seed, stale=()):
+        rng = np.random.default_rng(seed)
+        idx = pd.bdate_range('2015-01-02', periods=n)
+        data = {}
+        for i in range(n_sym):
+            close = 100.0 * np.exp(
+                np.cumsum(rng.normal(0.0, 0.01 + 0.004 * i, n)))
+            data[f'F{i}'] = pd.DataFrame(
+                {'close': close, 'volume': np.full(n, 1e6)}, index=idx)
+        for sym, drop in stale:
+            data[sym] = data[sym].iloc[:n - drop]
+        return data
+
+    def _pr81_panel():
+        # Data BYTE-IDENTICAL to tests' adversarial `stale_5_35_100` golden
+        # (the exact shape whose 1-ULP vol drift first exposed the platform
+        # sensitivity on Linux CI). Matching the data — not just the shape —
+        # GUARANTEES this probe reproduces that golden's divergence on any
+        # platform where it exists, so the fast path deterministically
+        # disables there rather than shipping a case the goldens then fail.
+        idx = pd.bdate_range(end='2024-12-31', periods=900)
+        data = {}
+        for i in range(10):
+            rng = np.random.default_rng(300 + i)
+            close = 100.0 * np.cumprod(
+                1.0 + rng.normal(0.0006 * (i - 5.0), 0.012, 900))
+            data[f'S{i:02d}'] = pd.DataFrame(
+                {'close': close, 'volume': np.full(900, 500_000.0)}, index=idx)
+        for sym, drop in (('S02', 5), ('S05', 35), ('S07', 100)):
+            data[sym] = data[sym].iloc[:900 - drop]
+        return data
+
+    return [
+        _panel(800, 8, 11),                                  # shared, medium
+        _panel(1500, 12, 12),                                # shared, wide+long
+        _panel(2200, 8, 13),                                 # shared, backtest-deep
+        _panel(900, 10, 14, stale=[('F2', 5), ('F5', 35),    # PR#81-shaped
+                                   ('F7', 100)]),
+        _panel(1500, 10, 15, stale=[('F1', 2), ('F4', 60),   # long + varied stale
+                                    ('F8', 250)]),
+        _pr81_panel(),                                       # PR#81 exact data
+    ]
 
 
 def _run_calibration() -> bool:
     """Drive the truncated build against the verbatim full build through
-    the same scoring machinery on a hand-weighted model. Requires the fast
-    path to actually engage, and every score to match bit-for-bit."""
+    the same scoring machinery on a hand-weighted model, over every
+    calibration panel. Requires the fast path to actually engage on each,
+    and every score to match bit-for-bit."""
     model = FactorModel()
     model._weights = dict(zip(FACTOR_COLUMNS, (0.7, -0.3, 0.2, 0.05)))
     model._fitted = True
