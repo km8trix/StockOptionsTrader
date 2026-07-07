@@ -694,3 +694,23 @@ class TestRealisticFills:
         assert trade['price'] == pytest.approx(expected_price)
         assert engine.portfolio.get_position(asset) is None
         assert asset not in engine.pending_intents
+
+
+class TestEnrichedFeatureColumnsPlumbing:
+    def test_engine_frames_carry_the_enriched_extras(
+            self, make_ohlcv, patch_market_data):
+        """run() enriches every symbol's frame with the extended-feature
+        extras/seasonal columns so the ML models' predict fast paths can
+        read them instead of rebuilding O(history) features daily."""
+        from desks.features import ENRICHED_EXTRA_COLUMNS
+
+        df = make_ohlcv(n_days=30, seed=11)
+        patch_market_data({'TEST': df})
+        engine = BacktestEngine(ScriptedStrategy(),  # never trades
+                                initial_capital=100000.0,
+                                commission=COMMISSION)
+        engine.run(['TEST'], '2023-01-01', '2023-12-31', position_size=0.1)
+        frame = engine._enriched_all['TEST']
+        assert set(ENRICHED_EXTRA_COLUMNS) <= set(frame.columns)
+        # Inert for existing consumers: raw OHLCV untouched.
+        assert (frame['close'] == df['close']).all()
