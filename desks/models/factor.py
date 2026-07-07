@@ -73,7 +73,6 @@ scores across runs.
 from __future__ import annotations
 
 import logging
-import struct
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -533,27 +532,46 @@ def _calibration_universe():
 
 
 def _run_calibration() -> bool:
-    """Drive the truncated build against the verbatim full build through
-    the same scoring machinery on a hand-weighted model, over every
-    calibration panel. Requires the fast path to actually engage on each,
-    and every score to match bit-for-bit."""
+    """Drive the truncated build against the verbatim full build over every
+    calibration panel, requiring the fast path to actually engage and every
+    per-factor CONSUMED exposure to match bit-for-bit.
+
+    Compared at the CONSUMED-EXPOSURE level via four unit-vector weightings:
+    scoring with weights ``e_k`` makes each score exactly the standardized
+    exposure of factor ``k`` at the symbol's consumed row, so the four runs
+    pin every factor axis independently at precisely the rows predict reads
+    — nothing else. This is the right granularity:
+
+      * A single hand-weighted score can MASK a 1-ULP factor drift (the
+        weights round it away); the PR#81 Linux vol drift slipped a
+        hand-weighted check exactly this way. Unit vectors cannot mask —
+        each isolates one factor.
+      * Comparing whole RAW PANELS is too STRICT: they can differ by a ULP
+        at a NON-consumed tail row (observed on macOS) that never reaches
+        any score, which would needlessly disable a bit-identical platform.
+        Only consumed rows feed scores, so only they must match."""
     model = FactorModel()
-    model._weights = dict(zip(FACTOR_COLUMNS, (0.7, -0.3, 0.2, 0.05)))
     model._fitted = True
+    unit_weights = [dict(zip(FACTOR_COLUMNS, w)) for w in (
+        (1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))]
     for data in _calibration_universe():
         trunc = _truncated_predict_data(data)
         if trunc is None:
             return False
         if not any(len(trunc[s]) < len(f) for s, f in data.items()):
             return False
-        fast = model._score_from_raw_panel(_raw_factor_panel(trunc))
-        full = model._score_from_raw_panel(_raw_factor_panel(data))
-        if list(fast) != list(full):
-            return False
-        for symbol in full:
-            if struct.pack('<d', fast[symbol]) \
-                    != struct.pack('<d', full[symbol]):
+        raw_fast = _raw_factor_panel(trunc)
+        raw_full = _raw_factor_panel(data)
+        for weights in unit_weights:
+            model._weights = weights
+            fast = model._score_from_raw_panel(raw_fast)
+            full = model._score_from_raw_panel(raw_full)
+            if list(fast) != list(full):
                 return False
+            for symbol in full:
+                if fast[symbol] != full[symbol]:  # 1-ULP drift -> not equal
+                    return False
     return True
 
 
