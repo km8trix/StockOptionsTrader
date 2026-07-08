@@ -83,20 +83,15 @@ def _trades_in(closed, start, end):
             'pnl': sum(t['pnl'] for t in sel)}
 
 
-def run_desk(key, symbols, start, end, model_key=None, capital=100_000.0):
-    """Backtest one desk; return a compact comparable result dict."""
-    desk = create_desk(key, model_key=model_key)
-    engine = BacktestEngine(desk=desk, initial_capital=capital)
-    t0 = time.time()
-    report = engine.run(symbols, start, end)
-    summary = report['summary']
-    closed = report['closed_trades']
-    regimes = {name: {**(_slice_metrics(report['portfolio_history'], s, e) or {}),
-                      **_trades_in(closed, s, e)}
-               for name, s, e in REGIMES}
+def build_result_dict(desk_name, model_name, symbols, summary, closed,
+                      regimes, oos_folds, start, end, t0):
+    """The compact comparable result dict shared by run_desk and the
+    proto_momentum / proto_hybrid research runners (which differ only in the
+    hard-coded desk/model label). Single source of truth for the
+    analysis/backtests JSON shape."""
     return {
-        'desk': key,
-        'model': model_key,
+        'desk': desk_name,
+        'model': model_name,
         'window': [start, end],
         'n_symbols': len(symbols),
         'wall_seconds': round(time.time() - t0, 1),
@@ -108,9 +103,25 @@ def run_desk(key, symbols, start, end, model_key=None, capital=100_000.0):
         'psr': summary['psr'],
         'max_drawdown_pct': summary['max_drawdown'],
         'win_rate': summary['win_rate'],
-        'oos_folds': report.get('oos_folds', {'available': False}),
+        'oos_folds': oos_folds,
         'regimes': regimes,
     }
+
+
+def run_desk(key, symbols, start, end, model_key=None, capital=100_000.0):
+    """Backtest one desk; return a compact comparable result dict."""
+    desk = create_desk(key, model_key=model_key)
+    engine = BacktestEngine(desk=desk, initial_capital=capital)
+    t0 = time.time()
+    report = engine.run(symbols, start, end)
+    summary = report['summary']
+    closed = report['closed_trades']
+    regimes = {name: {**(_slice_metrics(report['portfolio_history'], s, e) or {}),
+                      **_trades_in(closed, s, e)}
+               for name, s, e in REGIMES}
+    return build_result_dict(
+        key, model_key, symbols, summary, closed, regimes,
+        report.get('oos_folds', {'available': False}), start, end, t0)
 
 
 def _fmt(x, nd=2):
