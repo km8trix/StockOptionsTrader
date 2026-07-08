@@ -460,23 +460,39 @@ def _truncated_predict_data(
         return None
 
 
-def _fully_aligned(data: Dict[str, pd.DataFrame]) -> bool:
-    """True iff every ELIGIBLE frame shares one identical date index.
+def _dense_aligned(data: Dict[str, pd.DataFrame]) -> bool:
+    """True iff every ELIGIBLE frame forms a COMPLETE cross-section
+    rectangle: one shared date index AND finite, non-zero ``close``
+    throughout.
 
-    The sliced fast path is guaranteed bit-identical to the full-history
-    scorer ONLY on aligned panels. When symbols carry DIFFERENT date sets —
-    stale symbols (a shorter last date) or mixed calendars (holidays / halts
-    / differing listing histories) — the needed-date slicing changes the
-    number of date-rows fed to the shape-sensitive cross-sectional mean/std
-    (``desks.features.cross_sectional_rank``), which can round 1 ULP away
-    from the full panel even where the platform probe passes (PR #82
-    review). Real dense universes are always aligned (verified: 0
-    mixed-calendar predict calls over a live aqr window), so the fast path
-    still engages for them; anything else falls back to full-history, so
-    ``predict`` returns the canonical value unconditionally.
+    The sliced fast path is bit-identical to the full-history scorer only
+    on such panels. The divergence lives in the shape-sensitive row-wise
+    cross-sectional mean/std (``desks.features.cross_sectional_rank``:
+    ``panel.mean(axis=1)`` / ``std(axis=1)``): it is row-count-independent
+    only when every row is a COMPLETE cross-section (no NaN cells, so pandas
+    takes a plain row-local mean rather than the row-count-sensitive
+    ``skipna`` reduction). Two things break completeness, both round 1 ULP
+    away from the full panel even where the platform probe passes (PR #82
+    review):
 
-    Cheap: an O(1) length short-circuit before any O(dates) index compare,
-    and it never touches the ineligible frames the builder skips anyway.
+      * mixed date sets — stale symbols (shorter last date) or holiday /
+        halt / listing-gap holes — misalign the symbols' date indices, so
+        the outer-join panel carries NaN cells;
+      * NaN / zero ``close`` — makes a symbol's factor rows drop out via the
+        builder's keep-mask at DIFFERENT positions than its peers, so the
+        raw factor panels misalign into NaN cells even under one shared
+        input index.
+
+    Requiring finite non-zero close + a shared index rules both out (a
+    uniform keep-mask over aligned frames yields aligned raw panels -> a
+    complete rectangle). Real dense universes satisfy this (verified: 0
+    divergent predict calls over a live aqr window); anything else falls
+    back to full-history, so ``predict`` returns the canonical value
+    unconditionally.
+
+    Cheap: an O(1) length short-circuit before the O(dates) index compare /
+    finiteness scan, and it never touches the ineligible frames the builder
+    skips anyway.
     """
     ref: Optional[pd.Index] = None
     for frame in data.values():
@@ -487,6 +503,9 @@ def _fully_aligned(data: Dict[str, pd.DataFrame]) -> bool:
         if ref is None:
             ref = idx
         elif len(idx) != len(ref) or not idx.equals(ref):
+            return False
+        close = frame['close'].to_numpy(dtype=float)
+        if not np.isfinite(close).all() or (close == 0.0).any():
             return False
     return ref is not None
 
@@ -502,7 +521,7 @@ def _fully_aligned(data: Dict[str, pd.DataFrame]) -> bool:
 # mean/std — and those kernels can round shape-equivalent reductions apart
 # across platforms (x86 rounds the sliced standardization 1 ULP from the
 # full one; PR #82). predict only runs the fast path on ALIGNED panels
-# (_fully_aligned), so the probe validates exactly that: the fast path's
+# (_dense_aligned), so the probe validates exactly that: the fast path's
 # consumed scores are probed against the FULL-HISTORY scorer's once per
 # process on a sweep of long, ALIGNED panel shapes, and the whole fast path
 # stands aside for the process on any bitwise mismatch — predict then
@@ -536,7 +555,7 @@ def _calibration_universe():
         return data
 
     # ALIGNED (shared-calendar, shared-last-date) panels only: the fast path
-    # runs only on aligned inputs (predict's _fully_aligned guard), so the
+    # runs only on aligned inputs (predict's _dense_aligned guard), so the
     # probe validates exactly that shape — a range of history lengths (up to
     # real-backtest depth) at wide symbol counts, each engaging truncation.
     return [
@@ -778,21 +797,22 @@ class FactorModel(WalkForwardModel):
         build (:func:`_truncated_predict_data`) and restricting
         standardization to the consumed dates (:meth:`_score_sliced`) — but
         the sliced cross-sectional standardization is bit-identical to the
-        full one only for ALIGNED panels on a calibrated platform. It is
-        gated on BOTH: a once-per-process bitwise probe against the
-        full-history reference (catches a platform where even aligned panels
-        round apart — x86 SIMD; PR #82), and a per-call
-        :func:`_fully_aligned` guard (stale / mixed-calendar panels change
-        the standardization row-count and can round apart even where the
+        full one only for a COMPLETE cross-section rectangle on a calibrated
+        platform. It is gated on BOTH: a once-per-process bitwise probe
+        against the full-history reference (catches a platform where even
+        dense panels round apart — x86 SIMD; PR #82), and a per-call
+        :func:`_dense_aligned` guard (a stale / mixed-calendar date set, or a
+        NaN / zero close, puts NaN cells into the cross-section and changes
+        the shape-sensitive row-wise reduction, rounding apart even where the
         probe passes). Fail either and predict computes full-history
         directly, so its output is the canonical value on every platform for
-        every input. Real dense universes are always aligned, so they keep
-        the fast path. ``fit`` and ``desks.factor_risk`` are independent of
-        this path.
+        every input. Real dense universes are complete rectangles, so they
+        keep the fast path. ``fit`` and ``desks.factor_risk`` are independent
+        of this path.
         """
         if not self._fitted or not self._weights:
             return {}
-        if _calibrated_fast_path() and _fully_aligned(data):
+        if _calibrated_fast_path() and _dense_aligned(data):
             trunc = _truncated_predict_data(data)
             raw_panel = _raw_factor_panel(trunc if trunc is not None else data)
             if not raw_panel:

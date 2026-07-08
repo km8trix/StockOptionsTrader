@@ -862,7 +862,7 @@ class TestPredictTruncationGolden:
         assert set(got) == set(data)
         engaged = any(got[s] < len(f) for s, f in data.items()
                       if f is not None)
-        fast = FactorModel.fast_path_calibrated() and factor_mod._fully_aligned(data)
+        fast = FactorModel.fast_path_calibrated() and factor_mod._dense_aligned(data)
         if not fast:
             # Fallback (uncalibrated OR non-aligned stale/mixed panel):
             # full-history, builder saw the ORIGINALS. Value verified above.
@@ -970,30 +970,43 @@ class TestPredictTruncationGolden:
         assert len(calls) == 1
         assert calls[0] == {s: len(f) for s, f in data.items()}
 
-    def test_fully_aligned_guard(self):
-        # The _fully_aligned guard: dense shared-index panels -> True (fast
-        # path); any symbol with a different date set (stale last date /
-        # mixed calendar) -> False (full-history fallback). Sub-_MIN_ROWS
+    def test_dense_aligned_guard(self):
+        # The _dense_aligned guard: a COMPLETE rectangle — one shared index
+        # AND finite non-zero close throughout — is True (fast path).
+        # Anything that puts a NaN cell into the cross-section rectangle is
+        # False (full-history fallback): a different date set (stale last
+        # date / calendar holes) OR NaN / zero close (which drops a symbol's
+        # factor rows at different positions than its peers). Sub-_MIN_ROWS
         # frames are ignored (the builder skips them either way).
         aligned = _long_panel(4, 400)
-        assert factor_mod._fully_aligned(aligned)
+        assert factor_mod._dense_aligned(aligned)
         stale = dict(aligned)
         stale['S00'] = aligned['S00'].iloc[:-3]           # shorter last date
-        assert not factor_mod._fully_aligned(stale)
+        assert not factor_mod._dense_aligned(stale)
         holes = dict(aligned)
         keep = np.ones(400, bool)
         keep[[50, 120, 300]] = False                      # interior holes
         holes['S01'] = aligned['S01'].iloc[keep]
-        assert not factor_mod._fully_aligned(holes)
+        assert not factor_mod._dense_aligned(holes)
+        nan_close = dict(aligned)
+        v = aligned['S02']['close'].to_numpy().copy()
+        v[100] = np.nan                                   # NaN cell, same index
+        nan_close['S02'] = aligned['S02'].assign(close=v)
+        assert not factor_mod._dense_aligned(nan_close)
+        zero_close = dict(aligned)
+        v = aligned['S03']['close'].to_numpy().copy()
+        v[200] = 0.0                                      # zero cell, same index
+        zero_close['S03'] = aligned['S03'].assign(close=v)
+        assert not factor_mod._dense_aligned(zero_close)
         plus_tiny = dict(aligned)
         plus_tiny['T'] = aligned['S00'].iloc[:3]          # sub-_MIN_ROWS: ignored
-        assert factor_mod._fully_aligned(plus_tiny)
-        assert not factor_mod._fully_aligned({})          # nothing eligible
+        assert factor_mod._dense_aligned(plus_tiny)
+        assert not factor_mod._dense_aligned({})          # nothing eligible
 
     def test_mixed_calendar_predict_is_full_history(self):
         # Adversarial-review case (PR #82): on MIXED per-symbol calendars
         # (holidays/halts) the sliced fast path can round 1 ULP from
-        # full-history even on a CALIBRATED platform. The _fully_aligned
+        # full-history even on a CALIBRATED platform. The _dense_aligned
         # guard routes such panels to the full-history fallback, so predict
         # equals the canonical value byte-for-byte regardless of calibration.
         rng = np.random.default_rng(201)
@@ -1009,7 +1022,7 @@ class TestPredictTruncationGolden:
             data[f'F{i}'] = pd.DataFrame(
                 {'close': close, 'volume': np.full(int(keep.sum()), 1e6)},
                 index=base[keep])
-        assert not factor_mod._fully_aligned(data)        # genuinely mixed
+        assert not factor_mod._dense_aligned(data)        # genuinely mixed
         model = FactorModel()
         model.fit(data)
         prod = model.predict(data, base[-1])
