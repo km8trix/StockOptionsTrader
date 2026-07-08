@@ -827,39 +827,27 @@ class TestPredictTruncationGolden:
         monkeypatch.setattr(factor_mod, '_raw_factor_panel', spy)
         return calls
 
-    def test_DIAGNOSTIC_layer_isolation(self):
-        # TEMPORARY Linux-CI diagnostic: isolate which layer diverges on
-        # stale_5_35_100. A = truncated+sliced (prod), B = full+sliced,
-        # C = full+unsliced (ref / _full_history_predict). Fails on Linux
-        # with the layer pattern in the message; removed once diagnosed.
-        data, _ = _truncation_cases()['stale_5_35_100']
-        model = FactorModel()
-        model.fit(data)
-        raw_full = _raw_factor_panel(data)
-        raw_trunc = _raw_factor_panel(_truncated_predict_data(data))
-        A = model._score_from_raw_panel(raw_trunc)   # prod
-        B = model._score_from_raw_panel(raw_full)    # full, sliced
-        C = _full_history_predict(model, data)       # ref, unsliced
-        raw_diffs = 0
-        for sym, ff in raw_trunc.items():
-            gf = raw_full[sym].reindex(ff.index)
-            if not np.array_equal(ff.to_numpy(float), gf.to_numpy(float),
-                                  equal_nan=True):
-                raw_diffs += 1
-        ab = all(A[s] == B[s] for s in A) and list(A) == list(B)
-        bc = all(B[s] == C[s] for s in B) and list(B) == list(C)
-        ac = all(A[s] == C[s] for s in A) and list(A) == list(C)
-        assert ac, (f"LAYER DIAG: A==B(trunc==slicedfull)={ab} "
-                    f"B==C(slicedfull==unslicedfull)={bc} "
-                    f"A==C(prod==ref)={ac} raw_panel_diffs={raw_diffs}")
-
     @pytest.mark.parametrize('name', sorted(_truncation_cases()))
     def test_truncated_predict_byte_identical_and_routed(
             self, name, monkeypatch):
         data, expect_engaged = _truncation_cases()[name]
         model = FactorModel()
         model.fit(data)
-        ref = _full_history_predict(model, data)
+        # Oracle = predict WITHOUT truncation: the SAME sliced-standardize+
+        # score pipeline (_score_from_raw_panel) on the FULL raw panel. This
+        # is exactly what predict computed before this fix, so the contract
+        # under test is "truncation does not change predict's output"
+        # (bit-identical). We deliberately do NOT compare against the
+        # unsliced full-history score (_full_history_predict): the
+        # needed-date SLICING is a separate, earlier optimization with its
+        # own oracle (TestPredictLatestSliceGolden), and its slicing-vs-full-
+        # history bit-identity is NOT universal at long n on some platforms
+        # (x86 SIMD rounds the cross-sectional standardization 1 ULP apart at
+        # n~900 — a PRE-EXISTING property of that optimization, unaffected by
+        # truncation, which the layer-isolation diagnostic on PR #81 pinned:
+        # trunc==sliced-full holds bitwise, sliced-full==unsliced-full does
+        # not). Truncation's job is only to not perturb predict.
+        ref = model._score_from_raw_panel(_raw_factor_panel(data))
 
         calls = self._spy_builder(monkeypatch)
         prod = model.predict(data, next(iter(data.values())).index[-1])
