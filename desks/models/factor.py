@@ -385,7 +385,7 @@ def _truncated_predict_data(
 
     ``FactorModel.predict`` consumes ONLY each symbol's rows at the needed
     dates (every symbol's last panel date, plus one pad date when they all
-    coincide — see ``_score_from_raw_panel``), yet ``_raw_factor_panel``
+    coincide — see ``_score_sliced``), yet ``_raw_factor_panel``
     costs O(history) per symbol. Truncating each frame to its last
     ``k_sym = (rows back to the oldest needed date) + _SAFE_TAIL`` rows
     keeps every consumed row's factor inputs at identical relative offsets,
@@ -430,7 +430,7 @@ def _truncated_predict_data(
         last_dates = [f.index[-1] for f in eligible.values()]
         first = last_dates[0]
         if all(d == first for d in last_dates[1:]):
-            # One shared needed date: _score_from_raw_panel pads the slice
+            # One shared needed date: _score_sliced pads the slice
             # with one symbol's second-to-last panel row; the min over ALL
             # candidates over-covers whichever symbol supplies the pad.
             needed_oldest = min(f.index[-2] for f in eligible.values())
@@ -460,35 +460,87 @@ def _truncated_predict_data(
         return None
 
 
+def _dense_aligned(data: Dict[str, pd.DataFrame]) -> bool:
+    """True iff every ELIGIBLE frame forms a COMPLETE cross-section
+    rectangle: one shared date index AND finite, non-zero ``close``
+    throughout.
+
+    The sliced fast path is bit-identical to the full-history scorer only
+    on such panels. The divergence lives in the shape-sensitive row-wise
+    cross-sectional mean/std (``desks.features.cross_sectional_rank``:
+    ``panel.mean(axis=1)`` / ``std(axis=1)``): it is row-count-independent
+    only when every row is a COMPLETE cross-section (no NaN cells, so pandas
+    takes a plain row-local mean rather than the row-count-sensitive
+    ``skipna`` reduction). Two things break completeness, both round 1 ULP
+    away from the full panel even where the platform probe passes (PR #82
+    review):
+
+      * mixed date sets — stale symbols (shorter last date) or holiday /
+        halt / listing-gap holes — misalign the symbols' date indices, so
+        the outer-join panel carries NaN cells;
+      * NaN / zero ``close`` — makes a symbol's factor rows drop out via the
+        builder's keep-mask at DIFFERENT positions than its peers, so the
+        raw factor panels misalign into NaN cells even under one shared
+        input index.
+
+    Requiring finite non-zero close + a shared index rules both out (a
+    uniform keep-mask over aligned frames yields aligned raw panels -> a
+    complete rectangle). Real dense universes satisfy this (verified: 0
+    divergent predict calls over a live aqr window); anything else falls
+    back to full-history, so ``predict`` returns the canonical value
+    unconditionally.
+
+    Cheap: an O(1) length short-circuit before the O(dates) index compare /
+    finiteness scan, and it never touches the ineligible frames the builder
+    skips anyway.
+    """
+    ref: Optional[pd.Index] = None
+    for frame in data.values():
+        if frame is None or frame.empty or 'close' not in frame.columns \
+                or len(frame) < _MIN_ROWS:
+            continue
+        idx = frame.index
+        if ref is None:
+            ref = idx
+        elif len(idx) != len(ref) or not idx.equals(ref):
+            return False
+        close = frame['close'].to_numpy(dtype=float)
+        if not np.isfinite(close).all() or (close == 0.0).any():
+            return False
+    return ref is not None
+
+
 # ----------------------------------------------------------------------
-# Once-per-process platform calibration of the truncation fast path.
+# Once-per-process platform calibration of the WHOLE predict fast path
+# (tail truncation + needed-date slicing) against the full-history
+# reference.
 #
-# The bit-identity argument above is positional, but truncation changes the
-# raw-build array shapes (the clean-return stream height feeding the vol
-# two-pass std), and numpy/SIMD reduction kernels can round shape-equivalent
-# reductions apart across platforms. So the TRUNCATED build's consumed
-# scores are probed against the FULL build's (same downstream slice +
-# standardize + score) once per process on a diverse sweep of long,
-# variously-stale panel shapes, and the fast path stands aside for the whole
-# process on any bitwise mismatch. On a truncation-sensitive platform it
-# disables (a logged, perf-only regression); a silent number change is
-# impossible. NOTE the probe compares truncated-vs-full through the SAME
-# sliced scoring path (that is truncation's exact contract — leave predict's
-# output unchanged); the separate needed-date slicing optimization owns its
-# own vs-full-history bit-identity (and is not universal at long n on x86 —
-# see the PR#81 layer-isolation diagnostic — but that predates and is
-# independent of truncation).
+# Both optimizations change the SHAPE of arrays fed to numpy/SIMD
+# reductions — truncation the clean-return stream height feeding the vol
+# two-pass std, slicing the number of date-rows feeding the cross-sectional
+# mean/std — and those kernels can round shape-equivalent reductions apart
+# across platforms (x86 rounds the sliced standardization 1 ULP from the
+# full one; PR #82). predict only runs the fast path on ALIGNED panels
+# (_dense_aligned), so the probe validates exactly that: the fast path's
+# consumed scores are probed against the FULL-HISTORY scorer's once per
+# process on a sweep of long, ALIGNED panel shapes, and the whole fast path
+# stands aside for the process on any bitwise mismatch — predict then
+# computes the full-history value directly. On a sensitive platform this is
+# a logged, perf-only regression; a silent number change is impossible, and
+# predict's output is the full-history value on EVERY platform. (The two
+# optimizations are calibrated together, not separately, because they are
+# coupled: standardizing a truncated panel in full is not full-history
+# either, so the fallback must drop both.)
 # ----------------------------------------------------------------------
 _FAST_PATH_OK: Optional[bool] = None
 
 
 def _calibration_universe():
-    """Deterministic panels exercising the engaged-truncation shapes:
-    shared-last-date (pad path) and mixed-last-date (stale symbols) panels
-    across a range of history lengths (up to real-backtest depth) and
-    staleness patterns, at wide symbol counts. Each panel MUST engage
-    truncation (n well over the 275-row tail) so the probe compares the fast
-    path, not a no-op."""
+    """Deterministic ALIGNED panels (all symbols share one dense index — the
+    only shape predict runs the fast path on) across a range of history
+    lengths up to real-backtest depth, at wide symbol counts. Each panel
+    engages truncation (n well over the 275-row tail) so the probe compares
+    the fast path, not a no-op."""
     def _panel(n, n_sym, seed, stale=()):
         rng = np.random.default_rng(seed)
         idx = pd.bdate_range('2015-01-02', periods=n)
@@ -502,22 +554,24 @@ def _calibration_universe():
             data[sym] = data[sym].iloc[:n - drop]
         return data
 
+    # ALIGNED (shared-calendar, shared-last-date) panels only: the fast path
+    # runs only on aligned inputs (predict's _dense_aligned guard), so the
+    # probe validates exactly that shape — a range of history lengths (up to
+    # real-backtest depth) at wide symbol counts, each engaging truncation.
     return [
-        _panel(800, 8, 11),                                  # shared, medium
-        _panel(1500, 12, 12),                                # shared, wide+long
-        _panel(2200, 8, 13),                                 # shared, backtest-deep
-        _panel(900, 10, 14, stale=[('F2', 5), ('F5', 35),    # stale, long
-                                   ('F7', 100)]),
-        _panel(1500, 10, 15, stale=[('F1', 2), ('F4', 60),   # stale, varied
-                                    ('F8', 250)]),
+        _panel(800, 8, 11),                                  # medium
+        _panel(1500, 12, 12),                                # wide + long
+        _panel(2200, 8, 13),                                 # backtest-deep
+        _panel(1000, 10, 14),                                # mid
+        _panel(1800, 12, 15),                                # wide + longer
     ]
 
 
 def _run_calibration() -> bool:
-    """Drive the truncated build against the FULL build over every
-    calibration panel, THROUGH THE SAME sliced scoring path, requiring the
-    fast path to actually engage and every per-factor CONSUMED exposure to
-    match bit-for-bit.
+    """Drive the fast path (truncate + slice, ``_score_sliced``) against the
+    full-history scorer (``_score_full_history``) over every calibration
+    panel, requiring truncation to actually engage and every per-factor
+    CONSUMED score to match bit-for-bit.
 
     Compared at the CONSUMED-EXPOSURE level via four unit-vector weightings:
     scoring with weights ``e_k`` makes each score exactly the standardized
@@ -531,8 +585,8 @@ def _run_calibration() -> bool:
       * Comparing whole RAW PANELS is too STRICT: they can differ by a ULP
         at a NON-consumed tail row (observed on both macOS and Linux) that
         never reaches any score, which would needlessly disable a
-        truncation-bit-identical platform. Only consumed rows feed scores,
-        so only they must match."""
+        bit-identical platform. Only consumed rows feed scores, so only
+        they must match."""
     model = FactorModel()
     model._fitted = True
     unit_weights = [dict(zip(FACTOR_COLUMNS, w)) for w in (
@@ -544,12 +598,12 @@ def _run_calibration() -> bool:
             return False
         if not any(len(trunc[s]) < len(f) for s, f in data.items()):
             return False
-        raw_fast = _raw_factor_panel(trunc)
-        raw_full = _raw_factor_panel(data)
+        raw_fast = _raw_factor_panel(trunc)      # truncated (fast path input)
+        raw_full = _raw_factor_panel(data)       # full history (reference)
         for weights in unit_weights:
             model._weights = weights
-            fast = model._score_from_raw_panel(raw_fast)
-            full = model._score_from_raw_panel(raw_full)
+            fast = model._score_sliced(raw_fast)          # truncate + slice
+            full = model._score_full_history(raw_full)    # canonical
             if list(fast) != list(full):
                 return False
             for symbol in full:
@@ -560,7 +614,8 @@ def _run_calibration() -> bool:
 
 def _calibrated_fast_path() -> bool:
     """Lazy once-per-process probe; any failure or exception disables the
-    truncation fast path for the process with a WARNING."""
+    predict fast path (truncation + slicing) for the process with a
+    WARNING, so predict computes the full-history value directly."""
     global _FAST_PATH_OK
     if _FAST_PATH_OK is None:
         try:
@@ -569,9 +624,9 @@ def _calibrated_fast_path() -> bool:
             _FAST_PATH_OK = False
         if not _FAST_PATH_OK:
             logger.warning(
-                "FactorModel predict truncation fast path disabled: "
-                "platform calibration found a bitwise mismatch against the "
-                "verbatim full-history build; using the full build "
+                "FactorModel predict fast path disabled: platform "
+                "calibration found a bitwise mismatch against the "
+                "full-history reference; using full-history standardization "
                 "(results unaffected)")
     return _FAST_PATH_OK
 
@@ -720,8 +775,9 @@ class FactorModel(WalkForwardModel):
     @staticmethod
     def fast_path_calibrated() -> bool:
         """Whether this platform passed the once-per-process bitwise
-        calibration of the predict truncation fast path (tests use this
-        to decide whether fast-path-engagement assertions apply)."""
+        calibration of the predict fast path (truncation + needed-date
+        slicing) against the full-history reference. Tests use this to
+        decide whether fast-path-engagement assertions apply."""
         return _calibrated_fast_path()
 
     def predict(self, data: Dict[str, pd.DataFrame], date) -> Dict[str, float]:
@@ -734,32 +790,77 @@ class FactorModel(WalkForwardModel):
         normally guarantees a usable model, so this only fires if ``fit`` was
         never called).
 
-        PERF: the raw panel build is O(history) per symbol yet only the
-        needed-date rows are consumed, so when the calibrated guards hold
-        the frames are tail-truncated first (``_truncated_predict_data``,
-        byte-identical by construction and by the golden tests); any guard
-        failure falls back to the verbatim full-history build for the whole
-        call. ``fit`` and ``desks.factor_risk`` keep full-history semantics
-        — the truncation lives at this call site only.
+        CANONICAL SEMANTICS = full-history: standardize the WHOLE raw factor
+        panel, then read each symbol's latest standardized row
+        (:meth:`_score_full_history`). Two compounding optimizations make
+        that cheaper — tail-truncating each frame before the O(history) raw
+        build (:func:`_truncated_predict_data`) and restricting
+        standardization to the consumed dates (:meth:`_score_sliced`) — but
+        the sliced cross-sectional standardization is bit-identical to the
+        full one only for a COMPLETE cross-section rectangle on a calibrated
+        platform. It is gated on BOTH: a once-per-process bitwise probe
+        against the full-history reference (catches a platform where even
+        dense panels round apart — x86 SIMD; PR #82), and a per-call
+        :func:`_dense_aligned` guard (a stale / mixed-calendar date set, or a
+        NaN / zero close, puts NaN cells into the cross-section and changes
+        the shape-sensitive row-wise reduction, rounding apart even where the
+        probe passes). Fail either and predict computes full-history
+        directly, so its output is the canonical value on every platform for
+        every input. Real dense universes are complete rectangles, so they
+        keep the fast path. ``fit`` and ``desks.factor_risk`` are independent
+        of this path.
         """
         if not self._fitted or not self._weights:
             return {}
-        raw_panel = None
-        if _calibrated_fast_path():
+        if _calibrated_fast_path() and _dense_aligned(data):
             trunc = _truncated_predict_data(data)
-            if trunc is not None:
-                raw_panel = _raw_factor_panel(trunc)
-        if raw_panel is None:
-            raw_panel = _raw_factor_panel(data)
+            raw_panel = _raw_factor_panel(trunc if trunc is not None else data)
+            if not raw_panel:
+                return {}
+            return self._score_sliced(raw_panel)
+        # Full-history fallback (canonical): taken on an uncalibrated
+        # platform OR a non-aligned panel (stale / mixed calendars), where
+        # the sliced fast path is not guaranteed bit-identical. No
+        # truncation, no slicing.
+        raw_panel = _raw_factor_panel(data)
         if not raw_panel:
             return {}
-        return self._score_from_raw_panel(raw_panel)
+        return self._score_full_history(raw_panel)
 
-    def _score_from_raw_panel(
+    def _score_from_standardized(
+            self, standardized: Dict[str, pd.DataFrame]) -> Dict[str, float]:
+        """Weighted score of each symbol's LATEST standardized row (the tail
+        shared verbatim by the sliced and full-history scorers)."""
+        weights = np.array([self._weights[c] for c in FACTOR_COLUMNS],
+                           dtype=float)
+        scores: Dict[str, float] = {}
+        for symbol, std_frame in standardized.items():
+            if std_frame.empty:
+                continue
+            latest = std_frame.iloc[-1]
+            # Treat an absent (still-warming) factor as 0 (neutral on that
+            # axis) rather than dropping the whole name — keeps the universe
+            # wide while a long lookback warms up.
+            exposure = latest.reindex(FACTOR_COLUMNS).fillna(0.0).to_numpy(
+                dtype=float)
+            if not np.all(np.isfinite(exposure)):
+                continue
+            scores[symbol] = float(np.dot(weights, exposure))
+        return scores
+
+    def _score_full_history(
             self, raw_panel: Dict[str, pd.DataFrame]) -> Dict[str, float]:
-        """Needed-date slicing + standardization + weighted scoring of a
-        NON-EMPTY raw factor panel (the tail of ``predict``, shared verbatim
-        by the full and truncated builds and by the calibration probe)."""
+        """CANONICAL scorer: standardize the FULL raw panel (every date),
+        then score each symbol's latest row. The reference the fast path is
+        calibrated against and the fallback used wherever the fast path is
+        not bit-identical to it."""
+        return self._score_from_standardized(_standardized_panel(raw_panel))
+
+    def _score_sliced(
+            self, raw_panel: Dict[str, pd.DataFrame]) -> Dict[str, float]:
+        """FAST scorer: standardize ONLY the consumed dates' cross-sections,
+        then score. Bit-identical to :meth:`_score_full_history` on a
+        calibrated platform; predict only reaches it behind that probe."""
         # PERF: only each symbol's LATEST standardized row is consumed below,
         # and the cross-sectional z-score is strictly PER-DATE (row-wise
         # across symbols — desks.features.cross_sectional_rank), so
@@ -769,9 +870,10 @@ class FactorModel(WalkForwardModel):
         # dates — each symbol's own latest formable date. Usually that is one
         # shared date; a stale symbol contributes its own last date, and
         # every OTHER symbol's row at that date is kept too, so each needed
-        # date's cross-section is COMPLETE. Identical row values in identical
-        # column order through the unchanged standardization machinery yield
-        # byte-identical scores (golden test: TestPredictLatestSliceGolden).
+        # date's cross-section is COMPLETE. On a CALIBRATED platform the
+        # sliced standardization is byte-identical to the full one (probe +
+        # golden test TestPredictLatestSliceGolden); the whole-path probe in
+        # predict is what makes that safe on platforms where it is not.
         needed_dates = {frame.index[-1] for frame in raw_panel.values()}
         if len(needed_dates) == 1:
             # BYTE-IDENTITY GUARD: a lone needed date would make the
@@ -794,23 +896,7 @@ class FactorModel(WalkForwardModel):
         latest_panel = {
             symbol: frame.loc[frame.index.isin(needed_dates)]
             for symbol, frame in raw_panel.items()}
-        standardized = _standardized_panel(latest_panel)
-        weights = np.array([self._weights[c] for c in FACTOR_COLUMNS],
-                           dtype=float)
-        scores: Dict[str, float] = {}
-        for symbol, std_frame in standardized.items():
-            if std_frame.empty:
-                continue
-            latest = std_frame.iloc[-1]
-            # Treat an absent (still-warming) factor as 0 (neutral on that
-            # axis) rather than dropping the whole name — keeps the universe
-            # wide while a long lookback warms up.
-            exposure = latest.reindex(FACTOR_COLUMNS).fillna(0.0).to_numpy(
-                dtype=float)
-            if not np.all(np.isfinite(exposure)):
-                continue
-            scores[symbol] = float(np.dot(weights, exposure))
-        return scores
+        return self._score_from_standardized(_standardized_panel(latest_panel))
 
 
 __all__ = ['FactorModel', 'FACTOR_COLUMNS']

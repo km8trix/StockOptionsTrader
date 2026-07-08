@@ -833,21 +833,14 @@ class TestPredictTruncationGolden:
         data, expect_engaged = _truncation_cases()[name]
         model = FactorModel()
         model.fit(data)
-        # Oracle = predict WITHOUT truncation: the SAME sliced-standardize+
-        # score pipeline (_score_from_raw_panel) on the FULL raw panel. This
-        # is exactly what predict computed before this fix, so the contract
-        # under test is "truncation does not change predict's output"
-        # (bit-identical). We deliberately do NOT compare against the
-        # unsliced full-history score (_full_history_predict): the
-        # needed-date SLICING is a separate, earlier optimization with its
-        # own oracle (TestPredictLatestSliceGolden), and its slicing-vs-full-
-        # history bit-identity is NOT universal at long n on some platforms
-        # (x86 SIMD rounds the cross-sectional standardization 1 ULP apart at
-        # n~900 — a PRE-EXISTING property of that optimization, unaffected by
-        # truncation, which the layer-isolation diagnostic on PR #81 pinned:
-        # trunc==sliced-full holds bitwise, sliced-full==unsliced-full does
-        # not). Truncation's job is only to not perturb predict.
-        ref = model._score_from_raw_panel(_raw_factor_panel(data))
+        # Oracle = the CANONICAL full-history score (standardize the WHOLE
+        # raw panel, no truncation, no slicing). PR #82 gates the whole fast
+        # path (truncation + needed-date slicing) behind a bitwise probe vs
+        # this reference, so predict's output IS the full-history value on
+        # EVERY platform — on a calibrated platform via the fast path
+        # (bit-identical), elsewhere by computing it directly. Hence the
+        # equality below holds unconditionally, platform-independently.
+        ref = _full_history_predict(model, data)
 
         calls = self._spy_builder(monkeypatch)
         prod = model.predict(data, next(iter(data.values())).index[-1])
@@ -860,19 +853,25 @@ class TestPredictTruncationGolden:
         eligible = sum(1 for f in data.values() if len(f) >= _MIN_ROWS)
         assert len(prod) >= max(1, eligible - 1)
 
-        # Routing: predict calls the builder exactly once; the fast path
-        # hands it a shorter frame, the fallback the originals verbatim.
+        # Routing: predict calls the builder exactly once. The fast path
+        # (calibrated platform AND aligned panel) hands it truncated frames
+        # when the case is truncatable; otherwise predict takes the
+        # full-history fallback and the builder sees the originals verbatim.
         assert len(calls) == 1
         got = calls[0]
         assert set(got) == set(data)
         engaged = any(got[s] < len(f) for s, f in data.items()
                       if f is not None)
-        if expect_engaged and not FactorModel.fast_path_calibrated():
-            pytest.skip('platform failed truncation calibration; '
-                        'fast path stood aside (results still verified)')
-        assert engaged == expect_engaged
-        if not expect_engaged:
+        fast = FactorModel.fast_path_calibrated() and factor_mod._dense_aligned(data)
+        if not fast:
+            # Fallback (uncalibrated OR non-aligned stale/mixed panel):
+            # full-history, builder saw the ORIGINALS. Value verified above.
+            assert not engaged
             assert got == {s: len(f) for s, f in data.items()}
+        else:
+            assert engaged == expect_engaged
+            if not expect_engaged:
+                assert got == {s: len(f) for s, f in data.items()}
 
     def test_truncation_k_sym_math_per_symbol(self):
         # Fresh symbols must keep (staleness span + _SAFE_TAIL) rows; the
@@ -939,6 +938,100 @@ class TestPredictTruncationGolden:
         full = {s: len(f) for s, f in data.items()}
         assert all(c == full for c in calls)
 
+    def test_full_history_fallback_when_uncalibrated(self, monkeypatch):
+        # PLATFORM-INDEPENDENT coverage of the full-history FALLBACK branch
+        # (the fix's whole point): force the probe "off" and assert predict
+        # computes the canonical full-history value DIRECTLY — no truncation,
+        # no slicing — so the builder sees the ORIGINAL frames and the scores
+        # equal _full_history_predict byte-for-byte. On a calibrated platform
+        # (macOS) this branch is otherwise never exercised, so pin it here.
+        data, _ = _truncation_cases()['stale_5_35_100']
+        model = FactorModel()
+        model.fit(data)
+        ref = _full_history_predict(model, data)
+
+        FactorModel.fast_path_calibrated()          # settle the real probe
+        monkeypatch.setattr(factor_mod, '_FAST_PATH_OK', False)
+        assert FactorModel.fast_path_calibrated() is False
+
+        calls = []
+        real = factor_mod._raw_factor_panel
+        monkeypatch.setattr(
+            factor_mod, '_raw_factor_panel',
+            lambda d: (calls.append({s: len(f) for s, f in d.items()})
+                       or real(d)))
+        prod = model.predict(data, next(iter(data.values())).index[-1])
+
+        # Value == canonical full-history, byte-for-byte.
+        assert list(prod) == list(ref)
+        for s in ref:
+            assert prod[s] == ref[s]
+        # Routing: exactly one build, on the ORIGINAL (untruncated) frames.
+        assert len(calls) == 1
+        assert calls[0] == {s: len(f) for s, f in data.items()}
+
+    def test_dense_aligned_guard(self):
+        # The _dense_aligned guard: a COMPLETE rectangle — one shared index
+        # AND finite non-zero close throughout — is True (fast path).
+        # Anything that puts a NaN cell into the cross-section rectangle is
+        # False (full-history fallback): a different date set (stale last
+        # date / calendar holes) OR NaN / zero close (which drops a symbol's
+        # factor rows at different positions than its peers). Sub-_MIN_ROWS
+        # frames are ignored (the builder skips them either way).
+        aligned = _long_panel(4, 400)
+        assert factor_mod._dense_aligned(aligned)
+        stale = dict(aligned)
+        stale['S00'] = aligned['S00'].iloc[:-3]           # shorter last date
+        assert not factor_mod._dense_aligned(stale)
+        holes = dict(aligned)
+        keep = np.ones(400, bool)
+        keep[[50, 120, 300]] = False                      # interior holes
+        holes['S01'] = aligned['S01'].iloc[keep]
+        assert not factor_mod._dense_aligned(holes)
+        nan_close = dict(aligned)
+        v = aligned['S02']['close'].to_numpy().copy()
+        v[100] = np.nan                                   # NaN cell, same index
+        nan_close['S02'] = aligned['S02'].assign(close=v)
+        assert not factor_mod._dense_aligned(nan_close)
+        zero_close = dict(aligned)
+        v = aligned['S03']['close'].to_numpy().copy()
+        v[200] = 0.0                                      # zero cell, same index
+        zero_close['S03'] = aligned['S03'].assign(close=v)
+        assert not factor_mod._dense_aligned(zero_close)
+        plus_tiny = dict(aligned)
+        plus_tiny['T'] = aligned['S00'].iloc[:3]          # sub-_MIN_ROWS: ignored
+        assert factor_mod._dense_aligned(plus_tiny)
+        assert not factor_mod._dense_aligned({})          # nothing eligible
+
+    def test_mixed_calendar_predict_is_full_history(self):
+        # Adversarial-review case (PR #82): on MIXED per-symbol calendars
+        # (holidays/halts) the sliced fast path can round 1 ULP from
+        # full-history even on a CALIBRATED platform. The _dense_aligned
+        # guard routes such panels to the full-history fallback, so predict
+        # equals the canonical value byte-for-byte regardless of calibration.
+        rng = np.random.default_rng(201)
+        n, nsym = 1000, 10
+        base = pd.bdate_range(end='2024-12-31', periods=n)
+        data = {}
+        for i in range(nsym):
+            drop = rng.random(n) < 0.02
+            drop[-1] = False                              # shared last date
+            keep = ~drop
+            close = 100.0 * np.exp(
+                np.cumsum(rng.normal(0.0, 0.01 + 0.003 * i, int(keep.sum()))))
+            data[f'F{i}'] = pd.DataFrame(
+                {'close': close, 'volume': np.full(int(keep.sum()), 1e6)},
+                index=base[keep])
+        assert not factor_mod._dense_aligned(data)        # genuinely mixed
+        model = FactorModel()
+        model.fit(data)
+        prod = model.predict(data, base[-1])
+        ref = _full_history_predict(model, data)
+        assert list(prod) == list(ref)
+        for s in ref:
+            assert prod[s] == ref[s]                       # byte-for-byte
+        assert len(prod) >= nsym - 1                       # non-vacuous
+
     def test_safe_tail_constant_pins_momentum_reach(self):
         # TEETH for trap #4, part 1: pin _SAFE_TAIL to its derived value so a
         # helper edit that SHRINKS it FAILS in CI (platform-independent),
@@ -968,7 +1061,7 @@ class TestPredictTruncationGolden:
             trunc = _truncated_predict_data(data)
             assert trunc is not None
             raw = _raw_factor_panel(trunc)
-            # needed dates EXACTLY as _score_from_raw_panel derives them.
+            # needed dates EXACTLY as _score_sliced derives them.
             needed = {f.index[-1] for f in raw.values()}
             if len(needed) == 1:
                 for f in raw.values():
