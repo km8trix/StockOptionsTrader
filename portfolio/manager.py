@@ -23,6 +23,14 @@ class PortfolioManager:
         self.closed_trades: List[Trade] = []
         self.order_history: List[Order] = []
         self.portfolio_history: List[Dict] = []
+        #: Memoized realized P&L; None means "recompute on next read".
+        #: close_position invalidates it, so get_realized_pnl only re-sums
+        #: after a NEW trade closes — record_snapshot calls it 3x/day, and
+        #: most days close no trade, so this collapses the old
+        #: O(trades x snapshots) re-summing while staying byte-identical
+        #: (it still uses sum(), whose compensated summation an incremental
+        #: += would NOT reproduce bit-for-bit on Python >= 3.12).
+        self._realized_pnl: Optional[float] = None
         
     def add_position(self, position: Position):
         """Add or update a position"""
@@ -64,7 +72,8 @@ class PortfolioManager:
             exit_time=exit_time
         )
         self.closed_trades.append(trade)
-        
+        self._realized_pnl = None  # invalidate the memo; a trade just closed
+
         if position.quantity == quantity:
             self.remove_position(asset)
         else:
@@ -105,8 +114,16 @@ class PortfolioManager:
         return ((portfolio_value - self.initial_capital) / self.initial_capital) * 100
     
     def get_realized_pnl(self) -> float:
-        """Calculate total realized P&L from closed trades"""
-        return sum(trade.pnl for trade in self.closed_trades)
+        """Total realized P&L from closed trades.
+
+        Memoized: recomputed via ``sum`` only when a trade has closed since
+        the last read (close_position sets the memo to None), so repeated
+        reads between closes are O(1). Byte-identical to the old
+        ``sum(t.pnl for t in self.closed_trades)`` — the same call, cached.
+        """
+        if self._realized_pnl is None:
+            self._realized_pnl = sum(trade.pnl for trade in self.closed_trades)
+        return self._realized_pnl
     
     def get_total_return(self) -> float:
         """Get total return including realized and unrealized P&L"""
