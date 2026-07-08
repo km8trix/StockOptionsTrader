@@ -833,21 +833,14 @@ class TestPredictTruncationGolden:
         data, expect_engaged = _truncation_cases()[name]
         model = FactorModel()
         model.fit(data)
-        # Oracle = predict WITHOUT truncation: the SAME sliced-standardize+
-        # score pipeline (_score_from_raw_panel) on the FULL raw panel. This
-        # is exactly what predict computed before this fix, so the contract
-        # under test is "truncation does not change predict's output"
-        # (bit-identical). We deliberately do NOT compare against the
-        # unsliced full-history score (_full_history_predict): the
-        # needed-date SLICING is a separate, earlier optimization with its
-        # own oracle (TestPredictLatestSliceGolden), and its slicing-vs-full-
-        # history bit-identity is NOT universal at long n on some platforms
-        # (x86 SIMD rounds the cross-sectional standardization 1 ULP apart at
-        # n~900 — a PRE-EXISTING property of that optimization, unaffected by
-        # truncation, which the layer-isolation diagnostic on PR #81 pinned:
-        # trunc==sliced-full holds bitwise, sliced-full==unsliced-full does
-        # not). Truncation's job is only to not perturb predict.
-        ref = model._score_from_raw_panel(_raw_factor_panel(data))
+        # Oracle = the CANONICAL full-history score (standardize the WHOLE
+        # raw panel, no truncation, no slicing). PR #82 gates the whole fast
+        # path (truncation + needed-date slicing) behind a bitwise probe vs
+        # this reference, so predict's output IS the full-history value on
+        # EVERY platform — on a calibrated platform via the fast path
+        # (bit-identical), elsewhere by computing it directly. Hence the
+        # equality below holds unconditionally, platform-independently.
+        ref = _full_history_predict(model, data)
 
         calls = self._spy_builder(monkeypatch)
         prod = model.predict(data, next(iter(data.values())).index[-1])
@@ -860,16 +853,21 @@ class TestPredictTruncationGolden:
         eligible = sum(1 for f in data.values() if len(f) >= _MIN_ROWS)
         assert len(prod) >= max(1, eligible - 1)
 
-        # Routing: predict calls the builder exactly once; the fast path
-        # hands it a shorter frame, the fallback the originals verbatim.
+        # Routing: predict calls the builder exactly once; the engaged fast
+        # path hands it a shorter frame, the fallback the originals verbatim.
         assert len(calls) == 1
         got = calls[0]
         assert set(got) == set(data)
         engaged = any(got[s] < len(f) for s, f in data.items()
                       if f is not None)
-        if expect_engaged and not FactorModel.fast_path_calibrated():
-            pytest.skip('platform failed truncation calibration; '
-                        'fast path stood aside (results still verified)')
+        if not FactorModel.fast_path_calibrated():
+            # Uncalibrated platform: predict took the full-history fallback
+            # for the WHOLE call (no truncation, no slicing) — the builder
+            # saw the originals verbatim. Equality above already proved the
+            # value; here just pin the fallback routing.
+            assert got == {s: len(f) for s, f in data.items()}
+            pytest.skip('platform not calibrated; full-history fallback '
+                        'engaged (value still verified above)')
         assert engaged == expect_engaged
         if not expect_engaged:
             assert got == {s: len(f) for s, f in data.items()}
@@ -939,6 +937,38 @@ class TestPredictTruncationGolden:
         full = {s: len(f) for s, f in data.items()}
         assert all(c == full for c in calls)
 
+    def test_full_history_fallback_when_uncalibrated(self, monkeypatch):
+        # PLATFORM-INDEPENDENT coverage of the full-history FALLBACK branch
+        # (the fix's whole point): force the probe "off" and assert predict
+        # computes the canonical full-history value DIRECTLY — no truncation,
+        # no slicing — so the builder sees the ORIGINAL frames and the scores
+        # equal _full_history_predict byte-for-byte. On a calibrated platform
+        # (macOS) this branch is otherwise never exercised, so pin it here.
+        data, _ = _truncation_cases()['stale_5_35_100']
+        model = FactorModel()
+        model.fit(data)
+        ref = _full_history_predict(model, data)
+
+        FactorModel.fast_path_calibrated()          # settle the real probe
+        monkeypatch.setattr(factor_mod, '_FAST_PATH_OK', False)
+        assert FactorModel.fast_path_calibrated() is False
+
+        calls = []
+        real = factor_mod._raw_factor_panel
+        monkeypatch.setattr(
+            factor_mod, '_raw_factor_panel',
+            lambda d: (calls.append({s: len(f) for s, f in d.items()})
+                       or real(d)))
+        prod = model.predict(data, next(iter(data.values())).index[-1])
+
+        # Value == canonical full-history, byte-for-byte.
+        assert list(prod) == list(ref)
+        for s in ref:
+            assert prod[s] == ref[s]
+        # Routing: exactly one build, on the ORIGINAL (untruncated) frames.
+        assert len(calls) == 1
+        assert calls[0] == {s: len(f) for s, f in data.items()}
+
     def test_safe_tail_constant_pins_momentum_reach(self):
         # TEETH for trap #4, part 1: pin _SAFE_TAIL to its derived value so a
         # helper edit that SHRINKS it FAILS in CI (platform-independent),
@@ -968,7 +998,7 @@ class TestPredictTruncationGolden:
             trunc = _truncated_predict_data(data)
             assert trunc is not None
             raw = _raw_factor_panel(trunc)
-            # needed dates EXACTLY as _score_from_raw_panel derives them.
+            # needed dates EXACTLY as _score_sliced derives them.
             needed = {f.index[-1] for f in raw.values()}
             if len(needed) == 1:
                 for f in raw.values():
