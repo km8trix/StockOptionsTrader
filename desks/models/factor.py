@@ -460,6 +460,37 @@ def _truncated_predict_data(
         return None
 
 
+def _fully_aligned(data: Dict[str, pd.DataFrame]) -> bool:
+    """True iff every ELIGIBLE frame shares one identical date index.
+
+    The sliced fast path is guaranteed bit-identical to the full-history
+    scorer ONLY on aligned panels. When symbols carry DIFFERENT date sets —
+    stale symbols (a shorter last date) or mixed calendars (holidays / halts
+    / differing listing histories) — the needed-date slicing changes the
+    number of date-rows fed to the shape-sensitive cross-sectional mean/std
+    (``desks.features.cross_sectional_rank``), which can round 1 ULP away
+    from the full panel even where the platform probe passes (PR #82
+    review). Real dense universes are always aligned (verified: 0
+    mixed-calendar predict calls over a live aqr window), so the fast path
+    still engages for them; anything else falls back to full-history, so
+    ``predict`` returns the canonical value unconditionally.
+
+    Cheap: an O(1) length short-circuit before any O(dates) index compare,
+    and it never touches the ineligible frames the builder skips anyway.
+    """
+    ref: Optional[pd.Index] = None
+    for frame in data.values():
+        if frame is None or frame.empty or 'close' not in frame.columns \
+                or len(frame) < _MIN_ROWS:
+            continue
+        idx = frame.index
+        if ref is None:
+            ref = idx
+        elif len(idx) != len(ref) or not idx.equals(ref):
+            return False
+    return ref is not None
+
+
 # ----------------------------------------------------------------------
 # Once-per-process platform calibration of the WHOLE predict fast path
 # (tail truncation + needed-date slicing) against the full-history
@@ -470,9 +501,10 @@ def _truncated_predict_data(
 # two-pass std, slicing the number of date-rows feeding the cross-sectional
 # mean/std — and those kernels can round shape-equivalent reductions apart
 # across platforms (x86 rounds the sliced standardization 1 ULP from the
-# full one at long history; PR #82). So the fast path's consumed scores are
-# probed against the FULL-HISTORY scorer's once per process on a diverse
-# sweep of long, variously-stale panel shapes, and the whole fast path
+# full one; PR #82). predict only runs the fast path on ALIGNED panels
+# (_fully_aligned), so the probe validates exactly that: the fast path's
+# consumed scores are probed against the FULL-HISTORY scorer's once per
+# process on a sweep of long, ALIGNED panel shapes, and the whole fast path
 # stands aside for the process on any bitwise mismatch — predict then
 # computes the full-history value directly. On a sensitive platform this is
 # a logged, perf-only regression; a silent number change is impossible, and
@@ -485,12 +517,11 @@ _FAST_PATH_OK: Optional[bool] = None
 
 
 def _calibration_universe():
-    """Deterministic panels exercising the engaged-truncation shapes:
-    shared-last-date (pad path) and mixed-last-date (stale symbols) panels
-    across a range of history lengths (up to real-backtest depth) and
-    staleness patterns, at wide symbol counts. Each panel MUST engage
-    truncation (n well over the 275-row tail) so the probe compares the fast
-    path, not a no-op."""
+    """Deterministic ALIGNED panels (all symbols share one dense index — the
+    only shape predict runs the fast path on) across a range of history
+    lengths up to real-backtest depth, at wide symbol counts. Each panel
+    engages truncation (n well over the 275-row tail) so the probe compares
+    the fast path, not a no-op."""
     def _panel(n, n_sym, seed, stale=()):
         rng = np.random.default_rng(seed)
         idx = pd.bdate_range('2015-01-02', periods=n)
@@ -504,14 +535,16 @@ def _calibration_universe():
             data[sym] = data[sym].iloc[:n - drop]
         return data
 
+    # ALIGNED (shared-calendar, shared-last-date) panels only: the fast path
+    # runs only on aligned inputs (predict's _fully_aligned guard), so the
+    # probe validates exactly that shape — a range of history lengths (up to
+    # real-backtest depth) at wide symbol counts, each engaging truncation.
     return [
-        _panel(800, 8, 11),                                  # shared, medium
-        _panel(1500, 12, 12),                                # shared, wide+long
-        _panel(2200, 8, 13),                                 # shared, backtest-deep
-        _panel(900, 10, 14, stale=[('F2', 5), ('F5', 35),    # stale, long
-                                   ('F7', 100)]),
-        _panel(1500, 10, 15, stale=[('F1', 2), ('F4', 60),   # stale, varied
-                                    ('F8', 250)]),
+        _panel(800, 8, 11),                                  # medium
+        _panel(1500, 12, 12),                                # wide + long
+        _panel(2200, 8, 13),                                 # backtest-deep
+        _panel(1000, 10, 14),                                # mid
+        _panel(1800, 12, 15),                                # wide + longer
     ]
 
 
@@ -744,24 +777,31 @@ class FactorModel(WalkForwardModel):
         that cheaper — tail-truncating each frame before the O(history) raw
         build (:func:`_truncated_predict_data`) and restricting
         standardization to the consumed dates (:meth:`_score_sliced`) — but
-        the sliced cross-sectional standardization is NOT bit-identical to
-        the full one on every platform (x86 SIMD rounds the row-wise
-        mean/std 1 ULP apart at long history; PR #82). So the WHOLE fast
-        path is gated behind a once-per-process bitwise probe vs the
-        full-history reference: it engages only where the two match to the
-        bit, and falls back to full-history otherwise, so predict's output
-        is the full-history value on every platform. ``fit`` and
-        ``desks.factor_risk`` are independent of this path.
+        the sliced cross-sectional standardization is bit-identical to the
+        full one only for ALIGNED panels on a calibrated platform. It is
+        gated on BOTH: a once-per-process bitwise probe against the
+        full-history reference (catches a platform where even aligned panels
+        round apart — x86 SIMD; PR #82), and a per-call
+        :func:`_fully_aligned` guard (stale / mixed-calendar panels change
+        the standardization row-count and can round apart even where the
+        probe passes). Fail either and predict computes full-history
+        directly, so its output is the canonical value on every platform for
+        every input. Real dense universes are always aligned, so they keep
+        the fast path. ``fit`` and ``desks.factor_risk`` are independent of
+        this path.
         """
         if not self._fitted or not self._weights:
             return {}
-        if _calibrated_fast_path():
+        if _calibrated_fast_path() and _fully_aligned(data):
             trunc = _truncated_predict_data(data)
             raw_panel = _raw_factor_panel(trunc if trunc is not None else data)
             if not raw_panel:
                 return {}
             return self._score_sliced(raw_panel)
-        # Full-history fallback (canonical): no truncation, no slicing.
+        # Full-history fallback (canonical): taken on an uncalibrated
+        # platform OR a non-aligned panel (stale / mixed calendars), where
+        # the sliced fast path is not guaranteed bit-identical. No
+        # truncation, no slicing.
         raw_panel = _raw_factor_panel(data)
         if not raw_panel:
             return {}

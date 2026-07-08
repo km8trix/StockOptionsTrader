@@ -853,24 +853,25 @@ class TestPredictTruncationGolden:
         eligible = sum(1 for f in data.values() if len(f) >= _MIN_ROWS)
         assert len(prod) >= max(1, eligible - 1)
 
-        # Routing: predict calls the builder exactly once; the engaged fast
-        # path hands it a shorter frame, the fallback the originals verbatim.
+        # Routing: predict calls the builder exactly once. The fast path
+        # (calibrated platform AND aligned panel) hands it truncated frames
+        # when the case is truncatable; otherwise predict takes the
+        # full-history fallback and the builder sees the originals verbatim.
         assert len(calls) == 1
         got = calls[0]
         assert set(got) == set(data)
         engaged = any(got[s] < len(f) for s, f in data.items()
                       if f is not None)
-        if not FactorModel.fast_path_calibrated():
-            # Uncalibrated platform: predict took the full-history fallback
-            # for the WHOLE call (no truncation, no slicing) — the builder
-            # saw the originals verbatim. Equality above already proved the
-            # value; here just pin the fallback routing.
+        fast = FactorModel.fast_path_calibrated() and factor_mod._fully_aligned(data)
+        if not fast:
+            # Fallback (uncalibrated OR non-aligned stale/mixed panel):
+            # full-history, builder saw the ORIGINALS. Value verified above.
+            assert not engaged
             assert got == {s: len(f) for s, f in data.items()}
-            pytest.skip('platform not calibrated; full-history fallback '
-                        'engaged (value still verified above)')
-        assert engaged == expect_engaged
-        if not expect_engaged:
-            assert got == {s: len(f) for s, f in data.items()}
+        else:
+            assert engaged == expect_engaged
+            if not expect_engaged:
+                assert got == {s: len(f) for s, f in data.items()}
 
     def test_truncation_k_sym_math_per_symbol(self):
         # Fresh symbols must keep (staleness span + _SAFE_TAIL) rows; the
@@ -968,6 +969,55 @@ class TestPredictTruncationGolden:
         # Routing: exactly one build, on the ORIGINAL (untruncated) frames.
         assert len(calls) == 1
         assert calls[0] == {s: len(f) for s, f in data.items()}
+
+    def test_fully_aligned_guard(self):
+        # The _fully_aligned guard: dense shared-index panels -> True (fast
+        # path); any symbol with a different date set (stale last date /
+        # mixed calendar) -> False (full-history fallback). Sub-_MIN_ROWS
+        # frames are ignored (the builder skips them either way).
+        aligned = _long_panel(4, 400)
+        assert factor_mod._fully_aligned(aligned)
+        stale = dict(aligned)
+        stale['S00'] = aligned['S00'].iloc[:-3]           # shorter last date
+        assert not factor_mod._fully_aligned(stale)
+        holes = dict(aligned)
+        keep = np.ones(400, bool)
+        keep[[50, 120, 300]] = False                      # interior holes
+        holes['S01'] = aligned['S01'].iloc[keep]
+        assert not factor_mod._fully_aligned(holes)
+        plus_tiny = dict(aligned)
+        plus_tiny['T'] = aligned['S00'].iloc[:3]          # sub-_MIN_ROWS: ignored
+        assert factor_mod._fully_aligned(plus_tiny)
+        assert not factor_mod._fully_aligned({})          # nothing eligible
+
+    def test_mixed_calendar_predict_is_full_history(self):
+        # Adversarial-review case (PR #82): on MIXED per-symbol calendars
+        # (holidays/halts) the sliced fast path can round 1 ULP from
+        # full-history even on a CALIBRATED platform. The _fully_aligned
+        # guard routes such panels to the full-history fallback, so predict
+        # equals the canonical value byte-for-byte regardless of calibration.
+        rng = np.random.default_rng(201)
+        n, nsym = 1000, 10
+        base = pd.bdate_range(end='2024-12-31', periods=n)
+        data = {}
+        for i in range(nsym):
+            drop = rng.random(n) < 0.02
+            drop[-1] = False                              # shared last date
+            keep = ~drop
+            close = 100.0 * np.exp(
+                np.cumsum(rng.normal(0.0, 0.01 + 0.003 * i, int(keep.sum()))))
+            data[f'F{i}'] = pd.DataFrame(
+                {'close': close, 'volume': np.full(int(keep.sum()), 1e6)},
+                index=base[keep])
+        assert not factor_mod._fully_aligned(data)        # genuinely mixed
+        model = FactorModel()
+        model.fit(data)
+        prod = model.predict(data, base[-1])
+        ref = _full_history_predict(model, data)
+        assert list(prod) == list(ref)
+        for s in ref:
+            assert prod[s] == ref[s]                       # byte-for-byte
+        assert len(prod) >= nsym - 1                       # non-vacuous
 
     def test_safe_tail_constant_pins_momentum_reach(self):
         # TEETH for trap #4, part 1: pin _SAFE_TAIL to its derived value so a
