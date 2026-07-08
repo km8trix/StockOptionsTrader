@@ -219,11 +219,11 @@ class MarketDataHandler:
                     for item in result.results:
                         data_list.append({
                             'date': item.date,
-                            'open': float(item.open) if item.open else None,
-                            'high': float(item.high) if item.high else None,
-                            'low': float(item.low) if item.low else None,
-                            'close': float(item.close) if item.close else None,
-                            'volume': float(item.volume) if item.volume else None,
+                            'open': float(item.open) if item.open is not None else None,
+                            'high': float(item.high) if item.high is not None else None,
+                            'low': float(item.low) if item.low is not None else None,
+                            'close': float(item.close) if item.close is not None else None,
+                            'volume': float(item.volume) if item.volume is not None else None,
                         })
 
                     if data_list:

@@ -88,6 +88,11 @@ class AuditLog:
                     hash TEXT NOT NULL
                 )
             """)
+            # event_type is the common filter (circuit_breaker / api_live /
+            # parity_harness query WHERE event_type = ?); index it. Idempotent.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_log_event_type "
+                "ON audit_log(event_type)")
             conn.commit()
         finally:
             conn.close()

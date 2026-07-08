@@ -310,14 +310,21 @@ def manage_risk_settings():
             })
             
         data = request.get_json(silent=True) or {}
-        if 'max_position_size' in data:
-            risk_manager.max_position_size = data['max_position_size']
-        if 'max_sector_exposure' in data:
-            risk_manager.max_sector_exposure = data['max_sector_exposure']
-        if 'max_daily_loss' in data:
-            risk_manager.max_daily_loss = data['max_daily_loss']
-        if 'position_stop_loss' in data:
-            risk_manager.position_stop_loss = data['position_stop_loss']
+        # Each risk limit is a fraction of the portfolio: numeric, finite,
+        # in (0, 1]. Reject bad input rather than silently setting a limit
+        # that would disable or invert downstream risk gates.
+        for key in ('max_position_size', 'max_sector_exposure',
+                    'max_daily_loss', 'position_stop_loss'):
+            if key not in data:
+                continue
+            try:
+                value = float(data[key])
+            except (TypeError, ValueError):
+                return jsonify({'error': f"'{key}' must be a number"}), 400
+            if not math.isfinite(value) or not 0 < value <= 1:
+                return jsonify(
+                    {'error': f"'{key}' must be in range (0, 1]"}), 400
+            setattr(risk_manager, key, value)
             
         return jsonify({'message': 'Settings updated'})
     except Exception:

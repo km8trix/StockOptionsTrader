@@ -689,6 +689,14 @@ def export_report(backtest_id):
         if not backtest:
             return jsonify({'error': 'Backtest not found'}), 404
             
+        # Metrics can be NULL (a backtest that produced no metric yet); format
+        # None as 'N/A' rather than crashing on a numeric format spec.
+        def _fmt(value, spec):
+            return format(value, spec) if value is not None else 'N/A'
+
+        total_return = backtest.get('total_return')
+        initial_capital = backtest.get('initial_capital') or 0
+        final_value = initial_capital * (1 + (total_return or 0))
         report = f"""
 BACKTEST REPORT
 ===============
@@ -698,14 +706,14 @@ Period: {backtest.get('start_date', '')} to {backtest.get('end_date', '')}
 
 PERFORMANCE METRICS
 -------------------
-Total Return: {backtest.get('total_return', 0):.2%}
-Sharpe Ratio: {backtest.get('sharpe_ratio', 0):.2f}
-Max Drawdown: {backtest.get('max_drawdown', 0):.2%}
-Win Rate: {backtest.get('win_rate', 0):.2%}
+Total Return: {_fmt(total_return, '.2%')}
+Sharpe Ratio: {_fmt(backtest.get('sharpe_ratio'), '.2f')}
+Max Drawdown: {_fmt(backtest.get('max_drawdown'), '.2%')}
+Win Rate: {_fmt(backtest.get('win_rate'), '.2%')}
 Total Trades: {backtest.get('total_trades', 0)}
 
-Initial Capital: ${backtest.get('initial_capital', 0):,.2f}
-Final Value: ${backtest.get('initial_capital', 0) * (1 + backtest.get('total_return', 0)):,.2f}
+Initial Capital: ${initial_capital:,.2f}
+Final Value: ${final_value:,.2f}
 """
         return report, 200, {'Content-Type': 'text/plain'}
     except Exception:
