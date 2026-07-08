@@ -37,7 +37,8 @@ from data.universe import LARGE_CAP_100  # noqa: E402
 from desks.cross_sectional import CrossSectionalLongShortDesk  # noqa: E402
 from desks.walk_forward import WalkForwardController, WalkForwardModel  # noqa: E402
 from desk_backtest import (FULL_END, FULL_START, REGIMES, _slice_metrics,  # noqa: E402
-                           _trades_in, print_result, save_result)
+                           _trades_in, build_result_dict, print_result,
+                           save_result)
 
 
 class MomentumModel(WalkForwardModel):
@@ -209,18 +210,9 @@ def run(desk, symbols, start, end, capital: float = 100_000.0) -> dict:
     regimes = {name: {**(_slice_metrics(report['portfolio_history'], s, e) or {}),
                       **_trades_in(closed, s, e)}
                for name, s, e in REGIMES}
-    return {
-        'desk': 'momentum', 'model': None, 'window': [start, end],
-        'n_symbols': len(symbols), 'wall_seconds': round(time.time() - t0, 1),
-        'trades': len(closed), 'total_return': summary['total_return'],
-        'total_return_pct': summary['total_return_pct'],
-        'sharpe': summary['sharpe_ratio'],
-        'deflated_sharpe': summary['deflated_sharpe'], 'psr': summary['psr'],
-        'max_drawdown_pct': summary['max_drawdown'],
-        'win_rate': summary['win_rate'],
-        'oos_folds': report.get('oos_folds', {'available': False}),
-        'regimes': regimes,
-    }
+    return build_result_dict(
+        'momentum', None, symbols, summary, closed, regimes,
+        report.get('oos_folds', {'available': False}), start, end, t0)
 
 
 def _selftest():

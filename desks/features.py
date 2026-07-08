@@ -37,7 +37,7 @@ GradientBoostingModel.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -529,3 +529,37 @@ def cross_sectional_rank(
             index=sub.index, columns=sub.columns)
         centered_ranks.loc[single] = fill
     return centered_ranks
+
+
+def build_training_set(
+        train_data: Dict[str, pd.DataFrame]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pooled per-row (X, y) across symbols with the golden label alignment.
+
+    For each symbol, feature rows (:func:`extended_feature_frame`) are aligned
+    to ``label[i] = 1 if close[i+1]/close[i] - 1 > 0 else 0``; the final row of
+    each frame has no next-day return and is dropped (the off-by-one the label
+    demands — identical to ``GradientBoostingModel.build_training_set``). The
+    single source of truth shared by the boosting (LightGBM/stacking) and
+    neural (MLP/LSTM) models, whose training matrices were byte-for-byte the
+    same construction.
+    """
+    x_parts, y_parts = [], []
+    for _symbol, data in train_data.items():
+        if data is None or data.empty or 'close' not in data.columns:
+            continue
+        frame = extended_feature_frame(data)
+        if frame.empty:
+            continue
+        close = data['close']
+        next_return = close.shift(-1) / close - 1.0
+        labels = (next_return > 0).astype(int)
+        usable = frame.index.intersection(next_return.dropna().index)
+        if usable.empty:
+            continue
+        x_parts.append(frame.loc[usable].to_numpy(dtype=float))
+        y_parts.append(labels.loc[usable].to_numpy(dtype=int))
+
+    if not x_parts:
+        return (np.empty((0, len(FEATURE_COLUMNS))), np.empty((0,)))
+    return np.vstack(x_parts), np.concatenate(y_parts)
