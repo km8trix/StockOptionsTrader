@@ -17,8 +17,10 @@ from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
 from desks.janestreet import JaneStreetDesk
 from desks.orchestrator import FundOrchestrator
+from desks.pead import PEADDesk
 from desks.renaissance import RenaissanceDesk
 from desks.twosigma import TwoSigmaDesk
+from desks.vix_revert import VixReversionDesk
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,39 @@ _DESK_SPECS: Dict[str, Dict] = {
         # the crash isn't a regularization-strength problem. Reverted; the
         # factor_alpha param stays in the desk (default 1.0).
         'config': {'size_by_signal_strength': True},
+    },
+    'vixrevert': {
+        'name': 'VIX Reversion Desk',
+        'firm_inspiration': 'House',
+        'description': ('Volatility mean reversion: buys SPY when VIX spikes '
+                        'above 1.25x its 20-day average, exits when the spike '
+                        'resolves or after a 21-day time stop; long-only, '
+                        'reverse-martingale sized. Requires ^VIX as an '
+                        'auxiliary (never traded) symbol in the run universe; '
+                        'without it the desk stays flat. Gate 2015-2024 and '
+                        '2005-2024: FAIL (positive expectancy, ~69% win rate, '
+                        'but crisis-year losses leave it below the risk-free '
+                        'hurdle) — see scripts/vixrevert_gate.py.'),
+        'status': 'ready',
+        'activates_in_phase': None,
+        'accent': '#bf3989',
+        'factory': VixReversionDesk,
+    },
+    'pead': {
+        'name': 'PEAD Desk',
+        'firm_inspiration': 'Academia (Bernard & Thomas)',
+        'description': ('Post-earnings-announcement drift on true SUE from '
+                        'PIT SF1 filings: long the strongest positive '
+                        'standardized earnings surprises, short the strongest '
+                        'negative, while the filing is fresh (63 days). '
+                        'Requires the Sharadar PIT warehouse (sf1 ingested); '
+                        'without it the desk stays flat. Run gates with '
+                        'scripts/pead_desk_gate.py on the survivorship-free '
+                        'warehouse feed.'),
+        'status': 'ready',
+        'activates_in_phase': None,
+        'accent': '#9a6700',
+        'factory': PEADDesk,
     },
 }
 

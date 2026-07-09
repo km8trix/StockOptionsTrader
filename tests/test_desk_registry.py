@@ -14,8 +14,10 @@ from desks.janestreet import JaneStreetDesk
 from desks.orchestrator import FundOrchestrator
 from desks.registry import (_MODEL_SELECTABLE_DESKS, _PROMOTED_DESKS,
                             create_desk, create_fund_orchestrator, list_desks)
+from desks.pead import PEADDesk
 from desks.renaissance import RenaissanceDesk
 from desks.twosigma import TwoSigmaDesk
+from desks.vix_revert import VixReversionDesk
 
 EXPECTED_KEYS = {'key', 'name', 'firm_inspiration', 'description', 'status',
                  'activates_in_phase', 'accent', 'gate_status'}
@@ -43,7 +45,8 @@ class TestListDesks:
     def test_all_desks_present_with_plan_metadata(self):
         by_key = {entry['key']: entry for entry in list_desks()}
         assert set(by_key) == {'foundation', 'renaissance', 'citadel',
-                               'janestreet', 'twosigma', 'aqr'}
+                               'janestreet', 'twosigma', 'aqr',
+                               'vixrevert', 'pead'}
 
         assert by_key['foundation']['status'] == 'ready'
         assert by_key['foundation']['accent'] == '#4493f8'
@@ -77,6 +80,14 @@ class TestListDesks:
         assert by_key['aqr']['accent'] == '#f0883e'
         assert by_key['aqr']['firm_inspiration'] == 'AQR Capital Management'
 
+        # New desks (docs/vix_pead_desks_spec.md): both ready, research-gated.
+        assert by_key['vixrevert']['status'] == 'ready'
+        assert by_key['vixrevert']['activates_in_phase'] is None
+        assert by_key['vixrevert']['accent'] == '#bf3989'
+        assert by_key['pead']['status'] == 'ready'
+        assert by_key['pead']['activates_in_phase'] is None
+        assert by_key['pead']['accent'] == '#9a6700'
+
 
 class TestCreateDesk:
     def test_creates_foundation_desk_with_default_allocation(self):
@@ -98,6 +109,22 @@ class TestCreateDesk:
         assert desk.key == 'renaissance'
         assert desk.accent == '#58a6ff'
         assert desk.capital_allocation == 1.0
+
+    def test_creates_vixrevert_desk(self):
+        desk = create_desk('vixrevert', capital_allocation=0.3)
+        assert isinstance(desk, VixReversionDesk)
+        assert desk.key == 'vixrevert'
+        assert desk.capital_allocation == 0.3
+        # Sizing headroom invariant: the risk cap must clear the sizer's max
+        # entry (base * max_mult) or every pressed entry would be blocked.
+        assert desk.risk_manager.max_position_size > \
+            desk.base_entry * desk.sizer.max_mult
+
+    def test_creates_pead_desk(self):
+        desk = create_desk('pead', capital_allocation=0.4)
+        assert isinstance(desk, PEADDesk)
+        assert desk.key == 'pead'
+        assert desk.capital_allocation == 0.4
 
     def test_renaissance_capital_allocation_is_passed_through(self):
         desk = create_desk('renaissance', capital_allocation=0.3)

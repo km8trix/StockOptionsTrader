@@ -55,9 +55,11 @@ the dates-only PEAD proxy on large caps was directionally right but not signific
 "needs true SUE + small/mid" — both now available.
 
 **SUE definition (pre-specified):** for the latest quarterly filing with
-`datekey ≤ t`: seasonal diff `d_q = epsdil_q − epsdil_{q−4}`;
-`SUE = d_latest / std(trailing d over 8 quarters, ddof=1)`, requiring ≥ 4 valid
-seasonal diffs; multiple filings per `reportperiod` deduped keeping the earliest
+`datekey ≤ t`: seasonal diff `d_q = epsdil_q − epsdil_{q−4}` (calendar-matched,
+330-410 days back); `SUE = (d_latest − mean(trailing d)) / std(trailing d)` over
+the prior 8 quarters (current excluded, ddof=1, ≥ 4 valid diffs) — the
+drift-adjusted Bernard–Thomas form, so steady growth scores ~0, not as a
+perpetual "surprise"; multiple filings per `reportperiod` deduped keeping the earliest
 `datekey` (first-known, PIT-cleanest). **Freshness:** signal only if the filing's
 `datekey` is within 63 calendar days of `t` (drift decays; stale filings are noise).
 PIT timestamp is `datekey` (SEC filing date, median 41 days after quarter end) — this
@@ -98,6 +100,35 @@ pattern) so listing/registering never touches parquet; missing warehouse degrade
 reads to None → flat book. Registry/app contract tests (`test_desk_registry.py`,
 `test_app.py`) updated. GUI Floor picks both up automatically via `list_desks()`;
 Production workspace semantics untouched (desks stay Sandbox-only).
+
+## Results (2026-07-09, honest — no parameter was tuned after seeing these)
+
+**PEAD-SUE screen** (full survivorship-free small/mid universe, 4,481 names,
+192,632 events, winsorized, 30bp/leg): **micro tercile 63d is a BH survivor** —
+gross +2.63%, net +2.03%, t=3.40, p=0.0007. Pooled 63d right-signed but not
+BH-significant (t=2.33); small/mid terciles weak; all 21d horizons
+cost-negative. Same micro-concentration pattern as value/quality.
+
+**PEAD desk gates** (micro band, 600 seeded names, survivorship-free feed,
+2015-2024, `validate_strategy_oos`):
+- L/S: +5.3%, Sharpe 0.09, PSR 0.62, 0 BH years, maxDD −50% → **FAIL**
+  (short-leg bleed, the insider lesson repeated).
+- Long-only: **+93.6%, Sharpe 0.30, PSR 0.85**, 0 BH years (best years
+  p≈0.06) → **FAIL, but the strongest realized desk result in the program**
+  (vs trend 0.07, momentum 0.20, insider −0.21). The 30bp/leg assumption is
+  optimistic on micro-caps, reinforcing the FAIL.
+
+**VIX-MR desk gate** (SPY + ^VIX): 2015-2024 +0.25%, Sharpe −0.69, PSR 0.01 →
+**FAIL**. Robustness 2005-2024: 74 round-trips, 68.9% win rate, but avg loss
+($950) > avg win ($603) and every crisis year (2008/10/11/18/20) is net
+negative → +4.2%/20y → **FAIL**. Positive expectancy, no risk-adjusted edge.
+
+**Verdict: both desks ship as research desks; `_PROMOTED_DESKS` stays empty.**
+The nearest promotion candidate in the whole program is PEAD long-only micro;
+its plausible unlocks are (a) lower execution cost (IBKR), (b) press-release
+dating instead of the ~41-day filing lag (needs an earnings-announcement-date
+feed for small caps), (c) combining with the value+quality composite via the
+capital allocator.
 
 ## Testing
 

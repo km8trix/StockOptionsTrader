@@ -191,6 +191,46 @@ class PitWarehouse:
             out.append(dict(zip(cols, rows[i - 1])) if i else None)
         return out
 
+    def eps_quarterly(self, tickers: Optional[Sequence[str]] = None, *,
+                      asof=None) -> pd.DataFrame:
+        """Quarterly as-reported diluted EPS rows for SUE-style computations.
+
+        One scan of SF1 (dimension=ARQ) returning columns
+        ``ticker, reportperiod, datekey, epsdil`` — deduped to ONE row per
+        (ticker, reportperiod) keeping the EARLIEST datekey (the first-known
+        filing; amendments/restatements filed later are dropped, the
+        PIT-cleanest choice). Rows are restricted to ``datekey <= asof`` when
+        given, so the frame contains only filings KNOWN on that date. Empty
+        DataFrame when sf1 was never ingested.
+        """
+        cols = ['ticker', 'reportperiod', 'datekey', 'epsdil']
+        sql = ("SELECT ticker, CAST(reportperiod AS DATE) AS reportperiod, "
+               "CAST(datekey AS DATE) AS datekey, epsdil FROM src "
+               "WHERE dimension = 'ARQ' AND epsdil IS NOT NULL")
+        args: list = []
+        if tickers is not None:
+            if not len(tickers):
+                return pd.DataFrame(columns=cols)
+            sql += " AND ticker IN (%s)" % ",".join("?" * len(tickers))
+            args.extend(tickers)
+        if asof is not None:
+            d = self._date(asof)
+            if d is None:
+                return pd.DataFrame(columns=cols)
+            sql += " AND CAST(datekey AS DATE) <= ?"
+            args.append(d)
+        sql += (" QUALIFY row_number() OVER (PARTITION BY ticker, reportperiod"
+                " ORDER BY CAST(datekey AS DATE)) = 1"
+                " ORDER BY ticker, CAST(reportperiod AS DATE)")
+        res = self._query('sf1', sql, args)
+        if not res:
+            return pd.DataFrame(columns=cols)
+        df = res.fetchdf()
+        df['reportperiod'] = pd.to_datetime(df['reportperiod'])
+        df['datekey'] = pd.to_datetime(df['datekey'])
+        df['epsdil'] = df['epsdil'].astype(float)
+        return df
+
     def prices(self, ticker: str, start, end, *,
                field: str = 'closeadj') -> pd.Series:
         """Total-return-adjusted close series (default ``closeadj``), [start, end].
