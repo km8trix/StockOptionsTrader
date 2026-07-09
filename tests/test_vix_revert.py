@@ -67,13 +67,15 @@ class _StubPM:
         return self.pos
 
 
-def _frames(n, vix_close, vix_sma, spy_close=None):
+def _frames(n, vix_close, vix_sma, spy_close=None, spy_open=None):
     """Build {^VIX, SPY} frames of length n with explicit indicator columns."""
     idx = pd.bdate_range('2023-01-02', periods=n)
     vix = pd.DataFrame({'close': np.asarray(vix_close, float),
                         'sma_20': np.asarray(vix_sma, float)}, index=idx)
     spy_close = spy_close if spy_close is not None else np.full(n, 400.0)
     spy = pd.DataFrame({'close': np.asarray(spy_close, float)}, index=idx)
+    if spy_open is not None:
+        spy['open'] = np.asarray(spy_open, float)
     return {'^VIX': vix, 'SPY': spy}, idx
 
 
@@ -103,12 +105,13 @@ class TestVixReversionDesk:
         # signal still ON next day, but no fresh crossing -> no new entry
         assert desk.generate_intents(all_data, idx[61], pm) == []
 
-    def test_exit_on_reversion_records_win_and_presses_next_entry(self):
+    def test_exit_on_reversion_classifies_win_at_fill_and_presses_entry(self):
         close, sma = _calm(60)
-        close += [21.0, 21.0, 14.0]          # spike, hold, reverted
-        sma += [15.0, 15.0, 15.0]
-        spy = [400.0] * 60 + [400.0, 401.0, 420.0]
-        all_data, idx = _frames(63, close, sma, spy)
+        close += [21.0, 21.0, 14.0, 14.0]    # spike, hold, reverted, fill day
+        sma += [15.0, 15.0, 15.0, 15.0]
+        spy = [400.0] * 60 + [400.0, 401.0, 402.0, 419.0]
+        opens = [400.0] * 63 + [420.0]       # exit fills at day-63's open
+        all_data, idx = _frames(64, close, sma, spy, spy_open=opens)
         pm = _StubPM()
         desk = VixReversionDesk()
         assert desk.generate_intents(
@@ -116,17 +119,21 @@ class TestVixReversionDesk:
         pm.pos = _Pos(50, 400.0)             # T+1 fill observed
         assert desk.generate_intents(
             {k: v.iloc[:62] for k, v in all_data.items()}, idx[61], pm) == []
-        intents = desk.generate_intents(all_data, idx[62], pm)
+        intents = desk.generate_intents(
+            {k: v.iloc[:63] for k, v in all_data.items()}, idx[62], pm)
         assert [i.action for i in intents] == ['SELL']
         assert 'reverted' in intents[0].reason
-        # 420 > 400 entry => WIN => next entry pressed to 0.30
+        # Outcome is NOT classified at the signal — only at the fill.
+        assert desk.sizer.win_streak == 0
+        pm.pos = None                        # SELL filled at day-63's open
+        assert desk.generate_intents(all_data, idx[63], pm) == []
+        # fill-day open 420 > entry 400 => WIN => next entry pressed to 0.30
         assert desk.sizer.win_streak == 1
-        pm.pos = None                        # close fill observed
         close2, sma2 = _calm(60)
         close2 += [21.0]
         sma2 += [15.0]
         all_data2, idx2 = _frames(61, close2, sma2)
-        # fresh desk state carries over: same desk, new spike later
+        # streak carries over: same desk, new spike later
         intents2 = desk.generate_intents(all_data2, idx2[60], pm)
         assert intents2 and intents2[0].size_fraction == pytest.approx(0.30)
 
@@ -164,6 +171,61 @@ class TestVixReversionDesk:
         pm.pos = None
         desk.generate_intents(all_data, idx[62], pm)
         assert desk.sizer.win_streak == 0     # loss by construction
+
+    def test_foreign_position_is_ignored(self):
+        """A shared-book SPY position the desk did not open is never adopted,
+        never exited, and blocks new entries (fund-mode safety)."""
+        close, sma = _calm(60)
+        close += [14.0]                       # calm: 'reverted' if we held
+        sma += [15.0]
+        all_data, idx = _frames(61, close, sma)
+        pm = _StubPM()
+        pm.pos = _Pos(80, 390.0)              # another desk's SPY long
+        desk = VixReversionDesk()
+        assert desk.generate_intents(all_data, idx[60], pm) == []
+        assert desk._entry_px is None         # not adopted
+        # ...and a spike crossing while the foreign position exists: no BUY.
+        close2, sma2 = _calm(60)
+        close2 += [21.0]
+        sma2 += [15.0]
+        all_data2, idx2 = _frames(61, close2, sma2)
+        assert desk.generate_intents(all_data2, idx2[60], pm) == []
+
+    def test_stalled_exit_is_reemitted(self):
+        n_spike = 30
+        all_data, idx = self._spiked(60, n_spike)
+        pm = _StubPM()
+        desk = VixReversionDesk(max_hold_days=2)   # exit signal fires fast
+        assert desk.generate_intents(
+            {k: v.iloc[:61] for k, v in all_data.items()}, idx[60], pm)
+        pm.pos = _Pos(50, 400.0)
+        sells = []
+        for d in range(61, 60 + n_spike):
+            day = {k: v.iloc[:d + 1] for k, v in all_data.items()}
+            out = desk.generate_intents(day, idx[d], pm)
+            sells.extend(out)                 # position never goes flat
+        assert len(sells) >= 2                # original exit + >=1 retry
+        assert any('retry' in i.reason for i in sells[1:])
+        assert all(i.action == 'SELL' for i in sells)
+
+    def test_apply_risk_blocks_index_level_opens(self):
+        from core.models import Asset, AssetType
+        from desks.base import DeskIntent
+        from portfolio.manager import PortfolioManager
+        desk = VixReversionDesk()
+        pm = PortfolioManager(initial_capital=100_000.0)
+        vix_asset = Asset(symbol='^VIX', asset_type=AssetType.STOCK)
+        spy_asset = Asset(symbol='SPY', asset_type=AssetType.STOCK)
+        intents = [
+            DeskIntent(asset=vix_asset, action='BUY', size_fraction=0.1,
+                       reason='rogue index buy'),
+            DeskIntent(asset=spy_asset, action='BUY', size_fraction=0.1,
+                       reason='legit'),
+        ]
+        approved = desk.apply_risk(intents, pm, {}, pd.Timestamp('2023-06-01'))
+        assert [i.asset.symbol for i in approved] == ['SPY']
+        assert any(n.category == 'risk' and '^VIX' in n.message
+                   for n in desk.notes)
 
     def test_missing_vix_degrades_flat_with_one_info_note(self):
         idx = pd.bdate_range('2023-01-02', periods=70)

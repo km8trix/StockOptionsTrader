@@ -111,6 +111,14 @@ def build_result_dict(desk_name, model_name, symbols, summary, closed,
 def run_desk(key, symbols, start, end, model_key=None, capital=100_000.0):
     """Backtest one desk; return a compact comparable result dict."""
     desk = create_desk(key, model_key=model_key)
+    if key == 'vixrevert':
+        # This desk trades SPY off the ^VIX level; without both in the
+        # universe it sits flat and the leaderboard row would silently read
+        # as a real 0-trade backtest. apply_risk blocks any OTHER desk from
+        # opening positions on '^' symbols, so the auxiliary series is safe
+        # to append here.
+        symbols = list(symbols) + [s for s in ('SPY', '^VIX')
+                                   if s not in symbols]
     engine = BacktestEngine(desk=desk, initial_capital=capital)
     t0 = time.time()
     report = engine.run(symbols, start, end)

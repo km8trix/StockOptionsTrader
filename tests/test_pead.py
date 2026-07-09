@@ -57,6 +57,15 @@ class TestSueTable:
         # diffs -> below min_diffs -> nothing computable.
         assert len(out) == 0
 
+    def test_out_of_order_filing_is_dropped(self):
+        # A delinquent filer: q2's FIRST filing lands after q8's — every SUE
+        # whose window straddles the disorder would embed EPS not yet public
+        # at its own datekey, so those rows must be dropped.
+        rows = _eps_rows('ZZZ', [1, 1, 1, 1, 2, 3, 2, 3, 5])
+        rows[2]['datekey'] = pd.Timestamp('2023-06-01')   # filed years late
+        out = sue_table(pd.DataFrame(rows))
+        assert len(out) == 0                  # q8's SUE (the only one) killed
+
     def test_min_diffs_enforced_and_empty_input(self):
         eps = pd.DataFrame(_eps_rows('DDD', [1, 1, 1, 1, 2, 3]))
         assert len(sue_table(eps)) == 0                # only 2 diffs exist
@@ -216,6 +225,26 @@ class TestPEADDesk:
         assert scores is not None
         assert set(scores) <= {'AAA', 'BBB'}
         assert 'CCC' not in scores and 'DDD' not in scores
+
+    def test_new_symbols_trigger_repull(self):
+        """A name entering all_data mid-run (IPO) must be scored, not frozen
+        out by the first pull (adversarial-review finding)."""
+        eps = _surprise_eps()
+        extra = _eps_rows('EEE', [1.0 + 0.05 * q + (0.2 if q % 2 else 0.3)
+                                  * (q // 4 + 1) for q in range(12)])
+        prov = _FakeProvider(pd.concat([eps, pd.DataFrame(extra)],
+                                       ignore_index=True))
+        desk = PEADDesk(provider=prov, quantile=0.25)
+        frames1, idx1 = _desk_frames(['AAA', 'BBB', 'CCC', 'DDD'],
+                                     '2023-02-01')
+        assert desk._alpha_scores(frames1, idx1[-1]) is not None
+        calls = prov.eps_calls
+        # New month AND a new symbol: the desk must re-pull and score EEE.
+        frames2, idx2 = _desk_frames(['AAA', 'BBB', 'CCC', 'DDD', 'EEE'],
+                                     '2023-03-01')
+        scores2 = desk._alpha_scores(frames2, idx2[-1])
+        assert prov.eps_calls == calls + 1
+        assert scores2 is not None and 'EEE' in scores2
 
     def test_below_min_scored_flattens(self):
         prov = _FakeProvider(_surprise_eps())

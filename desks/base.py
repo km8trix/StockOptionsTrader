@@ -329,6 +329,20 @@ class Desk(ABC):
                 approved.append(intent)
                 continue
 
+            # Index levels ('^VIX', '^GSPC', ...) are auxiliary signal
+            # series, not tradeable instruments. A universe may include one
+            # (the VIX desk needs ^VIX injected), and every desk sees every
+            # all_data key — this shared guard keeps any desk from opening a
+            # position on the level itself. Closes still pass above.
+            if intent.asset.symbol.startswith('^'):
+                self.note(
+                    'risk',
+                    f"Blocked {intent.action} {intent.asset.symbol}: index "
+                    f"levels are auxiliary data, not tradeable instruments",
+                    symbol=intent.asset.symbol, action=intent.action,
+                    **self.risk_note_data(intent.asset))
+                continue
+
             if not buys_allowed:
                 # Already noted once above; the circuit blocks all new
                 # exposure (BUYs and SHORTs alike).

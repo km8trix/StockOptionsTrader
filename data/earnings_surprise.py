@@ -74,7 +74,16 @@ def sue_table(eps: pd.DataFrame, *, window: int = 8,
                 # into an absurd SUE. Cent-level real stds survive easily.
                 if np.isfinite(sd) and sd > 1e-9 * max(1.0, abs(past.mean())):
                     sue[i] = (diffs[i] - past.mean()) / sd
-        keep = np.isfinite(sue)
+        # Out-of-order-filing guard: a SUE is only PIT-clean if every row it
+        # consumed (seasonal match + trailing window) was filed on or before
+        # its own datekey. Requiring the row's datekey to be the running max
+        # in reportperiod order enforces exactly that (a delinquent old
+        # quarter first-filed LATER would otherwise leak future EPS into an
+        # earlier-dated SUE). Slightly conservative — it also drops the few
+        # rows straddling the disorder — and exact for normal filers.
+        dk = g['datekey'].to_numpy(dtype='datetime64[ns]')
+        in_order = dk == np.maximum.accumulate(dk)
+        keep = np.isfinite(sue) & in_order
         if keep.any():
             sub = g.loc[keep, ['ticker', 'reportperiod', 'datekey']].copy()
             sub['sue'] = sue[keep]

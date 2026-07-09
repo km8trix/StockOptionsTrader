@@ -18,7 +18,11 @@ FIXED factor: committee=[] so walk_forward_fits=[] and validation runs at
 n_trials=1 (no deflation) — honest, the rule is pre-specified in
 docs/vix_pead_desks_spec.md. Wide RiskManager (the signal is monthly; a 2%
 price stop would churn it). Scores are cached per calendar month (the base
-calls _alpha_scores daily). Run under
+calls _alpha_scores daily) — including a cached None, which keeps the book
+flat until the month rolls even if filings land mid-month. That is the same
+monthly cadence the screen validated (BMS rebalances) and mirrors the insider
+desk's documented behavior; trading mid-month would be an untested,
+faster-cadence variant. Run under
 ``BacktestEngine(desk=..., market_data=WarehouseMarketData())`` so delisted
 names are still priced (survivorship-free).
 """
@@ -82,7 +86,8 @@ class PEADDesk(CrossSectionalLongShortDesk):
         self._band_idx = None if band is None else _BANDS[band]
         self._n_bands = n_bands
         self._fresh_days = fresh_days
-        self._eps: Optional[pd.DataFrame] = None   # full pull, sliced PIT
+        self._eps: Optional[pd.DataFrame] = None   # cumulative pull, sliced PIT
+        self._eps_symbols: set = set()             # symbols covered by _eps
         self._cache_month: Optional[tuple] = None
         self._cache_scores: Optional[Dict[str, float]] = None
 
@@ -94,10 +99,14 @@ class PEADDesk(CrossSectionalLongShortDesk):
             return self._cache_scores        # signal is monthly; reuse
 
         symbols = list(all_data.keys())
-        if self._eps is None:
-            # ONE warehouse scan per run; every later read slices this frame
-            # to datekey <= date, which IS the PIT boundary (pinned by test).
-            self._eps = self._provider.eps_quarterly(symbols)
+        # One warehouse scan per run PLUS a re-pull whenever the engine hands
+        # us symbols not yet covered (mid-window IPOs enter all_data only once
+        # they have bars — a day-one-only pull would silently exclude them for
+        # the whole backtest). Every read slices this frame to datekey <= date,
+        # which IS the PIT boundary (pinned by test).
+        if self._eps is None or not set(symbols) <= self._eps_symbols:
+            self._eps_symbols |= set(symbols)
+            self._eps = self._provider.eps_quarterly(sorted(self._eps_symbols))
         if self._band_idx is not None:
             caps = pit_marketcaps(self._provider, symbols, date)
             buckets = size_buckets(caps, self._n_bands)

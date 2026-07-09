@@ -66,7 +66,11 @@ def collect_sue_events(prov, names, rebal_dates, horizons, *,
         live = []
         for t in rebal_dates:
             ts = pd.Timestamp(t)
-            i = int(np.searchsorted(keys, np.datetime64(ts), side='right'))
+            # side='left': a filing with datekey == t is NOT usable at t —
+            # its datekey covers after-close EDGAR acceptances, so the day-t
+            # close printed before the filing was public (and the tradeable
+            # desk only fills T+1 anyway).
+            i = int(np.searchsorted(keys, np.datetime64(ts), side='left'))
             if i == 0:
                 continue                       # nothing filed yet (PIT)
             dk = pd.Timestamp(keys[i - 1])

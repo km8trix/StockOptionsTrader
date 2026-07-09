@@ -103,32 +103,46 @@ Production workspace semantics untouched (desks stay Sandbox-only).
 
 ## Results (2026-07-09, honest — no parameter was tuned after seeing these)
 
+Numbers below are FINAL, after the adversarial review fixes (frozen-universe
+IPO exclusion in the desk, strict `datekey < t` screen entries, out-of-order
+filing guard) — the pre-fix numbers appear in the git history only.
+
 **PEAD-SUE screen** (full survivorship-free small/mid universe, 4,481 names,
-192,632 events, winsorized, 30bp/leg): **micro tercile 63d is a BH survivor** —
-gross +2.63%, net +2.03%, t=3.40, p=0.0007. Pooled 63d right-signed but not
-BH-significant (t=2.33); small/mid terciles weak; all 21d horizons
+188,624 events, 30bp/leg): **micro tercile 63d is a BH survivor** — gross
++2.71%, net +2.11%, t=3.48, p=0.0005 at winsor 0.01; **robust to aggressive
+5% winsorization** (net +1.50%, t=3.34, still the lone BH survivor) and got
+slightly stronger after the lookahead fixes. Pooled 63d right-signed but not
+BH-significant (t=2.26); small/mid terciles weak; all 21d horizons
 cost-negative. Same micro-concentration pattern as value/quality.
 
 **PEAD desk gates** (micro band, 600 seeded names, survivorship-free feed,
 2015-2024, `validate_strategy_oos`):
-- L/S: +5.3%, Sharpe 0.09, PSR 0.62, 0 BH years, maxDD −50% → **FAIL**
-  (short-leg bleed, the insider lesson repeated).
-- Long-only: **+93.6%, Sharpe 0.30, PSR 0.85**, 0 BH years (best years
-  p≈0.06) → **FAIL, but the strongest realized desk result in the program**
-  (vs trend 0.07, momentum 0.20, insider −0.21). The 30bp/leg assumption is
+- L/S: +53.3%, Sharpe 0.21, PSR 0.76, 0 BH years, maxDD −36.6% → **FAIL**
+  (the short leg still halves the long book's Sharpe — the insider lesson).
+- Long-only: **+115.0%, Sharpe 0.36, PSR 0.891**, 0 BH years, maxDD −30.6%
+  → **FAIL, but the strongest realized desk result in the program** (vs
+  trend 0.07, momentum 0.20, insider −0.21). The 30bp/leg cost assumption is
   optimistic on micro-caps, reinforcing the FAIL.
 
-**VIX-MR desk gate** (SPY + ^VIX): 2015-2024 +0.25%, Sharpe −0.69, PSR 0.01 →
-**FAIL**. Robustness 2005-2024: 74 round-trips, 68.9% win rate, but avg loss
-($950) > avg win ($603) and every crisis year (2008/10/11/18/20) is net
-negative → +4.2%/20y → **FAIL**. Positive expectancy, no risk-adjusted edge.
+**VIX-MR desk gate** (SPY + ^VIX): 2015-2024 −0.1%, Sharpe −0.70, PSR 0.01 →
+**FAIL**. Robustness 2005-2024: 74 round-trips, ~69% win rate, but avg loss >
+avg win and every crisis year (2008/10/11/18/20) is net negative → +5.0%/20y
+→ **FAIL**. Positive expectancy, no risk-adjusted edge.
+
+**Adversarial review (16-agent, 4 lenses + per-finding refuters): 12 confirmed
+findings, all fixed or dispositioned** — highlights: PEAD desk froze its EPS
+universe to day-one symbols (fixed: re-pull on new symbols; this RAISED both
+gate results materially, +5%→+53% L/S); screen admitted same-day filings and
+out-of-order delinquent filings (both fixed); shared `apply_risk` now blocks
+opening intents on '^' index levels desk-wide; VIX desk got fund-mode
+ownership tracking, stalled-exit retry, and fill-day win/loss classification.
 
 **Verdict: both desks ship as research desks; `_PROMOTED_DESKS` stays empty.**
-The nearest promotion candidate in the whole program is PEAD long-only micro;
-its plausible unlocks are (a) lower execution cost (IBKR), (b) press-release
-dating instead of the ~41-day filing lag (needs an earnings-announcement-date
-feed for small caps), (c) combining with the value+quality composite via the
-capital allocator.
+The nearest promotion candidate in the whole program is PEAD long-only micro
+(PSR 0.891 vs the 0.95 bar); its plausible unlocks are (a) lower execution
+cost (IBKR), (b) press-release dating instead of the ~41-day filing lag
+(needs an earnings-announcement-date feed for small caps), (c) combining with
+the value+quality composite via the capital allocator.
 
 ## Testing
 
