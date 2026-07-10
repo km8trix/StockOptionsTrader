@@ -34,6 +34,19 @@ RESULT (2026-07-02, winsorized): netmargin is a real profitability premium —
 (t~1.1). But netmargin has value's exact caveats: micro-concentrated (small/mid
 ex-micro only t~1.5) and regime-sensitive (strong in-sample, decays OOS 2020-24).
 A second decorrelated-but-marginal signal, like value.
+NOTE: the default factor family is now 4 (m=8 BH tests, stricter thresholds);
+reproducing the numbers above needs ``--factors netmargin grossmargin``.
+
+RESULT (2026-07-10, computed ratios, assets>=$1M floor, --terciles, full
+universe 4627 names / 330,411 events): 19/32 BH survivors — the strongest
+quality screen in the program. gp_assets (Novy-Marx) pooled 63d net +3.60%
+t=+4.44, micro 63d net +5.26% t=+4.98; roa survives in ALL 8 cells incl.
+MID-CAP (63d net +2.04% t=+2.36) — the tradeable slice where the native
+margins die. rank-corr(gp_assets, netmargin) per-date Spearman mean +0.067:
+profitability-scaled-by-assets is a nearly orthogonal quality dimension, an
+ADDITION to the VQ leg, not a replacement. The unguarded first run read the
+same 19 survivors with slightly weaker micro gp_assets — the unit-error rows
+were noise-dragging, not inflating. Screen-level only; no promotion claim.
 
 Deterministic; reads the warehouse (tickers + sep + sf1 ingested).
 """
