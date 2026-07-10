@@ -23,18 +23,44 @@ micro-concentrated and regime-dependent (value dead 2015-2019); the tradeable
 ex-micro slice was only t~1.9-2.6. This desk exists primarily as the
 decorrelated second leg for the PEAD combine (docs/vix_pead_desks_spec.md
 unlock c), not as a standalone promotion candidate.
+
+STRENGTHENING VARIANTS (2026-07-10, both opt-in, defaults byte-identical —
+the two merged screen facts behind them, both pre-registered, no tuning):
+
+  include_gp_assets  adds the gp/assets (Novy-Marx gross profitability) rank
+      to the composite at an EQUAL rank weight — the strongest quality factor
+      ever screened here (pooled 63d net +3.60% t=+4.44) and nearly
+      orthogonal to netmargin (per-date Spearman +0.067). Computed via
+      data/quality_ratios.computed_ratio on the SAME PIT SF1 row the desk
+      reads netmargin from; names with no computable gp_assets rank on the
+      available factors only (mean of the available ranks) rather than
+      dropping out — requiring the raws would shrink the base book.
+
+  issuance_filter    drops the TOP QUINTILE (0.2, rank-based among the
+      rebalance's scored names — the desk's own quantile convention, no
+      absolute threshold) of YoY net share issuers from LONG candidacy.
+      HIGH issuance predicts LOW returns (8/8 BH screen) but the long-only
+      issuance leg was weak (PR #96 negative) — as a FILTER the short-leg
+      information is harvested without shorting. Missing issuance is NOT
+      evidence of issuance: no-data names are never excluded. Longs only.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
+from data.quality_ratios import computed_ratio
+from data.share_issuance import issuance_table
 from data.size_buckets import pit_marketcaps, size_buckets
 from desks.cross_sectional import CrossSectionalLongShortDesk
 from portfolio.risk_manager import RiskManager
+
+#: issuance_filter exclusion quantile — pre-registered at the desk's own
+#: top-quintile convention (0.2, rank-based per rebalance), never tuned.
+_ISSUANCE_FILTER_QUINTILE = 0.2
 
 
 class ValueQualityDesk(CrossSectionalLongShortDesk):
@@ -49,13 +75,18 @@ class ValueQualityDesk(CrossSectionalLongShortDesk):
     def __init__(self, *, provider=None, capital_allocation: float = 1.0,
                  risk_manager: Optional[RiskManager] = None,
                  quantile: float = 0.2, long_only: bool = False,
-                 stale_days: int = 270, exclude_micro: bool = False):
+                 stale_days: int = 270, exclude_micro: bool = False,
+                 include_gp_assets: bool = False,
+                 issuance_filter: bool = False):
         if provider is None:
             from data.pit_warehouse import PitWarehouse
             provider = PitWarehouse()
         if risk_manager is None:
             risk_manager = RiskManager(position_stop_loss=0.50)
         super().__init__(
+            # STABLE key: fund allocation dicts address this desk by .key
+            # (tests/test_vq_fund_gate.py key contract) — never derive it
+            # from params (variants included).
             key='value_quality',
             name='Value+Quality Desk',
             description=('Cross-sectional value+quality composite: long the '
@@ -76,10 +107,18 @@ class ValueQualityDesk(CrossSectionalLongShortDesk):
         self._provider = provider
         self._stale_days = stale_days
         self._exclude_micro = exclude_micro
+        self._include_gp_assets = include_gp_assets
+        self._issuance_filter = issuance_filter
         self._nm: Optional[pd.DataFrame] = None    # cumulative pull, PIT-cut
         self._nm_symbols: set = set()
+        # issuance_filter state: cumulative share-count pull (the issuance
+        # desk's one-shot-pull pattern verbatim) + the monthly exclusion set
+        # (computed alongside the score cache, served via _long_exclusions).
+        self._shares: Optional[pd.DataFrame] = None
+        self._share_symbols: set = set()
         self._cache_month: Optional[tuple] = None
         self._cache_scores: Optional[Dict[str, float]] = None
+        self._cache_excluded: set = set()
 
     def _alpha_scores(self, all_data: Dict[str, pd.DataFrame],
                       date) -> Optional[Dict[str, float]]:
@@ -95,15 +134,23 @@ class ValueQualityDesk(CrossSectionalLongShortDesk):
             symbols = [s for s in symbols if buckets.get(s, 0) != 0]
         if self._nm is None or not set(symbols) <= self._nm_symbols:
             self._nm_symbols |= set(symbols)
+            # gp/assets raws ride the SAME pull (and so the same PIT SF1
+            # row) as netmargin when the gp_assets extension is on; the
+            # default pull is byte-identical. fundamentals_quarterly drops
+            # rows where the FIRST field is NULL, so the netmargin row set
+            # is unchanged either way.
+            fields = (('netmargin', 'gp', 'assets')
+                      if self._include_gp_assets else ('netmargin',))
             self._nm = self._provider.fundamentals_quarterly(
-                sorted(self._nm_symbols), fields=('netmargin',))
+                sorted(self._nm_symbols), fields=fields)
 
-        # Latest PIT netmargin per name, recent filings only.
+        # Latest PIT filing per name, recent filings only.
         vis = self._nm[(self._nm['datekey'] <= ts)
                        & (self._nm['datekey']
                           >= ts - pd.Timedelta(days=self._stale_days))]
-        nm = (vis.sort_values('datekey').groupby('ticker', sort=False)
-              .tail(1).set_index('ticker')['netmargin'])
+        latest = (vis.sort_values('datekey').groupby('ticker', sort=False)
+                  .tail(1).set_index('ticker'))
+        nm = latest['netmargin']
         # PIT price/book on the simulated date; value traps dropped.
         pbs = self._provider.daily_fields_bulk(symbols, ts, fields=('pb',))
 
@@ -115,15 +162,85 @@ class ValueQualityDesk(CrossSectionalLongShortDesk):
                 continue
             if margin is None or not np.isfinite(margin):
                 continue
-            rows[sym] = (pb, float(margin))
+            gpa = np.nan
+            if self._include_gp_assets:
+                # gp/assets from the SAME PIT SF1 row as the margin; NaN
+                # raws map to None so computed_ratio's non-null guard fires
+                # (mirroring the missing-netmargin detection above). A name
+                # with no computable gp_assets keeps a NaN here and ranks on
+                # the available factors only — it is NOT dropped.
+                row = latest.loc[sym]
+                fund = {f: (None if pd.isna(row[f]) else row[f])
+                        for f in ('gp', 'assets')}
+                v = computed_ratio(fund, 'gp', 'assets')
+                gpa = np.nan if v is None or not np.isfinite(v) else float(v)
+            rows[sym] = (pb, float(margin), gpa)
         result: Optional[Dict[str, float]] = None
         if len(rows) >= self.min_scored:
             frame = pd.DataFrame.from_dict(rows, orient='index',
-                                           columns=['pb', 'nm'])
+                                           columns=['pb', 'nm', 'gpa'])
             cheap = (-frame['pb']).rank(pct=True)      # low pb = high rank
             profit = frame['nm'].rank(pct=True)        # high margin = high
-            composite = (cheap + profit) / 2.0
+            if self._include_gp_assets:
+                # EQUAL rank weights (pre-registered — no weight tuning):
+                # the mean of the AVAILABLE ranks. pandas keeps NaN out of
+                # both the rank (na_option='keep') and the row mean
+                # (skipna), so a name with no computable gp_assets averages
+                # its pb+netmargin ranks alone.
+                quality2 = frame['gpa'].rank(pct=True)  # high gp/assets = high
+                composite = pd.concat([cheap, profit, quality2],
+                                      axis=1).mean(axis=1)
+            else:
+                composite = (cheap + profit) / 2.0
             result = {sym: float(v) for sym, v in composite.items()}
 
+        # Monthly exclusion set rides the score cache: rank-based among THIS
+        # rebalance's scored names, served to the base via _long_exclusions.
+        self._cache_excluded = (
+            self._issuance_exclusions(sorted(result), ts)
+            if self._issuance_filter and result else set())
         self._cache_month, self._cache_scores = month, result
         return result
+
+    def _issuance_exclusions(self, symbols: List[str], ts: pd.Timestamp
+                             ) -> set:
+        """The top-``_ISSUANCE_FILTER_QUINTILE`` heaviest YoY net issuers
+        among ``symbols`` (this rebalance's scored names) — barred from longs.
+
+        HIGH issuance predicts LOW returns (data/share_issuance sign
+        convention; 8/8 BH screen), and the long-only issuance DESK was weak
+        (PR #96 negative) — so the short-leg information is harvested as a
+        long-candidacy FILTER instead. Rank-based per rebalance (the desk's
+        own quantile convention, floor'd like the base's k so fewer than 5
+        computable names exclude nobody), ties broken by symbol. Names with
+        no computable issuance are NOT excluded — missing data is not
+        evidence of issuance; scored names already passed the composite's
+        filing-recency screen, so a separate staleness knob would be a new
+        parameter, not a safeguard.
+        """
+        # One warehouse scan per run plus a cumulative re-pull for symbols
+        # not yet covered — desks/issuance.py's one-shot-pull pattern
+        # verbatim; every read slices to datekey <= ts (the PIT boundary).
+        if self._shares is None or not set(symbols) <= self._share_symbols:
+            self._share_symbols |= set(symbols)
+            self._shares = self._provider.fundamentals_quarterly(
+                sorted(self._share_symbols),
+                fields=('sharesbas', 'sharefactor'))
+        visible = self._shares[self._shares['datekey'] <= ts]
+        table = issuance_table(visible)
+        if not len(table):
+            return set()
+        latest = (table.sort_values('datekey').groupby('ticker', sort=False)
+                  .tail(1).set_index('ticker')['issuance'])
+        scored = [(sym, float(latest[sym])) for sym in symbols
+                  if sym in latest.index and np.isfinite(latest[sym])]
+        k = int(_ISSUANCE_FILTER_QUINTILE * len(scored))
+        if k <= 0:
+            return set()
+        scored.sort(key=lambda item: (-item[1], item[0]))  # heaviest first
+        return {sym for sym, _ in scored[:k]}
+
+    def _long_exclusions(self, ranked_symbols: List[str], date) -> set:
+        """Serve the monthly issuance-filter set to the base's long-candidacy
+        filter (empty when ``issuance_filter`` is off — byte-identical)."""
+        return self._cache_excluded
