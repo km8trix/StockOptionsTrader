@@ -150,20 +150,21 @@ def factor_study(events, factor, horizons, cost_bps, *, quantile=0.2,
     return out
 
 
-def _print_report(all_stats, bh, cost_bps, n_names, n_events, label='value'):
+def _print_report(all_stats, bh, cost_bps, n_names, n_events, label='value',
+                  width=9):
     print(f"\n{label} factor screen: {n_names} names, {n_events} events, "
           f"cost {cost_bps:.0f}bp/leg (Fama-MacBeth spread, Newey-West t)\n")
-    print(f"  {'factor':>9}{'h':>4}{'dates':>7}{'gross%':>9}{'net%':>9}"
+    print(f"  {'factor':>{width}}{'h':>4}{'dates':>7}{'gross%':>9}{'net%':>9}"
           f"{'t':>7}{'p':>9}{'BH*':>5}")
     rej = bh['rejected_bh'] if bh else []
     j = 0
     for s in all_stats:
         if s.get('insufficient'):
-            print(f"  {s['factor']:>9}{s['h']:>4}   (insufficient)")
+            print(f"  {s['factor']:>{width}}{s['h']:>4}   (insufficient)")
             continue
         star = '  *' if j < len(rej) and rej[j] else ''
         j += 1
-        print(f"  {s['factor']:>9}{s['h']:>4}{s['n_dates']:>7}"
+        print(f"  {s['factor']:>{width}}{s['h']:>4}{s['n_dates']:>7}"
               f"{s['gross_spread']*100:>+9.3f}{s['net_spread']*100:>+9.3f}"
               f"{s['t']:>+7.2f}{s['p']:>9.4f}{star:>5}")
     if bh:

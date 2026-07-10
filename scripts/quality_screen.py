@@ -15,9 +15,15 @@ Two differences from the value screen, both economically motivated:
     (negative ROE / margin) is a legitimate short-leg member, not a dropped trap.
 
 Quality ratios (from SF1 ARQ, higher = better = the long):
-  netmargin, grossmargin
-NOTE: roe / roa are 100% NULL in the SF1 ARQ dimension (Sharadar only populates
-them in the trailing AR*T dimensions) — do not use them here. grossmargin is
+  netmargin, grossmargin              (native SF1 ratio columns)
+  gp_assets = gp / assets             (COMPUTED — Novy-Marx 2013 gross profitability)
+  roa       = netinc / assets         (COMPUTED)
+NOTE: the roe / roa RATIO columns are 100% NULL in the SF1 ARQ dimension
+(Sharadar only populates them in the trailing AR*T dimensions) — but the RAW
+inputs (gp 3.4% null, netinc 3.5%, assets 0.05%) are near-complete, so the
+COMPUTED_RATIOS above are rebuilt from raws per SF1 row (both inputs from the
+same quarter by construction; assets guarded by a relative-epsilon positive
+floor so a shell-company asset sliver cannot explode the ratio). grossmargin is
 bounded <=1 by definition, so values outside [-1,1] (near-zero-revenue garbage)
 are dropped. Forward returns are winsorized per date (--winsor 0.01) — without it
 +2000x micro-cap return artifacts dominate a leg and flip the sign (the first,
@@ -49,16 +55,43 @@ from data.pit_warehouse import PitWarehouse  # noqa: E402
 from scripts.factor_screen import _print_report, factor_study  # noqa: E402
 from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
 
-QUALITY_FACTORS = ['netmargin', 'grossmargin']   # roe/roa are null in SF1 ARQ
+# netmargin/grossmargin are native SF1 columns; gp_assets/roa are COMPUTED from
+# near-complete raws (the native roe/roa ratio columns are null in SF1 ARQ).
+QUALITY_FACTORS = ['netmargin', 'grossmargin', 'gp_assets', 'roa']
+
+COMPUTED_RATIOS = {                # factor -> (numerator, denominator) SF1 raws
+    'gp_assets': ('gp', 'assets'),      # Novy-Marx (2013) gross profitability
+    'roa': ('netinc', 'assets'),
+}
+_REL_EPS = 1e-9
+
+
+def computed_ratio(fund, num_field, den_field):
+    """num/den from ONE SF1 row (same quarter by construction), or None.
+
+    Guards: both inputs non-null, and the denominator positive with a
+    relative-epsilon floor (den > eps * max(1, |num|)) — a near-zero assets
+    base would otherwise explode the ratio into rank-dominating garbage.
+    """
+    num, den = fund.get(num_field), fund.get(den_field)
+    if num is None or den is None:
+        return None
+    num, den = float(num), float(den)            # DuckDB may hand Decimal
+    if den <= _REL_EPS * max(1.0, abs(num)):
+        return None
+    return num / den
 
 
 def collect_quality_events(prov, names, rebal_dates, horizons, factors,
-                           price_start, price_end):
+                           price_start, price_end, *, with_mcap=False):
     """One row per (name, rebalance): the PIT SF1 quality values + forward returns.
 
     Mirrors factor_screen.collect_factor_events but reads fundamentals_asof (SF1,
     datekey<=t) instead of daily_metric — profitability lives in the quarterly
-    fundamentals, not the daily valuation table.
+    fundamentals, not the daily valuation table. Factors named in COMPUTED_RATIOS
+    are rebuilt from the row's raw fields (see computed_ratio); with_mcap=True
+    additionally records the row's SF1 marketcap as ``mcap`` (for size terciles;
+    default False keeps the output byte-identical for existing callers).
     """
     maxh = max(horizons)
     recs = []
@@ -93,12 +126,19 @@ def collect_quality_events(prov, names, rebal_dates, horizons, factors,
                 continue
             rec = {'date': pd.Timestamp(t), 'name': name}
             for f in factors:
-                v = fund.get(f)
-                rec[f] = float(v) if v is not None else None  # DuckDB may hand Decimal
+                if f in COMPUTED_RATIOS:
+                    rec[f] = computed_ratio(fund, *COMPUTED_RATIOS[f])
+                else:
+                    v = fund.get(f)
+                    rec[f] = float(v) if v is not None else None  # DuckDB may hand Decimal
+            if with_mcap:
+                v = fund.get('marketcap')
+                rec['mcap'] = float(v) if v is not None else None
             for h in horizons:
                 rec[f'fwd_{h}'] = vals[pos + h] / entry - 1.0
             recs.append(rec)
-    cols = (['date', 'name'] + list(factors) + [f'fwd_{h}' for h in horizons])
+    cols = (['date', 'name'] + list(factors) + (['mcap'] if with_mcap else [])
+            + [f'fwd_{h}' for h in horizons])
     return pd.DataFrame(recs, columns=cols), n_names
 
 
@@ -115,6 +155,10 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--winsor', type=float, default=0.01,
                     help='per-date forward-return winsorization (0 = off)')
+    ap.add_argument('--terciles', action='store_true',
+                    help='also test per-date PIT size terciles (SF1 marketcap);'
+                         ' enlarges the BH family to factors x'
+                         ' (pooled+t0/t1/t2) x horizons')
     cli = ap.parse_args(argv)
 
     import random
@@ -130,22 +174,49 @@ def main(argv=None):
           file=sys.stderr)
 
     events, n_names = collect_quality_events(wh, names, rebal, cli.horizons,
-                                             cli.factors, pstart, pend)
+                                             cli.factors, pstart, pend,
+                                             with_mcap=cli.terciles)
     if 'grossmargin' in events:               # gross margin is <=1 by definition;
         events['grossmargin'] = events['grossmargin'].where(   # drop garbage tails
             events['grossmargin'].between(-1, 1))
+    if cli.terciles:                          # per-date PIT size slices, pead-style
+        from scripts.pead_screen import add_size_terciles
+        events = add_size_terciles(events)
+        slices = [('pooled', events)] + [
+            (f't{b}', events[events['tercile'] == b]) for b in (0, 1, 2)]
+    else:
+        slices = [('pooled', events)]
     all_stats, pvals = [], []
     for f in cli.factors:
-        # HIGH quality = long; keep negatives (unprofitable = short-leg member);
-        # winsorize returns (micro-cap +2000x artifacts otherwise flip the sign)
-        stats = factor_study(events, f, cli.horizons, cli.cost_bps,
-                             cheap_is_long=False, drop_nonpositive=False,
-                             winsor_returns=cli.winsor or None)
-        all_stats.extend(stats)
-        pvals.extend(s['p'] for s in stats if not s.get('insufficient'))
+        for slabel, ev in slices:
+            # HIGH quality = long; keep negatives (unprofitable = short-leg
+            # member); winsorize returns (micro-cap +2000x artifacts otherwise
+            # flip the sign)
+            stats = factor_study(ev, f, cli.horizons, cli.cost_bps,
+                                 cheap_is_long=False, drop_nonpositive=False,
+                                 winsor_returns=cli.winsor or None)
+            if cli.terciles:
+                for s in stats:                # reuse the report printer
+                    s['factor'] = f'{f}@{slabel}'
+            all_stats.extend(stats)
+            pvals.extend(s['p'] for s in stats if not s.get('insufficient'))
     bh = benjamini_hochberg(pvals) if pvals else None
+    # dynamic width ONLY for the factor@slice labels; the default report keeps
+    # the historical fixed-9 column (byte-identical, grossmargin overflow incl.)
+    width = (max(9, *(len(s['factor']) for s in all_stats))
+             if cli.terciles and all_stats else 9)
     _print_report(all_stats, bh, cli.cost_bps, n_names, len(events),
-                  label='quality')
+                  label='quality', width=width)
+    if cli.terciles:
+        print("\n(t0=micro, 1=small, 2=mid — per-date cross-sections on PIT "
+              "SF1 marketcap; high quality = long)")
+    if {'gp_assets', 'netmargin'}.issubset(events.columns):
+        both = events.dropna(subset=['gp_assets', 'netmargin'])
+        rc = both.groupby('date').apply(
+            lambda g: g['gp_assets'].corr(g['netmargin'], method='spearman'),
+            include_groups=False)
+        print(f"\nrank-corr(gp_assets, netmargin): per-date Spearman mean "
+              f"{rc.mean():+.3f} median {rc.median():+.3f} ({len(rc)} dates)")
     return 0
 
 
