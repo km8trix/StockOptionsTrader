@@ -20,6 +20,18 @@ tickers/sep/sf1/daily ingested; events too when --dating announce):
     python scripts/vq_fund_gate.py --mode vq --limit 600
     python scripts/vq_fund_gate.py --mode fund --limit 600
     python scripts/vq_fund_gate.py --selftest
+
+A/B RESULT (2026-07-10, --mode fund --limit 600 --dating announce, seed 42,
+2015-2024, post key-fix): static 50/50 = 1382 trades, +96.9%, Sharpe 0.41,
+maxDD -21.8%, PSR 0.9113 FAIL; TRUE risk parity (first ever run — the
+pre-fix "risk-parity" numbers were this static fund via the silent
+equal-weight fallback) = 1379 trades, +74.5%, Sharpe 0.35, maxDD -20.4%,
+PSR 0.8704 FAIL. Inverse-vol tilting HURTS this two-leg fund: it overweights
+the quieter leg into its flat stretches. Static weights are the better
+configuration; both arms FAIL the 0.95/BH gate (0 BH years). Deployment
+(mean ~0.62, min 0.39 in-run) bounds the cash-drag term: ~38% idle cash at
+the gate's 2% rf costs ~0.76%/yr of excess return — the residual
+engine-vs-paper Sharpe gap, now measured, not assumed.
 """
 
 from __future__ import annotations
