@@ -63,8 +63,9 @@ def run_gate(symbols, start, end, *, capital=100_000.0, seed=42):
     return report['summary'], gate, len(report['closed_trades'])
 
 
-def print_report(summary, gate, n_trades, symbols, start, end):
-    print(f"\n{'=' * 64}\nTrend Follower — gate backtest "
+def print_report(summary, gate, n_trades, symbols, start, end,
+                 title='Trend Follower'):
+    print(f"\n{'=' * 64}\n{title} — gate backtest "
           f"({start} .. {end}, {', '.join(symbols)})\n{'=' * 64}")
     print(f"  Trades         : {n_trades}"
           + ("" if n_trades >= 30 else "  *** thin book — few trades ***"))
