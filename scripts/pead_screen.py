@@ -192,7 +192,11 @@ def main(argv=None):
                     default='epsdil',
                     help="SF1 quarterly column to standardize: 'epsdil' = "
                          "classic SUE, 'revenue' = SURGE (standardized "
-                         "revenue-growth surprise, Jegadeesh-Livnat 2006)")
+                         "revenue-growth surprise, Jegadeesh-Livnat 2006). "
+                         "With --dating announce the EPS approximation "
+                         "extends to revenue: 8-K 2.02 press releases carry "
+                         "revenue too, and we treat it as equal to the later "
+                         "10-Q figure (same known-at-release caveat).")
     ap.add_argument('--selftest', action='store_true')
     cli = ap.parse_args(argv)
     if cli.selftest:
