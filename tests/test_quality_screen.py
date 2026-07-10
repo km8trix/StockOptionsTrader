@@ -38,27 +38,38 @@ def test_collect_keeps_negatives_and_coerces_none():
 
 def test_computed_ratio_guards():
     from decimal import Decimal
-    assert computed_ratio({'gp': 30.0, 'assets': 100.0}, 'gp', 'assets') == 0.3
+    assert computed_ratio({'gp': 30e6, 'assets': 100e6},
+                          'gp', 'assets') == 0.3
     # Decimal inputs (DuckDB) are coerced
-    assert computed_ratio({'gp': Decimal('30'), 'assets': Decimal('100')},
+    assert computed_ratio({'gp': Decimal('30000000'),
+                           'assets': Decimal('100000000')},
                           'gp', 'assets') == 0.3
     # either input missing -> None (same-quarter completeness guard)
-    assert computed_ratio({'gp': None, 'assets': 100.0}, 'gp', 'assets') is None
-    assert computed_ratio({'gp': 30.0, 'assets': None}, 'gp', 'assets') is None
+    assert computed_ratio({'gp': None, 'assets': 100e6},
+                          'gp', 'assets') is None
+    assert computed_ratio({'gp': 30e6, 'assets': None},
+                          'gp', 'assets') is None
     assert computed_ratio({}, 'gp', 'assets') is None
     # non-positive / relative-epsilon-sliver denominator -> None
-    assert computed_ratio({'gp': 30.0, 'assets': 0.0}, 'gp', 'assets') is None
-    assert computed_ratio({'gp': 30.0, 'assets': -5.0}, 'gp', 'assets') is None
-    assert computed_ratio({'gp': 1e12, 'assets': 1.0}, 'gp', 'assets') is None
+    assert computed_ratio({'gp': 30e6, 'assets': 0.0}, 'gp', 'assets') is None
+    assert computed_ratio({'gp': 30e6, 'assets': -5.0}, 'gp', 'assets') is None
+    assert computed_ratio({'gp': 1e21, 'assets': 100e6},
+                          'gp', 'assets') is None
+    # unit-inconsistency floor: the real VIVS row (gp $M-scale, assets
+    # raw-dollar) must be rejected, as must any sub-$1M assets base
+    assert computed_ratio({'gp': 1_677_000.0, 'assets': 3_628.0},
+                          'gp', 'assets') is None
+    assert computed_ratio({'gp': 400_000.0, 'assets': 999_999.0},
+                          'gp', 'assets') is None
     # negative NUMERATOR is legitimate (unprofitable firm = short-leg member)
-    assert computed_ratio({'netinc': -10.0, 'assets': 100.0},
+    assert computed_ratio({'netinc': -10e6, 'assets': 100e6},
                           'netinc', 'assets') == -0.1
 
 
 def test_collect_computes_gp_assets_and_roa():
-    funds = {'A': {'gp': 40.0, 'assets': 100.0, 'netinc': 10.0},
-             'B': {'gp': 5.0, 'assets': 0.0, 'netinc': None},   # guarded -> NaN
-             'C': {'gp': None, 'assets': 200.0, 'netinc': -20.0}}
+    funds = {'A': {'gp': 40e6, 'assets': 100e6, 'netinc': 10e6},
+             'B': {'gp': 5e6, 'assets': 0.0, 'netinc': None},  # guarded -> NaN
+             'C': {'gp': None, 'assets': 200e6, 'netinc': -20e6}}
     prov = _FakeProv(funds)
     rebal = pd.bdate_range('2015-01-01', '2015-06-30', freq='BMS')
     ev, _ = collect_quality_events(prov, ['A', 'B', 'C'], rebal, [21],

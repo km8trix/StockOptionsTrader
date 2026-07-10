@@ -64,20 +64,31 @@ COMPUTED_RATIOS = {                # factor -> (numerator, denominator) SF1 raws
     'roa': ('netinc', 'assets'),
 }
 _REL_EPS = 1e-9
+#: Absolute denominator floor. The relative epsilon only rejects ratios
+#: >= ~1e9, so real SF1 unit-inconsistency rows sail through (adversarial
+#: review 2026-07-10: VIVS 2011-10-31 gp=1,677,000 / assets=3,628 ->
+#: gp_assets=462; 235 ARQ rows with gp/assets > 2, 6,464 rows with
+#: 0 < assets < $1M). Sub-$1M "total assets" for a filer with $M-scale
+#: gross profit is a units error, not a company — and every such row lands
+#: deterministically in the top-rank LONG leg. $1M is far below any real
+#: small/mid-universe filer's balance sheet.
+_MIN_ASSETS = 1e6
 
 
 def computed_ratio(fund, num_field, den_field):
     """num/den from ONE SF1 row (same quarter by construction), or None.
 
-    Guards: both inputs non-null, and the denominator positive with a
-    relative-epsilon floor (den > eps * max(1, |num|)) — a near-zero assets
-    base would otherwise explode the ratio into rank-dominating garbage.
+    Guards: both inputs non-null, and the denominator positive with BOTH a
+    relative-epsilon floor (den > eps * max(1, |num|), float-noise) and an
+    absolute floor (_MIN_ASSETS, unit-inconsistency rows) — a near-zero
+    assets base would otherwise explode the ratio into rank-dominating
+    garbage in the long leg.
     """
     num, den = fund.get(num_field), fund.get(den_field)
     if num is None or den is None:
         return None
     num, den = float(num), float(den)            # DuckDB may hand Decimal
-    if den <= _REL_EPS * max(1.0, abs(num)):
+    if den <= max(_REL_EPS * max(1.0, abs(num)), _MIN_ASSETS):
         return None
     return num / den
 
