@@ -95,6 +95,21 @@ of half the window; the clean unlock is consolidated-tape minute data
 (Polygon Stocks Starter ~$29/mo). Shorts bleed (SPY L+S +72% vs LO +94%;
 TQQQ L+S -11% vs LO +69%) — consistent with every short-leg lesson in this
 program. Nothing promoted.
+
+PRE-REGISTERED 2026-07-10, BEFORE any run on the new data —
+SIP CONFIRMATION TRIAL: gated cut = LONG-ONLY portfolio, bars = bars_1m_sip
+(Massive consolidated tape), window 2025-01-02..2026-06-30 — a hold-out
+disjoint from every prior run (pilot ended 2024-12-31; selection of the
+long-only cut happened on the IEX sample, so this disjoint-sample
+confirmation is a single trial, n_trials=1, provenance documented here).
+Everything else (5-min OR, all-5-bars guard, half-day rule, stop, sizing,
+costs) UNCHANGED. ``--bars-table`` picks the intraday warehouse table and
+``--gated-cut`` picks which pre-registered portfolio the gate verdict
+applies to; the defaults (bars_1m, combined) reproduce the registered
+2016-2024 pilot byte-identically.
+
+    python scripts/orb_gate.py --bars-table bars_1m_sip \\
+        --gated-cut long_only --start 2025-01-02 --end 2026-06-30
 """
 
 from __future__ import annotations
@@ -287,16 +302,23 @@ def trade_stats(trades: List[Trade], n_days: int) -> Dict:
     }
 
 
-def run_gate(symbols, start, end, *, warehouse_dir=None) -> Dict:
-    """Load bars, run both pre-registered cuts, gate the combined portfolio."""
+def run_gate(symbols, start, end, *, warehouse_dir=None,
+             bars_table: str = 'bars_1m',
+             gated_cut: str = 'combined') -> Dict:
+    """Load bars, run both pre-registered cuts, gate ``gated_cut``.
+
+    Defaults (bars_1m, combined) are byte-identical to the registered
+    2016-2024 pilot; (bars_1m_sip, long_only) is the pre-registered SIP
+    confirmation trial (see module docstring, dated 2026-07-10)."""
     wh = PitWarehouse(warehouse_dir)
-    out: Dict = {'symbols': {}, 'long_only': {}}
+    out: Dict = {'symbols': {}, 'long_only': {},
+                 'bars_table': bars_table, 'gated_cut': gated_cut}
     per_symbol, per_symbol_lo = {}, {}
     for sym in symbols:
-        bars = wh.ohlcv_intraday_range(sym, start, end)
+        bars = wh.ohlcv_intraday_range(sym, start, end, table=bars_table)
         if bars.empty:
             raise SystemExit(
-                f"no bars_1m data for {sym} in {wh.warehouse_dir} — run "
+                f"no {bars_table} data for {sym} in {wh.warehouse_dir} — run "
                 f"scripts/ingest_alpaca_bars.py first")
         dates, rets, trades, equity = run_symbol(bars)
         per_symbol[sym] = (dates, rets)
@@ -319,7 +341,8 @@ def run_gate(symbols, start, end, *, warehouse_dir=None) -> Dict:
     out['portfolio_long_only'] = {'dates': days_lo, 'returns': port_lo}
     out['gate'] = validate_strategy_oos(
         port, [str(d.year) for d in days], psr_threshold=PSR_THRESHOLD)
-    # Long-only lens: reported, NOT the gate verdict.
+    # Long-only lens: reported by default; THE gate when --gated-cut
+    # long_only (the pre-registered SIP confirmation trial).
     out['gate_long_only_reported'] = validate_strategy_oos(
         port_lo, [str(d.year) for d in days_lo], psr_threshold=PSR_THRESHOLD)
     return out
@@ -328,12 +351,20 @@ def run_gate(symbols, start, end, *, warehouse_dir=None) -> Dict:
 def print_report(res: Dict, symbols, start, end) -> None:
     print(f"\n{'=' * 72}\nORB 5-min gate — pre-registered Z-A config "
           f"({start} .. {end}, {', '.join(symbols)})\n{'=' * 72}")
-    print("  [IEX-only minute bars: volume/range understated vs SIP — "
-          "see docstring]")
+    bars_table = res.get('bars_table', 'bars_1m')
+    lo_gated = res.get('gated_cut', 'combined') == 'long_only'
+    if bars_table == 'bars_1m':
+        print("  [IEX-only minute bars: volume/range understated vs SIP — "
+              "see docstring]")
+    else:
+        print(f"  [bars table: {bars_table} — Massive consolidated tape "
+              "(SIP)]")
     hdr = (f"  {'symbol':<7}{'days':>6}{'trades':>8}{'tr/yr':>8}"
            f"{'win%':>7}{'avgW$':>10}{'avgL$':>10}{'ret%':>9}")
-    for title, key in (('LONG+SHORT (gated)', 'symbols'),
-                       ('LONG-ONLY (reported)', 'long_only')):
+    for title, key in (
+            (f"LONG+SHORT ({'reported' if lo_gated else 'gated'})", 'symbols'),
+            (f"LONG-ONLY ({'gated' if lo_gated else 'reported'})",
+             'long_only')):
         print(f"\n  {title}\n{hdr}")
         for sym in symbols:
             s = res[key][sym]
@@ -342,9 +373,12 @@ def print_report(res: Dict, symbols, start, end) -> None:
                   f"{s['trades_per_year']:>8.1f}{s['win_rate']:>7.1%}"
                   f"{s['avg_win']:>10.0f}{s['avg_loss']:>10.0f}"
                   f"{s['total_return_pct']:>9.2f}")
-    for title, gkey in (('COMBINED long+short portfolio', 'gate'),
-                        ('long-only portfolio (reported, not gated)',
-                         'gate_long_only_reported')):
+    for title, gkey in (
+            (('COMBINED long+short portfolio (reported, not gated)'
+              if lo_gated else 'COMBINED long+short portfolio'), 'gate'),
+            (('long-only portfolio (GATED — SIP confirmation trial)'
+              if lo_gated else 'long-only portfolio (reported, not gated)'),
+             'gate_long_only_reported')):
         gate = res[gkey]
         psr = gate['psr']
         psr_str = f"{psr:.4f}" if psr is not None else "n/a"
@@ -361,8 +395,10 @@ def print_report(res: Dict, symbols, start, end) -> None:
                                  gate['bh']['rejected_bh']):
             ps = f"{p:.4f}" if p is not None else "n/a"
             print(f"    {str(label):<8}{ps:>10}{str(rej):>9}")
-    print(f"\n  VERDICT (combined long+short): "
-          f"{'PASS' if res['gate']['passed'] else 'FAIL'}\n")
+    vkey = 'gate_long_only_reported' if lo_gated else 'gate'
+    vlabel = 'long-only' if lo_gated else 'combined long+short'
+    print(f"\n  VERDICT ({vlabel}): "
+          f"{'PASS' if res[vkey]['passed'] else 'FAIL'}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +497,8 @@ def _selftest() -> None:
     print('selftest OK')
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """CLI parser (module-level so tests can pin the defaults)."""
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -472,12 +509,25 @@ def main() -> None:
                     help='warehouse dir (else PIT_WAREHOUSE_DIR resolution)')
     ap.add_argument('--selftest', action='store_true',
                     help='offline pinned-PnL asserts, then exit')
-    args = ap.parse_args()
+    ap.add_argument('--bars-table', default='bars_1m',
+                    help='intraday warehouse table — bars_1m_sip for the '
+                         'pre-registered SIP confirmation trial')
+    ap.add_argument('--gated-cut', choices=('combined', 'long_only'),
+                    default='combined',
+                    help='which pre-registered portfolio the gate verdict '
+                         'applies to (default combined = the registered '
+                         '2016-2024 pilot behavior)')
+    return ap
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     if args.selftest:
         _selftest()
         return
     res = run_gate(args.symbols, args.start, args.end,
-                   warehouse_dir=args.dir)
+                   warehouse_dir=args.dir, bars_table=args.bars_table,
+                   gated_cut=args.gated_cut)
     print_report(res, args.symbols, args.start, args.end)
 
 
