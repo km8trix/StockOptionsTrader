@@ -25,11 +25,47 @@ desk's documented behavior; trading mid-month would be an untested,
 faster-cadence variant. Run under
 ``BacktestEngine(desk=..., market_data=WarehouseMarketData())`` so delisted
 names are still priced (survivorship-free).
+
+PRE-REGISTERED SURGE VARIANTS (2026-07-10, both opt-in, defaults
+byte-identical; rules and constants declared HERE before any variant
+backtest ran — 2 trials this round, no further variant joins after seeing
+results). SURGE = the standardized revenue-growth surprise
+(Jegadeesh-Livnat 2006, who found earnings+revenue surprise jointly beat
+either alone): sue_table(column='revenue') over a SEPARATE
+fundamentals_quarterly(fields=('revenue',)) pull. Separate, not a joint
+('epsdil', 'revenue') pull: the warehouse NULL-filters and dedups on the
+FIRST field, so only a revenue-first pull yields the honest first-known
+revenue row set (a joint pull would drop revenue-only filings and date each
+quarter by its first EPSDIL-bearing filing) — and the default desk's
+eps_quarterly call stays literally untouched. SURGE rows then get EXACTLY
+the SUE treatment: the same PIT slice (datekey <= date; announce mode's
++60d padding and 8-K re-dating included) and the same ``fresh_days``
+freshness window.
+
+  surge_confirm   longs must ALSO have SURGE >= the MEDIAN
+      (_SURGE_CONFIRM_PCTL = 0.5, rank-based among the rebalance's scored
+      names with a computable fresh SURGE — never an absolute threshold).
+      Names with NO computable fresh SURGE are NOT excluded — missing data
+      is not evidence of a weak revenue surprise (the ValueQualityDesk
+      issuance-filter convention, staleness included: a revenue filing
+      older than ``fresh_days`` counts as missing). Longs only, served via
+      the base's _long_exclusions hook (the top-k backfills; a blocked
+      held long is closed by the normal reconcile).
+
+  rank_combine    desk score = the EQUAL-WEIGHT mean of the SUE percentile
+      rank and the SURGE percentile rank among the rebalance's scored
+      names (weights pre-registered, never tuned). A scored name missing
+      SURGE ranks on SUE alone — the mean of its AVAILABLE ranks (the
+      ValueQualityDesk gp_assets convention); the scored set itself is
+      unchanged (names with a computable fresh SUE).
+
+The two variants are SEPARATE pre-registered trials: composing them was
+never pre-registered, so the constructor rejects both-on.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -42,24 +78,37 @@ from portfolio.risk_manager import RiskManager
 
 _BANDS = {'micro': 0, 'small': 1, 'mid': 2}   # ascending PIT market-cap tercile
 
+#: surge_confirm long-candidacy threshold — pre-registered at the MEDIAN
+#: (0.5, rank-based among the rebalance's scored names with a computable
+#: fresh SURGE; module docstring), declared before any variant backtest ran
+#: and never tuned.
+_SURGE_CONFIRM_PCTL = 0.5
+
 
 class PEADDesk(CrossSectionalLongShortDesk):
     """Long the top SUE quantile, short the bottom, among names with a FRESH
     earnings filing. ``provider`` exposes eps_quarterly (+ daily_metric when
-    ``band`` is set); it is queried with the simulated ``date`` as the
-    point-in-time boundary."""
+    ``band`` is set, + fundamentals_quarterly when a SURGE variant is on);
+    it is queried with the simulated ``date`` as the point-in-time
+    boundary."""
 
     def __init__(self, band: Optional[str] = None, *, provider=None,
                  capital_allocation: float = 1.0,
                  risk_manager: Optional[RiskManager] = None,
                  fresh_days: int = 63, quantile: float = 0.2,
                  n_bands: int = 3, long_only: bool = False,
-                 dating: str = 'filing'):
+                 dating: str = 'filing', surge_confirm: bool = False,
+                 rank_combine: bool = False):
         if band is not None and band not in _BANDS:
             raise ValueError(f"band {band!r} must be one of {list(_BANDS)}")
         if dating not in ('filing', 'announce'):
             raise ValueError(f"dating {dating!r} must be 'filing' or "
                              f"'announce'")
+        if surge_confirm and rank_combine:
+            raise ValueError(
+                "surge_confirm and rank_combine are SEPARATE pre-registered "
+                "trials (module docstring); composing them was never "
+                "pre-registered — pick one")
         if provider is None:
             from data.pit_warehouse import PitWarehouse
             provider = PitWarehouse()
@@ -92,11 +141,20 @@ class PEADDesk(CrossSectionalLongShortDesk):
         self._n_bands = n_bands
         self._fresh_days = fresh_days
         self.dating = dating
+        self._surge_confirm = surge_confirm
+        self._rank_combine = rank_combine
         self._events: Optional[pd.DataFrame] = None
         self._eps: Optional[pd.DataFrame] = None   # cumulative pull, sliced PIT
         self._eps_symbols: set = set()             # symbols covered by _eps
+        # SURGE state (variant-only): cumulative revenue pull mirroring _eps,
+        # plus the monthly surge_confirm exclusion set (computed alongside
+        # the score cache, served via _long_exclusions — the ValueQualityDesk
+        # issuance-filter pattern verbatim).
+        self._rev: Optional[pd.DataFrame] = None
+        self._rev_symbols: set = set()
         self._cache_month: Optional[tuple] = None
         self._cache_scores: Optional[Dict[str, float]] = None
+        self._cache_excluded: set = set()
 
     def _alpha_scores(self, all_data: Dict[str, pd.DataFrame],
                       date) -> Optional[Dict[str, float]]:
@@ -141,6 +199,76 @@ class PEADDesk(CrossSectionalLongShortDesk):
         scores = {sym: float(sue[sym]) for sym in keep
                   if sym in sue.index and np.isfinite(sue[sym])}
 
+        if self._rank_combine and scores:
+            # Pre-registered combine (module docstring): the EQUAL-WEIGHT
+            # mean of the SUE and SURGE percentile ranks among the scored
+            # names. pandas keeps a missing SURGE out of both the rank
+            # (na_option='keep') and the row mean (skipna), so a scored name
+            # with no computable fresh SURGE ranks on SUE alone — the VQ
+            # gp_assets mean-of-available convention. The scored SET is
+            # unchanged: SURGE never adds or drops a name.
+            sue_rank = pd.Series(scores).rank(pct=True)
+            surge = self._fresh_surge(sorted(scores), ts)
+            surge_rank = (pd.Series(surge, dtype=float)
+                          .reindex(sue_rank.index).rank(pct=True))
+            composite = pd.concat([sue_rank, surge_rank], axis=1).mean(axis=1)
+            scores = {sym: float(v) for sym, v in composite.items()}
+
         result = scores if len(scores) >= self.min_scored else None
+        # Monthly exclusion set rides the score cache (VQ issuance-filter
+        # pattern): rank-based among THIS rebalance's scored names, served
+        # to the base via _long_exclusions. Empty unless surge_confirm.
+        self._cache_excluded = (
+            self._surge_exclusions(sorted(result), ts)
+            if self._surge_confirm and result else set())
         self._cache_month, self._cache_scores = month, result
         return result
+
+    def _fresh_surge(self, symbols: List[str], ts: pd.Timestamp
+                     ) -> Dict[str, float]:
+        """symbol -> latest FRESH SURGE (standardized revenue-growth
+        surprise) for the ``symbols`` with one computable at ``ts``.
+
+        Mirrors the SUE pipeline EXACTLY: the same cumulative one-pull
+        pattern (a separate revenue-first pull — module docstring), the same
+        PIT slice per dating mode (announce mode's +60d filing padding and
+        8-K re-dating via the SAME events table included), and the same
+        ``fresh_days`` freshness window. Names with no computable fresh
+        SURGE are simply absent from the result."""
+        if self._rev is None or not set(symbols) <= self._rev_symbols:
+            self._rev_symbols |= set(symbols)
+            self._rev = self._provider.fundamentals_quarterly(
+                sorted(self._rev_symbols), fields=('revenue',))
+        if self.dating == 'announce':
+            visible = self._rev[self._rev['datekey']
+                                <= ts + pd.Timedelta(days=60)]
+            rows = apply_announcement_dating(
+                sue_table(visible, column='revenue'), self._events)
+        else:
+            visible = self._rev[self._rev['datekey'] <= ts]
+            rows = sue_table(visible, column='revenue')
+        surge = latest_fresh_sue(rows, ts, fresh_days=self._fresh_days)
+        return {sym: float(surge[sym]) for sym in symbols
+                if sym in surge.index and np.isfinite(surge[sym])}
+
+    def _surge_exclusions(self, symbols: List[str], ts: pd.Timestamp) -> set:
+        """Scored names whose fresh SURGE sits strictly BELOW the median —
+        barred from long candidacy (surge_confirm, module docstring).
+
+        The cut is ``_SURGE_CONFIRM_PCTL`` (the median), rank-based among
+        THIS rebalance's scored names with a computable fresh SURGE — never
+        an absolute threshold. Names with no computable fresh SURGE are not
+        in the population and are NOT excluded (missing data is not evidence
+        of a weak revenue surprise — the VQ issuance-filter convention);
+        SURGE == the median passes (rank >= median)."""
+        surge = self._fresh_surge(symbols, ts)
+        if not surge:
+            return set()
+        vals = pd.Series(surge, dtype=float)
+        cut = vals.quantile(_SURGE_CONFIRM_PCTL)
+        return set(vals.index[vals < cut])
+
+    def _long_exclusions(self, ranked_symbols: List[str], date) -> set:
+        """Serve the monthly surge_confirm set to the base's long-candidacy
+        filter (empty when ``surge_confirm`` is off — byte-identical)."""
+        return self._cache_excluded
