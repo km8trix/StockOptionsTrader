@@ -257,6 +257,7 @@ def _stats(months) -> dict:
     worst = min(months, key=lambda m: m['pnl'])
     return {
         'n': len(months),
+        'iv_partial_months': sum(1 for m in months if m.get('iv_partial')),
         'mean_premium_pct': float(np.mean(prem)),
         'median_premium_pct': float(np.median(prem)),
         'win_rate': float(np.mean([x > 0 for x in pnls])),
@@ -362,7 +363,8 @@ def _print_stats(s: dict, *, label: str) -> None:
     print(f"  {'':>{len(label)}}  IV {_fmt(s['mean_iv'], '.3f')} vs RV "
           f"{_fmt(s['mean_rv'], '.3f')} -> mean IV-RV "
           f"{_fmt(s['mean_iv_minus_rv'], '+.3f')}  "
-          f"[{s['n_fallback_settles']} fallback settle(s)]")
+          f"[{s['n_fallback_settles']} fallback settle(s), "
+          f"{s['iv_partial_months']} iv-partial month(s) excluded]")
 
 
 # ---------------------------------------------------------------------------
