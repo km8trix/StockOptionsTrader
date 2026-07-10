@@ -18,6 +18,13 @@ Modes:
                    (PEAD micro + VQ + issuance, equal 1/3 split — weights
                    fixed BEFORE the run, not tuned).
 
+--cash-yield (all modes): idle cash accrues the DATED FRED DTB3 3M T-bill
+rate (data/riskfree.py — vendored, reproducible) in every engine this
+script builds, including BOTH fund arms and the risk-parity solo shadow
+passes. The gate benchmark stays flat-2% rf — self-consistent (the fund
+EARNS real dated yield, is JUDGED vs 2%), but comparators must be rerun
+under the same setting; labels carry ' [+DTB3]' so numbers are never mixed.
+
 Both run on the survivorship-free warehouse feed with a seeded random
 small/mid universe subset, and apply the single research gate
 (analysis.research_stats.validate_strategy_oos). OPERATOR-run (requires
@@ -74,6 +81,16 @@ modest solo but blend-friendly; composed they close ~1/3 of the gap to the
 0.95 bar. ALL SIX FAIL: PSR < 0.95 and 0 BH-significant years everywhere
 (best year 2019 p=0.041, an order of magnitude from clearing BH).
 Nothing promoted.
+
+DTB3 RESULT (2026-07-10, incumbent-best config --vq-variant both
+--weighting static --dating announce --cash-yield, 600 names seed 42):
+1873 trades (IDENTICAL count to yield-off — accrual is pure economics),
++119.9%, Sharpe 0.48, maxDD -24.1%, PSR 0.9435 FAIL vs the yield-off
+0.9257 — dated T-bill yield on the ~38% idle cash adds +0.018 PSR /
++0.04 Sharpe, concentrated in the 2023-24 5%-bill years. Gap to the
+0.95 PSR bar: 0.0065. BH years still 0 — smooth yield cannot manufacture
+a standout year; the BH leg remains the binding constraint. Nothing
+promoted.
 """
 
 from __future__ import annotations
@@ -91,6 +108,7 @@ from analysis.research_stats import validate_strategy_oos  # noqa: E402
 from backtesting.backtest_engine import BacktestEngine  # noqa: E402
 from backtesting.reweighting_fund import ReweightingFundBacktest  # noqa: E402
 from data.pit_warehouse import PitWarehouse  # noqa: E402
+from data.riskfree import load_dtb3  # noqa: E402
 from data.warehouse_feed import WarehouseMarketData  # noqa: E402
 from desks.citadel import CitadelDesk  # noqa: E402
 from desks.foundation import FoundationDesk  # noqa: E402
@@ -186,27 +204,30 @@ def _universe(wh, start, end, limit, seed):
 
 
 def run_vq(start, end, *, limit=None, capital=100_000.0, seed=42,
-           long_only=False, vq_variant='base'):
+           long_only=False, vq_variant='base', cash_yield=None):
     wh = PitWarehouse()
     universe = _universe(wh, start, end, limit, seed)
     desk = ValueQualityDesk(provider=wh, long_only=long_only,
                             **VQ_VARIANT_KWARGS[vq_variant])
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
-                            market_data=WarehouseMarketData(wh))
+                            market_data=WarehouseMarketData(wh),
+                            cash_yield=cash_yield)
     report = engine.run(universe, start, end)
     returns, years = _daily_returns_with_years(report['portfolio_history'])
     gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
-def run_issuance(start, end, *, limit=None, capital=100_000.0, seed=42):
+def run_issuance(start, end, *, limit=None, capital=100_000.0, seed=42,
+                 cash_yield=None):
     """Solo IssuanceDesk gate — run_vq's exact shape on the third-leg
     candidate at its desk defaults (long-only, ex-micro, 400d staleness)."""
     wh = PitWarehouse()
     universe = _universe(wh, start, end, limit, seed)
     desk = IssuanceDesk(provider=wh)
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
-                            market_data=WarehouseMarketData(wh))
+                            market_data=WarehouseMarketData(wh),
+                            cash_yield=cash_yield)
     report = engine.run(universe, start, end)
     returns, years = _daily_returns_with_years(report['portfolio_history'])
     gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
@@ -235,7 +256,7 @@ def _deployment_stats(portfolio_history):
 
 def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
              dating='filing', legacy=False, weighting='risk_parity',
-             issuance=False, vq_variant='base'):
+             issuance=False, vq_variant='base', cash_yield=None):
     allocations = dict(THREE_LEG_ALLOCATIONS if issuance
                        else LEGACY_FUND_ALLOCATIONS if legacy
                        else FUND_ALLOCATIONS)
@@ -244,9 +265,12 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
     feed = WarehouseMarketData(wh)
 
     def solo_curve(key, symbols, s, e):
+        # cash_yield threads into the solo shadow passes too: the reweighter
+        # must see the same economics in the shadow books as in the fund it
+        # weights, or risk parity would be computed off yield-free curves.
         desk = _make_desk(key, wh, dating=dating, vq_variant=vq_variant)
         engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
-                                market_data=feed)
+                                market_data=feed, cash_yield=cash_yield)
         report = engine.run(list(symbols), s, e, benchmark_symbol=None)
         if 'error' in report:
             return []
@@ -272,14 +296,16 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
         # cost model as the risk-parity arm — it differs ONLY in weighting.
         engine = BacktestEngine(
             orchestrator=orchestrator_factory(allocations), reweighter=None,
-            initial_capital=capital, seed=seed, market_data=feed)
+            initial_capital=capital, seed=seed, market_data=feed,
+            cash_yield=cash_yield)
         report = engine.run(universe, start, end, benchmark_symbol=None)
     else:
         fund = ReweightingFundBacktest(
             allocations, initial_capital=capital, seed=seed,
             weighting='risk_parity', market_data=feed,
             solo_curve_provider=solo_curve,
-            orchestrator_factory=orchestrator_factory)
+            orchestrator_factory=orchestrator_factory,
+            cash_yield=cash_yield)
         report = fund.run(universe, start, end, benchmark_symbol=None)
     if 'error' in report:
         raise SystemExit(f"fund backtest failed: {report['error']}")
@@ -376,25 +402,48 @@ def main():
                          'byte-identical current desk (default, unlabelled '
                          'in the report); gpa = + gp/assets rank; issfilter '
                          '= top-quintile issuers barred from longs; both')
+    ap.add_argument('--cash-yield', action='store_true',
+                    help='idle cash accrues the DATED FRED DTB3 3M T-bill '
+                         'rate (data/riskfree.py) daily — ~0.05-0.3%% '
+                         'through ZIRP 2015-2021, ~5%% 2023-2024; flat retro '
+                         'rates are dishonest by design. The gate benchmark '
+                         'stays flat-2%% rf (the fund EARNS dated yield, is '
+                         'JUDGED vs 2%%); rerun comparators under the same '
+                         'setting')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
+    cash_yield = load_dtb3() if args.cash_yield else None
+    # Short-capable books under --cash-yield: short-sale proceeds sit in
+    # cash under the cash-account approximation, so they earn the same DTB3
+    # rate — a full short rebate, an APPROXIMATION (real rebates run below
+    # the bill rate, hard-to-borrow names far below). Documented, not
+    # fatal. Fires only where shorts can actually occur: the legacy fund
+    # mix, or --mode vq without --long-only (--legacy is inert outside
+    # fund mode, so no caveat there).
+    if args.cash_yield and ((args.mode == 'fund' and args.legacy)
+                            or (args.mode == 'vq' and not args.long_only)):
+        print('CAVEAT: --cash-yield on a short-capable book: short '
+              'proceeds earn the full DTB3 rate (a rebate approximation).')
     vtag = '' if args.vq_variant == 'base' else f" [vq={args.vq_variant}]"
+    ytag = ' [+DTB3]' if args.cash_yield else ''
     if args.mode == 'vq':
         summary, gate, n_trades, n_names = run_vq(
             args.start, args.end, limit=args.limit, seed=args.seed,
-            long_only=args.long_only, vq_variant=args.vq_variant)
+            long_only=args.long_only, vq_variant=args.vq_variant,
+            cash_yield=cash_yield)
         label = ('Value+Quality' + vtag
-                 + (' (long-only)' if args.long_only else ''))
+                 + (' (long-only)' if args.long_only else '') + ytag)
         deploy = None
     elif args.mode == 'issuance':
         if args.vq_variant != 'base':
             ap.error('--vq-variant has no effect in --mode issuance')
         summary, gate, n_trades, n_names = run_issuance(
-            args.start, args.end, limit=args.limit, seed=args.seed)
-        label = 'Net-Issuance (long-only, ex-micro)'
+            args.start, args.end, limit=args.limit, seed=args.seed,
+            cash_yield=cash_yield)
+        label = 'Net-Issuance (long-only, ex-micro)' + ytag
         deploy = None
     else:
         if args.issuance and args.legacy:
@@ -404,13 +453,13 @@ def main():
             args.start, args.end, limit=args.limit, seed=args.seed,
             dating=args.dating, legacy=args.legacy,
             weighting=args.weighting, issuance=args.issuance,
-            vq_variant=args.vq_variant)
+            vq_variant=args.vq_variant, cash_yield=cash_yield)
         core = ('PEAD+VQ+issuance' if args.issuance
                 else 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ')
         wlabel = ('static weights' if args.weighting == 'static'
                   else 'risk-parity')
         label = (f"{core} fund{vtag} ({wlabel}, long-only core legs, "
-                 f"{args.dating} dating)")
+                 f"{args.dating} dating){ytag}")
     print_report(summary, gate, n_trades, n_names, label, args.start,
                  args.end)
     if deploy is not None:

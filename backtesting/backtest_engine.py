@@ -108,7 +108,8 @@ class BacktestEngine:
                  impact_coef: float = 0.1,
                  participation_cap: float = 0.1,
                  adv_window: int = 20,
-                 market_data: Optional[MarketDataHandler] = None):
+                 market_data: Optional[MarketDataHandler] = None,
+                 cash_yield=None):
         if sum(driver is not None
                for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
@@ -156,6 +157,21 @@ class BacktestEngine:
         self.impact_coef = impact_coef
         self.participation_cap = participation_cap
         self.adv_window = adv_window
+        # Idle-cash yield (OPT-IN, default None = byte-identical: cash earns
+        # zero, exactly as before the param existed). Pass a date->annual-rate
+        # callable OR a pd.Series (datetime index -> annualized decimal rate,
+        # e.g. data.riskfree.load_dtb3()); a Series is wrapped in the
+        # forward-fill rate_asof lookup. When set, POSITIVE cash accrues
+        # cash * rate(date)/252 each simulated day just before the snapshot.
+        # HONESTY: only a DATED series makes sense here — a flat retro rate
+        # ("cash earned 2% through ZIRP") would be dishonest; the gate's
+        # benchmark stays flat-2% rf (the fund EARNS real dated yield, is
+        # JUDGED vs 2%), and comparators must be rerun under the same setting.
+        if cash_yield is not None and not callable(cash_yield):
+            from data.riskfree import rate_asof
+            series = cash_yield
+            cash_yield = lambda date: rate_asof(series, date)  # noqa: E731
+        self.cash_yield = cash_yield
         # Injectable price source. Default = live MarketDataHandler (OpenBB).
         # Pass a WarehouseMarketData to run a SURVIVORSHIP-FREE backtest that can
         # hold delisted names (the live feed silently drops them).
@@ -327,6 +343,12 @@ class BacktestEngine:
                             'days_waiting': 0,
                         })
 
+            # --- CASH YIELD (opt-in): idle cash accrues the dated T-bill
+            # rate for today, BEFORE the snapshot so the equity curve (and
+            # every gate metric downstream of it) includes the interest. ---
+            if self.cash_yield is not None:
+                self._accrue_cash_yield(date)
+
             # --- PHASE 4: RECORD SNAPSHOT ---
             self.portfolio.record_snapshot(date)
 
@@ -354,6 +376,20 @@ class BacktestEngine:
 
         return self._generate_report(benchmark_symbol=benchmark_symbol,
                                      start_date=start_date, end_date=end_date)
+
+    def _accrue_cash_yield(self, date) -> None:
+        """One day of idle-cash interest: cash += cash * rate(date) / 252.
+
+        POSITIVE cash only. NEGATIVE cash (a margin debit — shouldn't occur
+        in the long-only books, but guard anyway) accrues NOTHING: earning
+        yield ON a debit would be free leverage. This seam models a cash
+        sweep, not a margin facility — a real facility would CHARGE interest
+        on the debit, so skipping the charge is GENEROUS to a debit-carrying
+        book; acceptable only because the books here are long-only and a
+        debit is a bug to surface, not an economics to model."""
+        if self.portfolio.cash > 0:
+            self.portfolio.cash += (self.portfolio.cash
+                                    * self.cash_yield(date) / 252.0)
 
     def _enriched_through(self, symbol: str, date) -> pd.DataFrame:
         """Slice the precomputed indicator frame through `date` (inclusive).
