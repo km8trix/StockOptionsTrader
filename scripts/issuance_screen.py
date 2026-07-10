@@ -10,9 +10,17 @@ issuance quantile (buyback names) and the short leg is the heavy issuers —
 because a NEGATIVE value (net buyback) is the prime long-leg member, not a
 trap to drop.
 
-Signal: split-adjusted shares outstanding = sharesbas * sharefactor from PIT
+Signal: adjusted shares outstanding = sharesbas * sharefactor from PIT
 SF1 ARQ (fundamentals_quarterly, deduped to the earliest-datekey filing per
-quarter). YoY net issuance = adjshares_t / adjshares_{t-4 quarters} - 1, with
+quarter). SPLIT NEUTRALITY comes from the VENDOR, not sharefactor: Sharadar
+retroactively restates sharesbas to the current split basis (verified
+2026-07-10 against the warehouse — NVDA/TSLA/AAPL forward and CERO/UNCY
+reverse splits are invisible in sharesbas), so both quarters of the ratio
+share one basis and future-split factors cancel; the surviving factor is
+exactly the intervening split a PIT investor would also know. sharefactor is
+a near-constant ADR/unit multiplier (varies only for share-class/ADR cases
+like BRK.B, V, ONON); multiplying each quarter by its OWN factor handles
+ADR-ratio changes. YoY net issuance = adjshares_t / adjshares_{t-4q} - 1, with
 the year-ago quarter matched per ticker BY CALENDAR (latest reportperiod
 330-410 days earlier — the sue_table convention) so missing quarters skip the
 row instead of silently misaligning it; no cross-frame merge_asof. Guards:
@@ -321,6 +329,12 @@ def main(argv=None):
     events, n_names = collect_issuance_events(
         wh, names, rebal, cli.horizons, stale_days=cli.stale_days,
         price_start=pstart, price_end=pend)
+    if not len(events):
+        # Honest empty report instead of add_size_terciles' opaque pandas
+        # ValueError (empty warehouse, or filters that exclude everything).
+        print("no issuance events collected — nothing to test",
+              file=sys.stderr)
+        return 1
     events = add_size_terciles(events)
     neg = float((events['issuance'] < 0).mean()) if len(events) else 0.0
     print(f"events={len(events)} median_issuance="

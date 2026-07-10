@@ -34,9 +34,21 @@ class TestIssuanceTable:
         assert out['issuance'].iloc[-1] == pytest.approx(-0.10)
 
     def test_split_is_not_issuance(self):
-        # 2:1 split: sharesbas doubles, sharefactor halves — adjusted flat.
-        rows = (_share_rows('SPL', [100.0] * 5)
-                + _share_rows('SPL', [200.0] * 4, start='2021-06-30',
+        # Real Sharadar split semantics: the vendor retroactively restates
+        # sharesbas to the CURRENT split basis (verified 2026-07-10 against
+        # the warehouse — NVDA/TSLA/AAPL forward, CERO/UNCY reverse), so a
+        # split is invisible in the data a run ever sees: both quarters
+        # carry the same basis, sharefactor stays constant.
+        rows = _share_rows('SPL', [200.0] * 9)   # post-2:1 restated vintage
+        assert issuance_table(pd.DataFrame(rows))['issuance'].abs().max() < 1e-12
+
+    def test_adr_ratio_change_is_not_issuance(self):
+        # sharefactor is an ADR/unit multiplier, near-constant per ticker
+        # (BRK.B, V, ONON class). On a ratio change the vendor moves the
+        # count and the factor inversely; using each quarter's OWN factor
+        # keeps the economic share count flat — no phantom issuance.
+        rows = (_share_rows('ADR', [100.0] * 5)
+                + _share_rows('ADR', [200.0] * 4, start='2021-06-30',
                               factor=0.5))
         assert issuance_table(pd.DataFrame(rows))['issuance'].abs().max() < 1e-12
 
