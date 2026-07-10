@@ -441,6 +441,9 @@ class BacktestEngine:
                 'days_waiting': 0,
                 'size_fraction': intent.size_fraction,
                 'quantity': intent.quantity,
+                # Fund-mode ownership: stamped onto the opened Position so
+                # each desk's book logic only touches positions it owns.
+                'desk_keys': intent.desk_keys,
             })
 
     # ------------------------------------------------------------------
@@ -666,7 +669,7 @@ class BacktestEngine:
             self.portfolio.add_position(Position(
                 asset=asset, quantity=signed_quantity,
                 avg_entry_price=fill_price, current_price=fill_price,
-                timestamp=fill_date))
+                timestamp=fill_date, owners=intent.get('desk_keys')))
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset),
@@ -908,7 +911,8 @@ class BacktestEngine:
             else:
                 self.portfolio.add_position(Position(
                     asset=asset, quantity=quantity, avg_entry_price=fill_price,
-                    current_price=fill_price, timestamp=fill_date))
+                    current_price=fill_price, timestamp=fill_date,
+                    owners=intent.get('desk_keys')))
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset), 'action': 'BUY',
@@ -976,7 +980,8 @@ class BacktestEngine:
             else:
                 self.portfolio.add_position(Position(
                     asset=asset, quantity=-quantity, avg_entry_price=fill_price,
-                    current_price=fill_price, timestamp=fill_date))
+                    current_price=fill_price, timestamp=fill_date,
+                    owners=intent.get('desk_keys')))
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset), 'action': 'SHORT',

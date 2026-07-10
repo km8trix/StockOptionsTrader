@@ -122,12 +122,19 @@ class DeskIntent:
     shares). size_fraction is still required and is what the shared risk
     checks (position-size limit) evaluate, so set it to the intent's
     approximate capital fraction.
+
+    desk_keys (OPTIONAL, fund mode only): the key(s) of the desk(s) whose
+    opening view this intent carries, set by the FundOrchestrator's
+    netting. The engine stamps them onto the Position it opens (see
+    core.models.Position.owners) so each desk's book logic only touches
+    positions it owns. Never set outside fund mode.
     """
     asset: Asset
     action: str
     size_fraction: float
     reason: str
     quantity: Optional[int] = None
+    desk_keys: Optional[tuple] = None
 
     def __post_init__(self):
         if self.action not in INTENT_ACTIONS:
