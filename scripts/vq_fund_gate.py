@@ -7,6 +7,10 @@ Modes:
   --mode fund   PEAD(micro, long-only) + ValueQuality(long-only) through
                 ReweightingFundBacktest (risk-parity, monthly rebalance,
                 shadow-solo-book) — N+1 backtests, the honest combine.
+                --weighting static instead runs ONE engine at fixed
+                construction weights (reweighter=None, no solo shadow
+                passes) — the reweighter-vs-cash-drag A/B arm. Fund mode
+                also prints post-hoc deployment fractions (1 - cash/NAV).
 
 Both run on the survivorship-free warehouse feed with a seeded random
 small/mid universe subset, and apply the single research gate
@@ -104,8 +108,22 @@ def run_vq(start, end, *, limit=None, capital=100_000.0, seed=42,
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
+def _deployment_stats(portfolio_history):
+    """Mean/median/min deployed fraction (1 - cash/NAV) across the run's
+    daily snapshots. Pure post-hoc reporting on fields the engine already
+    records (portfolio/manager.record_snapshot) — the cash-drag diagnostic
+    for the engine-vs-paper Sharpe gap. None when there are no snapshots."""
+    fracs = [1.0 - float(h['cash']) / float(h['portfolio_value'])
+             for h in portfolio_history if float(h['portfolio_value'])]
+    if not fracs:
+        return None
+    s = pd.Series(fracs)
+    return {'mean': float(s.mean()), 'median': float(s.median()),
+            'min': float(s.min())}
+
+
 def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
-             dating='filing', legacy=False):
+             dating='filing', legacy=False, weighting='risk_parity'):
     allocations = dict(LEGACY_FUND_ALLOCATIONS if legacy
                        else FUND_ALLOCATIONS)
     wh = PitWarehouse()
@@ -132,18 +150,30 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
              for k, a in allocations.items()],
             risk_manager=RiskManager(position_stop_loss=0.50))
 
-    fund = ReweightingFundBacktest(
-        allocations, initial_capital=capital, seed=seed,
-        weighting='risk_parity', market_data=feed,
-        solo_curve_provider=solo_curve,
-        orchestrator_factory=orchestrator_factory)
-    report = fund.run(universe, start, end, benchmark_symbol=None)
+    if weighting == 'static':
+        # A/B arm: reweighter=None makes the engine run the fund at its
+        # construction-time weights unchanged (backtest_engine guard), so the
+        # N expensive solo shadow passes are skipped. Same orchestrator
+        # factory (wide 0.50 stop included), capital, seed, feed and default
+        # cost model as the risk-parity arm — it differs ONLY in weighting.
+        engine = BacktestEngine(
+            orchestrator=orchestrator_factory(allocations), reweighter=None,
+            initial_capital=capital, seed=seed, market_data=feed)
+        report = engine.run(universe, start, end, benchmark_symbol=None)
+    else:
+        fund = ReweightingFundBacktest(
+            allocations, initial_capital=capital, seed=seed,
+            weighting='risk_parity', market_data=feed,
+            solo_curve_provider=solo_curve,
+            orchestrator_factory=orchestrator_factory)
+        report = fund.run(universe, start, end, benchmark_symbol=None)
     if 'error' in report:
         raise SystemExit(f"fund backtest failed: {report['error']}")
     returns, years = _daily_returns_with_years(report['portfolio_history'])
     gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
     n_trades = len(report.get('closed_trades', []))
-    return report['summary'], gate, n_trades, len(universe)
+    deploy = _deployment_stats(report.get('portfolio_history', []))
+    return report['summary'], gate, n_trades, len(universe), deploy
 
 
 def print_report(summary, gate, n_trades, n_names, label, start, end):
@@ -214,6 +244,11 @@ def main():
                     help='(vq mode) drop the short leg')
     ap.add_argument('--dating', choices=['filing', 'announce'],
                     default='filing', help='(fund mode) PEAD leg dating')
+    ap.add_argument('--weighting', choices=['risk_parity', 'static'],
+                    default='risk_parity',
+                    help='(fund mode) risk_parity = in-run reweighting '
+                         '(default, unchanged); static = fixed construction '
+                         'weights, no reweighter, no solo shadow passes')
     ap.add_argument('--legacy', action='store_true',
                     help='(fund mode) mix the four stock-only frozen legacy '
                          'desks into the fund (ownership-scoping exercise)')
@@ -227,15 +262,22 @@ def main():
             args.start, args.end, limit=args.limit, seed=args.seed,
             long_only=args.long_only)
         label = 'Value+Quality' + (' (long-only)' if args.long_only else '')
+        deploy = None
     else:
-        summary, gate, n_trades, n_names = run_fund(
+        summary, gate, n_trades, n_names, deploy = run_fund(
             args.start, args.end, limit=args.limit, seed=args.seed,
-            dating=args.dating, legacy=args.legacy)
+            dating=args.dating, legacy=args.legacy,
+            weighting=args.weighting)
         core = 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ'
-        label = (f"{core} fund (risk-parity, long-only core legs, "
+        wlabel = ('static weights' if args.weighting == 'static'
+                  else 'risk-parity')
+        label = (f"{core} fund ({wlabel}, long-only core legs, "
                  f"{args.dating} dating)")
     print_report(summary, gate, n_trades, n_names, label, args.start,
                  args.end)
+    if deploy is not None:
+        print(f"\n  Deployment (1 - cash/NAV): mean {deploy['mean']:.3f}"
+              f"  median {deploy['median']:.3f}  min {deploy['min']:.3f}")
 
 
 if __name__ == '__main__':
