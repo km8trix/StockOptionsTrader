@@ -61,6 +61,13 @@ from portfolio.risk_manager import RiskManager
 #: issuance_filter exclusion quantile — pre-registered at the desk's own
 #: top-quintile convention (0.2, rank-based per rebalance), never tuned.
 _ISSUANCE_FILTER_QUINTILE = 0.2
+#: issuance_filter staleness cut, days — the issuance-desk/screen default
+#: (400). The composite's filing-recency screen bounds NETMARGIN freshness,
+#: not issuance freshness (different pulls, different NULL filters, plus
+#: issuance_table's own guards), so without this cut a name whose last
+#: COMPUTABLE issuance row is years old would be barred from longs on
+#: ancient history. Stale issuance = no data = NOT excluded.
+_ISSUANCE_STALE_DAYS = 400
 
 
 class ValueQualityDesk(CrossSectionalLongShortDesk):
@@ -214,9 +221,9 @@ class ValueQualityDesk(CrossSectionalLongShortDesk):
         own quantile convention, floor'd like the base's k so fewer than 5
         computable names exclude nobody), ties broken by symbol. Names with
         no computable issuance are NOT excluded — missing data is not
-        evidence of issuance; scored names already passed the composite's
-        filing-recency screen, so a separate staleness knob would be a new
-        parameter, not a safeguard.
+        evidence of issuance — and a latest computable row older than
+        ``_ISSUANCE_STALE_DAYS`` counts as missing (the issuance-desk/screen
+        staleness convention; see the constant's rationale).
         """
         # One warehouse scan per run plus a cumulative re-pull for symbols
         # not yet covered — desks/issuance.py's one-shot-pull pattern
@@ -231,7 +238,10 @@ class ValueQualityDesk(CrossSectionalLongShortDesk):
         if not len(table):
             return set()
         latest = (table.sort_values('datekey').groupby('ticker', sort=False)
-                  .tail(1).set_index('ticker')['issuance'])
+                  .tail(1).set_index('ticker'))
+        fresh = latest[latest['datekey']
+                       >= ts - pd.Timedelta(days=_ISSUANCE_STALE_DAYS)]
+        latest = fresh['issuance']
         scored = [(sym, float(latest[sym])) for sym in symbols
                   if sym in latest.index and np.isfinite(latest[sym])]
         k = int(_ISSUANCE_FILTER_QUINTILE * len(scored))

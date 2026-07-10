@@ -246,6 +246,22 @@ def test_filing_after_the_rebalance_is_invisible_to_the_filter():
         symbols, pd.Timestamp('2022-06-01')) == {'HVY'}
 
 
+def test_stale_issuance_counts_as_missing_not_excluded():
+    # All histories file their last quarter 2022-05-10. Within 400 days the
+    # heavy issuer is excluded; past 400 days its issuance is STALE and
+    # counts as missing (stale data must not bar a 2024 long on 2019-vintage
+    # issuance — the issuance-desk/screen convention, adversarial-review
+    # finding 2026-07-10).
+    funds, pbs, shares = _filter_universe()
+    desk = ValueQualityDesk(provider=_FakeProvider(funds, pbs, shares),
+                            issuance_filter=True)
+    symbols = ['HVY', 'M1', 'M2', 'M3', 'M4']
+    assert desk._issuance_exclusions(
+        symbols, pd.Timestamp('2023-06-01')) == {'HVY'}   # 387d: fresh
+    assert desk._issuance_exclusions(
+        symbols, pd.Timestamp('2023-07-01')) == set()     # 417d: stale
+
+
 def test_one_pull_per_run_and_monthly_cache():
     funds, pbs, shares = _filter_universe()
     prov = _FakeProvider(funds, pbs, shares)

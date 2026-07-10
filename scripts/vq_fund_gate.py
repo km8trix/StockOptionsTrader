@@ -375,6 +375,8 @@ def main():
                  + (' (long-only)' if args.long_only else ''))
         deploy = None
     elif args.mode == 'issuance':
+        if args.vq_variant != 'base':
+            ap.error('--vq-variant has no effect in --mode issuance')
         summary, gate, n_trades, n_names = run_issuance(
             args.start, args.end, limit=args.limit, seed=args.seed)
         label = 'Net-Issuance (long-only, ex-micro)'
