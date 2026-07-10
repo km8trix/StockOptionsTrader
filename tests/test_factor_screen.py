@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from scripts.factor_screen import factor_study
+from scripts.factor_screen import _print_report, factor_study
 from scripts.value_validate import _date_spreads
 
 
@@ -65,6 +65,22 @@ def test_winsor_returns_tames_outlier_leg():
     wins = factor_study(ev, 'pb', [21], 0.0,
                         winsor_returns=0.1)[0]['gross_spread']
     assert raw > 5 * wins
+
+
+def test_print_report_default_width_byte_identical(capsys):
+    # the width param is opt-in: default output must keep the original
+    # fixed-9 factor column, byte for byte.
+    stats = [{'factor': 'pb', 'h': 21, 'n_dates': 24, 'gross_spread': 0.0123,
+              'net_spread': 0.0063, 't': 2.5, 'p': 0.0124}]
+    _print_report(stats, None, 30.0, 10, 240)
+    out = capsys.readouterr().out
+    assert ("  {:>9}{:>4}{:>7}{:>9}{:>9}{:>7}{:>9}{:>5}"
+            .format('factor', 'h', 'dates', 'gross%', 'net%', 't', 'p', 'BH*')
+            in out)
+    assert "         pb  21     24   +1.230   +0.630  +2.50   0.0124" in out
+    _print_report(stats, None, 30.0, 10, 240, width=15)
+    wide = capsys.readouterr().out
+    assert "             pb  21" in wide          # factor column widened
 
 
 def test_date_spreads_series_matches_factor_study_mean():

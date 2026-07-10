@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 
 from scripts.factor_screen import factor_study
-from scripts.quality_screen import collect_quality_events
+from scripts.quality_screen import (COMPUTED_RATIOS, collect_quality_events,
+                                    computed_ratio)
 
 
 class _FakeProv:
@@ -33,6 +34,94 @@ def test_collect_keeps_negatives_and_coerces_none():
     assert (ev.loc[ev['name'] == 'B', 'roe'] < 0).all()   # negative kept at collect
     assert ev.loc[ev['name'] == 'C', 'roe'].isna().all()  # None -> NaN
     assert 'fwd_21' in ev.columns
+
+
+def test_computed_ratio_guards():
+    from decimal import Decimal
+    assert computed_ratio({'gp': 30e6, 'assets': 100e6},
+                          'gp', 'assets') == 0.3
+    # Decimal inputs (DuckDB) are coerced
+    assert computed_ratio({'gp': Decimal('30000000'),
+                           'assets': Decimal('100000000')},
+                          'gp', 'assets') == 0.3
+    # either input missing -> None (same-quarter completeness guard)
+    assert computed_ratio({'gp': None, 'assets': 100e6},
+                          'gp', 'assets') is None
+    assert computed_ratio({'gp': 30e6, 'assets': None},
+                          'gp', 'assets') is None
+    assert computed_ratio({}, 'gp', 'assets') is None
+    # non-positive / relative-epsilon-sliver denominator -> None
+    assert computed_ratio({'gp': 30e6, 'assets': 0.0}, 'gp', 'assets') is None
+    assert computed_ratio({'gp': 30e6, 'assets': -5.0}, 'gp', 'assets') is None
+    assert computed_ratio({'gp': 1e21, 'assets': 100e6},
+                          'gp', 'assets') is None
+    # unit-inconsistency floor: the real VIVS row (gp $M-scale, assets
+    # raw-dollar) must be rejected, as must any sub-$1M assets base
+    assert computed_ratio({'gp': 1_677_000.0, 'assets': 3_628.0},
+                          'gp', 'assets') is None
+    assert computed_ratio({'gp': 400_000.0, 'assets': 999_999.0},
+                          'gp', 'assets') is None
+    # negative NUMERATOR is legitimate (unprofitable firm = short-leg member)
+    assert computed_ratio({'netinc': -10e6, 'assets': 100e6},
+                          'netinc', 'assets') == -0.1
+
+
+def test_collect_computes_gp_assets_and_roa():
+    funds = {'A': {'gp': 40e6, 'assets': 100e6, 'netinc': 10e6},
+             'B': {'gp': 5e6, 'assets': 0.0, 'netinc': None},  # guarded -> NaN
+             'C': {'gp': None, 'assets': 200e6, 'netinc': -20e6}}
+    prov = _FakeProv(funds)
+    rebal = pd.bdate_range('2015-01-01', '2015-06-30', freq='BMS')
+    ev, _ = collect_quality_events(prov, ['A', 'B', 'C'], rebal, [21],
+                                   ['gp_assets', 'roa'],
+                                   '2014-12-01', '2016-06-30')
+    a = ev[ev['name'] == 'A']
+    assert (a['gp_assets'] == 0.4).all() and (a['roa'] == 0.1).all()
+    b = ev[ev['name'] == 'B']
+    assert b['gp_assets'].isna().all() and b['roa'].isna().all()
+    c = ev[ev['name'] == 'C']
+    assert c['gp_assets'].isna().all() and (c['roa'] == -0.1).all()
+
+
+def test_mcap_column_is_opt_in():
+    funds = {'A': {'netmargin': 0.1, 'marketcap': 5e8},
+             'B': {'netmargin': 0.2, 'marketcap': None}}
+    prov = _FakeProv(funds)
+    rebal = pd.bdate_range('2015-01-01', '2015-06-30', freq='BMS')
+    args = (prov, ['A', 'B'], rebal, [21], ['netmargin'],
+            '2014-12-01', '2016-06-30')
+    ev, _ = collect_quality_events(*args)
+    assert 'mcap' not in ev.columns                       # default: unchanged
+    ev2, _ = collect_quality_events(*args, with_mcap=True)
+    assert (ev2.loc[ev2['name'] == 'A', 'mcap'] == 5e8).all()
+    assert ev2.loc[ev2['name'] == 'B', 'mcap'].isna().all()
+
+
+def test_native_factors_unchanged_by_computed_additions():
+    # netmargin rows/values and study stats must be BYTE-IDENTICAL whether or
+    # not the computed factors ride along (they are additive columns only).
+    funds = {f'N{i}': {'netmargin': (i - 3) / 10.0, 'gp': 10.0 * i,
+                       'assets': 100.0, 'netinc': 2.0 * i - 5}
+             for i in range(8)}
+    prov = _FakeProv(funds)
+    rebal = pd.bdate_range('2015-01-01', '2016-06-30', freq='BMS')
+    names = sorted(funds)
+    old, _ = collect_quality_events(prov, names, rebal, [21], ['netmargin'],
+                                    '2014-12-01', '2016-06-30')
+    new, _ = collect_quality_events(prov, names, rebal, [21],
+                                    ['netmargin', 'gp_assets', 'roa'],
+                                    '2014-12-01', '2016-06-30')
+    pd.testing.assert_frame_equal(old, new[old.columns])
+    s_old = factor_study(old, 'netmargin', [21], 30.0, cheap_is_long=False,
+                         drop_nonpositive=False, winsor_returns=0.01)
+    s_new = factor_study(new, 'netmargin', [21], 30.0, cheap_is_long=False,
+                         drop_nonpositive=False, winsor_returns=0.01)
+    np.testing.assert_equal(s_old, s_new)     # NaN-tolerant (degenerate t)
+
+
+def test_computed_ratios_registry():
+    assert COMPUTED_RATIOS == {'gp_assets': ('gp', 'assets'),
+                               'roa': ('netinc', 'assets')}
 
 
 def _q_events(n_dates=24, k=20, edge=0.02, seed=0):
