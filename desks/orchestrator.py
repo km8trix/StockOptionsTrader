@@ -43,6 +43,18 @@ SIZING: intents leave the orchestrator expressed as ACCOUNT-ABSOLUTE fractions
 one path with no per-desk capital math. Option intents keep their absolute
 contract `quantity` (Jane Street sizes structures in exact contracts).
 
+POSITION OWNERSHIP (fund mode): every netted opening intent carries the
+originating desk key(s) in DeskIntent.desk_keys (winning side only on an
+opposing-open residual), and the engine stamps them onto the opened
+Position (core.models.Position.owners). ENFORCEMENT is per desk family:
+CrossSectionalLongShortDesk scopes its reconcile/orphan-sweep/retention to
+positions it owns, so cross-sectional desks whose universes overlap through
+time can share one fund honestly. The frozen legacy families (Renaissance,
+Citadel, Foundation, Jane Street, trend follower) still read the portfolio
+UNSCOPED — mixing one of them with another desk in a fund can close the
+other desk's positions (the pre-ownership behavior). Extend their
+sweep/exit paths with the same owners check before composing such funds.
+
 ADDITIVE: single-desk and strategy backtests are untouched (the engine only
 enters the orchestrator path when an orchestrator is supplied). Reports gain an
 additive 'orchestrator' block; single-desk reports stay byte-identical.
@@ -267,7 +279,8 @@ class FundOrchestrator:
         return DeskIntent(
             asset=item.intent.asset, action=item.intent.action,
             size_fraction=min(1.0, item.account_fraction),
-            reason=item.intent.reason, quantity=item.intent.quantity)
+            reason=item.intent.reason, quantity=item.intent.quantity,
+            desk_keys=(item.desk.key,))
 
     def _net_stock_asset(self, asset: Asset,
                          group: List[_Tagged]) -> List[DeskIntent]:
@@ -309,11 +322,17 @@ class FundOrchestrator:
                 return []  # views fully offset -> the fund stays flat
             action = 'BUY' if net > 0 else 'SHORT'
             magnitude = min(1.0, abs(net))
+            # Ownership: only the desks on the WINNING side of the net own
+            # the residual position (a netted-away short view must not let
+            # its desk manage the long that survived).
+            owners = tuple(sorted({t.desk.key for t in opens
+                                   if t.intent.action == action}))
             return [DeskIntent(
                 asset=asset, action=action, size_fraction=magnitude,
                 reason=(f"fund {action} {asset.symbol}: {'+'.join(desk_keys)} "
                         f"(net {magnitude:.4f} of account"
-                        f"{', opposing views offset' if opposed else ''})"))]
+                        f"{', opposing views offset' if opposed else ''})"),
+                desk_keys=owners)]
 
         # Only closes, all the same action: one full-size close.
         action = closes[0].intent.action

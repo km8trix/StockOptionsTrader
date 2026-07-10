@@ -14,7 +14,10 @@ re-introducing the churn / orphan-sweep bug that was fixed):
       guards an in-flight close so it is never re-fired or orphan-swept;
     * an ORPHAN SWEEP scoped to desk-traded symbols (the engine holds
       pending intents longer than the reconcile grace, so an entry can fill
-      after its tracking was reconciled away);
+      after its tracking was reconciled away) AND, in a fund, to positions
+      this desk OWNS (core.models.Position.owners) — _traded_symbols grows
+      for the whole run, so without ownership scoping the sweep would close
+      positions another desk opened later in a symbol this desk once traded;
     * dollar-balanced sizing: each side gets half of ``target_gross`` spread
       across its legs, CLAMPED to ``max_name_size`` so a small selected set
       stays inside the shared position-size cap;
@@ -61,6 +64,15 @@ logger = logging.getLogger(__name__)
 #: bookkeeping is dropped (intent emitted day T fills day T+1). Mirrors the
 #: Renaissance reconcile grace so the orphan-sweep timing is identical.
 RECONCILE_GRACE_DAYS = 2
+
+#: FUND MODE ONLY: trading days a still-held in-flight close may wait before
+#: the desk re-emits it. The engine can DROP a pending close (no usable bar
+#: for its 5-day pending lifetime, or a fund netting conflict), and ownership
+#: scoping means no other desk will ever sweep the position for us — without
+#: a retry the leg would leak forever. Must exceed the engine's
+#: MAX_PENDING_DAYS (5) so a merely bar-less close that is still pending is
+#: not re-queued while alive (re-queueing resets its expiry clock).
+CLOSE_RETRY_DAYS = 6
 
 
 def _stock(symbol: str) -> Asset:
@@ -301,9 +313,9 @@ class CrossSectionalLongShortDesk(Desk):
                 symbol = asset.symbol
                 if symbol in desired or state.get('closing'):
                     continue  # already wanted (entry/flip), or mid-close
-                position = portfolio.get_position(asset)
+                position = self._owned_position(portfolio, asset)
                 if position is None or position.quantity == 0:
-                    continue  # only retain legs that actually filled
+                    continue  # only retain legs that actually filled (ours)
                 direction = state['direction']
                 held_days = self._day_index - state.get('entry_day',
                                                         self._day_index)
@@ -524,12 +536,43 @@ class CrossSectionalLongShortDesk(Desk):
     def _symbol_is_free(self, symbol: str,
                         portfolio: PortfolioManager) -> bool:
         """Enterable only if no book leg tracks it AND the portfolio holds no
-        position in it (any direction)."""
+        position in it (any direction).
+
+        Deliberately checks the WHOLE portfolio, not just owned positions:
+        the book holds ONE position per symbol, so an entry into a symbol
+        another desk holds would never fill (a phantom leg) — cross-desk
+        exclusion here is what keeps every position single-owner."""
         asset = _stock(symbol)
         if asset in self._book_positions:
             return False
         position = portfolio.get_position(asset)
         return position is None or position.quantity == 0
+
+    def _owned_position(self, portfolio: PortfolioManager, asset: Asset):
+        """The desk's OWN position in ``asset``, else None.
+
+        Fund-mode ownership scoping (core.models.Position.owners): a
+        position tagged with owner desk keys that do NOT include this desk
+        belongs to another desk — invisible to this desk's book logic
+        (reconcile / orphan sweep / turnover retention), so a fund can host
+        several cross-sectional desks whose universes overlap through time
+        without them closing each other's positions. An UNTAGGED position
+        (owners is None — always the case outside fund mode) is treated as
+        owned, byte-identical to pre-ownership behavior.
+
+        CO-OWNED positions (two desks' same-direction opens netted into one
+        fill) are owned by BOTH: closes are full-size on the one-position
+        book, so the first co-owner to rebalance out closes the other's
+        stake too — the other desk's leg then drops via the reconcile grace
+        and re-enters at its next rebalance if still wanted. Disjoint-at-a-
+        time universes never co-own."""
+        position = portfolio.get_position(asset)
+        if position is None:
+            return None
+        owners = position.owners
+        if owners is not None and self.key not in owners:
+            return None
+        return position
 
     def _reconcile_book(self, portfolio: PortfolioManager,
                         desired: Dict[str, str]) -> List[DeskIntent]:
@@ -550,7 +593,11 @@ class CrossSectionalLongShortDesk(Desk):
         # ---- Close legs that left their side / drop dead bookkeeping ----
         for asset in sorted(self._book_positions, key=lambda a: a.symbol):
             state = self._book_positions[asset]
-            position = portfolio.get_position(asset)
+            # Ownership-scoped: a position another desk owns (this desk's
+            # entry was netted away or blocked while the other's filled) is
+            # NOT this desk's fill — treat the leg as never-filled so the
+            # grace drops it instead of closing the other desk's position.
+            position = self._owned_position(portfolio, asset)
             held = position is not None and position.quantity != 0
 
             if held:
@@ -558,6 +605,29 @@ class CrossSectionalLongShortDesk(Desk):
                     # Close already emitted; KEEP tracking (so the orphan
                     # sweep never re-fires on our own in-flight close, and the
                     # name is not re-opened) until the fill flattens it.
+                    # FUND MODE ONLY (position ownership-tagged): if the
+                    # close was dropped by the engine or the fund netting,
+                    # re-emit it every CLOSE_RETRY_DAYS — ownership scoping
+                    # means no other desk can ever close this position for
+                    # us. Single-desk positions are untagged (owners None)
+                    # and keep the emit-once behavior byte-identically.
+                    if (position.owners is not None
+                            and self._day_index - state['close_day']
+                            >= CLOSE_RETRY_DAYS):
+                        state['close_day'] = self._day_index
+                        intents.append(DeskIntent(
+                            asset=asset,
+                            action=self._close_action(state['direction']),
+                            size_fraction=1.0,
+                            reason=(f"{self._reason_prefix} close retry: the "
+                                    f"in-flight close never filled")))
+                        self.note(
+                            'risk',
+                            f"Close retry {asset.symbol}: the emitted "
+                            f"{state['direction']}-book close never filled "
+                            f"within {CLOSE_RETRY_DAYS} days; re-emitting",
+                            symbol=asset.symbol,
+                            direction=state['direction'])
                     continue
                 want = desired.get(asset.symbol)
                 if want == state['direction']:
@@ -566,7 +636,9 @@ class CrossSectionalLongShortDesk(Desk):
                 # and mark the leg closing. Bookkeeping is retained until the
                 # position is actually flat, so the leg is neither re-closed,
                 # re-opened, nor orphan-swept while its close is in flight.
+                # close_day anchors the fund-mode retry above.
                 state['closing'] = True
+                state['close_day'] = self._day_index
                 intents.append(DeskIntent(
                     asset=asset,
                     action=self._close_action(state['direction']),
@@ -601,7 +673,11 @@ class CrossSectionalLongShortDesk(Desk):
             asset = _stock(symbol)
             if asset in self._book_positions:
                 continue  # properly tracked
-            position = portfolio.get_position(asset)
+            # Ownership-scoped: _traded_symbols grows for the whole run, so
+            # in a fund it covers symbols ANOTHER desk may hold today (band
+            # membership migrates; disjoint-today books overlap through
+            # time). Only this desk's own orphans are swept.
+            position = self._owned_position(portfolio, asset)
             if position is None or position.quantity == 0:
                 continue
             direction = 'long' if position.quantity > 0 else 'short'

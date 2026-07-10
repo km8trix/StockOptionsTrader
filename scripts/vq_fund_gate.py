@@ -37,6 +37,7 @@ from data.warehouse_feed import WarehouseMarketData  # noqa: E402
 from desks.orchestrator import FundOrchestrator  # noqa: E402
 from desks.pead import PEADDesk  # noqa: E402
 from desks.value_quality import ValueQualityDesk  # noqa: E402
+from portfolio.risk_manager import RiskManager  # noqa: E402
 from scripts.insider_desk_gate import (  # noqa: E402
     _daily_returns_with_years)
 from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
@@ -99,9 +100,14 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
                 for h in report.get('portfolio_history', [])]
 
     def orchestrator_factory(allocations):
-        return FundOrchestrator([
-            _make_desk(k, wh, capital_allocation=a, dating=dating)
-            for k, a in allocations.items()])
+        # Account-wide risk gate mirrors the legs' own config: both desks
+        # run monthly signals under a wide 50% stop (their solo default);
+        # the orchestrator's default RiskManager would 2%-stop the shared
+        # book daily and churn both books to noise.
+        return FundOrchestrator(
+            [_make_desk(k, wh, capital_allocation=a, dating=dating)
+             for k, a in allocations.items()],
+            risk_manager=RiskManager(position_stop_loss=0.50))
 
     fund = ReweightingFundBacktest(
         dict(FUND_ALLOCATIONS), initial_capital=capital, seed=seed,

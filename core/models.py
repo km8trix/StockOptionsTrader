@@ -94,12 +94,20 @@ class Position:
     For OPTION assets quantity is in CONTRACTS and prices are per-share,
     so pnl() and position value carry the asset's contract multiplier
     (x100); stock paths multiply by 1 and are unchanged.
+
+    owners (FUND MODE ONLY): the desk key(s) whose netted opening intent
+    created this position, so each desk's book logic (reconcile / orphan
+    sweep) only ever touches positions it owns. None — the default, and
+    always the case outside fund mode — means UNSCOPED: every consumer
+    treats the position as its own, byte-identical to pre-ownership
+    behavior.
     """
     asset: Asset
     quantity: int
     avg_entry_price: float
     current_price: float
     timestamp: datetime
+    owners: Optional[tuple] = None
 
     def pnl(self) -> float:
         """Calculate unrealized P&L (contract-multiplier aware)."""

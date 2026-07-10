@@ -187,6 +187,45 @@ announce-dated PEAD long-only micro (PSR 0.926) and the PEAD+VQ paper blend
 (realize the blend in-engine), a third decorrelated leg, or accepting the
 strategy class is near — but below — the bar on this decade.
 
+## Fund ownership fix (2026-07-09, follow-up: desk-scoped positions)
+
+The engine-level blocker above is fixed. Fund mode now records which desk(s)'
+netted opening intent created each position (`core.models.Position.owners`,
+stamped at fill time from `DeskIntent.desk_keys`, which the orchestrator's
+netting sets — winning side only on opposing residuals), and the
+cross-sectional book machinery (reconcile held-check, orphan sweep, turnover
+retention) treats a position owned by another desk as invisible: a desk can
+no longer close a position another desk opened later in a symbol it once
+traded. `_symbol_is_free` still checks the whole portfolio (the unified book
+holds ONE position per symbol; cross-desk exclusion there is what keeps every
+position single-owner). Untagged positions — always the case outside fund
+mode — behave exactly as before, so single-desk mode is byte-identical by
+construction (pinned by `tests/test_fund_position_ownership.py`; full suite
+2216 green). Two companions: (1) the gate's fund factory now gives the
+account-wide risk overlay the same wide 0.50 stop the solo legs validated
+with — the orchestrator's default 2% account stop would churn the monthly
+books daily; (2) a FUND-ONLY close retry (`CLOSE_RETRY_DAYS`) re-emits an
+in-flight close the engine dropped (bar-less pending expiry / netting
+conflict), since ownership scoping means no other desk can ever close the
+position for us — pre-fix that leg leaked forever. Ownership is ENFORCED by
+the cross-sectional family only; the frozen legacy desks (Renaissance,
+Citadel, Foundation, Jane Street, trend follower) still sweep unscoped —
+documented in `desks/orchestrator.py`, follow-up filed.
+
+Result — `vq_fund_gate.py --mode fund --limit 600 --dating announce`:
+**1,382 trades (was 24k), +96.9%, Sharpe 0.41, maxDD −21.8%, PSR 0.9113,
+0 BH-significant years → FAIL.** The engine fund now reproduces the paper
+blend's PSR (0.911) almost exactly: the shared book no longer destroys the
+combine, and what remains is the strategy class sitting below the bar, not an
+engine artifact. The Sharpe gap vs the paper 0.55 is real engine economics
+the paper blend ignores (shared cash earning zero under ~half deployment,
+risk-parity reweighting vs static 50/50, cross-desk same-symbol exclusion) —
+not churn: 1,382 fund trades ≈ the sum of the two ~800-trade solo books minus
+overlap exclusions.
+
+**Verdict unchanged: no promotion.** The honest engine-level combine is PSR
+0.911 vs the 0.95 bar — the fund seam is no longer the constraint.
+
 ## Testing
 
 - Unit: sizer streak math; VIX crossing/exit/stop logic on synthetic frames
