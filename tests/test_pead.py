@@ -75,6 +75,38 @@ class TestSueTable:
         assert list(empty.columns) == ['ticker', 'reportperiod', 'datekey',
                                        'sue']
 
+    def test_column_default_pins_epsdil_behavior(self):
+        # The column parameter must be a pure generalization: the default
+        # call and column='epsdil' produce IDENTICAL frames (byte-identity
+        # for the existing desk/screen callers).
+        eps = pd.DataFrame(_eps_rows('AAA', [1, 1, 1, 1, 2, 3, 2, 3, 5]))
+        pd.testing.assert_frame_equal(sue_table(eps),
+                                      sue_table(eps, column='epsdil'))
+
+    def test_revenue_column_scale_free(self):
+        # SURGE = the same machinery on 'revenue'. Standardization is
+        # scale-free, so dollar-scale revenue must reproduce the EPS SUE
+        # exactly (same series x 1e9, different column name).
+        vals = [1, 1, 1, 1, 2, 3, 2, 3, 5]
+        eps = pd.DataFrame(_eps_rows('AAA', vals))
+        rev = eps.rename(columns={'epsdil': 'revenue'})
+        rev['revenue'] *= 1e9
+        out = sue_table(rev, column='revenue')
+        assert list(out.columns) == ['ticker', 'reportperiod', 'datekey',
+                                     'sue']
+        assert out['sue'].iloc[0] == pytest.approx(2.598, abs=1e-3)
+
+    def test_degenerate_guard_holds_at_revenue_scale(self):
+        # Steady dollar-scale growth with sub-dollar noise: seasonal diffs
+        # of ~$4e8 whose std (~$0.07) is huge vs any ABSOLUTE 1e-9 epsilon
+        # but noise vs the diff level. The RELATIVE epsilon
+        # (1e-9 * |mean diff| = $0.4 here) must still read this as
+        # degenerate — no absurd SURGE rows from near-constant growers.
+        rev = pd.DataFrame(_eps_rows(
+            'BBB', [1e9 + 1e8 * q + 0.05 * (q % 3) for q in range(12)]))
+        rev = rev.rename(columns={'epsdil': 'revenue'})
+        assert len(sue_table(rev, column='revenue')) == 0
+
 
 class TestLatestFreshSue:
     def _sues(self):

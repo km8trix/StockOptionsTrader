@@ -34,13 +34,20 @@ _SEASONAL_LO_DAYS, _SEASONAL_HI_DAYS = 330, 410
 
 
 def sue_table(eps: pd.DataFrame, *, window: int = 8,
-              min_diffs: int = 4) -> pd.DataFrame:
+              min_diffs: int = 4, column: str = 'epsdil') -> pd.DataFrame:
     """Per-filing SUE rows from quarterly EPS history.
 
     eps: columns ticker, reportperiod (datetime), datekey (datetime),
     epsdil (float); one row per (ticker, reportperiod). Returns the subset of
     filings with a computable SUE — columns ticker, reportperiod, datekey, sue
     — sorted by (ticker, reportperiod).
+
+    column: which value column to standardize (default 'epsdil' = classic
+    SUE). Any quarterly flow works — e.g. 'revenue' gives the standardized
+    revenue-growth surprise (SURGE, Jegadeesh-Livnat 2006): the seasonal
+    DIFFERENCING plus (d - mean)/std normalization is scale-free, and the
+    degenerate-std guard is relative to the mean diff, so dollar-scale
+    revenue behaves like float-scale EPS. Output column stays 'sue'.
     """
     out = []
     if eps is None or len(eps) == 0:
@@ -48,7 +55,7 @@ def sue_table(eps: pd.DataFrame, *, window: int = 8,
     for ticker, g in eps.groupby('ticker', sort=False):
         g = g.sort_values('reportperiod')
         rp = g['reportperiod'].to_numpy(dtype='datetime64[ns]')
-        e = g['epsdil'].to_numpy(dtype=float)
+        e = g[column].to_numpy(dtype=float)
         n = len(g)
         # Seasonal diff vs the latest quarter 330-410 days earlier.
         lo = np.searchsorted(rp, rp - np.timedelta64(_SEASONAL_HI_DAYS, 'D'),
