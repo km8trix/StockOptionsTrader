@@ -53,15 +53,20 @@ _TABLES = {
 }
 
 #: Intraday minute-bar tables — SIBLING registry to ``_TABLES``, deliberately
-#: separate: these come from the Alpaca Data API v2 (REST paging, operator-run
+#: separate: these come from REST-paged minute-bar APIs (operator-run
 #: ``scripts/ingest_alpaca_bars.py``), NOT the Sharadar bulk-export machinery,
 #: so ``ingest_table`` must keep rejecting them. Layout differs too: one
 #: Parquet PER SYMBOL under ``<warehouse>/<table>/<TICKER>.parquet`` so a
 #: re-ingest of one name never rewrites the others. Same (source, params)
-#: value shape as ``_TABLES`` for auditability.
+#: value shape as ``_TABLES`` for auditability. ``bars_1m`` is the Alpaca
+#: IEX pilot table; ``bars_1m_sip`` is the Massive (ex-Polygon)
+#: consolidated-tape sibling (``--provider massive --table bars_1m_sip``) —
+#: same schema, kept separate so neither ingest overwrites the other.
 _INTRADAY_TABLES = {
     'bars_1m': ('ALPACA/v2/stocks/{symbol}/bars',
                 {'timeframe': '1Min', 'feed': 'iex'}),
+    'bars_1m_sip': ('MASSIVE/v2/aggs/ticker/{symbol}/range/1/minute',
+                    {'adjusted': 'false', 'limit': 50000}),
 }
 
 #: bars_1m column contract (writer validates, readers return the non-key
@@ -562,20 +567,25 @@ class PitWarehouse:
         return {t: mc for t, mc in res.fetchall() if mc is not None}
 
     # ------------------------------------------------------------------
-    # Intraday minute bars (bars_1m — Alpaca IEX; see _INTRADAY_TABLES)
+    # Intraday minute bars (bars_1m and siblings; see _INTRADAY_TABLES).
+    # Every helper takes an additive ``table`` param defaulting to
+    # 'bars_1m' — the default path is byte-identical to the pre-sibling
+    # behavior (pinned in tests).
     # ------------------------------------------------------------------
     def _bars_pq(self, ticker: str, table: str = 'bars_1m') -> str:
         """Per-symbol Parquet path: ``<warehouse>/<table>/<TICKER>.parquet``."""
         return os.path.join(self.warehouse_dir, table, f"{ticker}.parquet")
 
-    def write_bars_1m(self, ticker: str, df: pd.DataFrame) -> int:
+    def write_bars_1m(self, ticker: str, df: pd.DataFrame, *,
+                      table: str = 'bars_1m') -> int:
         """Write one symbol's minute bars (OVERWRITES that symbol's Parquet;
         idempotency policy — skip-existing vs re-download — belongs to the
         caller, scripts/ingest_alpaca_bars.py). ``df`` must carry the full
         ``_BARS_1M_COLUMNS`` contract with ``ts`` tz-naive US/Eastern; rows
         are sorted by ``ts`` and de-duplicated on it before the write. An
         empty frame writes NOTHING (so a failed fetch never masquerades as
-        an ingested symbol) and returns 0. Returns the row count written."""
+        an ingested symbol) and returns 0. Returns the row count written.
+        ``table`` picks the sibling intraday table (e.g. ``bars_1m_sip``)."""
         missing = [c for c in _BARS_1M_COLUMNS if c not in df.columns]
         if missing:
             raise ValueError(f"bars_1m frame missing columns {missing}")
@@ -584,7 +594,7 @@ class PitWarehouse:
         out = (df.loc[:, list(_BARS_1M_COLUMNS)]
                  .sort_values('ts')
                  .drop_duplicates(subset='ts', keep='first'))
-        path = self._bars_pq(ticker)
+        path = self._bars_pq(ticker, table)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         con = self._con()
         con.register('_bars_1m_df', out)
@@ -595,12 +605,13 @@ class PitWarehouse:
             con.unregister('_bars_1m_df')
         return len(out)
 
-    def _bars_query(self, ticker: str, where: str, params: list) -> pd.DataFrame:
+    def _bars_query(self, ticker: str, where: str, params: list, *,
+                    table: str = 'bars_1m') -> pd.DataFrame:
         """Shared bars_1m read: ts-indexed OHLCV+trade_count+vwap frame, empty
         (same columns) for a never-ingested symbol or a failed query."""
         cols = ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap']
         empty = pd.DataFrame(columns=cols, index=pd.DatetimeIndex([], name='ts'))
-        path = self._bars_pq(ticker)
+        path = self._bars_pq(ticker, table)
         if not os.path.exists(path):
             return empty
         sql = (f"SELECT ts, \"open\", high, low, \"close\", volume, "
@@ -614,26 +625,31 @@ class PitWarehouse:
         df['ts'] = pd.to_datetime(df['ts'])
         return df.set_index('ts')
 
-    def ohlcv_intraday(self, ticker: str, date) -> pd.DataFrame:
+    def ohlcv_intraday(self, ticker: str, date, *,
+                       table: str = 'bars_1m') -> pd.DataFrame:
         """ONE session's 1-minute bars for ``ticker``: DataFrame indexed by
         ``ts`` (tz-naive US/Eastern, ascending) with columns open/high/low/
         close/volume/trade_count/vwap. ALL bars of the calendar day are
         returned (extended hours included — the warehouse stores what the
         feed served; session filtering is the consumer's job). Empty frame
-        for a bad date or a never-ingested symbol."""
+        for a bad date or a never-ingested symbol. ``table`` picks the
+        sibling intraday table (e.g. ``bars_1m_sip``)."""
         d = self._date(date)
         if d is None:
-            return self._bars_query(ticker, 'false', [])
-        return self._bars_query(ticker, 'CAST(ts AS DATE) = ?', [d])
+            return self._bars_query(ticker, 'false', [], table=table)
+        return self._bars_query(ticker, 'CAST(ts AS DATE) = ?', [d],
+                                table=table)
 
-    def ohlcv_intraday_range(self, ticker: str, start, end) -> pd.DataFrame:
+    def ohlcv_intraday_range(self, ticker: str, start, end, *,
+                             table: str = 'bars_1m') -> pd.DataFrame:
         """Bulk twin of ``ohlcv_intraday`` over [start, end] calendar days —
         ONE Parquet scan for a multi-year study instead of one per session."""
         s, e = self._date(start), self._date(end)
         if s is None or e is None:
-            return self._bars_query(ticker, 'false', [])
+            return self._bars_query(ticker, 'false', [], table=table)
         return self._bars_query(
-            ticker, 'CAST(ts AS DATE) >= ? AND CAST(ts AS DATE) <= ?', [s, e])
+            ticker, 'CAST(ts AS DATE) >= ? AND CAST(ts AS DATE) <= ?', [s, e],
+            table=table)
 
     # ------------------------------------------------------------------
     # Ingest — OPERATOR-ONLY, network: bulk-export -> zip -> Parquet

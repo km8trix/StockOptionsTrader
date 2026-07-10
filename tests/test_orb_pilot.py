@@ -445,7 +445,9 @@ def test_existing_sharadar_registry_byte_identical():
         'actions': ('SHARADAR/ACTIONS', {}),
         'events': ('SHARADAR/EVENTS', {}),
     }
-    assert set(_INTRADAY_TABLES) == {'bars_1m'}
+    # bars_1m_sip joined the intraday registry 2026-07-10 (Massive SIP
+    # sibling); the full registry is pinned in test_massive_sip_trial.py.
+    assert set(_INTRADAY_TABLES) == {'bars_1m', 'bars_1m_sip'}
     assert not (set(_INTRADAY_TABLES) & set(_TABLES))
     with pytest.raises(ValueError, match='unknown table'):
         PitWarehouse('/nonexistent').ingest_table('bars_1m')
