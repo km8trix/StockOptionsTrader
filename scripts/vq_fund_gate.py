@@ -3,14 +3,20 @@
 (docs/vix_pead_desks_spec.md, unlock c: combine decorrelated survivors).
 
 Modes:
-  --mode vq     ValueQualityDesk solo through the engine (its own number).
-  --mode fund   PEAD(micro, long-only) + ValueQuality(long-only) through
-                ReweightingFundBacktest (risk-parity, monthly rebalance,
-                shadow-solo-book) — N+1 backtests, the honest combine.
-                --weighting static instead runs ONE engine at fixed
-                construction weights (reweighter=None, no solo shadow
-                passes) — the reweighter-vs-cash-drag A/B arm. Fund mode
-                also prints post-hoc deployment fractions (1 - cash/NAV).
+  --mode vq        ValueQualityDesk solo through the engine (its own number).
+  --mode issuance  IssuanceDesk solo through the engine (desk defaults:
+                   long-only, ex-micro, 400d staleness) — the third-leg
+                   candidate's own number.
+  --mode fund      PEAD(micro, long-only) + ValueQuality(long-only) through
+                   ReweightingFundBacktest (risk-parity, monthly rebalance,
+                   shadow-solo-book) — N+1 backtests, the honest combine.
+                   --weighting static instead runs ONE engine at fixed
+                   construction weights (reweighter=None, no solo shadow
+                   passes) — the reweighter-vs-cash-drag A/B arm. Fund mode
+                   also prints post-hoc deployment fractions (1 - cash/NAV).
+                   --issuance swaps in the pre-registered three-leg fund
+                   (PEAD micro + VQ + issuance, equal 1/3 split — weights
+                   fixed BEFORE the run, not tuned).
 
 Both run on the survivorship-free warehouse feed with a seeded random
 small/mid universe subset, and apply the single research gate
@@ -32,6 +38,15 @@ configuration; both arms FAIL the 0.95/BH gate (0 BH years). Deployment
 (mean ~0.62, min 0.39 in-run) bounds the cash-drag term: ~38% idle cash at
 the gate's 2% rf costs ~0.76%/yr of excess return — the residual
 engine-vs-paper Sharpe gap, now measured, not assumed.
+
+3-LEG RESULT (2026-07-10, --issuance --weighting static --dating announce,
+600 names seed 42): PEAD+VQ+issuance 1/3 each = 1732 trades, +73.1%, Sharpe
+0.36, maxDD -20.8%, PSR 0.8784 FAIL (0 BH years) — WORSE than the two-leg
+static 50/50. Solo issuance (--mode issuance): 489 trades, +45.4%, Sharpe
+0.21, PSR 0.7415 FAIL — the screen's 8/8 BH edge attenuates hard long-only
+ex-micro (the spread's short leg carried much of it). The weak leg dilutes
+more than decorrelation adds; deployment mean 0.596. DO NOT mix the
+issuance leg in this form — two-leg static stays the best honest fund.
 """
 
 from __future__ import annotations
@@ -52,6 +67,7 @@ from data.pit_warehouse import PitWarehouse  # noqa: E402
 from data.warehouse_feed import WarehouseMarketData  # noqa: E402
 from desks.citadel import CitadelDesk  # noqa: E402
 from desks.foundation import FoundationDesk  # noqa: E402
+from desks.issuance import IssuanceDesk  # noqa: E402
 from desks.orchestrator import FundOrchestrator  # noqa: E402
 from desks.pead import PEADDesk  # noqa: E402
 from desks.renaissance import RenaissanceDesk  # noqa: E402
@@ -76,6 +92,13 @@ FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 #: baseline is de facto a static 50/50 fund (reweight_log: fallback=True
 #: throughout).
 FUND_ALLOCATIONS = {'pead_micro': 0.5, 'value_quality': 0.5}
+#: --issuance three-leg fund: the two incumbent legs + the issuance desk at a
+#: PRE-REGISTERED equal split. The 1/3 weights are fixed here, before any
+#: three-leg backtest ran — tuning them post hoc would turn the gate into an
+#: in-sample fit. Keys MUST equal the constructed desks' .key (same contract
+#: as FUND_ALLOCATIONS above; pinned in tests/test_vq_fund_gate.py).
+THREE_LEG_ALLOCATIONS = {'pead_micro': 1 / 3, 'value_quality': 1 / 3,
+                         'issuance': 1 / 3}
 #: --legacy mix: the validated core keeps half the fund; the four stock-only
 #: frozen legacy desks split the rest. Exercises the fund-wide ownership
 #: scoping (Desk._owns_position) — legacy sweeps/exits must never close the
@@ -97,6 +120,12 @@ def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing'):
         return ValueQualityDesk(provider=wh, long_only=True,
                                 capital_allocation=capital_allocation,
                                 exclude_micro=True)
+    if key == 'issuance':
+        # Desk defaults ARE the fund slot: long_only=True, exclude_micro=True
+        # (rides the same ex-micro slice as VQ — the screen's uniquely
+        # surviving tradeable slice), stale_days=400.
+        return IssuanceDesk(provider=wh,
+                            capital_allocation=capital_allocation)
     if key == 'foundation':
         return FoundationDesk(capital_allocation=capital_allocation)
     if key == 'trend_follower':
@@ -129,6 +158,20 @@ def run_vq(start, end, *, limit=None, capital=100_000.0, seed=42,
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
+def run_issuance(start, end, *, limit=None, capital=100_000.0, seed=42):
+    """Solo IssuanceDesk gate — run_vq's exact shape on the third-leg
+    candidate at its desk defaults (long-only, ex-micro, 400d staleness)."""
+    wh = PitWarehouse()
+    universe = _universe(wh, start, end, limit, seed)
+    desk = IssuanceDesk(provider=wh)
+    engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
+                            market_data=WarehouseMarketData(wh))
+    report = engine.run(universe, start, end)
+    returns, years = _daily_returns_with_years(report['portfolio_history'])
+    gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
+    return report['summary'], gate, len(report['closed_trades']), len(universe)
+
+
 def _deployment_stats(portfolio_history):
     """Mean/median/min deployed fraction (1 - cash/NAV) across the run's
     daily snapshots. Pure post-hoc reporting on fields the engine already
@@ -150,8 +193,10 @@ def _deployment_stats(portfolio_history):
 
 
 def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
-             dating='filing', legacy=False, weighting='risk_parity'):
-    allocations = dict(LEGACY_FUND_ALLOCATIONS if legacy
+             dating='filing', legacy=False, weighting='risk_parity',
+             issuance=False):
+    allocations = dict(THREE_LEG_ALLOCATIONS if issuance
+                       else LEGACY_FUND_ALLOCATIONS if legacy
                        else FUND_ALLOCATIONS)
     wh = PitWarehouse()
     universe = _universe(wh, start, end, limit, seed)
@@ -262,7 +307,8 @@ def _selftest():
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--mode', choices=['vq', 'fund'], default='fund')
+    ap.add_argument('--mode', choices=['vq', 'issuance', 'fund'],
+                    default='fund')
     ap.add_argument('--limit', type=int, default=None)
     ap.add_argument('--start', default=FULL_START)
     ap.add_argument('--end', default=FULL_END)
@@ -279,6 +325,9 @@ def main():
     ap.add_argument('--legacy', action='store_true',
                     help='(fund mode) mix the four stock-only frozen legacy '
                          'desks into the fund (ownership-scoping exercise)')
+    ap.add_argument('--issuance', action='store_true',
+                    help='(fund mode) run the pre-registered three-leg fund '
+                         '(PEAD micro + VQ + issuance, equal 1/3 split)')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
@@ -290,12 +339,21 @@ def main():
             long_only=args.long_only)
         label = 'Value+Quality' + (' (long-only)' if args.long_only else '')
         deploy = None
+    elif args.mode == 'issuance':
+        summary, gate, n_trades, n_names = run_issuance(
+            args.start, args.end, limit=args.limit, seed=args.seed)
+        label = 'Net-Issuance (long-only, ex-micro)'
+        deploy = None
     else:
+        if args.issuance and args.legacy:
+            ap.error('--issuance and --legacy select different allocation '
+                     'mixes; pick one')
         summary, gate, n_trades, n_names, deploy = run_fund(
             args.start, args.end, limit=args.limit, seed=args.seed,
             dating=args.dating, legacy=args.legacy,
-            weighting=args.weighting)
-        core = 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ'
+            weighting=args.weighting, issuance=args.issuance)
+        core = ('PEAD+VQ+issuance' if args.issuance
+                else 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ')
         wlabel = ('static weights' if args.weighting == 'static'
                   else 'risk-parity')
         label = (f"{core} fund ({wlabel}, long-only core legs, "

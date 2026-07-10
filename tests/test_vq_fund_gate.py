@@ -163,9 +163,46 @@ def test_allocation_keys_match_desk_keys():
     # the whole-fund equal-weight fallback (how the pre-2026-07-10 'pead'
     # vs 'pead_micro' bug made the risk-parity arm a de facto static fund).
     # Real desk classes, no stubs: the .key values are what production sees.
-    for allocations in (vfg.FUND_ALLOCATIONS, vfg.LEGACY_FUND_ALLOCATIONS):
+    for allocations in (vfg.FUND_ALLOCATIONS, vfg.LEGACY_FUND_ALLOCATIONS,
+                        vfg.THREE_LEG_ALLOCATIONS):
         for key in allocations:
             desk = vfg._make_desk(key, object())
             assert desk.key == key, (
                 f"allocation key {key!r} builds desk.key {desk.key!r}: "
                 f"solo curves would never reach the reweighter")
+
+
+def test_three_leg_allocations_are_the_preregistered_equal_split():
+    # The third-leg combine is pre-registered: exactly the two incumbent
+    # legs + issuance at 1/3 each. Any weight tuning must fail this test and
+    # be argued in review, not slipped in.
+    assert vfg.THREE_LEG_ALLOCATIONS == {
+        'pead_micro': pytest.approx(1 / 3),
+        'value_quality': pytest.approx(1 / 3),
+        'issuance': pytest.approx(1 / 3)}
+
+
+def test_issuance_fund_builds_three_leg_orchestrator(stubbed, monkeypatch):
+    # run_fund(issuance=True) must hand the THREE_LEG allocations to the
+    # orchestrator factory — same static-arm engine construction otherwise.
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['engine_kwargs'] = kwargs
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
+                 dating='announce', weighting='static', issuance=True)
+
+    kwargs = captured['engine_kwargs']
+    assert kwargs['reweighter'] is None
+    orch, desks, risk_manager = kwargs['orchestrator']
+    assert desks == (('pead_micro', pytest.approx(1 / 3), 'announce'),
+                     ('value_quality', pytest.approx(1 / 3), 'announce'),
+                     ('issuance', pytest.approx(1 / 3), 'announce'))
+    assert risk_manager == ('RM', 0.50)

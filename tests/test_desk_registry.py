@@ -46,7 +46,8 @@ class TestListDesks:
         by_key = {entry['key']: entry for entry in list_desks()}
         assert set(by_key) == {'foundation', 'renaissance', 'citadel',
                                'janestreet', 'twosigma', 'aqr',
-                               'vixrevert', 'pead', 'value_quality'}
+                               'vixrevert', 'pead', 'value_quality',
+                               'issuance'}
 
         assert by_key['foundation']['status'] == 'ready'
         assert by_key['foundation']['accent'] == '#4493f8'
@@ -135,6 +136,13 @@ class TestCreateDesk:
         assert isinstance(desk, ValueQualityDesk)
         assert desk.key == 'value_quality'
         assert desk.capital_allocation == 0.25
+
+    def test_creates_issuance_desk(self):
+        from desks.issuance import IssuanceDesk
+        desk = create_desk('issuance', capital_allocation=0.2)
+        assert isinstance(desk, IssuanceDesk)
+        assert desk.key == 'issuance'
+        assert desk.capital_allocation == 0.2
 
     def test_renaissance_capital_allocation_is_passed_through(self):
         desk = create_desk('renaissance', capital_allocation=0.3)
