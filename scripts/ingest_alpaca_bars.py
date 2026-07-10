@@ -27,7 +27,10 @@ CONVENTIONS (documented, consistent everywhere):
   * IDEMPOTENT re-runs: a symbol whose Parquet already exists is SKIPPED;
     pass ``--force`` to re-download and overwrite that symbol's file.
   * Rate limit (~200 req/min): simple sleep-and-retry on HTTP 429, honoring
-    Retry-After when present.
+    a NUMERIC Retry-After when present; the HTTP-date form (or junk) falls
+    back to RETRY_429_DEFAULT and every retry sleep is floored at
+    MIN_RETRY_SLEEP so ``Retry-After: 0`` cannot hot-loop (amended
+    2026-07-10).
 
 SECRETS: keys are read from the environment by NAME only —
 ``ALPACA_PAPER_API_KEY`` / ``ALPACA_PAPER_API_SECRET`` (the data API accepts
@@ -55,8 +58,24 @@ BARS_URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
 PILOT_SYMBOLS = ['SPY', 'QQQ', 'IWM', 'TQQQ']
 FULL_START, FULL_END = '2016-01-01', '2024-12-31'
 PAGE_LIMIT = 10_000
-RETRY_429_DEFAULT = 10.0   # seconds, when no Retry-After header
+RETRY_429_DEFAULT = 10.0   # seconds, when Retry-After is absent/unparseable
+MIN_RETRY_SLEEP = 1.0      # floor — "Retry-After: 0" must not hot-loop
 MAX_429_RETRIES = 30
+
+
+def _retry_after_seconds(header_value) -> float:
+    """``Retry-After`` header value -> seconds to sleep (numeric form only).
+
+    The HTTP-date form ("Wed, 21 Oct 2026 07:28:00 GMT"), a missing header
+    (None) or any other junk falls back to RETRY_429_DEFAULT; the result is
+    floored at MIN_RETRY_SLEEP so ``Retry-After: 0`` cannot spin a hot
+    retry loop.
+    """
+    try:
+        wait = float(header_value)
+    except (TypeError, ValueError):
+        wait = RETRY_429_DEFAULT
+    return max(wait, MIN_RETRY_SLEEP)
 
 
 def _headers() -> dict:
@@ -126,8 +145,7 @@ def fetch_symbol_bars(symbol: str, start: str, end: str, *,
             if retries_429 > MAX_429_RETRIES:
                 raise RuntimeError(f"{symbol}: gave up after "
                                    f"{MAX_429_RETRIES} consecutive 429s")
-            wait = float(resp.headers.get('Retry-After')
-                         or RETRY_429_DEFAULT)
+            wait = _retry_after_seconds(resp.headers.get('Retry-After'))
             print(f"  {symbol}: 429 rate-limited, sleeping {wait:.0f}s",
                   file=sys.stderr)
             sleep(wait)

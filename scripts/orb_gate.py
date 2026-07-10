@@ -11,12 +11,33 @@ applies unchanged). Data: Alpaca IEX 1-minute bars from the PitWarehouse
 
 PRE-REGISTERED SPEC (Zarattini-Aziz-style, single config, fixed BEFORE any
 run — this is the FIRST and ONLY registered ORB config; NO parameter sweeps
-in this round, so n_trials=1 and DSR == PSR):
+in this round, so n_trials=1 and DSR == PSR. AMENDED 2026-07-10 after
+adversarial code review, still pre-registration: NO ORB backtest had run
+yet, so the session-end detection rule and the full-OR requirement below
+are spec amendments made before the first data run, not post-hoc tweaks):
 
   * Opening range : high/low of the 09:30-09:34 ET minute bars (five 1-min
                     bars; labels are bar START times; all times tz-naive ET).
-                    No trade if the window has no bars or zero range.
-  * Entry         : scanning the 09:35 bar through the 15:54 bar, the FIRST
+                    No trade unless ALL FIVE bars are present
+                    (OR_REQUIRED_BARS; amended 2026-07-10 — a data-quality
+                    guard: a 1-2 bar OR on a thin IEX open understates the
+                    range and oversizes the position). No trade on zero
+                    range.
+  * Session end   : DATA-DRIVEN early-close detection (amended 2026-07-10),
+                    no memorized holiday list: a session with fewer than
+                    HALF_DAY_MIN_PROBE_BARS (=30, a data-quality constant)
+                    bars with ts in [13:15, 15:45) ends at 13:00 (early
+                    close), else 16:00. Rationale: on regular days liquid
+                    ETFs print >100 IEX bars in that window; NYSE
+                    13:00-close half days (~9/yr) show only sparse
+                    after-hours prints there. Without this rule the
+                    [09:30,16:00) filter admits AH IEX prints on half days
+                    -> phantom entries/stops/EOD exits. The cutoff bounds
+                    the tradeable window (entries only through the bar
+                    starting 6 min before the cutoff — 12:54, mirroring the
+                    15:54 rule), the stop scan, and the EOD flat exit.
+  * Entry         : scanning the 09:35 bar through the 15:54 bar (12:54 on
+                    detected half days), the FIRST
                     bar that trades THROUGH the range — high > OR-high =>
                     long, low < OR-low => short. First breakout wins; ONE
                     trade per day max. If that first breaking bar breaches
@@ -25,13 +46,14 @@ in this round, so n_trials=1 and DSR == PSR):
                     the breakout BAR'S CLOSE plus adverse slippage — the
                     first trade THROUGH the level, never the level itself.
   * Stop          : the opposite side of the opening range, checked on bars
-                    AFTER the entry bar: filled at the bar's OPEN when it
+                    AFTER the entry bar (session bars only — never
+                    after-hours prints): filled at the bar's OPEN when it
                     gaps through the stop, else at the stop level; adverse
                     slippage either way.
   * Exit          : stop, else flat at the close of the session's LAST bar
-                    before 16:00 (the 15:59 bar on full days; the last
-                    available bar on half days / gappy IEX days) — the
-                    15:55-16:00 close exit. No overnight positions, ever.
+                    strictly before the session cutoff — 16:00, or 13:00 on
+                    detected early-close days (the 15:59 bar on full days) —
+                    the close exit. No overnight positions, ever.
   * Sizing        : risk 1% of current equity on the OR range — shares =
                     0.01*equity / (ORhigh - ORlow) — with notional capped at
                     4x equity at the entry fill. Fractional shares (research
@@ -82,8 +104,17 @@ FULL_START, FULL_END = '2016-01-01', '2024-12-31'
 # --- pre-registered constants (see module docstring) -----------------------
 OR_START = dtime(9, 30)
 OR_END = dtime(9, 35)        # exclusive — OR bars are 09:30..09:34
+OR_REQUIRED_BARS = 5         # data quality: ALL FIVE OR bars, else no trade
 ENTRY_END = dtime(15, 55)    # exclusive — no fresh entries 15:55 onward
 SESSION_END = dtime(16, 0)   # exclusive — regular session bars only
+# Early-close (half-day) detection — data-driven, amended 2026-07-10:
+HALF_DAY_PROBE_START = dtime(13, 15)   # probe window: did the afternoon
+HALF_DAY_PROBE_END = dtime(15, 45)     # session actually trade? (exclusive)
+HALF_DAY_MIN_PROBE_BARS = 30           # data quality: fewer bars than this
+#                                        in the probe window => early close
+HALF_DAY_SESSION_END = dtime(13, 0)    # exclusive — half-day session bars
+HALF_DAY_ENTRY_END = dtime(12, 55)     # exclusive — last entry bar 12:54,
+#                                        mirroring the 15:54 rule
 COMMISSION = 0.0035          # $/share per side
 SLIPPAGE = 0.01              # $/share per side, adverse (half-spread)
 RISK_FRAC = 0.01             # fraction of equity risked on the OR range
@@ -116,7 +147,17 @@ def simulate_session(day: pd.DataFrame, equity: float, *,
     None (no-trade day). Pure function of (bars, equity) — no I/O.
     """
     times = day.index.time
-    rth = day[(times >= OR_START) & (times < SESSION_END)]
+    # Data-driven session end (amended 2026-07-10, pre-registered before any
+    # run): a session with < HALF_DAY_MIN_PROBE_BARS bars in the probe window
+    # is a 13:00 early close — its post-13:00 prints are after-hours, and
+    # admitting them would fabricate phantom entries/stops/EOD exits.
+    n_probe = int(((times >= HALF_DAY_PROBE_START)
+                   & (times < HALF_DAY_PROBE_END)).sum())
+    if n_probe < HALF_DAY_MIN_PROBE_BARS:
+        session_end, entry_end = HALF_DAY_SESSION_END, HALF_DAY_ENTRY_END
+    else:
+        session_end, entry_end = SESSION_END, ENTRY_END
+    rth = day[(times >= OR_START) & (times < session_end)]
     if rth.empty:
         return None
     rt = rth.index.time
@@ -126,15 +167,15 @@ def simulate_session(day: pd.DataFrame, equity: float, *,
     closes = rth['close'].to_numpy(dtype=float)
 
     or_mask = rt < OR_END
-    if not or_mask.any():
-        return None
+    if int(or_mask.sum()) < OR_REQUIRED_BARS:
+        return None                              # partial OR — no trade
     or_high = float(highs[or_mask].max())
     or_low = float(lows[or_mask].min())
     or_range = or_high - or_low
     if or_range <= 0:
         return None
 
-    scan = (rt >= OR_END) & (rt < ENTRY_END)
+    scan = (rt >= OR_END) & (rt < entry_end)
     up = scan & (highs > or_high)
     dn = scan & (lows < or_low)
     breaking = up | dn
@@ -329,20 +370,34 @@ def _or_block():
             ('09:34', 100.5, 100.9, 100.1, 100.5)]
 
 
+def _regular_afternoon():
+    """30 in-range 13:15-13:44 bars — marks a synthetic session as a REGULAR
+    day under the data-driven session-end rule; never breaks the _or_block
+    range or its stops."""
+    return [(f'13:{m}', 100.5, 100.5, 100.5, 100.5) for m in range(15, 45)]
+
+
 def _selftest() -> None:
-    """Planted breakout / stop-out / no-trade days; PnL hand-computed from
-    the pre-registered fills and costs (equity $100k, shares 1000):
+    """Planted breakout / stop-out / no-trade / half-day / partial-OR days;
+    PnL hand-computed from the pre-registered fills and costs (equity $100k,
+    shares 1000):
       breakout+EOD : entry 101.20+0.01, exit 102.00-0.01
                      -> 1000*0.78 - 7.00 = +773.00
       stop-out     : entry 101.21, stop fill 100.00-0.01
                      -> 1000*(-1.22) - 7.00 = -1227.00
       no-trade     : never trades through either side -> None
+      half-day EOD : entry 101.21, exit at the 12:59 close 101.80-0.01
+                     -> 1000*0.58 - 7.00 = +573.00 (AH prints ignored)
+      half-day AH  : no break before 13:00; the AH print through OR-high
+                     must NOT enter -> None
+      partial OR   : only 4 of 5 OR bars -> None
     """
     eq = 100_000.0
     day_a = make_session('2021-01-04', _or_block() + [
         ('09:35', 100.5, 100.8, 100.2, 100.6),
         ('09:36', 100.7, 101.5, 100.6, 101.2),   # breaks OR-high -> long
-        ('09:37', 101.2, 101.6, 100.8, 101.4),
+        ('09:37', 101.2, 101.6, 100.8, 101.4)]
+        + _regular_afternoon() + [
         ('15:59', 101.8, 102.1, 101.7, 102.0)])  # EOD close 102.00
     tr = simulate_session(day_a, eq)
     assert tr is not None and tr.direction == 1 and not tr.stopped, tr
@@ -351,16 +406,42 @@ def _selftest() -> None:
 
     day_b = make_session('2021-01-05', _or_block() + [
         ('09:36', 100.7, 101.5, 100.6, 101.2),   # long entry, fill 101.21
-        ('09:40', 100.5, 100.6, 99.9, 100.0),    # low<=100 -> stop fill 99.99
+        ('09:40', 100.5, 100.6, 99.9, 100.0)]    # low<=100 -> stop fill 99.99
+        + _regular_afternoon() + [
         ('15:59', 100.2, 100.3, 100.1, 100.2)])
     tr = simulate_session(day_b, eq)
     assert tr is not None and tr.stopped, tr
     assert abs(tr.pnl - (-1227.0)) < 1e-6, tr.pnl
 
     day_c = make_session('2021-01-06', _or_block() + [
-        ('09:36', 100.5, 101.0, 100.0, 100.5),   # touches, never THROUGH
+        ('09:36', 100.5, 101.0, 100.0, 100.5)]   # touches, never THROUGH
+        + _regular_afternoon() + [
         ('15:59', 100.5, 100.9, 100.1, 100.5)])
     assert simulate_session(day_c, eq) is None
+
+    # Half day (sparse probe window): EOD exit at the last pre-13:00 bar;
+    # the 13:30 AH print through the stop must NOT fill anything.
+    day_d = make_session('2021-11-26', _or_block() + [
+        ('09:40', 100.7, 101.5, 100.6, 101.2),   # real breakout -> long
+        ('12:59', 101.5, 101.9, 101.4, 101.8),   # last bar before 13:00
+        ('13:30', 99.0, 99.1, 98.5, 98.6)])      # AH print through the stop
+    tr = simulate_session(day_d, eq)
+    assert tr is not None and not tr.stopped, tr
+    assert tr.exit_ts == pd.Timestamp('2021-11-26 12:59'), tr.exit_ts
+    assert abs(tr.pnl - 573.0) < 1e-6, tr.pnl
+
+    # Half day, no break before 13:00: the AH print through OR-high is a
+    # phantom breakout and must be suppressed.
+    day_e = make_session('2021-11-27', _or_block() + [
+        ('12:59', 100.5, 100.8, 100.3, 100.6),
+        ('13:30', 101.2, 101.6, 101.1, 101.5)])  # through OR-high, but AH
+    assert simulate_session(day_e, eq) is None
+
+    day_f = make_session('2021-01-08', _or_block()[:4] + [
+        ('09:36', 100.7, 101.5, 100.6, 101.2)]   # would break, but 4-bar OR
+        + _regular_afternoon() + [
+        ('15:59', 101.8, 102.1, 101.7, 102.0)])
+    assert simulate_session(day_f, eq) is None
     print('selftest OK')
 
 
