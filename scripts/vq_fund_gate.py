@@ -81,6 +81,16 @@ modest solo but blend-friendly; composed they close ~1/3 of the gap to the
 0.95 bar. ALL SIX FAIL: PSR < 0.95 and 0 BH-significant years everywhere
 (best year 2019 p=0.041, an order of magnitude from clearing BH).
 Nothing promoted.
+
+DTB3 RESULT (2026-07-10, incumbent-best config --vq-variant both
+--weighting static --dating announce --cash-yield, 600 names seed 42):
+1873 trades (IDENTICAL count to yield-off — accrual is pure economics),
++119.9%, Sharpe 0.48, maxDD -24.1%, PSR 0.9435 FAIL vs the yield-off
+0.9257 — dated T-bill yield on the ~38% idle cash adds +0.018 PSR /
++0.04 Sharpe, concentrated in the 2023-24 5%-bill years. Gap to the
+0.95 PSR bar: 0.0065. BH years still 0 — smooth yield cannot manufacture
+a standout year; the BH leg remains the binding constraint. Nothing
+promoted.
 """
 
 from __future__ import annotations
