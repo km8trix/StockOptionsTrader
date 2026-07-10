@@ -110,6 +110,17 @@ applies to; the defaults (bars_1m, combined) reproduce the registered
 
     python scripts/orb_gate.py --bars-table bars_1m_sip \\
         --gated-cut long_only --start 2025-01-02 --end 2026-06-30
+
+SIP CONFIRMATION RESULT (2026-07-10, first and only run of the registered
+hold-out trial): **HYPOTHESIS REFUTED.** Long-only portfolio PSR 0.3519,
+0 BH years, FAIL — long-only SPY -9.2% / QQQ -8.7% / TQQQ -12.0% / IWM
++7.9%; combined L+S 0.5052 FAIL. Data quality was NOT the issue: the SIP
+grid is complete (373/373 sessions tradeable; the all-5-OR-bars guard
+never fired). The IEX pilot's long-only PSR 0.9697 did not survive clean
+data on an unseen window — sample luck and/or a 2020-24 trending-open
+regime that 2025-26 does not repeat. ORB in this form is CLOSED as a
+research direction; the SIP ingest seam (free tier, ~2y rolling window)
+remains as durable infrastructure. Nothing promoted.
 """
 
 from __future__ import annotations
