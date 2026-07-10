@@ -28,6 +28,18 @@ rules and constants: desks/pead.py module docstring. HONESTY: the TWO
 non-base variants are TWO pre-registered trials this round — declared in
 code before any variant backtest ran; results land here unedited, and no
 further variant joins this round after seeing them.
+
+RESULT (2026-07-10, micro long-only announce, 600 names seed 42 2015-2024;
+baseline base = 0.42/0.926 Sharpe/PSR): BOTH VARIANTS HURT — surge_confirm
+815 trades, +90.1%, Sharpe 0.32, maxDD -42.7%, PSR 0.8498 FAIL;
+rank_combine 803 trades, +48.2%, Sharpe 0.20, PSR 0.7345 FAIL. In the fund
+(--vq-variant both incumbent 0.44/0.9257): surge_confirm 0.35/0.8646,
+rank_combine 0.29/0.8226 — both FAIL, both worse. The J-L double-sort does
+not transfer: gating the program's strongest leg on a weaker correlated
+signal (Spearman +0.34) dilutes it. DO NOT adopt either variant. Curiosity
+for the record: surge_confirm solo produced the program's FIRST
+BH-significant OOS year (2019, p=0.0047) while failing everything else —
+concentration buys one standout year at the cost of the book (maxDD -42.7%).
 """
 
 from __future__ import annotations
