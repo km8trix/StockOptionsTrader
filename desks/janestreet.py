@@ -1421,11 +1421,16 @@ class JaneStreetDesk(Desk):
         state = self._rv_position
         if self._day_index - state['entry_day'] < RECONCILE_GRACE_DAYS:
             return []
-        open_legs = {symbol: direction
-                     for symbol, direction in state['legs'].items()
-                     if (portfolio.get_position(_stock(symbol)) is not None
-                         and portfolio.get_position(_stock(symbol)).quantity
-                         != 0)}
+        # Ownership-scoped (fund mode): a leg position another desk owns
+        # (this desk's entry was netted away while the other's filled) is
+        # NOT this desk's leg — count it unfilled so the survivors close
+        # without ever touching the other desk's position.
+        open_legs = {}
+        for symbol, direction in state['legs'].items():
+            position = portfolio.get_position(_stock(symbol))
+            if (position is not None and position.quantity != 0
+                    and self._owns_position(position)):
+                open_legs[symbol] = direction
         if len(open_legs) == len(state['legs']):
             return []
         intents: List[DeskIntent] = []
@@ -1473,7 +1478,8 @@ class JaneStreetDesk(Desk):
                 for symbol in sorted(state['legs']):
                     direction = state['legs'][symbol]
                     position = portfolio.get_position(_stock(symbol))
-                    if position is None or position.quantity == 0:
+                    if (position is None or position.quantity == 0
+                            or not self._owns_position(position)):
                         continue
                     intents.append(DeskIntent(
                         asset=_stock(symbol),

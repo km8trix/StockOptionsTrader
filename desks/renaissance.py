@@ -332,7 +332,12 @@ class RenaissanceDesk(Desk):
                             key=lambda a: a.symbol):
             state = self._book_positions[asset]
             position = portfolio.get_position(asset)
-            if position is not None and position.quantity != 0:
+            # Ownership-scoped: a position another desk owns (this desk's
+            # entry was netted away or blocked while the other's filled) is
+            # NOT this desk's fill — treat the leg as never-filled so the
+            # grace drops it instead of closing the other desk's position.
+            if (position is not None and position.quantity != 0
+                    and self._owns_position(position)):
                 continue
             if self._day_index - state['entry_day'] < RECONCILE_GRACE_DAYS:
                 continue  # intent may still be pending its next-open fill
@@ -357,6 +362,8 @@ class RenaissanceDesk(Desk):
             position = portfolio.get_position(asset)
             if position is None or position.quantity == 0:
                 continue
+            if not self._owns_position(position):
+                continue  # another desk's position — invisible to the sweep
             book = self._traded_books[symbol]
             direction = 'long' if position.quantity > 0 else 'short'
             intents.append(DeskIntent(
