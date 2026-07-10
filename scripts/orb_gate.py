@@ -79,6 +79,22 @@ are spec amendments made before the first data run, not post-hoc tweaks):
 
     python scripts/orb_gate.py --start 2016-01-01 --end 2024-12-31
     python scripts/orb_gate.py --selftest       # offline, pinned PnL asserts
+
+RESULT (2026-07-10, first run of the registered config, SPY/QQQ/IWM/TQQQ
+2016-2024 on Alpaca IEX minute bars): REGISTERED GATE (combined long+short
+portfolio) = PSR 0.8648, 0 BH-significant years -> FAIL. The pre-registered
+REPORTED long-only cut reads PSR 0.9697 (above the 0.95 line) but ALSO 0 BH
+years (best 2022 p=0.0416 vs BH rank-1 threshold 0.01) — and long-only was
+not the gated config: adopting it after seeing this table would be post-hoc
+selection, so it stands as a HYPOTHESIS for a genuinely new out-of-sample
+test (different window/symbols, or consolidated-tape data), not a result.
+DATA COVERAGE caveats: IEX thinness left only 1,116 tradeable sessions of
+~2,265 (all-5-OR-bars guard) and validate_strategy_oos found only 5
+testable years (2020-2024) — the pilot's verdict rests on half the sessions
+of half the window; the clean unlock is consolidated-tape minute data
+(Polygon Stocks Starter ~$29/mo). Shorts bleed (SPY L+S +72% vs LO +94%;
+TQQQ L+S -11% vs LO +69%) — consistent with every short-leg lesson in this
+program. Nothing promoted.
 """
 
 from __future__ import annotations
