@@ -128,6 +128,11 @@ class FoundationDesk(Desk):
 
             asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
             position = portfolio.get_position(asset)
+            # Ownership-scoped (fund mode): another desk's position is
+            # invisible — no exit fires on it, and the symbol stays
+            # unenterable (a BUY would co-mingle the two desks' books).
+            if position is not None and not self._owns_position(position):
+                continue
 
             macd_cross_up = (current['macd'] > current['signal']
                              and prev['macd'] <= prev['signal'])

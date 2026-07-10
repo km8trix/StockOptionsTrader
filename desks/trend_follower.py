@@ -106,6 +106,11 @@ class TrendFollowerDesk(Desk):
 
             asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
             position = portfolio.get_position(asset)
+            # Ownership-scoped (fund mode): another desk's position is
+            # invisible — no regime/ATR exit fires on it, and the symbol
+            # stays unenterable (a BUY would pyramid onto its book).
+            if position is not None and not self._owns_position(position):
+                continue
             qty = position.quantity if position is not None else 0
             holding = qty > 0
 

@@ -667,7 +667,12 @@ class CitadelDesk(Desk):
         for asset in sorted(self._pod_positions, key=lambda a: a.symbol):
             state = self._pod_positions[asset]
             position = portfolio.get_position(asset)
-            if position is not None and position.quantity != 0:
+            # Ownership-scoped: a position another desk owns (this desk's
+            # entry was netted away or blocked while the other's filled) is
+            # NOT this desk's fill — treat the leg as never-filled so the
+            # grace drops it instead of closing the other desk's position.
+            if (position is not None and position.quantity != 0
+                    and self._owns_position(position)):
                 continue
             if self._day_index - state['entry_day'] < RECONCILE_GRACE_DAYS:
                 continue  # intent may still be pending its next-open fill
@@ -688,6 +693,8 @@ class CitadelDesk(Desk):
             position = portfolio.get_position(asset)
             if position is None or position.quantity == 0:
                 continue
+            if not self._owns_position(position):
+                continue  # another desk's position — invisible to the sweep
             pod_key = self._traded_pods[symbol]
             direction = 'long' if position.quantity > 0 else 'short'
             intents.append((pod_key, DeskIntent(

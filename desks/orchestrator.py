@@ -46,14 +46,18 @@ contract `quantity` (Jane Street sizes structures in exact contracts).
 POSITION OWNERSHIP (fund mode): every netted opening intent carries the
 originating desk key(s) in DeskIntent.desk_keys (winning side only on an
 opposing-open residual), and the engine stamps them onto the opened
-Position (core.models.Position.owners). ENFORCEMENT is per desk family:
-CrossSectionalLongShortDesk scopes its reconcile/orphan-sweep/retention to
-positions it owns, so cross-sectional desks whose universes overlap through
-time can share one fund honestly. The frozen legacy families (Renaissance,
-Citadel, Foundation, Jane Street, trend follower) still read the portfolio
-UNSCOPED — mixing one of them with another desk in a fund can close the
-other desk's positions (the pre-ownership behavior). Extend their
-sweep/exit paths with the same owners check before composing such funds.
+Position (core.models.Position.owners). ENFORCEMENT: every desk family
+scopes its sweep/exit logic to positions it owns (Desk._owns_position) —
+CrossSectionalLongShortDesk's reconcile/sweep/retention, the Renaissance
+and Citadel reconciles + orphan sweeps, Foundation's MACD/RSI exits, the
+trend follower's regime/ATR exits, and Jane Street's relative-value
+reconcile/exits — a position owned by another desk is invisible to all of
+them (pinned by tests/test_legacy_desk_ownership.py). Entry-blocking
+held-checks stay deliberately UNSCOPED (one position per symbol: entering
+a symbol another desk holds would co-mingle books). Residual edge:
+Renaissance/Citadel signal exits fire off tracked state, so a tracked leg
+whose fill actually belongs to another desk can still be closed during the
+reconcile grace (2 days) before its bookkeeping drops.
 
 ADDITIVE: single-desk and strategy backtests are untouched (the engine only
 enters the orchestrator path when an orchestrator is supplied). Reports gain an

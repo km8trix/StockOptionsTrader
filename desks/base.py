@@ -204,6 +204,20 @@ class Desk(ABC):
         """
         return {}
 
+    def _owns_position(self, position) -> bool:
+        """Fund-mode ownership scoping (core.models.Position.owners).
+
+        False when the position is owner-tagged and this desk's key is
+        NOT among the owners — it belongs to another desk in the fund
+        and must be invisible to this desk's sweep/exit logic (never
+        closed by it). An UNTAGGED position (owners is None — always
+        the case outside fund mode) is owned: single-desk behavior is
+        byte-identical. Entry-blocking held-checks deliberately stay
+        unscoped: entering a symbol another desk holds would co-mingle
+        the books into one position.
+        """
+        return position.owners is None or self.key in position.owners
+
     # ------------------------------------------------------------------
     # Strategy surface
     # ------------------------------------------------------------------
