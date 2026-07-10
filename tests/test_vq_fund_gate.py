@@ -45,8 +45,8 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(
         vfg, '_make_desk',
         lambda key, wh, *, capital_allocation=1.0, dating='filing',
-        vq_variant='base':
-        (key, capital_allocation, dating, vq_variant))
+        vq_variant='base', pead_variant='base':
+        (key, capital_allocation, dating, vq_variant, pead_variant))
     monkeypatch.setattr(
         vfg, 'FundOrchestrator',
         lambda desks, risk_manager=None: ('ORCH', tuple(desks), risk_manager))
@@ -138,8 +138,8 @@ def test_static_builds_engine_with_no_reweighter(stubbed, monkeypatch):
     assert kwargs['cash_yield'] is None  # default: no yield, byte-identical
     orch, desks, risk_manager = kwargs['orchestrator']
     assert orch == 'ORCH'
-    assert desks == (('pead_micro', 0.5, 'announce', 'base'),
-                     ('value_quality', 0.5, 'announce', 'base'))
+    assert desks == (('pead_micro', 0.5, 'announce', 'base', 'base'),
+                     ('value_quality', 0.5, 'announce', 'base', 'base'))
     assert risk_manager == ('RM', 0.50)
     assert captured['run'] == (('AAA', 'BBB'), '2015-01-01', '2024-12-31',
                                None)
@@ -206,9 +206,9 @@ def test_issuance_fund_builds_three_leg_orchestrator(stubbed, monkeypatch):
     assert kwargs['reweighter'] is None
     orch, desks, risk_manager = kwargs['orchestrator']
     assert desks == (
-        ('pead_micro', pytest.approx(1 / 3), 'announce', 'base'),
-        ('value_quality', pytest.approx(1 / 3), 'announce', 'base'),
-        ('issuance', pytest.approx(1 / 3), 'announce', 'base'))
+        ('pead_micro', pytest.approx(1 / 3), 'announce', 'base', 'base'),
+        ('value_quality', pytest.approx(1 / 3), 'announce', 'base', 'base'),
+        ('issuance', pytest.approx(1 / 3), 'announce', 'base', 'base'))
     assert risk_manager == ('RM', 0.50)
 
 
@@ -289,8 +289,8 @@ def test_run_fund_threads_vq_variant_to_the_orchestrator(stubbed,
     orch, desks, _ = captured['engine_kwargs']['orchestrator']
     # The stub echoes vq_variant for every leg; only the VQ leg acts on it
     # (test_make_desk_maps_variant_to_vq_kwargs pins that).
-    assert desks == (('pead_micro', 0.5, 'announce', 'gpa'),
-                     ('value_quality', 0.5, 'announce', 'gpa'))
+    assert desks == (('pead_micro', 0.5, 'announce', 'gpa', 'base'),
+                     ('value_quality', 0.5, 'announce', 'gpa', 'base'))
 
 
 def test_risk_parity_solo_curves_carry_the_variant(stubbed, monkeypatch):
@@ -319,7 +319,8 @@ def test_risk_parity_solo_curves_carry_the_variant(stubbed, monkeypatch):
     vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
                  vq_variant='issfilter')
     captured['solo']('value_quality', ['AAA'], '2015-01-01', '2024-12-31')
-    assert captured['desk'] == ('value_quality', 1.0, 'filing', 'issfilter')
+    assert captured['desk'] == ('value_quality', 1.0, 'filing', 'issfilter',
+                                'base')
 
 
 def test_cash_yield_threads_into_solo_mode_engines(stubbed, monkeypatch):
@@ -396,3 +397,82 @@ def test_cash_yield_threads_into_both_risk_parity_arms(stubbed, monkeypatch):
     assert captured['fund_cash_yield'] == 'DTB3'
     captured['solo']('pead_micro', ['AAA'], '2015-01-01', '2024-12-31')
     assert captured['solo_engine_kwargs']['cash_yield'] == 'DTB3'
+
+
+def test_pead_variant_registry_is_shared_with_the_solo_gate():
+    # ONE mapping serves both the solo comparator (pead_desk_gate --variant)
+    # and the fund leg (--pead-variant) — the SAME object, so the two
+    # scripts can never drift apart. Content is pinned in tests/test_pead.py
+    # (test_pead_variant_kwargs_are_the_preregistered_trials).
+    import scripts.pead_desk_gate as pdg
+    assert vfg.PEAD_VARIANT_KWARGS is pdg.PEAD_VARIANT_KWARGS
+
+
+def test_make_desk_maps_pead_variant_to_kwargs():
+    # Real desk classes, no stubs: every variant reaches the PEAD
+    # constructor as its registered kwargs, the 'pead_micro' key contract
+    # survives all of them, and the default is the unchanged base desk.
+    for variant, kwargs in vfg.PEAD_VARIANT_KWARGS.items():
+        desk = vfg._make_desk('pead_micro', object(), pead_variant=variant)
+        assert desk.key == 'pead_micro'
+        assert desk._surge_confirm is kwargs.get('surge_confirm', False)
+        assert desk._rank_combine is kwargs.get('rank_combine', False)
+    base = vfg._make_desk('pead_micro', object())
+    assert base._surge_confirm is False and base._rank_combine is False
+    # The VQ leg is untouched by the PEAD variant.
+    assert vfg._make_desk('value_quality', object(),
+                          pead_variant='rank_combine').key == 'value_quality'
+
+
+def test_run_fund_threads_pead_variant_to_the_orchestrator(stubbed,
+                                                           monkeypatch):
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['engine_kwargs'] = kwargs
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
+                 dating='announce', weighting='static',
+                 pead_variant='surge_confirm')
+    orch, desks, _ = captured['engine_kwargs']['orchestrator']
+    # The stub echoes pead_variant for every leg; only the PEAD leg acts on
+    # it (test_make_desk_maps_pead_variant_to_kwargs pins that).
+    assert desks == (
+        ('pead_micro', 0.5, 'announce', 'base', 'surge_confirm'),
+        ('value_quality', 0.5, 'announce', 'base', 'surge_confirm'))
+
+
+def test_risk_parity_solo_curves_carry_the_pead_variant(stubbed,
+                                                        monkeypatch):
+    # Same contract as the VQ variant above: the reweighting arm's solo
+    # shadow passes must build the SAME variant PEAD desk as the fund leg.
+    captured = {}
+
+    class FakeFund:
+        def __init__(self, allocations, **kwargs):
+            captured['solo'] = kwargs['solo_curve_provider']
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['desk'] = kwargs['desk']
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'ReweightingFundBacktest', FakeFund)
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
+                 pead_variant='rank_combine')
+    captured['solo']('pead_micro', ['AAA'], '2015-01-01', '2024-12-31')
+    assert captured['desk'] == ('pead_micro', 1.0, 'filing', 'base',
+                                'rank_combine')

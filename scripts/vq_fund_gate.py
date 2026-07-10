@@ -91,6 +91,18 @@ DTB3 RESULT (2026-07-10, incumbent-best config --vq-variant both
 0.95 PSR bar: 0.0065. BH years still 0 — smooth yield cannot manufacture
 a standout year; the BH leg remains the binding constraint. Nothing
 promoted.
+
+PEAD VARIANTS (--pead-variant, 2026-07-10): the same strengthening move
+applied to the fund's PEAD leg — the SURGE (revenue surprise) screen fact
+harvested as either a long confirm-filter (surge_confirm) or a SUE+SURGE
+equal-weight rank combine (rank_combine); base = byte-identical default
+desk. Pre-registered rules and constants live in desks/pead.py; the
+variant->kwargs registry (PEAD_VARIANT_KWARGS) lives in
+scripts/pead_desk_gate.py, whose --variant flag is the SOLO comparator
+(this script has no --mode pead). HONESTY: the two non-base variants are
+TWO pre-registered trials this round — declared in code before any variant
+backtest ran; results land in the RESULT blocks unedited, and no further
+variant joins this round after seeing them.
 """
 
 from __future__ import annotations
@@ -122,6 +134,7 @@ from portfolio.risk_manager import RiskManager  # noqa: E402
 from scripts.insider_desk_gate import (  # noqa: E402
     _daily_returns_with_years)
 from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
+from scripts.pead_desk_gate import PEAD_VARIANT_KWARGS  # noqa: E402
 
 FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 #: Fund legs: the strongest realized PEAD config + the VQ composite, both
@@ -167,10 +180,13 @@ VQ_VARIANT_KWARGS = {
 
 
 def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing',
-               vq_variant='base'):
+               vq_variant='base', pead_variant='base'):
     if key == 'pead_micro':
+        # 'base' unpacks to nothing — the constructor call is byte-identical
+        # to before --pead-variant existed (registry pinned in tests).
         return PEADDesk('micro', provider=wh, long_only=True,
-                        capital_allocation=capital_allocation, dating=dating)
+                        capital_allocation=capital_allocation, dating=dating,
+                        **PEAD_VARIANT_KWARGS[pead_variant])
     if key == 'value_quality':
         # ex-micro: the validated tradeable slice, AND disjoint from the
         # micro-band PEAD leg (overlapping books churn on a shared portfolio).
@@ -256,7 +272,8 @@ def _deployment_stats(portfolio_history):
 
 def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
              dating='filing', legacy=False, weighting='risk_parity',
-             issuance=False, vq_variant='base', cash_yield=None):
+             issuance=False, vq_variant='base', pead_variant='base',
+             cash_yield=None):
     allocations = dict(THREE_LEG_ALLOCATIONS if issuance
                        else LEGACY_FUND_ALLOCATIONS if legacy
                        else FUND_ALLOCATIONS)
@@ -268,7 +285,8 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
         # cash_yield threads into the solo shadow passes too: the reweighter
         # must see the same economics in the shadow books as in the fund it
         # weights, or risk parity would be computed off yield-free curves.
-        desk = _make_desk(key, wh, dating=dating, vq_variant=vq_variant)
+        desk = _make_desk(key, wh, dating=dating, vq_variant=vq_variant,
+                          pead_variant=pead_variant)
         engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
                                 market_data=feed, cash_yield=cash_yield)
         report = engine.run(list(symbols), s, e, benchmark_symbol=None)
@@ -284,7 +302,7 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
         # book daily and churn both books to noise.
         return FundOrchestrator(
             [_make_desk(k, wh, capital_allocation=a, dating=dating,
-                        vq_variant=vq_variant)
+                        vq_variant=vq_variant, pead_variant=pead_variant)
              for k, a in allocations.items()],
             risk_manager=RiskManager(position_stop_loss=0.50))
 
@@ -402,6 +420,14 @@ def main():
                          'byte-identical current desk (default, unlabelled '
                          'in the report); gpa = + gp/assets rank; issfilter '
                          '= top-quintile issuers barred from longs; both')
+    ap.add_argument('--pead-variant', choices=sorted(PEAD_VARIANT_KWARGS),
+                    default='base',
+                    help='PEAD leg construction (fund mode): base = '
+                         'byte-identical current desk (default, unlabelled '
+                         'in the report); surge_confirm = longs must clear '
+                         'the median fresh SURGE; rank_combine = SUE+SURGE '
+                         'equal-weight rank mean (desks/pead.py '
+                         'pre-registered rules)')
     ap.add_argument('--cash-yield', action='store_true',
                     help='idle cash accrues the DATED FRED DTB3 3M T-bill '
                          'rate (data/riskfree.py) daily — ~0.05-0.3%% '
@@ -415,6 +441,9 @@ def main():
     if args.selftest:
         _selftest()
         return
+    if args.mode != 'fund' and args.pead_variant != 'base':
+        ap.error('--pead-variant only affects the fund PEAD leg; solo PEAD '
+                 'variants run through scripts/pead_desk_gate.py --variant')
     cash_yield = load_dtb3() if args.cash_yield else None
     # Short-capable books under --cash-yield: short-sale proceeds sit in
     # cash under the cash-account approximation, so they earn the same DTB3
@@ -428,6 +457,8 @@ def main():
         print('CAVEAT: --cash-yield on a short-capable book: short '
               'proceeds earn the full DTB3 rate (a rebate approximation).')
     vtag = '' if args.vq_variant == 'base' else f" [vq={args.vq_variant}]"
+    ptag = ('' if args.pead_variant == 'base'
+            else f" [pead={args.pead_variant}]")
     ytag = ' [+DTB3]' if args.cash_yield else ''
     if args.mode == 'vq':
         summary, gate, n_trades, n_names = run_vq(
@@ -453,12 +484,13 @@ def main():
             args.start, args.end, limit=args.limit, seed=args.seed,
             dating=args.dating, legacy=args.legacy,
             weighting=args.weighting, issuance=args.issuance,
-            vq_variant=args.vq_variant, cash_yield=cash_yield)
+            vq_variant=args.vq_variant, pead_variant=args.pead_variant,
+            cash_yield=cash_yield)
         core = ('PEAD+VQ+issuance' if args.issuance
                 else 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ')
         wlabel = ('static weights' if args.weighting == 'static'
                   else 'risk-parity')
-        label = (f"{core} fund{vtag} ({wlabel}, long-only core legs, "
+        label = (f"{core} fund{vtag}{ptag} ({wlabel}, long-only core legs, "
                  f"{args.dating} dating){ytag}")
     print_report(summary, gate, n_trades, n_names, label, args.start,
                  args.end)

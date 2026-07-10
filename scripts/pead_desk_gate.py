@@ -16,6 +16,18 @@ tickers/sep/sf1/daily ingested):
     python scripts/pead_desk_gate.py --limit 600 --long-only    # long book only
     python scripts/pead_desk_gate.py --band small --limit 600   # one size sleeve
     python scripts/pead_desk_gate.py --selftest                 # offline assert
+
+PEAD VARIANTS (--variant, 2026-07-10): strengthen the PEAD signal with the
+merged SURGE screen fact (revenue surprise is real in micro, 63d net +2.96%
+t=+3.23, and moderately independent of SUE — Spearman +0.34 on 215k matched
+filings; Jegadeesh-Livnat 2006). base = default, byte-identical desk;
+surge_confirm = longs must also clear the median fresh SURGE (missing SURGE
+never excludes); rank_combine = equal-weight mean of the SUE and SURGE
+percentile ranks (missing SURGE ranks on SUE alone). Full pre-registered
+rules and constants: desks/pead.py module docstring. HONESTY: the TWO
+non-base variants are TWO pre-registered trials this round — declared in
+code before any variant backtest ran; results land here unedited, and no
+further variant joins this round after seeing them.
 """
 
 from __future__ import annotations
@@ -40,10 +52,25 @@ from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E4
 
 FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 
+#: --variant -> PEADDesk constructor kwargs. 'base' is empty by construction
+#: (byte-identical default desk); the two non-base entries are the round's
+#: two pre-registered trials (desks/pead.py module docstring): the SURGE
+#: median confirm-filter and the SUE+SURGE equal-weight rank combine —
+#: rules and constants declared in the desk before any variant backtest
+#: ran. scripts/vq_fund_gate.py imports this registry for the fund's PEAD
+#: leg (--pead-variant), so solo and fund runs share ONE mapping. Pinned in
+#: tests/test_pead.py — adding or tuning an entry must fail a test and be
+#: argued in review, not slipped in.
+PEAD_VARIANT_KWARGS = {
+    'base': {},
+    'surge_confirm': {'surge_confirm': True},
+    'rank_combine': {'rank_combine': True},
+}
+
 
 def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
              long_only=False, commission_bps=10.0, slippage_bps=5.0,
-             dating='filing'):
+             dating='filing', variant='base'):
     wh = PitWarehouse()
     rb = pd.bdate_range(start, end, freq='BMS')
     universe = resolve_universe(wh, rb, SCALE_SMALL_MID)
@@ -51,7 +78,8 @@ def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
         # seeded RANDOM sample (not the alphabetical head) so a subset is
         # representative of the small/mid universe, not a-names only.
         universe = sorted(random.Random(seed).sample(universe, limit))
-    desk = PEADDesk(band, provider=wh, long_only=long_only, dating=dating)
+    desk = PEADDesk(band, provider=wh, long_only=long_only, dating=dating,
+                    **PEAD_VARIANT_KWARGS[variant])
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
                             commission=commission_bps / 1e4,
                             slippage_bps=slippage_bps,
@@ -62,8 +90,10 @@ def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
-def print_report(summary, gate, n_trades, n_names, band, start, end):
-    label = band or 'all small/mid'
+def print_report(summary, gate, n_trades, n_names, band, start, end,
+                 variant='base'):
+    label = ((band or 'all small/mid')
+             + ('' if variant == 'base' else f" [pead={variant}]"))
     print(f"\n{'=' * 64}\nPEAD ({label}) — gate backtest "
           f"({start} .. {end}, {n_names} names)\n{'=' * 64}")
     print(f"  Trades         : {n_trades}"
@@ -155,6 +185,13 @@ def main():
                     help="SUE event timestamp: SF1 filing datekey (strict "
                          "PIT) or 8-K press-release date (needs events "
                          "ingested)")
+    ap.add_argument('--variant', choices=sorted(PEAD_VARIANT_KWARGS),
+                    default='base',
+                    help='PEAD desk construction: base = byte-identical '
+                         'default desk (unlabelled in the report); '
+                         'surge_confirm = longs must clear the median fresh '
+                         'SURGE; rank_combine = SUE+SURGE equal-weight rank '
+                         'mean (desks/pead.py pre-registered rules)')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
@@ -163,9 +200,10 @@ def main():
     summary, gate, n_trades, n_names = run_gate(
         args.band, args.start, args.end, limit=args.limit, seed=args.seed,
         long_only=args.long_only, commission_bps=args.commission_bps,
-        slippage_bps=args.slippage_bps, dating=args.dating)
+        slippage_bps=args.slippage_bps, dating=args.dating,
+        variant=args.variant)
     print_report(summary, gate, n_trades, n_names, args.band, args.start,
-                 args.end)
+                 args.end, variant=args.variant)
 
 
 if __name__ == '__main__':
