@@ -606,6 +606,8 @@ class CitadelDesk(Desk):
             position = portfolio.positions[asset]
             if position.quantity == 0:
                 continue
+            if not self._owns_position(position):
+                continue  # another desk's position — not this desk's P&L
             pod_key = self._owning_pod(asset)
             if pod_key is None:
                 logger.warning(

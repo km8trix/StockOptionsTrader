@@ -13,6 +13,7 @@ Frames are hand-built; no network, no randomness.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import numpy as np
@@ -96,6 +97,22 @@ class TestCitadelScoping:
 
     def test_sweep_closes_untagged_orphan_legacy(self):
         assert self._swept(owners=None) == ['XYZ']
+
+    def _nav_warnings(self, owners, caplog):
+        desk = CitadelDesk()
+        portfolio = book([held(stock('XYZ'), owners=owners)])
+        with caplog.at_level(logging.WARNING, logger='desks.citadel'):
+            desk._update_pod_navs(portfolio)
+        return [r for r in caplog.records if 'no owning pod' in r.message]
+
+    def test_nav_attribution_skips_foreign_position_silently(self, caplog):
+        assert self._nav_warnings(('other',), caplog) == []
+
+    def test_nav_attribution_still_warns_on_untagged_orphan(self, caplog):
+        assert len(self._nav_warnings(None, caplog)) == 1
+
+    def test_nav_attribution_still_warns_on_own_untracked(self, caplog):
+        assert len(self._nav_warnings(('citadel',), caplog)) == 1
 
     def test_foreign_fill_treated_as_never_filled(self):
         desk = CitadelDesk()
