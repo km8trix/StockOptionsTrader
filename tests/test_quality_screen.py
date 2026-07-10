@@ -3,9 +3,21 @@
 import numpy as np
 import pandas as pd
 
+from data.quality_ratios import computed_ratio
 from scripts.factor_screen import factor_study
-from scripts.quality_screen import (COMPUTED_RATIOS, collect_quality_events,
-                                    computed_ratio)
+from scripts.quality_screen import COMPUTED_RATIOS, collect_quality_events
+
+
+def test_screen_reexports_the_data_seam():
+    # The ratio math + guard constants live in data/quality_ratios (the
+    # sue_table/issuance_table seam convention); the screen re-imports them.
+    # Identity — not equality — pins that there is exactly ONE definition,
+    # so screen and desk can never drift apart.
+    import data.quality_ratios as seam
+    import scripts.quality_screen as screen
+    assert screen.computed_ratio is seam.computed_ratio
+    assert screen._REL_EPS is seam._REL_EPS
+    assert screen._MIN_ASSETS is seam._MIN_ASSETS
 
 
 class _FakeProv:

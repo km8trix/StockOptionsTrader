@@ -251,6 +251,20 @@ class CrossSectionalLongShortDesk(Desk):
         sectionally, so absolute scale is not significant.
         """
 
+    def _long_exclusions(self, ranked_symbols: List[str], date) -> set:
+        """Symbols barred from the LONG side of today's book (base: none).
+
+        Opt-in hook for desks that harvest a negative signal as a FILTER
+        (e.g. the Value+Quality issuance filter: heavy net issuers predict
+        low returns, so they are dropped from long candidacy without being
+        shorted). Applies to the LONG side only: blocked names still count
+        in ``n_scored``/``k`` and may still be shorted, but they are neither
+        entered long nor turnover-retained long — a blocked held long leaves
+        ``desired`` and is closed by the reconcile. The base returns an
+        empty set, which keeps selection byte-identical.
+        """
+        return set()
+
     # ------------------------------------------------------------------
     # Intent generation
     # ------------------------------------------------------------------
@@ -292,7 +306,17 @@ class CrossSectionalLongShortDesk(Desk):
             return intents
 
         k = max(1, int(self.quantile * n_scored))
-        longs = [symbol for symbol, _ in ranked[:k]]
+        blocked = self._long_exclusions([s for s, _ in ranked], date)
+        if blocked:
+            # Opt-in long-candidacy filter (see _long_exclusions): blocked
+            # names can never be longed — the top-k is drawn from the
+            # remaining candidates, so the next-ranked names backfill. A HELD
+            # long that becomes blocked leaves `desired` and is closed by the
+            # normal reconcile. Empty set (the base default) skips this
+            # branch entirely — byte-identical selection.
+            longs = [s for s, _ in ranked if s not in blocked][:k]
+        else:
+            longs = [symbol for symbol, _ in ranked[:k]]
         # Bottom-k, excluding anything already designated long (tiny
         # universes can overlap; the top ranking wins).
         shorts = ([] if self._long_only
@@ -317,6 +341,8 @@ class CrossSectionalLongShortDesk(Desk):
                 if position is None or position.quantity == 0:
                     continue  # only retain legs that actually filled (ours)
                 direction = state['direction']
+                if direction == 'long' and symbol in blocked:
+                    continue  # long-filtered names are never retained long
                 held_days = self._day_index - state.get('entry_day',
                                                         self._day_index)
                 keep = (self.min_holding_days > 0

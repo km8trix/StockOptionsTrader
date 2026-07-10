@@ -44,8 +44,9 @@ def stubbed(monkeypatch):
                         lambda returns, years, psr_threshold: {'psr': 0.5})
     monkeypatch.setattr(
         vfg, '_make_desk',
-        lambda key, wh, *, capital_allocation=1.0, dating='filing':
-        (key, capital_allocation, dating))
+        lambda key, wh, *, capital_allocation=1.0, dating='filing',
+        vq_variant='base':
+        (key, capital_allocation, dating, vq_variant))
     monkeypatch.setattr(
         vfg, 'FundOrchestrator',
         lambda desks, risk_manager=None: ('ORCH', tuple(desks), risk_manager))
@@ -135,8 +136,8 @@ def test_static_builds_engine_with_no_reweighter(stubbed, monkeypatch):
     assert kwargs['market_data'] == 'FEED'
     orch, desks, risk_manager = kwargs['orchestrator']
     assert orch == 'ORCH'
-    assert desks == (('pead_micro', 0.5, 'announce'),
-                     ('value_quality', 0.5, 'announce'))
+    assert desks == (('pead_micro', 0.5, 'announce', 'base'),
+                     ('value_quality', 0.5, 'announce', 'base'))
     assert risk_manager == ('RM', 0.50)
     assert captured['run'] == (('AAA', 'BBB'), '2015-01-01', '2024-12-31',
                                None)
@@ -202,7 +203,118 @@ def test_issuance_fund_builds_three_leg_orchestrator(stubbed, monkeypatch):
     kwargs = captured['engine_kwargs']
     assert kwargs['reweighter'] is None
     orch, desks, risk_manager = kwargs['orchestrator']
-    assert desks == (('pead_micro', pytest.approx(1 / 3), 'announce'),
-                     ('value_quality', pytest.approx(1 / 3), 'announce'),
-                     ('issuance', pytest.approx(1 / 3), 'announce'))
+    assert desks == (
+        ('pead_micro', pytest.approx(1 / 3), 'announce', 'base'),
+        ('value_quality', pytest.approx(1 / 3), 'announce', 'base'),
+        ('issuance', pytest.approx(1 / 3), 'announce', 'base'))
     assert risk_manager == ('RM', 0.50)
+
+
+def test_vq_variant_kwargs_are_the_preregistered_trials():
+    # The strengthening round is pre-registered: base is EMPTY (byte-
+    # identical default desk) and exactly three trial variants exist —
+    # equal-weight gp_assets, the top-quintile issuance long-filter, and
+    # their composition. Adding or tuning an entry must fail this test and
+    # be argued in review, not slipped in.
+    assert vfg.VQ_VARIANT_KWARGS == {
+        'base': {},
+        'gpa': {'include_gp_assets': True},
+        'issfilter': {'issuance_filter': True},
+        'both': {'include_gp_assets': True, 'issuance_filter': True}}
+
+
+def test_make_desk_maps_variant_to_vq_kwargs():
+    # Real desk classes, no stubs: every variant reaches the VQ constructor
+    # as its registered kwargs, the key contract survives all of them, and
+    # the default is the unchanged base desk.
+    for variant, kwargs in vfg.VQ_VARIANT_KWARGS.items():
+        desk = vfg._make_desk('value_quality', object(), vq_variant=variant)
+        assert desk.key == 'value_quality'
+        assert desk._include_gp_assets is kwargs.get('include_gp_assets',
+                                                     False)
+        assert desk._issuance_filter is kwargs.get('issuance_filter', False)
+    base = vfg._make_desk('value_quality', object())
+    assert base._include_gp_assets is False
+    assert base._issuance_filter is False
+    # Non-VQ legs are untouched by the variant.
+    assert vfg._make_desk('pead_micro', object(),
+                          vq_variant='both').key == 'pead_micro'
+
+
+def test_run_vq_applies_variant_kwargs(stubbed, monkeypatch):
+    captured = {}
+
+    class FakeDesk:
+        def __init__(self, **kwargs):
+            captured['desk_kwargs'] = kwargs
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'ValueQualityDesk', FakeDesk)
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_vq('2015-01-01', '2024-12-31', limit=2, seed=42,
+               long_only=True, vq_variant='both')
+    assert captured['desk_kwargs'] == {
+        'provider': 'WH', 'long_only': True,
+        'include_gp_assets': True, 'issuance_filter': True}
+    # Default: NO variant kwargs at all — the constructor call is
+    # byte-identical to before --vq-variant existed.
+    vfg.run_vq('2015-01-01', '2024-12-31', limit=2, seed=42, long_only=True)
+    assert captured['desk_kwargs'] == {'provider': 'WH', 'long_only': True}
+
+
+def test_run_fund_threads_vq_variant_to_the_orchestrator(stubbed,
+                                                         monkeypatch):
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['engine_kwargs'] = kwargs
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
+                 dating='announce', weighting='static', vq_variant='gpa')
+    orch, desks, _ = captured['engine_kwargs']['orchestrator']
+    # The stub echoes vq_variant for every leg; only the VQ leg acts on it
+    # (test_make_desk_maps_variant_to_vq_kwargs pins that).
+    assert desks == (('pead_micro', 0.5, 'announce', 'gpa'),
+                     ('value_quality', 0.5, 'announce', 'gpa'))
+
+
+def test_risk_parity_solo_curves_carry_the_variant(stubbed, monkeypatch):
+    # The reweighting arm's solo shadow passes must build the SAME variant
+    # desk as the fund legs, or the risk-parity weights would be computed
+    # off a different book than the one trading.
+    captured = {}
+
+    class FakeFund:
+        def __init__(self, allocations, **kwargs):
+            captured['solo'] = kwargs['solo_curve_provider']
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['desk'] = kwargs['desk']
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'ReweightingFundBacktest', FakeFund)
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
+                 vq_variant='issfilter')
+    captured['solo']('value_quality', ['AAA'], '2015-01-01', '2024-12-31')
+    assert captured['desk'] == ('value_quality', 1.0, 'filing', 'issfilter')

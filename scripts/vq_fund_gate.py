@@ -47,6 +47,33 @@ static 50/50. Solo issuance (--mode issuance): 489 trades, +45.4%, Sharpe
 ex-micro (the spread's short leg carried much of it). The weak leg dilutes
 more than decorrelation adds; deployment mean 0.596. DO NOT mix the
 issuance leg in this form — two-leg static stays the best honest fund.
+
+VQ VARIANTS (--vq-variant, 2026-07-10): strengthen the VQ leg itself (the
+PR #96 lesson: a weak third leg dilutes; the best honest fund is the
+two-leg static 50/50, so the marginal PSR lives in the VQ leg's solo
+Sharpe 0.35). base = default, byte-identical current desk; gpa = gp/assets
+(Novy-Marx) rank added to the composite at equal rank weight; issfilter =
+top-quintile YoY net issuers barred from VQ longs; both = the two composed.
+Applied identically to --mode vq and to the fund's VQ leg. HONESTY: the
+THREE non-base variants are THREE pre-registered trials this round —
+declared (equal weights, top-quintile rank threshold, composition) before
+any variant backtest ran; results land in the RESULT blocks below unedited,
+and no further variant joins this round after seeing them.
+
+VQ-VARIANT RESULT (2026-07-10, all three trials reported; solo = --mode vq
+--long-only, fund = --mode fund --dating announce --weighting static, 600
+names seed 42 2015-2024):
+  solo VQ   base 0.35/0.867 | gpa 0.42/0.9089 | issfilter 0.36/0.8721 |
+            both 0.43/0.9127 (Sharpe/PSR)
+  fund      base 0.41/0.9113 | gpa 0.40/0.9038 | issfilter 0.43/0.9216 |
+            both 0.44/0.9257 <- NEW PROGRAM BEST (1873 trades, +107.3%,
+            maxDD -24.1%, deployment mean 0.62)
+Instructive split: gp_assets lifts the solo leg but HURTS the blend alone
+(profitability tilt correlates with the PEAD leg); the issuance filter is
+modest solo but blend-friendly; composed they close ~1/3 of the gap to the
+0.95 bar. ALL SIX FAIL: PSR < 0.95 and 0 BH-significant years everywhere
+(best year 2019 p=0.041, an order of magnitude from clearing BH).
+Nothing promoted.
 """
 
 from __future__ import annotations
@@ -108,9 +135,21 @@ THREE_LEG_ALLOCATIONS = {'pead_micro': 1 / 3, 'value_quality': 1 / 3,
 LEGACY_FUND_ALLOCATIONS = {'pead_micro': 0.25, 'value_quality': 0.25,
                            'foundation': 0.125, 'trend_follower': 0.125,
                            'renaissance': 0.125, 'citadel': 0.125}
+#: --vq-variant -> ValueQualityDesk constructor kwargs. 'base' is empty by
+#: construction (byte-identical default desk); the three non-base entries
+#: are the round's three pre-registered trials (module docstring). Pinned in
+#: tests/test_vq_fund_gate.py — adding or tuning an entry must fail a test
+#: and be argued in review, not slipped in.
+VQ_VARIANT_KWARGS = {
+    'base': {},
+    'gpa': {'include_gp_assets': True},
+    'issfilter': {'issuance_filter': True},
+    'both': {'include_gp_assets': True, 'issuance_filter': True},
+}
 
 
-def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing'):
+def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing',
+               vq_variant='base'):
     if key == 'pead_micro':
         return PEADDesk('micro', provider=wh, long_only=True,
                         capital_allocation=capital_allocation, dating=dating)
@@ -119,7 +158,8 @@ def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing'):
         # micro-band PEAD leg (overlapping books churn on a shared portfolio).
         return ValueQualityDesk(provider=wh, long_only=True,
                                 capital_allocation=capital_allocation,
-                                exclude_micro=True)
+                                exclude_micro=True,
+                                **VQ_VARIANT_KWARGS[vq_variant])
     if key == 'issuance':
         # Desk defaults ARE the fund slot: long_only=True, exclude_micro=True
         # (rides the same ex-micro slice as VQ — the screen's uniquely
@@ -146,10 +186,11 @@ def _universe(wh, start, end, limit, seed):
 
 
 def run_vq(start, end, *, limit=None, capital=100_000.0, seed=42,
-           long_only=False):
+           long_only=False, vq_variant='base'):
     wh = PitWarehouse()
     universe = _universe(wh, start, end, limit, seed)
-    desk = ValueQualityDesk(provider=wh, long_only=long_only)
+    desk = ValueQualityDesk(provider=wh, long_only=long_only,
+                            **VQ_VARIANT_KWARGS[vq_variant])
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
                             market_data=WarehouseMarketData(wh))
     report = engine.run(universe, start, end)
@@ -194,7 +235,7 @@ def _deployment_stats(portfolio_history):
 
 def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
              dating='filing', legacy=False, weighting='risk_parity',
-             issuance=False):
+             issuance=False, vq_variant='base'):
     allocations = dict(THREE_LEG_ALLOCATIONS if issuance
                        else LEGACY_FUND_ALLOCATIONS if legacy
                        else FUND_ALLOCATIONS)
@@ -203,7 +244,7 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
     feed = WarehouseMarketData(wh)
 
     def solo_curve(key, symbols, s, e):
-        desk = _make_desk(key, wh, dating=dating)
+        desk = _make_desk(key, wh, dating=dating, vq_variant=vq_variant)
         engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
                                 market_data=feed)
         report = engine.run(list(symbols), s, e, benchmark_symbol=None)
@@ -218,7 +259,8 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
         # the orchestrator's default RiskManager would 2%-stop the shared
         # book daily and churn both books to noise.
         return FundOrchestrator(
-            [_make_desk(k, wh, capital_allocation=a, dating=dating)
+            [_make_desk(k, wh, capital_allocation=a, dating=dating,
+                        vq_variant=vq_variant)
              for k, a in allocations.items()],
             risk_manager=RiskManager(position_stop_loss=0.50))
 
@@ -328,18 +370,28 @@ def main():
     ap.add_argument('--issuance', action='store_true',
                     help='(fund mode) run the pre-registered three-leg fund '
                          '(PEAD micro + VQ + issuance, equal 1/3 split)')
+    ap.add_argument('--vq-variant', choices=sorted(VQ_VARIANT_KWARGS),
+                    default='base',
+                    help='VQ leg construction (vq AND fund modes): base = '
+                         'byte-identical current desk (default, unlabelled '
+                         'in the report); gpa = + gp/assets rank; issfilter '
+                         '= top-quintile issuers barred from longs; both')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
+    vtag = '' if args.vq_variant == 'base' else f" [vq={args.vq_variant}]"
     if args.mode == 'vq':
         summary, gate, n_trades, n_names = run_vq(
             args.start, args.end, limit=args.limit, seed=args.seed,
-            long_only=args.long_only)
-        label = 'Value+Quality' + (' (long-only)' if args.long_only else '')
+            long_only=args.long_only, vq_variant=args.vq_variant)
+        label = ('Value+Quality' + vtag
+                 + (' (long-only)' if args.long_only else ''))
         deploy = None
     elif args.mode == 'issuance':
+        if args.vq_variant != 'base':
+            ap.error('--vq-variant has no effect in --mode issuance')
         summary, gate, n_trades, n_names = run_issuance(
             args.start, args.end, limit=args.limit, seed=args.seed)
         label = 'Net-Issuance (long-only, ex-micro)'
@@ -351,12 +403,13 @@ def main():
         summary, gate, n_trades, n_names, deploy = run_fund(
             args.start, args.end, limit=args.limit, seed=args.seed,
             dating=args.dating, legacy=args.legacy,
-            weighting=args.weighting, issuance=args.issuance)
+            weighting=args.weighting, issuance=args.issuance,
+            vq_variant=args.vq_variant)
         core = ('PEAD+VQ+issuance' if args.issuance
                 else 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ')
         wlabel = ('static weights' if args.weighting == 'static'
                   else 'risk-parity')
-        label = (f"{core} fund ({wlabel}, long-only core legs, "
+        label = (f"{core} fund{vtag} ({wlabel}, long-only core legs, "
                  f"{args.dating} dating)")
     print_report(summary, gate, n_trades, n_names, label, args.start,
                  args.end)
