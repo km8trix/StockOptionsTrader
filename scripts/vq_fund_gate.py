@@ -54,20 +54,29 @@ FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 #: Fund legs: the strongest realized PEAD config + the VQ composite, both
 #: long-only (small-cap short legs bleed — insider/PEAD lesson), 50/50 start,
 #: risk-parity reweighted in-run.
-FUND_ALLOCATIONS = {'pead': 0.5, 'value_quality': 0.5}
+#:
+#: Allocation keys MUST equal the constructed desks' .key (pinned in
+#: tests/test_vq_fund_gate.py): ReweightingFundBacktest stores solo curves
+#: under the allocation key while DynamicReweighter looks them up by
+#: desk.key. Before 2026-07-10 this dict said 'pead' vs PEADDesk('micro').key
+#: == 'pead_micro', so every rebalance silently degenerated to the
+#: whole-fund equal-weight fallback — the recorded "risk-parity" PSR 0.9113
+#: baseline is de facto a static 50/50 fund (reweight_log: fallback=True
+#: throughout).
+FUND_ALLOCATIONS = {'pead_micro': 0.5, 'value_quality': 0.5}
 #: --legacy mix: the validated core keeps half the fund; the four stock-only
 #: frozen legacy desks split the rest. Exercises the fund-wide ownership
 #: scoping (Desk._owns_position) — legacy sweeps/exits must never close the
 #: PEAD/VQ books. Jane Street is left out: its vol books need synthetic
 #: options pricing (the documented premium-mispricing ruin) and its RV book
 #: is inert without an ETF in the small/mid universe.
-LEGACY_FUND_ALLOCATIONS = {'pead': 0.25, 'value_quality': 0.25,
+LEGACY_FUND_ALLOCATIONS = {'pead_micro': 0.25, 'value_quality': 0.25,
                            'foundation': 0.125, 'trend_follower': 0.125,
                            'renaissance': 0.125, 'citadel': 0.125}
 
 
 def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing'):
-    if key == 'pead':
+    if key == 'pead_micro':
         return PEADDesk('micro', provider=wh, long_only=True,
                         capital_allocation=capital_allocation, dating=dating)
     if key == 'value_quality':
@@ -112,9 +121,15 @@ def _deployment_stats(portfolio_history):
     """Mean/median/min deployed fraction (1 - cash/NAV) across the run's
     daily snapshots. Pure post-hoc reporting on fields the engine already
     records (portfolio/manager.record_snapshot) — the cash-drag diagnostic
-    for the engine-vs-paper Sharpe gap. None when there are no snapshots."""
+    for the engine-vs-paper Sharpe gap. None when there are no snapshots.
+
+    The day-1 snapshot is skipped: intents queue on the signal day and can
+    only fill at the NEXT open, so cash == NAV on day one by construction
+    and 'min' would always read 0.000 instead of measuring in-run drag.
+    The truthiness guard drops NAV == 0 snapshots (ruin) rather than
+    dividing by zero."""
     fracs = [1.0 - float(h['cash']) / float(h['portfolio_value'])
-             for h in portfolio_history if float(h['portfolio_value'])]
+             for h in portfolio_history[1:] if float(h['portfolio_value'])]
     if not fracs:
         return None
     s = pd.Series(fracs)

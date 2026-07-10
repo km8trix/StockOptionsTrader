@@ -13,8 +13,12 @@ import pytest
 import scripts.vq_fund_gate as vfg
 
 #: Minimal fund report: enough for the gate path + the deployment stats.
-#: Deployed fractions per snapshot: 0.5, 0.8, 0.8.
+#: Day-1 is all-cash by construction (T+1 fills) and must be SKIPPED by
+#: _deployment_stats; deployed fractions for the counted snapshots:
+#: 0.5, 0.8, 0.8 -> mean 0.7, median 0.8, min 0.5 (not 0.0).
 _HISTORY = [
+    {'timestamp': pd.Timestamp('2015-01-01'),
+     'portfolio_value': 100.0, 'cash': 100.0},
     {'timestamp': pd.Timestamp('2015-01-02'),
      'portfolio_value': 100.0, 'cash': 50.0},
     {'timestamp': pd.Timestamp('2015-01-05'),
@@ -131,7 +135,7 @@ def test_static_builds_engine_with_no_reweighter(stubbed, monkeypatch):
     assert kwargs['market_data'] == 'FEED'
     orch, desks, risk_manager = kwargs['orchestrator']
     assert orch == 'ORCH'
-    assert desks == (('pead', 0.5, 'announce'),
+    assert desks == (('pead_micro', 0.5, 'announce'),
                      ('value_quality', 0.5, 'announce'))
     assert risk_manager == ('RM', 0.50)
     assert captured['run'] == (('AAA', 'BBB'), '2015-01-01', '2024-12-31',
@@ -150,3 +154,18 @@ def test_deployment_stats_mean_median_min():
 
 def test_deployment_stats_empty_history_is_none():
     assert vfg._deployment_stats([]) is None
+
+
+def test_allocation_keys_match_desk_keys():
+    # THE reweighting contract: ReweightingFundBacktest stores solo curves
+    # under the allocation key; DynamicReweighter looks them up by desk.key.
+    # A mismatch does not crash — every rebalance silently degenerates to
+    # the whole-fund equal-weight fallback (how the pre-2026-07-10 'pead'
+    # vs 'pead_micro' bug made the risk-parity arm a de facto static fund).
+    # Real desk classes, no stubs: the .key values are what production sees.
+    for allocations in (vfg.FUND_ALLOCATIONS, vfg.LEGACY_FUND_ALLOCATIONS):
+        for key in allocations:
+            desk = vfg._make_desk(key, object())
+            assert desk.key == key, (
+                f"allocation key {key!r} builds desk.key {desk.key!r}: "
+                f"solo curves would never reach the reweighter")
