@@ -59,6 +59,21 @@ THREE non-base variants are THREE pre-registered trials this round —
 declared (equal weights, top-quintile rank threshold, composition) before
 any variant backtest ran; results land in the RESULT blocks below unedited,
 and no further variant joins this round after seeing them.
+
+VQ-VARIANT RESULT (2026-07-10, all three trials reported; solo = --mode vq
+--long-only, fund = --mode fund --dating announce --weighting static, 600
+names seed 42 2015-2024):
+  solo VQ   base 0.35/0.867 | gpa 0.42/0.9089 | issfilter 0.36/0.8721 |
+            both 0.43/0.9127 (Sharpe/PSR)
+  fund      base 0.41/0.9113 | gpa 0.40/0.9038 | issfilter 0.43/0.9216 |
+            both 0.44/0.9257 <- NEW PROGRAM BEST (1873 trades, +107.3%,
+            maxDD -24.1%, deployment mean 0.62)
+Instructive split: gp_assets lifts the solo leg but HURTS the blend alone
+(profitability tilt correlates with the PEAD leg); the issuance filter is
+modest solo but blend-friendly; composed they close ~1/3 of the gap to the
+0.95 bar. ALL SIX FAIL: PSR < 0.95 and 0 BH-significant years everywhere
+(best year 2019 p=0.041, an order of magnitude from clearing BH).
+Nothing promoted.
 """
 
 from __future__ import annotations
