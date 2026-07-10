@@ -34,7 +34,8 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from data.earnings_surprise import latest_fresh_sue, sue_table
+from data.earnings_surprise import (apply_announcement_dating,
+                                    latest_fresh_sue, sue_table)
 from data.size_buckets import pit_marketcaps, size_buckets
 from desks.cross_sectional import CrossSectionalLongShortDesk
 from portfolio.risk_manager import RiskManager
@@ -52,9 +53,13 @@ class PEADDesk(CrossSectionalLongShortDesk):
                  capital_allocation: float = 1.0,
                  risk_manager: Optional[RiskManager] = None,
                  fresh_days: int = 63, quantile: float = 0.2,
-                 n_bands: int = 3, long_only: bool = False):
+                 n_bands: int = 3, long_only: bool = False,
+                 dating: str = 'filing'):
         if band is not None and band not in _BANDS:
             raise ValueError(f"band {band!r} must be one of {list(_BANDS)}")
+        if dating not in ('filing', 'announce'):
+            raise ValueError(f"dating {dating!r} must be 'filing' or "
+                             f"'announce'")
         if provider is None:
             from data.pit_warehouse import PitWarehouse
             provider = PitWarehouse()
@@ -86,6 +91,8 @@ class PEADDesk(CrossSectionalLongShortDesk):
         self._band_idx = None if band is None else _BANDS[band]
         self._n_bands = n_bands
         self._fresh_days = fresh_days
+        self.dating = dating
+        self._events: Optional[pd.DataFrame] = None
         self._eps: Optional[pd.DataFrame] = None   # cumulative pull, sliced PIT
         self._eps_symbols: set = set()             # symbols covered by _eps
         self._cache_month: Optional[tuple] = None
@@ -106,7 +113,10 @@ class PEADDesk(CrossSectionalLongShortDesk):
         # which IS the PIT boundary (pinned by test).
         if self._eps is None or not set(symbols) <= self._eps_symbols:
             self._eps_symbols |= set(symbols)
-            self._eps = self._provider.eps_quarterly(sorted(self._eps_symbols))
+            syms = sorted(self._eps_symbols)
+            self._eps = self._provider.eps_quarterly(syms)
+            if self.dating == 'announce':
+                self._events = self._provider.earnings_events(syms)
         if self._band_idx is not None:
             caps = pit_marketcaps(self._provider, symbols, date)
             buckets = size_buckets(caps, self._n_bands)
@@ -114,9 +124,20 @@ class PEADDesk(CrossSectionalLongShortDesk):
         else:
             keep = set(symbols)
 
-        visible = self._eps[self._eps['datekey'] <= ts]
-        sue = latest_fresh_sue(sue_table(visible), ts,
-                               fresh_days=self._fresh_days)
+        if self.dating == 'announce':
+            # Include rows announced by ts but FILED up to ~60d later, then
+            # re-date each SUE to its 8-K press release; latest_fresh_sue's
+            # own <= ts filter then runs on announcement dates (unannounced
+            # padded rows keep datekey > ts and drop out). The 8-K-EPS ==
+            # filed-EPS approximation is documented on
+            # apply_announcement_dating.
+            visible = self._eps[self._eps['datekey']
+                                <= ts + pd.Timedelta(days=60)]
+            rows = apply_announcement_dating(sue_table(visible), self._events)
+        else:
+            visible = self._eps[self._eps['datekey'] <= ts]
+            rows = sue_table(visible)
+        sue = latest_fresh_sue(rows, ts, fresh_days=self._fresh_days)
         scores = {sym: float(sue[sym]) for sym in keep
                   if sym in sue.index and np.isfinite(sue[sym])}
 

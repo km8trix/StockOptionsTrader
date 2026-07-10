@@ -49,7 +49,13 @@ _TABLES = {
     'sf3': ('SHARADAR/SF3', {}),
     'daily': ('SHARADAR/DAILY', {}),
     'actions': ('SHARADAR/ACTIONS', {}),
+    'events': ('SHARADAR/EVENTS', {}),
 }
+
+#: SHARADAR/EVENTS code for an 8-K Item 2.02 "Results of Operations" filing —
+#: the earnings press release. Announcement dates lead the SF1 10-Q/10-K
+#: datekey by days (large caps) to weeks (small caps).
+EARNINGS_EVENT_CODE = '22'
 
 _PRICE_FIELDS = ('closeadj', 'close', 'open', 'high', 'low', 'volume')
 _DAILY_FIELDS = ('marketcap', 'pe', 'pb', 'ps', 'ev', 'evebit', 'evebitda')
@@ -191,22 +197,25 @@ class PitWarehouse:
             out.append(dict(zip(cols, rows[i - 1])) if i else None)
         return out
 
-    def eps_quarterly(self, tickers: Optional[Sequence[str]] = None, *,
-                      asof=None) -> pd.DataFrame:
-        """Quarterly as-reported diluted EPS rows for SUE-style computations.
+    def fundamentals_quarterly(self, tickers: Optional[Sequence[str]] = None,
+                               *, fields: Sequence[str] = ('epsdil',),
+                               asof=None) -> pd.DataFrame:
+        """Quarterly as-reported SF1 field rows, PIT-shaped.
 
         One scan of SF1 (dimension=ARQ) returning columns
-        ``ticker, reportperiod, datekey, epsdil`` — deduped to ONE row per
-        (ticker, reportperiod) keeping the EARLIEST datekey (the first-known
-        filing; amendments/restatements filed later are dropped, the
-        PIT-cleanest choice). Rows are restricted to ``datekey <= asof`` when
-        given, so the frame contains only filings KNOWN on that date. Empty
+        ``ticker, reportperiod, datekey`` + ``fields`` — deduped to ONE row
+        per (ticker, reportperiod) keeping the EARLIEST datekey (the
+        first-known filing; amendments/restatements filed later are dropped,
+        the PIT-cleanest choice). Rows where the FIRST field is NULL are
+        excluded. Restricted to ``datekey <= asof`` when given. Empty
         DataFrame when sf1 was never ingested.
         """
-        cols = ['ticker', 'reportperiod', 'datekey', 'epsdil']
-        sql = ("SELECT ticker, CAST(reportperiod AS DATE) AS reportperiod, "
-               "CAST(datekey AS DATE) AS datekey, epsdil FROM src "
-               "WHERE dimension = 'ARQ' AND epsdil IS NOT NULL")
+        fields = list(fields)
+        cols = ['ticker', 'reportperiod', 'datekey'] + fields
+        field_sql = ", ".join(fields)
+        sql = (f"SELECT ticker, CAST(reportperiod AS DATE) AS reportperiod, "
+               f"CAST(datekey AS DATE) AS datekey, {field_sql} FROM src "
+               f"WHERE dimension = 'ARQ' AND {fields[0]} IS NOT NULL")
         args: list = []
         if tickers is not None:
             if not len(tickers):
@@ -228,7 +237,63 @@ class PitWarehouse:
         df = res.fetchdf()
         df['reportperiod'] = pd.to_datetime(df['reportperiod'])
         df['datekey'] = pd.to_datetime(df['datekey'])
-        df['epsdil'] = df['epsdil'].astype(float)
+        for f in fields:
+            df[f] = pd.to_numeric(df[f], errors='coerce')
+        return df
+
+    def eps_quarterly(self, tickers: Optional[Sequence[str]] = None, *,
+                      asof=None) -> pd.DataFrame:
+        """Quarterly as-reported diluted EPS rows for SUE-style computations
+        (see fundamentals_quarterly — this is the fields=('epsdil',) view)."""
+        return self.fundamentals_quarterly(tickers, fields=('epsdil',),
+                                           asof=asof)
+
+    def daily_fields_bulk(self, tickers: Sequence[str], date, *,
+                          fields: Sequence[str] = ('pb',)
+                          ) -> Dict[str, Dict]:
+        """Bulk one-scan DAILY metrics for many names on ONE date:
+        {ticker: {field: float}}. Names with no row that day are omitted;
+        NULL fields come back as None. PIT by nature (DAILY is a daily
+        point-in-time table)."""
+        d = self._date(date)
+        if d is None or not len(tickers):
+            return {}
+        fields = [f for f in fields if f in _DAILY_FIELDS]
+        if not fields:
+            return {}
+        sql = (f"SELECT ticker, {', '.join(fields)} FROM src "
+               f"WHERE CAST(date AS DATE) = ? AND ticker IN "
+               f"({','.join('?' * len(tickers))})")
+        res = self._query('daily', sql, [d, *tickers])
+        if not res:
+            return {}
+        out: Dict[str, Dict] = {}
+        for row in res.fetchall():
+            out[row[0]] = {f: (float(v) if v is not None else None)
+                           for f, v in zip(fields, row[1:])}
+        return out
+
+    def earnings_events(self, tickers: Optional[Sequence[str]] = None
+                        ) -> pd.DataFrame:
+        """Earnings ANNOUNCEMENT dates (8-K Item 2.02 press releases) from
+        SHARADAR/EVENTS: columns ``ticker, date``, one row per announcement,
+        sorted by (ticker, date). Empty DataFrame when events was never
+        ingested. eventcodes is a pipe-separated code string ('22|91')."""
+        cols = ['ticker', 'date']
+        sql = ("SELECT ticker, CAST(date AS DATE) AS date FROM src "
+               "WHERE list_contains(string_split(eventcodes, '|'), ?)")
+        args: list = [EARNINGS_EVENT_CODE]
+        if tickers is not None:
+            if not len(tickers):
+                return pd.DataFrame(columns=cols)
+            sql += " AND ticker IN (%s)" % ",".join("?" * len(tickers))
+            args.extend(tickers)
+        sql += " ORDER BY ticker, CAST(date AS DATE)"
+        res = self._query('events', sql, args)
+        if not res:
+            return pd.DataFrame(columns=cols)
+        df = res.fetchdf()
+        df['date'] = pd.to_datetime(df['date'])
         return df
 
     def prices(self, ticker: str, start, end, *,

@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from data.earnings_surprise import latest_fresh_sue, sue_table
+from data.earnings_surprise import (apply_announcement_dating,
+                                    latest_fresh_sue, sue_table)
 from data.pit_warehouse import PitWarehouse
 from desks.pead import PEADDesk
 
@@ -94,6 +95,41 @@ class TestLatestFreshSue:
         assert len(latest_fresh_sue(None, '2020-01-01')) == 0
 
 
+class TestAnnouncementDating:
+    def _sues(self):
+        return sue_table(pd.DataFrame(
+            _eps_rows('AAA', [1, 1, 1, 1, 2, 3, 2, 3, 5])))
+
+    def test_redates_to_announcement_within_window(self):
+        sues = self._sues()                      # one row, datekey rp+40d
+        rp = sues['reportperiod'].iloc[0]
+        ann = pd.DataFrame({'ticker': ['AAA'], 'date': [rp
+                            + pd.Timedelta(days=12)]})
+        out = apply_announcement_dating(sues, ann)
+        assert out['datekey'].iloc[0] == rp + pd.Timedelta(days=12)
+
+    def test_no_announcement_keeps_filing_date(self):
+        sues = self._sues()
+        ann = pd.DataFrame({'ticker': ['ZZZ'],
+                            'date': [pd.Timestamp('2022-04-15')]})
+        out = apply_announcement_dating(sues, ann)
+        assert out['datekey'].iloc[0] == sues['datekey'].iloc[0]
+
+    def test_announcement_before_quarter_end_not_used(self):
+        sues = self._sues()
+        rp = sues['reportperiod'].iloc[0]
+        ann = pd.DataFrame({'ticker': ['AAA'],
+                            'date': [rp - pd.Timedelta(days=5)]})
+        out = apply_announcement_dating(sues, ann)
+        assert out['datekey'].iloc[0] == sues['datekey'].iloc[0]
+
+    def test_empty_events_passthrough(self):
+        sues = self._sues()
+        out = apply_announcement_dating(
+            sues, pd.DataFrame(columns=['ticker', 'date']))
+        assert out is sues
+
+
 # ---------------------------------------------------------------------------
 # PitWarehouse.eps_quarterly — hermetic parquet fixture
 # ---------------------------------------------------------------------------
@@ -146,9 +182,10 @@ class TestEpsQuarterly:
 # PEADDesk — PIT slicing, monthly cache, banding
 # ---------------------------------------------------------------------------
 class _FakeProvider:
-    def __init__(self, eps, caps=None):
+    def __init__(self, eps, caps=None, events=None):
         self._eps = eps
         self._caps = caps or {}
+        self._events = events
         self.eps_calls = 0
 
     def eps_quarterly(self, tickers=None, *, asof=None):
@@ -158,6 +195,14 @@ class _FakeProvider:
             df = df[df['ticker'].isin(tickers)]
         if asof is not None:
             df = df[df['datekey'] <= pd.Timestamp(asof)]
+        return df.reset_index(drop=True)
+
+    def earnings_events(self, tickers=None):
+        if self._events is None:
+            return pd.DataFrame(columns=['ticker', 'date'])
+        df = self._events
+        if tickers is not None:
+            df = df[df['ticker'].isin(tickers)]
         return df.reset_index(drop=True)
 
     def daily_marketcaps(self, tickers, date):
@@ -252,9 +297,33 @@ class TestPEADDesk:
         frames, idx = _desk_frames(['AAA', 'BBB'], '2023-02-01')
         assert desk._alpha_scores(frames, idx[-1]) is None
 
+    def test_announce_dating_sees_surprise_before_filing(self):
+        """The unlock: q11 announces 2023-01-10 but files 2023-02-09; an
+        announce-dated desk trades the surprise a month earlier."""
+        eps = _surprise_eps()
+        names = ['AAA', 'BBB', 'CCC', 'DDD']
+        ann_rows = []
+        for n in names:
+            for rp in eps[eps['ticker'] == n]['reportperiod']:
+                ann_rows.append({'ticker': n,
+                                 'date': rp + pd.Timedelta(days=10)})
+        events = pd.DataFrame(ann_rows)         # every quarter: rp+10d
+        asof = pd.Timestamp('2023-01-20')       # after ann, before filing
+        frames, _ = _desk_frames(names, '2023-01-02')
+        filing_desk = PEADDesk(provider=_FakeProvider(eps), quantile=0.25)
+        s_filing = filing_desk._alpha_scores(frames, asof)
+        assert s_filing is None or abs(s_filing.get('BBB', 0.0)) < 2
+        ann_desk = PEADDesk(provider=_FakeProvider(eps, events=events),
+                            quantile=0.25, dating='announce')
+        s_ann = ann_desk._alpha_scores(frames, asof)
+        assert s_ann is not None and s_ann['BBB'] > 2 and s_ann['CCC'] < -2
+
     def test_band_validation(self):
         with pytest.raises(ValueError):
             PEADDesk('mega', provider=_FakeProvider(_surprise_eps()))
+        with pytest.raises(ValueError):
+            PEADDesk(provider=_FakeProvider(_surprise_eps()),
+                     dating='psychic')
 
     def test_fixed_rule_has_no_walk_forward_fits(self):
         desk = PEADDesk(provider=_FakeProvider(_surprise_eps()))

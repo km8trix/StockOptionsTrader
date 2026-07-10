@@ -20,6 +20,7 @@ from desks.orchestrator import FundOrchestrator
 from desks.pead import PEADDesk
 from desks.renaissance import RenaissanceDesk
 from desks.twosigma import TwoSigmaDesk
+from desks.value_quality import ValueQualityDesk
 from desks.vix_revert import VixReversionDesk
 
 logger = logging.getLogger(__name__)
@@ -199,6 +200,21 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#9a6700',
         'factory': PEADDesk,
+    },
+    'value_quality': {
+        'name': 'Value+Quality Desk',
+        'firm_inspiration': 'AQR / Novy-Marx (academia)',
+        'description': ('Cross-sectional value+quality composite: long the '
+                        'cheapest (PIT price/book) most profitable (PIT net '
+                        'margin) names, short the richest least profitable, '
+                        'rank-blended monthly. Requires the Sharadar PIT '
+                        'warehouse (sf1 + daily); without it the desk stays '
+                        'flat. Built as the decorrelated second leg for the '
+                        'PEAD combine (scripts/vq_fund_gate.py).'),
+        'status': 'ready',
+        'activates_in_phase': None,
+        'accent': '#0969da',
+        'factory': ValueQualityDesk,
     },
 }
 

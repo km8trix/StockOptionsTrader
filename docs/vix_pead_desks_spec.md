@@ -144,6 +144,49 @@ cost (IBKR), (b) press-release dating instead of the ~41-day filing lag
 (needs an earnings-announcement-date feed for small caps), (c) combining with
 the value+quality composite via the capital allocator.
 
+## PEAD unlock results (2026-07-09, follow-up branch feat/pead-unlocks)
+
+All three spec unlocks were pursued; nothing cleared the 0.95 PSR bar, but two
+moved the needle materially. Baseline: long-only micro, filing-dated, PSR 0.891.
+
+**(a) IBKR-level costs — NO EFFECT.** Gate at 2bp/5bp/10bp per-side
+commission: PSR 0.890 / 0.862 / 0.891 (differences are fill-path noise, not
+monotone). Commission is not the binding constraint — and real micro-cap
+slippage exceeds the modeled 5bp, so live IBKR would be worse, not better.
+
+**(b) Press-release dating — THE BIG LEVER.** SHARADAR/EVENTS ingested
+(2.53M rows); event code 22 = 8-K Item 2.02 (earnings press release);
+`--dating announce` re-times each SUE from the 10-Q/10-K `datekey` to the
+announcement (median lead: days for large caps, weeks for small caps).
+Documented approximation: the SF1 EPS is assumed equal to the 8-K figure.
+- Screen: **4/8 BH survivors** (was 1/8) — micro 63d net **+2.99%, t=5.09**;
+  micro 21d turns cost-positive (net +0.52%, t=3.84); pooled 63d clears
+  (net +0.88%, t=3.09).
+- Desk gate: **+147.7%, Sharpe 0.42, PSR 0.926** (was 0.891) → still FAIL
+  (0 BH-significant years).
+
+**(c) Combine with value+quality — REAL DIVERSIFICATION, STILL SHORT, plus an
+architectural finding.** New `ValueQualityDesk` (pb×netmargin rank composite,
+PIT, monthly; solo long-only all-bands: +68.5%, Sharpe 0.35, PSR 0.867,
+maxDD −22.9% → FAIL; ex-micro slice weaker, +40.3%, as the validation battery
+predicted). Paper combine of the two solo legs (PEAD micro LO announce + VQ
+ex-micro LO): daily correlation **+0.29**, 50/50 blend **ann Sharpe 0.55,
+PSR 0.911** — the program's best portfolio-level number — **FAIL** (0 BH
+years; inverse-vol blend 0.885). The ENGINE-level fund
+(`scripts/vq_fund_gate.py --mode fund`, ReweightingFundBacktest) cannot
+honestly measure the combine yet: two cross-sectional desks on the shared
+book fight — each desk's orphan sweep covers every symbol it EVER traded, and
+band membership migrates monthly, so books that are disjoint today overlap
+through time (24k trades / Sharpe 0.09 overlapping; still 15k / 0.25
+"disjoint"). Fix = desk-scoped position ownership in the fund engine —
+follow-up work, out of scope here.
+
+**Post-unlocks verdict: still no promotion.** Closest books:
+announce-dated PEAD long-only micro (PSR 0.926) and the PEAD+VQ paper blend
+(PSR 0.911, Sharpe 0.55). Remaining honest levers: desk-scoped fund ownership
+(realize the blend in-engine), a third decorrelated leg, or accepting the
+strategy class is near — but below — the bar on this decade.
+
 ## Testing
 
 - Unit: sizer streak math; VIX crossing/exit/stop logic on synthetic frames
