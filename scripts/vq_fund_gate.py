@@ -406,13 +406,17 @@ def main():
         _selftest()
         return
     cash_yield = load_dtb3() if args.cash_yield else None
-    if args.cash_yield and args.legacy:
-        # Legacy desks can short; short-sale proceeds sit in cash under the
-        # cash-account approximation, so they earn the same DTB3 rate — a
-        # full short rebate, an APPROXIMATION (real rebates run below the
-        # bill rate, hard-to-borrow names far below). Documented, not fatal.
-        print('CAVEAT: --cash-yield with --legacy: short proceeds earn the '
-              'full DTB3 rate (a rebate approximation).')
+    # Short-capable books under --cash-yield: short-sale proceeds sit in
+    # cash under the cash-account approximation, so they earn the same DTB3
+    # rate — a full short rebate, an APPROXIMATION (real rebates run below
+    # the bill rate, hard-to-borrow names far below). Documented, not
+    # fatal. Fires only where shorts can actually occur: the legacy fund
+    # mix, or --mode vq without --long-only (--legacy is inert outside
+    # fund mode, so no caveat there).
+    if args.cash_yield and ((args.mode == 'fund' and args.legacy)
+                            or (args.mode == 'vq' and not args.long_only)):
+        print('CAVEAT: --cash-yield on a short-capable book: short '
+              'proceeds earn the full DTB3 rate (a rebate approximation).')
     vtag = '' if args.vq_variant == 'base' else f" [vq={args.vq_variant}]"
     ytag = ' [+DTB3]' if args.cash_yield else ''
     if args.mode == 'vq':
