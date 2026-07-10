@@ -696,6 +696,87 @@ class TestRealisticFills:
         assert asset not in engine.pending_intents
 
 
+class TestCashYield:
+    """Opt-in dated idle-cash yield (cash_yield=). Default None is
+    byte-identical: cash is never touched outside fills (pinned exactly,
+    no approx). The ON path accrues cash * rate(date)/252 just before the
+    daily snapshot, so the recorded equity curve carries the interest."""
+
+    #: 3 trading days; a HOLD-only strategy leaves cash untouched except
+    #: for the accrual, so snapshot cash is pure compounded interest.
+    DATES = pd.bdate_range('2023-01-02', periods=3)
+    #: Dated regime split: a ZIRP print on day 1, a 2023-style 5% after —
+    #: the whole point of a dated series vs a flat retro assumption.
+    RATES = {DATES[0]: 0.001, DATES[1]: 0.05, DATES[2]: 0.05}
+
+    def _run(self, patch_market_data, make_ohlcv, **engine_kw):
+        df = make_ohlcv(n_days=3)
+        patch_market_data({'TEST': df})
+        engine = BacktestEngine(ScriptedStrategy(),  # never signals
+                                initial_capital=100000.0,
+                                commission=COMMISSION, **engine_kw)
+        report = engine.run(['TEST'], '2023-01-01', '2023-12-31')
+        assert 'error' not in report
+        return [h['cash'] for h in report['portfolio_history']]
+
+    def test_accrual_math_three_days_hand_computed(self, patch_market_data,
+                                                   make_ohlcv):
+        cash = self._run(patch_market_data, make_ohlcv,
+                         cash_yield=lambda d: self.RATES[d])
+        # Hand-computed daily compounding on 100k (c += c*r/252 each day):
+        #   day1 @0.1%: +100000*0.001/252       = +0.39682539...
+        #   day2 @5%:   +100000.3968...*0.05/252 = +19.84134857...
+        #   day3 @5%:   +100020.2381...*0.05/252 = +19.84528535...
+        assert cash[0] == pytest.approx(100000.39682539682, rel=1e-12)
+        assert cash[1] == pytest.approx(100020.23817397328, rel=1e-12)
+        assert cash[2] == pytest.approx(100040.08345932527, rel=1e-12)
+        # ZIRP-vs-5% is visible in the increments (dated, not flat).
+        assert cash[1] - cash[0] > 40 * (cash[0] - 100000.0)
+
+    def test_series_input_forward_fills_and_prehistory_is_zero(
+            self, patch_market_data, make_ohlcv):
+        # A pd.Series is accepted directly (wrapped in rate_asof): first
+        # trading day predates the series -> 0.0 accrual; the single 5%
+        # print then forward-fills across the remaining days.
+        series = pd.Series([0.05], index=[self.DATES[1]])
+        cash = self._run(patch_market_data, make_ohlcv, cash_yield=series)
+        assert cash[0] == 100000.0                       # pre-history: zero
+        assert cash[1] == pytest.approx(100000.0 * (1 + 0.05 / 252),
+                                        rel=1e-12)
+        assert cash[2] == pytest.approx(cash[1] * (1 + 0.05 / 252),
+                                        rel=1e-12)       # ffilled carry
+
+    def test_default_none_is_byte_identical(self, patch_market_data,
+                                            make_ohlcv):
+        # The default pin: with the param ABSENT, cash is EXACTLY the
+        # initial capital on every snapshot of a no-trade run (the accrual
+        # seam never touches it), and identical to an explicit
+        # cash_yield=None run. Exact ==, not approx — byte identity.
+        absent = self._run(patch_market_data, make_ohlcv)
+        explicit_none = self._run(patch_market_data, make_ohlcv,
+                                  cash_yield=None)
+        assert absent == explicit_none
+        assert absent == [100000.0] * 3
+        # Not tautological: the ON path does change the same run.
+        on = self._run(patch_market_data, make_ohlcv,
+                       cash_yield=lambda d: 0.05)
+        assert on != absent
+
+    def test_negative_cash_accrues_nothing(self):
+        # Margin-debit guard: no free leverage — a negative balance earns
+        # zero (and is charged nothing; the docstring owns that asymmetry).
+        engine = BacktestEngine(ScriptedStrategy(),
+                                initial_capital=100000.0,
+                                cash_yield=lambda d: 0.05)
+        engine.portfolio.cash = -500.0
+        engine._accrue_cash_yield(self.DATES[0])
+        assert engine.portfolio.cash == -500.0
+        # And zero cash accrues nothing (no 0*rate float dust).
+        engine.portfolio.cash = 0.0
+        engine._accrue_cash_yield(self.DATES[0])
+        assert engine.portfolio.cash == 0.0
+
+
 class TestEnrichedFeatureColumnsPlumbing:
     def test_engine_frames_carry_the_enriched_extras(
             self, make_ohlcv, patch_market_data):

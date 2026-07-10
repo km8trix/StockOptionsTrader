@@ -68,7 +68,7 @@ class ReweightingFundBacktest:
                  sizing_modulator=None,
                  solo_curve_provider: Optional[SoloCurveProvider] = None,
                  orchestrator_factory: Optional[OrchestratorFactory] = None,
-                 market_data=None):
+                 market_data=None, cash_yield=None):
         if not allocations:
             raise ValueError(
                 "ReweightingFundBacktest requires at least one desk allocation")
@@ -97,6 +97,13 @@ class ReweightingFundBacktest:
         # default) keeps every engine on its own MarketDataHandler —
         # byte-identical to before.
         self.market_data = market_data
+        # OPTIONAL idle-cash yield (BacktestEngine cash_yield): a dated
+        # date->annual-rate lookup or Series. None (default) = byte-identical
+        # (cash earns zero). Threaded into the fund engine AND the default
+        # solo-curve engines: the reweighter must see the same economics in
+        # the shadow books as in the fund, or the risk-parity weights would
+        # be computed off curves missing the yield the fund actually earns.
+        self.cash_yield = cash_yield
         self._solo_curve_provider = (solo_curve_provider
                                      or self._default_solo_curve)
         self._orchestrator_factory = (orchestrator_factory
@@ -139,7 +146,8 @@ class ReweightingFundBacktest:
             initial_capital=self.initial_capital, commission=self.commission,
             slippage_bps=self.slippage_bps, spread_pct=self.spread_pct,
             per_contract_commission=self.per_contract_commission,
-            seed=self.seed, market_data=self.market_data)
+            seed=self.seed, market_data=self.market_data,
+            cash_yield=self.cash_yield)
         # progress_callback covers only the fund pass (the N solo passes run
         # first); callers wanting whole-job progress should wrap accordingly.
         return engine.run(symbols, start_date, end_date,
@@ -165,7 +173,8 @@ class ReweightingFundBacktest:
             commission=self.commission, slippage_bps=self.slippage_bps,
             spread_pct=self.spread_pct,
             per_contract_commission=self.per_contract_commission,
-            seed=self.seed, market_data=self.market_data)
+            seed=self.seed, market_data=self.market_data,
+            cash_yield=self.cash_yield)
         report = engine.run(list(symbols), start_date, end_date,
                             benchmark_symbol=None)
         if 'error' in report:

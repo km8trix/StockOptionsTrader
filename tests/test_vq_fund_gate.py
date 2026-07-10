@@ -85,7 +85,8 @@ def test_default_risk_parity_construction_unchanged(stubbed, monkeypatch):
     kwargs = captured['kwargs']
     assert set(kwargs) == {'initial_capital', 'seed', 'weighting',
                            'market_data', 'solo_curve_provider',
-                           'orchestrator_factory'}
+                           'orchestrator_factory', 'cash_yield'}
+    assert kwargs['cash_yield'] is None  # default: no yield, byte-identical
     assert kwargs['weighting'] == 'risk_parity'
     assert kwargs['initial_capital'] == 100_000.0
     assert kwargs['seed'] == 42
@@ -134,6 +135,7 @@ def test_static_builds_engine_with_no_reweighter(stubbed, monkeypatch):
     assert kwargs['initial_capital'] == 100_000.0
     assert kwargs['seed'] == 7
     assert kwargs['market_data'] == 'FEED'
+    assert kwargs['cash_yield'] is None  # default: no yield, byte-identical
     orch, desks, risk_manager = kwargs['orchestrator']
     assert orch == 'ORCH'
     assert desks == (('pead_micro', 0.5, 'announce', 'base'),
@@ -318,3 +320,79 @@ def test_risk_parity_solo_curves_carry_the_variant(stubbed, monkeypatch):
                  vq_variant='issfilter')
     captured['solo']('value_quality', ['AAA'], '2015-01-01', '2024-12-31')
     assert captured['desk'] == ('value_quality', 1.0, 'filing', 'issfilter')
+
+
+def test_cash_yield_threads_into_solo_mode_engines(stubbed, monkeypatch):
+    # --cash-yield reaches the run_vq and run_issuance engines unchanged
+    # (and stays None by default — the byte-identical arm).
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['engine_kwargs'] = kwargs
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+    monkeypatch.setattr(vfg, 'ValueQualityDesk', lambda **kw: 'DESK')
+    monkeypatch.setattr(vfg, 'IssuanceDesk', lambda **kw: 'DESK')
+
+    vfg.run_vq('2015-01-01', '2024-12-31', limit=2, seed=42,
+               cash_yield='DTB3')
+    assert captured['engine_kwargs']['cash_yield'] == 'DTB3'
+    vfg.run_vq('2015-01-01', '2024-12-31', limit=2, seed=42)
+    assert captured['engine_kwargs']['cash_yield'] is None
+    vfg.run_issuance('2015-01-01', '2024-12-31', limit=2, seed=42,
+                     cash_yield='DTB3')
+    assert captured['engine_kwargs']['cash_yield'] == 'DTB3'
+    vfg.run_issuance('2015-01-01', '2024-12-31', limit=2, seed=42)
+    assert captured['engine_kwargs']['cash_yield'] is None
+
+
+def test_cash_yield_threads_into_static_fund_engine(stubbed, monkeypatch):
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['engine_kwargs'] = kwargs
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
+                 weighting='static', cash_yield='DTB3')
+    assert captured['engine_kwargs']['cash_yield'] == 'DTB3'
+
+
+def test_cash_yield_threads_into_both_risk_parity_arms(stubbed, monkeypatch):
+    # The reweighting arm must carry the yield in BOTH places: the
+    # ReweightingFundBacktest fund pass AND the solo shadow passes — the
+    # reweighter has to see the same economics as the fund it weights.
+    captured = {}
+
+    class FakeFund:
+        def __init__(self, allocations, **kwargs):
+            captured['fund_cash_yield'] = kwargs['cash_yield']
+            captured['solo'] = kwargs['solo_curve_provider']
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured['solo_engine_kwargs'] = kwargs
+
+        def run(self, symbols, start, end, benchmark_symbol='SPY'):
+            return dict(_REPORT)
+
+    monkeypatch.setattr(vfg, 'ReweightingFundBacktest', FakeFund)
+    monkeypatch.setattr(vfg, 'BacktestEngine', FakeEngine)
+
+    vfg.run_fund('2015-01-01', '2024-12-31', limit=2, seed=42,
+                 cash_yield='DTB3')
+    assert captured['fund_cash_yield'] == 'DTB3'
+    captured['solo']('pead_micro', ['AAA'], '2015-01-01', '2024-12-31')
+    assert captured['solo_engine_kwargs']['cash_yield'] == 'DTB3'

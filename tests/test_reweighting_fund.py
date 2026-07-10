@@ -247,6 +247,44 @@ class TestCoordinatorInjected:
         assert sum(last.values()) == pytest.approx(0.6)
 
 
+    def test_cash_yield_threaded_into_solo_and_fund_engines(self,
+                                                            monkeypatch):
+        # cash_yield reaches EVERY BacktestEngine the coordinator builds —
+        # the N default solo-curve engines AND the fund engine (the
+        # reweighter must see the same economics in the shadow books as in
+        # the fund it weights). Default None everywhere = byte-identical.
+        _patch_fetch(monkeypatch,
+                     {'AAA': flat_frame(n=N_DAYS), 'BBB': flat_frame(n=N_DAYS)})
+        captured = []
+        real_engine = rf_module.BacktestEngine
+
+        def spy(*args, **kwargs):
+            captured.append(kwargs.get('cash_yield'))
+            return real_engine(*args, **kwargs)
+        monkeypatch.setattr(rf_module, 'BacktestEngine', spy)
+
+        def fake_create_desk(key, capital_allocation=1.0):
+            return ScriptedDesk(key, capital_allocation,
+                                risk_manager=wide_risk())
+        monkeypatch.setattr(registry, 'create_desk', fake_create_desk)
+        monkeypatch.setattr(rf_module, 'create_desk', fake_create_desk)
+
+        rate = lambda date: 0.05  # noqa: E731
+        rfb = ReweightingFundBacktest({'asim': 0.5, 'bsim': 0.5},
+                                      rebalance_every=21, cash_yield=rate)
+        rfb.run(['AAA', 'BBB'], START, END, benchmark_symbol=None)
+        # 2 solo passes + 1 fund pass, all carrying the same lookup.
+        assert len(captured) == 3
+        assert all(cy is rate for cy in captured)
+
+        captured.clear()
+        rfb_default = ReweightingFundBacktest({'asim': 0.5, 'bsim': 0.5},
+                                              rebalance_every=21)
+        rfb_default.run(['AAA', 'BBB'], START, END, benchmark_symbol=None)
+        assert len(captured) == 3
+        assert all(cy is None for cy in captured)
+
+
 class TestCoordinatorDefaultPath:
     def test_default_path_runs_solo_then_fund(self, monkeypatch):
         # Drive the REAL default providers (single-desk solo backtests +
