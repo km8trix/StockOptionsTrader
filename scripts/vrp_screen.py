@@ -62,6 +62,14 @@ HONESTY — read before quoting any number:
     pre-registered haircut is a guess at the spread cost, not a measurement.
   * Single pre-registered config. No parameter sweeps were run and none
     will be attributed to this screen.
+  * IV inversion uses the repo's European, no-dividend Black-Scholes on
+    AMERICAN options over dividend-paying ETFs (SPY/IWM ~1.2%/yr, ex-div
+    dates often inside the hold): the no-div bias mostly cancels in the
+    two-leg mean, but the put's early-exercise premium only biases IV
+    HIGH — the reported mean IV and IV-RV gap carry a small (tenths of a
+    vol point) UPWARD bias. P&L numbers are unaffected. Months where only
+    one leg inverts are excluded from the IV/RV stat (iv_partial count
+    reported), never substituted.
 
     python scripts/vrp_screen.py                    # after the ingest
     python scripts/vrp_screen.py --underlyings SPY
@@ -212,11 +220,18 @@ def screen_underlying(wh, sym: str, *, closes: pd.Series = None,
             implied_vol(c_close, s_entry, strike, t_years, rf, 'call'),
             implied_vol(p_close, s_entry, strike, t_years, rf, 'put'))
             if v is not None]
-        entry_iv = float(np.mean(ivs)) if ivs else None
+        # Registered definition: mean of BOTH legs' IVs. A month where one
+        # leg fails inversion (stale/below-intrinsic print) is flagged and
+        # EXCLUDED from the IV/RV diagnostic (P&L keeps it) — a one-leg IV
+        # silently substituting for the straddle IV would drift the VRP
+        # stat off its registered definition.
+        entry_iv = float(np.mean(ivs)) if len(ivs) == 2 else None
+        iv_partial = len(ivs) == 1
         rv = realized_vol(closes, sel_ts, settle_date)
         months.append({
             'month': sel_ts, 'strike': strike, 'expiry': expiry,
             'settle_date': settle_date, 'settle_fallback': fallback,
+            'iv_partial': iv_partial,
             'spot_entry': s_entry, 'call_close': c_close,
             'put_close': p_close,
             'premium': res['premium_gross'],

@@ -419,7 +419,7 @@ def test_screen_stats_and_pooled_report(tmp_path, capsys):
     assert pooled[0]['pnl'] == pytest.approx(res['months'][0]['pnl'])
     vrp.print_report([res])
     out = capsys.readouterr().out
-    assert 'HONESTY' in out and 'NOT' not in out.split('HONESTY')[0][:1]
+    assert 'HONESTY' in out
     assert 'EXISTENCE measurement, not a' in out
     assert 'NO promotion pathway' in out
     assert 'POOLED' in out
