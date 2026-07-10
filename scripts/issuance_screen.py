@@ -44,6 +44,18 @@ Deterministic; warehouse-only (tickers + sep + sf1 + daily ingested).
     python -m scripts.issuance_screen                # full universe
     python -m scripts.issuance_screen --limit 250    # seeded smoke subset
     python -m scripts.issuance_screen --selftest     # offline, no warehouse
+
+RESULT (2026-07-10, full universe 4608 names / 306,453 events, winsor 0.01):
+8/8 BH survivors at alpha=0.05 — the program's first clean sweep. Pooled 21d
+net +1.55% t=+3.76, 63d net +4.83% t=+3.42; micro 63d net +8.21% t=+4.02;
+and uniquely, MID-CAP survives (21d net +0.44% t=+2.67, 63d net +1.89%
+t=+2.79) — the tradeable slice where value/quality/PEAD all died. Median
+issuance +1.0%/yr, 21.9% of events negative (buybacks). Measured long-leg
+turnover: 7.3%/rebalance (~87%/yr one-sided, mean leg 523 names) — slower
+than monthly signals but NOT annual; note the net figures above deduct the
+full 2x30bp per rebalance while actual membership turnover is 7.3%, so
+realized cost drag is ~1/14th of what the netting assumes and true net sits
+near gross. Screen-level only; no desk, no promotion claim.
 """
 
 from __future__ import annotations
