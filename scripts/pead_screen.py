@@ -23,6 +23,17 @@ Deterministic; warehouse-only (tickers + sep + sf1 + daily ingested).
     python -m scripts.pead_screen --limit 250        # seeded smoke subset
     python -m scripts.pead_screen --field revenue    # SURGE (revenue surprise)
     python -m scripts.pead_screen --selftest         # offline, no warehouse
+
+SURGE RESULT (2026-07-10, --field revenue --dating announce, 4291 names /
+181,461 events): 2/8 BH survivors, micro only — 21d net +0.55% t=+3.23,
+63d net +2.96% t=+3.23. A real but weaker echo of EPS-SUE announce (4/8;
+micro 63d t=+5.09): comparable micro-63d magnitude, lower t, nothing
+outside micro. Independence on 215,296 matched filings: Spearman +0.34,
+sign agreement 62.8% (Pearson ~0 is winsorization-free tail noise —
+rank correlation is the honest number); degenerate-variance guard drops
+3.09% of revenue candidates vs 0.05% of EPS. Moderately independent ->
+a micro-band SUE x SURGE double-sort is the only combine worth testing;
+SURGE alone adds nothing outside micro. Screen-level only; no promotion.
 """
 
 from __future__ import annotations
