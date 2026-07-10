@@ -34,8 +34,12 @@ from backtesting.backtest_engine import BacktestEngine  # noqa: E402
 from backtesting.reweighting_fund import ReweightingFundBacktest  # noqa: E402
 from data.pit_warehouse import PitWarehouse  # noqa: E402
 from data.warehouse_feed import WarehouseMarketData  # noqa: E402
+from desks.citadel import CitadelDesk  # noqa: E402
+from desks.foundation import FoundationDesk  # noqa: E402
 from desks.orchestrator import FundOrchestrator  # noqa: E402
 from desks.pead import PEADDesk  # noqa: E402
+from desks.renaissance import RenaissanceDesk  # noqa: E402
+from desks.trend_follower import TrendFollowerDesk  # noqa: E402
 from desks.value_quality import ValueQualityDesk  # noqa: E402
 from portfolio.risk_manager import RiskManager  # noqa: E402
 from scripts.insider_desk_gate import (  # noqa: E402
@@ -47,6 +51,15 @@ FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 #: long-only (small-cap short legs bleed — insider/PEAD lesson), 50/50 start,
 #: risk-parity reweighted in-run.
 FUND_ALLOCATIONS = {'pead': 0.5, 'value_quality': 0.5}
+#: --legacy mix: the validated core keeps half the fund; the four stock-only
+#: frozen legacy desks split the rest. Exercises the fund-wide ownership
+#: scoping (Desk._owns_position) — legacy sweeps/exits must never close the
+#: PEAD/VQ books. Jane Street is left out: its vol books need synthetic
+#: options pricing (the documented premium-mispricing ruin) and its RV book
+#: is inert without an ETF in the small/mid universe.
+LEGACY_FUND_ALLOCATIONS = {'pead': 0.25, 'value_quality': 0.25,
+                           'foundation': 0.125, 'trend_follower': 0.125,
+                           'renaissance': 0.125, 'citadel': 0.125}
 
 
 def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing'):
@@ -59,6 +72,14 @@ def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing'):
         return ValueQualityDesk(provider=wh, long_only=True,
                                 capital_allocation=capital_allocation,
                                 exclude_micro=True)
+    if key == 'foundation':
+        return FoundationDesk(capital_allocation=capital_allocation)
+    if key == 'trend_follower':
+        return TrendFollowerDesk(capital_allocation=capital_allocation)
+    if key == 'renaissance':
+        return RenaissanceDesk(capital_allocation=capital_allocation)
+    if key == 'citadel':
+        return CitadelDesk(capital_allocation=capital_allocation)
     raise ValueError(f"unknown fund leg {key!r}")
 
 
@@ -84,7 +105,9 @@ def run_vq(start, end, *, limit=None, capital=100_000.0, seed=42,
 
 
 def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
-             dating='filing'):
+             dating='filing', legacy=False):
+    allocations = dict(LEGACY_FUND_ALLOCATIONS if legacy
+                       else FUND_ALLOCATIONS)
     wh = PitWarehouse()
     universe = _universe(wh, start, end, limit, seed)
     feed = WarehouseMarketData(wh)
@@ -110,7 +133,7 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
             risk_manager=RiskManager(position_stop_loss=0.50))
 
     fund = ReweightingFundBacktest(
-        dict(FUND_ALLOCATIONS), initial_capital=capital, seed=seed,
+        allocations, initial_capital=capital, seed=seed,
         weighting='risk_parity', market_data=feed,
         solo_curve_provider=solo_curve,
         orchestrator_factory=orchestrator_factory)
@@ -191,6 +214,9 @@ def main():
                     help='(vq mode) drop the short leg')
     ap.add_argument('--dating', choices=['filing', 'announce'],
                     default='filing', help='(fund mode) PEAD leg dating')
+    ap.add_argument('--legacy', action='store_true',
+                    help='(fund mode) mix the four stock-only frozen legacy '
+                         'desks into the fund (ownership-scoping exercise)')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
@@ -204,8 +230,9 @@ def main():
     else:
         summary, gate, n_trades, n_names = run_fund(
             args.start, args.end, limit=args.limit, seed=args.seed,
-            dating=args.dating)
-        label = (f"PEAD+VQ fund (risk-parity, long-only legs, "
+            dating=args.dating, legacy=args.legacy)
+        core = 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ'
+        label = (f"{core} fund (risk-parity, long-only core legs, "
                  f"{args.dating} dating)")
     print_report(summary, gate, n_trades, n_names, label, args.start,
                  args.end)
