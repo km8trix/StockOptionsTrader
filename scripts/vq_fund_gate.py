@@ -38,6 +38,15 @@ configuration; both arms FAIL the 0.95/BH gate (0 BH years). Deployment
 (mean ~0.62, min 0.39 in-run) bounds the cash-drag term: ~38% idle cash at
 the gate's 2% rf costs ~0.76%/yr of excess return — the residual
 engine-vs-paper Sharpe gap, now measured, not assumed.
+
+3-LEG RESULT (2026-07-10, --issuance --weighting static --dating announce,
+600 names seed 42): PEAD+VQ+issuance 1/3 each = 1732 trades, +73.1%, Sharpe
+0.36, maxDD -20.8%, PSR 0.8784 FAIL (0 BH years) — WORSE than the two-leg
+static 50/50. Solo issuance (--mode issuance): 489 trades, +45.4%, Sharpe
+0.21, PSR 0.7415 FAIL — the screen's 8/8 BH edge attenuates hard long-only
+ex-micro (the spread's short leg carried much of it). The weak leg dilutes
+more than decorrelation adds; deployment mean 0.596. DO NOT mix the
+issuance leg in this form — two-leg static stays the best honest fund.
 """
 
 from __future__ import annotations

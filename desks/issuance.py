@@ -37,6 +37,26 @@ Wide RiskManager (0.50 stop — monthly signal; a 2% stop would churn it).
 Monthly score cache (the base calls _alpha_scores daily), monthly effective
 cadence — the BMS cadence the screen validated. Run under
 ``BacktestEngine(desk=..., market_data=WarehouseMarketData())``.
+
+OVERLAP DISCLOSURE: in the three-leg fund this desk shares the ex-micro
+slice with ValueQualityDesk — the repo's first intentional same-slice
+overlap of two cross-sectional desks. Ownership scoping (PRs #87/#88) keeps
+the books honest, but co-owned positions carry documented residuals (a
+co-owner's full-size close takes the other's stake; the unscoped
+entry-block under-deploys whichever desk rebalances second), and the solo
+shadow curves do not model the interaction.
+
+GATE RESULT (2026-07-10, 600 names seed 42, 2015-2024): FAIL — solo 489
+trades, +45.4%, Sharpe 0.21, maxDD -24.7%, PSR 0.7415, 0 BH years. The 8/8
+BH cross-sectional screen edge attenuates hard in a long-only ex-micro
+top-quintile book (much of the spread lived in the short leg — heavy
+issuers). Three-leg fund (PEAD+VQ+issuance 1/3 static, announce): Sharpe
+0.36, PSR 0.8784 FAIL — WORSE than the two-leg static 50/50 (0.41/0.9113):
+the weak leg dilutes more than decorrelation adds. DO NOT mix this leg into
+the fund in this form. Not promoted; kept as a documented negative and
+reusable infrastructure (short leg unusable at retail; a long-short
+variant, or issuance as a FILTER on the VQ composite, are the untested
+follow-ups).
 """
 
 from __future__ import annotations
