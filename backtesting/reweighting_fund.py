@@ -67,7 +67,8 @@ class ReweightingFundBacktest:
                  risk_aggregator=None, seed: Optional[int] = None,
                  sizing_modulator=None,
                  solo_curve_provider: Optional[SoloCurveProvider] = None,
-                 orchestrator_factory: Optional[OrchestratorFactory] = None):
+                 orchestrator_factory: Optional[OrchestratorFactory] = None,
+                 market_data=None):
         if not allocations:
             raise ValueError(
                 "ReweightingFundBacktest requires at least one desk allocation")
@@ -91,6 +92,11 @@ class ReweightingFundBacktest:
         # FUND pass receives it — the N solo passes measure undistorted desk
         # risk and must never be throttled.
         self.sizing_modulator = sizing_modulator
+        # OPTIONAL market-data feed shared by the solo and fund engines
+        # (e.g. WarehouseMarketData for survivorship-free desks). None (the
+        # default) keeps every engine on its own MarketDataHandler —
+        # byte-identical to before.
+        self.market_data = market_data
         self._solo_curve_provider = (solo_curve_provider
                                      or self._default_solo_curve)
         self._orchestrator_factory = (orchestrator_factory
@@ -133,7 +139,7 @@ class ReweightingFundBacktest:
             initial_capital=self.initial_capital, commission=self.commission,
             slippage_bps=self.slippage_bps, spread_pct=self.spread_pct,
             per_contract_commission=self.per_contract_commission,
-            seed=self.seed)
+            seed=self.seed, market_data=self.market_data)
         # progress_callback covers only the fund pass (the N solo passes run
         # first); callers wanting whole-job progress should wrap accordingly.
         return engine.run(symbols, start_date, end_date,
@@ -159,7 +165,7 @@ class ReweightingFundBacktest:
             commission=self.commission, slippage_bps=self.slippage_bps,
             spread_pct=self.spread_pct,
             per_contract_commission=self.per_contract_commission,
-            seed=self.seed)
+            seed=self.seed, market_data=self.market_data)
         report = engine.run(list(symbols), start_date, end_date,
                             benchmark_symbol=None)
         if 'error' in report:

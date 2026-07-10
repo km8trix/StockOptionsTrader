@@ -38,19 +38,26 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from analysis.research_stats import benjamini_hochberg  # noqa: E402
-from data.earnings_surprise import sue_table  # noqa: E402
+from data.earnings_surprise import (  # noqa: E402
+    apply_announcement_dating, sue_table)
 from data.pit_warehouse import PitWarehouse  # noqa: E402
 from scripts.factor_screen import _print_report, factor_study  # noqa: E402
 from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
 
 
 def collect_sue_events(prov, names, rebal_dates, horizons, *,
-                       fresh_days=63, price_start=None, price_end=None):
+                       fresh_days=63, price_start=None, price_end=None,
+                       announcements=None):
     """One row per (name, rebalance) with a fresh PIT SUE: columns
-    ['date','name','sue','mcap'] + fwd_h. Cohort key = the rebalance date."""
+    ['date','name','sue','mcap'] + fwd_h. Cohort key = the rebalance date.
+    announcements (optional, PitWarehouse.earnings_events shape): re-dates
+    each SUE from the SF1 filing to the 8-K press release (--dating announce),
+    capturing the early-drift window the ~41-day filing lag forfeits."""
     maxh = max(horizons)
     eps = prov.eps_quarterly(list(names))
     sues = sue_table(eps)
+    if announcements is not None and len(announcements):
+        sues = apply_announcement_dating(sues, announcements)
     n_names = 0
     recs = []
     batch = getattr(prov, 'daily_metrics', None)
@@ -173,6 +180,11 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--winsor', type=float, default=0.01,
                     help='per-date forward-return winsorization (0 = off)')
+    ap.add_argument('--dating', choices=['filing', 'announce'],
+                    default='filing',
+                    help="event timestamp: SF1 filing datekey (strict PIT) "
+                         "or 8-K press-release date (needs events ingested; "
+                         "documented 8-K-EPS==10-Q-EPS approximation)")
     ap.add_argument('--selftest', action='store_true')
     cli = ap.parse_args(argv)
     if cli.selftest:
@@ -191,9 +203,16 @@ def main(argv=None):
     print(f"names={len(names)} rebalances={len(rebal)} "
           f"fresh_days={cli.fresh_days}", file=sys.stderr)
 
+    ann = None
+    if cli.dating == 'announce':
+        ann = wh.earnings_events(list(names))
+        if not len(ann):
+            raise SystemExit("--dating announce needs the events table: "
+                             "python -m data.pit_warehouse --tables events")
+        print(f"announcements={len(ann)}", file=sys.stderr)
     events, n_names = collect_sue_events(
         wh, names, rebal, cli.horizons, fresh_days=cli.fresh_days,
-        price_start=pstart, price_end=pend)
+        price_start=pstart, price_end=pend, announcements=ann)
     events = add_size_terciles(events)
 
     slices = [('pooled', events)] + [

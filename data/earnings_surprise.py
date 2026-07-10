@@ -95,6 +95,40 @@ def sue_table(eps: pd.DataFrame, *, window: int = 8,
             .reset_index(drop=True))
 
 
+def apply_announcement_dating(sue_rows: pd.DataFrame, events: pd.DataFrame,
+                              *, max_lead_days: int = 45) -> pd.DataFrame:
+    """Re-timestamp SUE rows from the SEC filing (datekey) to the earnings
+    ANNOUNCEMENT (8-K Item 2.02 press release), where one exists.
+
+    For each filing, the matched announcement is the latest event date in
+    [datekey - max_lead_days, datekey] that is on/after the row's own
+    reportperiod (an announcement cannot precede its quarter end — this also
+    keeps a delinquent old filing from stealing the NEXT quarter's
+    announcement). Unmatched rows keep their datekey.
+
+    APPROXIMATION, DOCUMENTED: the press release contained the EPS, so the
+    number was public at the announcement — but our SF1 row materializes at
+    the filing datekey, so announcement-dated backtests assume the 8-K EPS
+    equals the later-filed figure (rare, small discrepancies). Live trading
+    would read the press release directly; strict-PIT runs use filing dating.
+
+    events: columns ``ticker, date`` (PitWarehouse.earnings_events shape).
+    """
+    if (sue_rows is None or len(sue_rows) == 0
+            or events is None or len(events) == 0):
+        return sue_rows
+    s = sue_rows.sort_values('datekey').reset_index(drop=True)
+    e = (events.rename(columns={'date': 'ann_date'})
+         .sort_values('ann_date').reset_index(drop=True))
+    out = pd.merge_asof(s, e, left_on='datekey', right_on='ann_date',
+                        by='ticker', direction='backward',
+                        tolerance=pd.Timedelta(days=max_lead_days))
+    ok = out['ann_date'].notna() & (out['ann_date'] >= out['reportperiod'])
+    out['datekey'] = out['ann_date'].where(ok, out['datekey'])
+    return (out.drop(columns=['ann_date'])
+            .sort_values(['ticker', 'reportperiod']).reset_index(drop=True))
+
+
 def latest_fresh_sue(sue_rows: pd.DataFrame, asof, *,
                      fresh_days: int = 63) -> pd.Series:
     """ticker -> SUE of each ticker's latest filing visible at ``asof``,

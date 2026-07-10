@@ -42,7 +42,8 @@ FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 
 
 def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
-             long_only=False):
+             long_only=False, commission_bps=10.0, slippage_bps=5.0,
+             dating='filing'):
     wh = PitWarehouse()
     rb = pd.bdate_range(start, end, freq='BMS')
     universe = resolve_universe(wh, rb, SCALE_SMALL_MID)
@@ -50,8 +51,10 @@ def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
         # seeded RANDOM sample (not the alphabetical head) so a subset is
         # representative of the small/mid universe, not a-names only.
         universe = sorted(random.Random(seed).sample(universe, limit))
-    desk = PEADDesk(band, provider=wh, long_only=long_only)
+    desk = PEADDesk(band, provider=wh, long_only=long_only, dating=dating)
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
+                            commission=commission_bps / 1e4,
+                            slippage_bps=slippage_bps,
                             market_data=WarehouseMarketData(wh))
     report = engine.run(universe, start, end)
     returns, years = _daily_returns_with_years(report['portfolio_history'])
@@ -142,6 +145,16 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--long-only', action='store_true',
                     help='drop the short leg (long positive surprises only)')
+    ap.add_argument('--commission-bps', type=float, default=10.0,
+                    help='per-side commission in bps (engine default 10; '
+                         'IBKR-tiered small-cap is ~2-5)')
+    ap.add_argument('--slippage-bps', type=float, default=5.0,
+                    help='per-side adverse slippage in bps (engine default 5)')
+    ap.add_argument('--dating', choices=['filing', 'announce'],
+                    default='filing',
+                    help="SUE event timestamp: SF1 filing datekey (strict "
+                         "PIT) or 8-K press-release date (needs events "
+                         "ingested)")
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
@@ -149,7 +162,8 @@ def main():
         return
     summary, gate, n_trades, n_names = run_gate(
         args.band, args.start, args.end, limit=args.limit, seed=args.seed,
-        long_only=args.long_only)
+        long_only=args.long_only, commission_bps=args.commission_bps,
+        slippage_bps=args.slippage_bps, dating=args.dating)
     print_report(summary, gate, n_trades, n_names, args.band, args.start,
                  args.end)
 
