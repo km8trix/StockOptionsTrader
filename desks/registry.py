@@ -15,6 +15,7 @@ from desks.aqr import AqrDesk
 from desks.base import Desk
 from desks.citadel import CitadelDesk
 from desks.foundation import FoundationDesk
+from desks.issuance import IssuanceDesk
 from desks.janestreet import JaneStreetDesk
 from desks.orchestrator import FundOrchestrator
 from desks.pead import PEADDesk
@@ -215,6 +216,22 @@ _DESK_SPECS: Dict[str, Dict] = {
         'activates_in_phase': None,
         'accent': '#0969da',
         'factory': ValueQualityDesk,
+    },
+    'issuance': {
+        'name': 'Net-Issuance Desk',
+        'firm_inspiration': 'Academia (Pontiff & Woodgate / Daniel & Titman)',
+        'description': ('Cross-sectional net share issuance: long the names '
+                        'retiring shares (buybacks — lowest YoY '
+                        'split-adjusted share growth from PIT SF1 filings), '
+                        'short the heaviest issuers (suppressed by default: '
+                        'long-only). Requires the Sharadar PIT warehouse '
+                        '(sf1 + daily); without it the desk stays flat. '
+                        'Built as the third-leg candidate for the PEAD+VQ '
+                        'combine (scripts/vq_fund_gate.py --issuance).'),
+        'status': 'ready',
+        'activates_in_phase': None,
+        'accent': '#8250df',
+        'factory': IssuanceDesk,
     },
 }
 

@@ -73,82 +73,10 @@ if ROOT not in sys.path:
 
 from analysis.research_stats import benjamini_hochberg  # noqa: E402
 from data.pit_warehouse import PitWarehouse  # noqa: E402
+from data.share_issuance import _share_rows, issuance_table  # noqa: E402
 from scripts.factor_screen import _print_report, factor_study  # noqa: E402
 from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
 from scripts.pead_screen import add_size_terciles  # noqa: E402
-
-#: Seasonal-match window (sue_table convention): the year-ago quarter must
-#: sit this many calendar days back from the current reportperiod.
-_SEASONAL_LO_DAYS, _SEASONAL_HI_DAYS = 330, 410
-
-#: Relative epsilon for the share-count denominator/numerator: a >1e6-fold
-#: change in SPLIT-ADJUSTED shares within a year is data garbage (e.g.
-#: sharefactor==0 rows exist in SF1), not a corporate action.
-_REL_EPS = 1e-6
-
-
-def issuance_table(shares: pd.DataFrame, *, min_history: int = 4
-                   ) -> pd.DataFrame:
-    """Per-filing YoY net issuance rows from quarterly share-count history.
-
-    shares: columns ticker, reportperiod (datetime), datekey (datetime),
-    sharesbas, sharefactor — one row per (ticker, reportperiod), the
-    fundamentals_quarterly(fields=('sharesbas','sharefactor')) shape. Returns
-    the subset of filings with a computable issuance — columns ticker,
-    reportperiod, datekey, issuance — sorted by (ticker, reportperiod).
-
-    issuance = adjshares_t / adjshares_{t-4q} - 1 where adjshares =
-    sharesbas * sharefactor (split-adjusted, so a 2:1 split is NOT issuance).
-    NEGATIVE = net buyback = the academic long. Guards: both fields finite at
-    both quarters; relative-epsilon against zero/near-zero adjusted counts;
-    at least ``min_history`` PRIOR quarterly filings (thin gappy histories
-    dropped); and the sue_table out-of-order-filing rule — a row's datekey
-    must be the running max in reportperiod order, else the seasonal match
-    consumed a share count not yet public at the row's own datekey.
-    """
-    cols = ['ticker', 'reportperiod', 'datekey', 'issuance']
-    out = []
-    if shares is None or len(shares) == 0:
-        return pd.DataFrame(columns=cols)
-    for ticker, g in shares.groupby('ticker', sort=False):
-        g = g.sort_values('reportperiod')
-        rp = g['reportperiod'].to_numpy(dtype='datetime64[ns]')
-        base = pd.to_numeric(g['sharesbas'], errors='coerce').to_numpy(float)
-        fact = pd.to_numeric(g['sharefactor'], errors='coerce').to_numpy(float)
-        adj = base * fact                       # split-adjusted shares
-        n = len(g)
-        # Seasonal match vs the latest quarter 330-410 days earlier (calendar,
-        # not row position — a missing quarter skips, never misaligns).
-        lo = np.searchsorted(rp, rp - np.timedelta64(_SEASONAL_HI_DAYS, 'D'),
-                             side='left')
-        hi = np.searchsorted(rp, rp - np.timedelta64(_SEASONAL_LO_DAYS, 'D'),
-                             side='right')
-        iss = np.full(n, np.nan)
-        for i in range(n):
-            if hi[i] <= lo[i] or i < min_history:   # no match / thin history
-                continue
-            j = hi[i] - 1                           # latest match in window
-            cur, prev = adj[i], adj[j]
-            if not (np.isfinite(cur) and np.isfinite(prev)):
-                continue                            # a field NULL at a quarter
-            if min(cur, prev) <= _REL_EPS * max(cur, prev, 1.0):
-                continue                            # zero/near-zero garbage
-            iss[i] = cur / prev - 1.0
-        # Out-of-order-filing guard (see sue_table): the issuance is only
-        # PIT-clean if the year-ago row was filed on or before this row's own
-        # datekey; running-max datekey in reportperiod order enforces that.
-        dk = g['datekey'].to_numpy(dtype='datetime64[ns]')
-        in_order = dk == np.maximum.accumulate(dk)
-        keep = np.isfinite(iss) & in_order
-        if keep.any():
-            sub = g.loc[keep, ['ticker', 'reportperiod', 'datekey']].copy()
-            sub['issuance'] = iss[keep]
-            out.append(sub)
-    if not out:
-        return pd.DataFrame(columns=cols)
-    return (pd.concat(out, ignore_index=True)
-            .sort_values(['ticker', 'reportperiod'])
-            .reset_index(drop=True))
 
 
 def collect_issuance_events(prov, names, rebal_dates, horizons, *,
@@ -233,17 +161,6 @@ def long_leg_turnover(events: pd.DataFrame, factor: str = 'issuance', *,
             'mean_leg_size': float(np.mean([len(s) for _, s in legs])),
             'per_rebalance': float(np.mean(rates)),
             'annualized': float(np.mean(rates)) * 12.0}
-
-
-def _share_rows(ticker, counts, start='2020-03-31', lag_days=40, factor=1.0):
-    """Quarterly share rows: reportperiod every 3 months, datekey +lag_days."""
-    rows = []
-    for q, c in enumerate(counts):
-        rp = pd.Timestamp(start) + pd.DateOffset(months=3 * q)
-        rows.append({'ticker': ticker, 'reportperiod': rp,
-                     'datekey': rp + pd.Timedelta(days=lag_days),
-                     'sharesbas': float(c), 'sharefactor': float(factor)})
-    return rows
 
 
 def _selftest():

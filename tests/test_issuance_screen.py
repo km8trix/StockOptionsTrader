@@ -8,9 +8,19 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from data.share_issuance import _share_rows, issuance_table
 from scripts.factor_screen import factor_study
-from scripts.issuance_screen import (_share_rows, collect_issuance_events,
-                                     issuance_table, long_leg_turnover)
+from scripts.issuance_screen import collect_issuance_events, long_leg_turnover
+
+
+def test_screen_reexports_the_data_seam():
+    # The signal math lives in data/share_issuance (the sue_table seam
+    # convention); the screen re-imports it. Identity — not equality — pins
+    # that there is exactly ONE definition, so screen and desk can never
+    # drift apart.
+    import scripts.issuance_screen as screen
+    assert screen.issuance_table is issuance_table
+    assert screen._share_rows is _share_rows
 
 
 # ---------------------------------------------------------------------------
