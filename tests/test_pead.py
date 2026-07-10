@@ -8,6 +8,8 @@ in-memory fake provider — no network, no real warehouse.
 
 from __future__ import annotations
 
+import inspect
+
 import duckdb
 import numpy as np
 import pandas as pd
@@ -74,6 +76,49 @@ class TestSueTable:
             columns=['ticker', 'reportperiod', 'datekey', 'epsdil']))
         assert list(empty.columns) == ['ticker', 'reportperiod', 'datekey',
                                        'sue']
+
+    def test_column_default_pins_epsdil_behavior(self):
+        # The column parameter must be a pure generalization for existing
+        # desk/screen callers. Comparing default vs column='epsdil' on the
+        # NEW code would be tautological; the durable pin is (a) the default
+        # IS 'epsdil' and (b) the default path still produces the exact
+        # hand-computed SUE the pre-parameter code did (2.598 for this
+        # fixture — same value test_revenue_column_scale_free pins for the
+        # renamed column). Old-vs-new frame identity was additionally
+        # fuzz-verified across NaN/missing-quarter/delinquent fixtures in
+        # review (2026-07-10).
+        assert (inspect.signature(sue_table).parameters['column'].default
+                == 'epsdil')
+        eps = pd.DataFrame(_eps_rows('AAA', [1, 1, 1, 1, 2, 3, 2, 3, 5]))
+        out = sue_table(eps)
+        assert out['sue'].iloc[0] == pytest.approx(2.598, abs=1e-3)
+
+    def test_revenue_column_scale_free(self):
+        # SURGE = the same machinery on 'revenue'. Standardization is
+        # scale-free, so dollar-scale revenue must reproduce the EPS SUE
+        # exactly (same series x 1e9, different column name).
+        vals = [1, 1, 1, 1, 2, 3, 2, 3, 5]
+        eps = pd.DataFrame(_eps_rows('AAA', vals))
+        rev = eps.rename(columns={'epsdil': 'revenue'})
+        rev['revenue'] *= 1e9
+        out = sue_table(rev, column='revenue')
+        assert list(out.columns) == ['ticker', 'reportperiod', 'datekey',
+                                     'sue']
+        assert out['sue'].iloc[0] == pytest.approx(2.598, abs=1e-3)
+
+    def test_degenerate_guard_holds_at_revenue_scale(self):
+        # Steady dollar-scale growth with sub-dollar noise: seasonal diffs
+        # of ~$4e8 whose std (~$0.07) is huge vs any ABSOLUTE 1e-9 epsilon
+        # but noise vs the diff level. The RELATIVE epsilon
+        # (1e-9 * |mean diff| = $0.4 here) must still read this as
+        # degenerate. Scope honestly: the guard rejects FLOAT-ARITHMETIC
+        # noise only — a grower whose diffs vary at reporting granularity
+        # (whole dollars) still standardizes, exactly as sub-cent EPS
+        # variation always did.
+        rev = pd.DataFrame(_eps_rows(
+            'BBB', [1e9 + 1e8 * q + 0.05 * (q % 3) for q in range(12)]))
+        rev = rev.rename(columns={'epsdil': 'revenue'})
+        assert len(sue_table(rev, column='revenue')) == 0
 
 
 class TestLatestFreshSue:

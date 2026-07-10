@@ -21,7 +21,19 @@ Deterministic; warehouse-only (tickers + sep + sf1 + daily ingested).
 
     python -m scripts.pead_screen                    # full universe
     python -m scripts.pead_screen --limit 250        # seeded smoke subset
+    python -m scripts.pead_screen --field revenue    # SURGE (revenue surprise)
     python -m scripts.pead_screen --selftest         # offline, no warehouse
+
+SURGE RESULT (2026-07-10, --field revenue --dating announce, 4291 names /
+181,461 events): 2/8 BH survivors, micro only — 21d net +0.55% t=+3.23,
+63d net +2.96% t=+3.23. A real but weaker echo of EPS-SUE announce (4/8;
+micro 63d t=+5.09): comparable micro-63d magnitude, lower t, nothing
+outside micro. Independence on 215,296 matched filings: Spearman +0.34,
+sign agreement 62.8% (Pearson ~0 is winsorization-free tail noise —
+rank correlation is the honest number); degenerate-variance guard drops
+3.09% of revenue candidates vs 0.05% of EPS. Moderately independent ->
+a micro-band SUE x SURGE double-sort is the only combine worth testing;
+SURGE alone adds nothing outside micro. Screen-level only; no promotion.
 """
 
 from __future__ import annotations
@@ -47,15 +59,17 @@ from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E4
 
 def collect_sue_events(prov, names, rebal_dates, horizons, *,
                        fresh_days=63, price_start=None, price_end=None,
-                       announcements=None):
+                       announcements=None, field='epsdil'):
     """One row per (name, rebalance) with a fresh PIT SUE: columns
     ['date','name','sue','mcap'] + fwd_h. Cohort key = the rebalance date.
     announcements (optional, PitWarehouse.earnings_events shape): re-dates
     each SUE from the SF1 filing to the 8-K press release (--dating announce),
-    capturing the early-drift window the ~41-day filing lag forfeits."""
+    capturing the early-drift window the ~41-day filing lag forfeits.
+    field: SF1 quarterly column to standardize — 'epsdil' = classic SUE,
+    'revenue' = SURGE (Jegadeesh-Livnat 2006); same math either way."""
     maxh = max(horizons)
-    eps = prov.eps_quarterly(list(names))
-    sues = sue_table(eps)
+    eps = prov.fundamentals_quarterly(list(names), fields=(field,))
+    sues = sue_table(eps, column=field)
     if announcements is not None and len(announcements):
         sues = apply_announcement_dating(sues, announcements)
     n_names = 0
@@ -185,6 +199,15 @@ def main(argv=None):
                     help="event timestamp: SF1 filing datekey (strict PIT) "
                          "or 8-K press-release date (needs events ingested; "
                          "documented 8-K-EPS==10-Q-EPS approximation)")
+    ap.add_argument('--field', choices=['epsdil', 'revenue'],
+                    default='epsdil',
+                    help="SF1 quarterly column to standardize: 'epsdil' = "
+                         "classic SUE, 'revenue' = SURGE (standardized "
+                         "revenue-growth surprise, Jegadeesh-Livnat 2006). "
+                         "With --dating announce the EPS approximation "
+                         "extends to revenue: 8-K 2.02 press releases carry "
+                         "revenue too, and we treat it as equal to the later "
+                         "10-Q figure (same known-at-release caveat).")
     ap.add_argument('--selftest', action='store_true')
     cli = ap.parse_args(argv)
     if cli.selftest:
@@ -212,7 +235,8 @@ def main(argv=None):
         print(f"announcements={len(ann)}", file=sys.stderr)
     events, n_names = collect_sue_events(
         wh, names, rebal, cli.horizons, fresh_days=cli.fresh_days,
-        price_start=pstart, price_end=pend, announcements=ann)
+        price_start=pstart, price_end=pend, announcements=ann,
+        field=cli.field)
     events = add_size_terciles(events)
 
     slices = [('pooled', events)] + [
@@ -227,8 +251,9 @@ def main(argv=None):
         all_stats.extend(stats)
         pvals.extend(s['p'] for s in stats if not s.get('insufficient'))
     bh = benjamini_hochberg(pvals) if pvals else None
+    label = 'PEAD-SUE' if cli.field == 'epsdil' else 'SURGE-REV'
     _print_report(all_stats, bh, cli.cost_bps, n_names, len(events),
-                  label='PEAD-SUE')
+                  label=label)
     print("\n(tercile0=micro, 1=small, 2=mid — per-date event cross-sections "
           "on PIT marketcap; high SUE = long)")
     return 0
