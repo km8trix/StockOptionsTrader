@@ -7,6 +7,10 @@ Modes:
   --mode fund   PEAD(micro, long-only) + ValueQuality(long-only) through
                 ReweightingFundBacktest (risk-parity, monthly rebalance,
                 shadow-solo-book) — N+1 backtests, the honest combine.
+                --weighting static instead runs ONE engine at fixed
+                construction weights (reweighter=None, no solo shadow
+                passes) — the reweighter-vs-cash-drag A/B arm. Fund mode
+                also prints post-hoc deployment fractions (1 - cash/NAV).
 
 Both run on the survivorship-free warehouse feed with a seeded random
 small/mid universe subset, and apply the single research gate
@@ -16,6 +20,18 @@ tickers/sep/sf1/daily ingested; events too when --dating announce):
     python scripts/vq_fund_gate.py --mode vq --limit 600
     python scripts/vq_fund_gate.py --mode fund --limit 600
     python scripts/vq_fund_gate.py --selftest
+
+A/B RESULT (2026-07-10, --mode fund --limit 600 --dating announce, seed 42,
+2015-2024, post key-fix): static 50/50 = 1382 trades, +96.9%, Sharpe 0.41,
+maxDD -21.8%, PSR 0.9113 FAIL; TRUE risk parity (first ever run — the
+pre-fix "risk-parity" numbers were this static fund via the silent
+equal-weight fallback) = 1379 trades, +74.5%, Sharpe 0.35, maxDD -20.4%,
+PSR 0.8704 FAIL. Inverse-vol tilting HURTS this two-leg fund: it overweights
+the quieter leg into its flat stretches. Static weights are the better
+configuration; both arms FAIL the 0.95/BH gate (0 BH years). Deployment
+(mean ~0.62, min 0.39 in-run) bounds the cash-drag term: ~38% idle cash at
+the gate's 2% rf costs ~0.76%/yr of excess return — the residual
+engine-vs-paper Sharpe gap, now measured, not assumed.
 """
 
 from __future__ import annotations
@@ -50,20 +66,29 @@ FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 #: Fund legs: the strongest realized PEAD config + the VQ composite, both
 #: long-only (small-cap short legs bleed — insider/PEAD lesson), 50/50 start,
 #: risk-parity reweighted in-run.
-FUND_ALLOCATIONS = {'pead': 0.5, 'value_quality': 0.5}
+#:
+#: Allocation keys MUST equal the constructed desks' .key (pinned in
+#: tests/test_vq_fund_gate.py): ReweightingFundBacktest stores solo curves
+#: under the allocation key while DynamicReweighter looks them up by
+#: desk.key. Before 2026-07-10 this dict said 'pead' vs PEADDesk('micro').key
+#: == 'pead_micro', so every rebalance silently degenerated to the
+#: whole-fund equal-weight fallback — the recorded "risk-parity" PSR 0.9113
+#: baseline is de facto a static 50/50 fund (reweight_log: fallback=True
+#: throughout).
+FUND_ALLOCATIONS = {'pead_micro': 0.5, 'value_quality': 0.5}
 #: --legacy mix: the validated core keeps half the fund; the four stock-only
 #: frozen legacy desks split the rest. Exercises the fund-wide ownership
 #: scoping (Desk._owns_position) — legacy sweeps/exits must never close the
 #: PEAD/VQ books. Jane Street is left out: its vol books need synthetic
 #: options pricing (the documented premium-mispricing ruin) and its RV book
 #: is inert without an ETF in the small/mid universe.
-LEGACY_FUND_ALLOCATIONS = {'pead': 0.25, 'value_quality': 0.25,
+LEGACY_FUND_ALLOCATIONS = {'pead_micro': 0.25, 'value_quality': 0.25,
                            'foundation': 0.125, 'trend_follower': 0.125,
                            'renaissance': 0.125, 'citadel': 0.125}
 
 
 def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing'):
-    if key == 'pead':
+    if key == 'pead_micro':
         return PEADDesk('micro', provider=wh, long_only=True,
                         capital_allocation=capital_allocation, dating=dating)
     if key == 'value_quality':
@@ -104,8 +129,28 @@ def run_vq(start, end, *, limit=None, capital=100_000.0, seed=42,
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
+def _deployment_stats(portfolio_history):
+    """Mean/median/min deployed fraction (1 - cash/NAV) across the run's
+    daily snapshots. Pure post-hoc reporting on fields the engine already
+    records (portfolio/manager.record_snapshot) — the cash-drag diagnostic
+    for the engine-vs-paper Sharpe gap. None when there are no snapshots.
+
+    The day-1 snapshot is skipped: intents queue on the signal day and can
+    only fill at the NEXT open, so cash == NAV on day one by construction
+    and 'min' would always read 0.000 instead of measuring in-run drag.
+    The truthiness guard drops NAV == 0 snapshots (ruin) rather than
+    dividing by zero."""
+    fracs = [1.0 - float(h['cash']) / float(h['portfolio_value'])
+             for h in portfolio_history[1:] if float(h['portfolio_value'])]
+    if not fracs:
+        return None
+    s = pd.Series(fracs)
+    return {'mean': float(s.mean()), 'median': float(s.median()),
+            'min': float(s.min())}
+
+
 def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
-             dating='filing', legacy=False):
+             dating='filing', legacy=False, weighting='risk_parity'):
     allocations = dict(LEGACY_FUND_ALLOCATIONS if legacy
                        else FUND_ALLOCATIONS)
     wh = PitWarehouse()
@@ -132,18 +177,30 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
              for k, a in allocations.items()],
             risk_manager=RiskManager(position_stop_loss=0.50))
 
-    fund = ReweightingFundBacktest(
-        allocations, initial_capital=capital, seed=seed,
-        weighting='risk_parity', market_data=feed,
-        solo_curve_provider=solo_curve,
-        orchestrator_factory=orchestrator_factory)
-    report = fund.run(universe, start, end, benchmark_symbol=None)
+    if weighting == 'static':
+        # A/B arm: reweighter=None makes the engine run the fund at its
+        # construction-time weights unchanged (backtest_engine guard), so the
+        # N expensive solo shadow passes are skipped. Same orchestrator
+        # factory (wide 0.50 stop included), capital, seed, feed and default
+        # cost model as the risk-parity arm — it differs ONLY in weighting.
+        engine = BacktestEngine(
+            orchestrator=orchestrator_factory(allocations), reweighter=None,
+            initial_capital=capital, seed=seed, market_data=feed)
+        report = engine.run(universe, start, end, benchmark_symbol=None)
+    else:
+        fund = ReweightingFundBacktest(
+            allocations, initial_capital=capital, seed=seed,
+            weighting='risk_parity', market_data=feed,
+            solo_curve_provider=solo_curve,
+            orchestrator_factory=orchestrator_factory)
+        report = fund.run(universe, start, end, benchmark_symbol=None)
     if 'error' in report:
         raise SystemExit(f"fund backtest failed: {report['error']}")
     returns, years = _daily_returns_with_years(report['portfolio_history'])
     gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
     n_trades = len(report.get('closed_trades', []))
-    return report['summary'], gate, n_trades, len(universe)
+    deploy = _deployment_stats(report.get('portfolio_history', []))
+    return report['summary'], gate, n_trades, len(universe), deploy
 
 
 def print_report(summary, gate, n_trades, n_names, label, start, end):
@@ -214,6 +271,11 @@ def main():
                     help='(vq mode) drop the short leg')
     ap.add_argument('--dating', choices=['filing', 'announce'],
                     default='filing', help='(fund mode) PEAD leg dating')
+    ap.add_argument('--weighting', choices=['risk_parity', 'static'],
+                    default='risk_parity',
+                    help='(fund mode) risk_parity = in-run reweighting '
+                         '(default, unchanged); static = fixed construction '
+                         'weights, no reweighter, no solo shadow passes')
     ap.add_argument('--legacy', action='store_true',
                     help='(fund mode) mix the four stock-only frozen legacy '
                          'desks into the fund (ownership-scoping exercise)')
@@ -227,15 +289,22 @@ def main():
             args.start, args.end, limit=args.limit, seed=args.seed,
             long_only=args.long_only)
         label = 'Value+Quality' + (' (long-only)' if args.long_only else '')
+        deploy = None
     else:
-        summary, gate, n_trades, n_names = run_fund(
+        summary, gate, n_trades, n_names, deploy = run_fund(
             args.start, args.end, limit=args.limit, seed=args.seed,
-            dating=args.dating, legacy=args.legacy)
+            dating=args.dating, legacy=args.legacy,
+            weighting=args.weighting)
         core = 'PEAD+VQ+4 legacy desks' if args.legacy else 'PEAD+VQ'
-        label = (f"{core} fund (risk-parity, long-only core legs, "
+        wlabel = ('static weights' if args.weighting == 'static'
+                  else 'risk-parity')
+        label = (f"{core} fund ({wlabel}, long-only core legs, "
                  f"{args.dating} dating)")
     print_report(summary, gate, n_trades, n_names, label, args.start,
                  args.end)
+    if deploy is not None:
+        print(f"\n  Deployment (1 - cash/NAV): mean {deploy['mean']:.3f}"
+              f"  median {deploy['median']:.3f}  min {deploy['min']:.3f}")
 
 
 if __name__ == '__main__':
