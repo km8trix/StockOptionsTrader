@@ -74,6 +74,20 @@ HONESTY — read before quoting any number:
     python scripts/vrp_screen.py                    # after the ingest
     python scripts/vrp_screen.py --underlyings SPY
     python scripts/vrp_screen.py --selftest         # offline pinned asserts
+
+RESULT (2026-07-10, first and only run of the registered config; 23 months
+x 3 underlyings, 2024-08..2026-06, real Massive EOD chains): **VRP EXISTS
+BUT IS ECONOMICALLY UNHARVESTABLE AT RETAIL COSTS on this window.** Mean
+entry IV exceeded subsequent RV by just +1.0 to +2.2 vol points (pooled
++1.3) — real, small. Short-straddle P&L after the registered costs: SPY
+-$32.54/mo (win 39%), QQQ +$62.43 (61%), IWM +$77.07 (61%), pooled
++$35.66/mo, NW t +0.13 (p 0.896) — statistically indistinguishable from
+zero, with a single month (2026-04) costing -$3.6k pooled (the classic
+short-vol tail). The janestreet premium family's burial is hereby
+re-confirmed WITH REAL DATA: the synthetic-IV ruin was by construction,
+but even real premia at ~1-2 vol points cannot clear retail spread+
+commission costs at monthly ATM tenor. No paid deep-history options data
+is justified by this measurement. Nothing promoted.
 """
 
 from __future__ import annotations
