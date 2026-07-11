@@ -7,7 +7,8 @@ in NATIVE units — shares for equities, CONTRACTS for options (the broker's
 portfolio reports option quantity in contracts; market values differ x100
 from share-math, which is why comparisons happen on quantities and any
 value math goes through position_market_value's explicit multiplier).
-Cash must agree within $0.01.
+Cash must agree within cash_tolerance (default $0.01; operational callers
+widen it to absorb unreported per-fill fees — see reconcile()).
 
 ON MISMATCH THE CALLER ENGAGES THE KILL SWITCH — a book that disagrees
 with the broker means something filled, expired, or got assigned that the
@@ -40,7 +41,8 @@ def position_market_value(quantity: float, price: float,
 
 
 def reconcile(local_positions: Dict[str, float], local_cash: float,
-              broker, clock: Optional[Callable[[], datetime]] = None) -> Dict:
+              broker, clock: Optional[Callable[[], datetime]] = None,
+              cash_tolerance: float = CASH_TOLERANCE) -> Dict:
     """Compare the local book against broker.get_portfolio_status().
 
     Args:
@@ -51,6 +53,13 @@ def reconcile(local_positions: Dict[str, float], local_cash: float,
             'positions': [{'symbol', 'quantity', ...}]} (ExecutionBroker
             contract; LiveEtradeBroker maps option instruments to
             canonical keys).
+        cash_tolerance: dollars of cash disagreement to accept (default
+            CASH_TOLERANCE = $0.01, the strict check). Brokers rarely
+            report fees/commissions per fill, so the local book's cash
+            drifts by fee accrual between re-basings — routine
+            operational reconciles pass a fee-aware tolerance here (see
+            brokers.local_book.LocalBook). POSITION quantities are
+            always strict; only the cash check widens.
 
     Returns (contract C19):
         {'ok': bool,
@@ -77,7 +86,7 @@ def reconcile(local_positions: Dict[str, float], local_cash: float,
                                "local": local_qty, "broker": broker_qty})
 
     broker_cash = float(status.get("cash", 0.0))
-    if abs(float(local_cash) - broker_cash) > CASH_TOLERANCE:
+    if abs(float(local_cash) - broker_cash) > cash_tolerance:
         mismatches.append({"kind": "cash", "symbol": None,
                            "local": float(local_cash),
                            "broker": broker_cash})
@@ -88,6 +97,6 @@ def reconcile(local_positions: Dict[str, float], local_cash: float,
                      len(mismatches), mismatches)
     else:
         logger.info("Reconciliation clean: %d position keys, cash within "
-                    "$%.2f", len(broker_positions), CASH_TOLERANCE)
+                    "$%.2f", len(broker_positions), cash_tolerance)
     return {"ok": ok, "mismatches": mismatches,
             "checked_at": clock().isoformat()}

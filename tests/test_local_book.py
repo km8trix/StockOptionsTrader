@@ -61,6 +61,25 @@ class TestFillMath:
         assert snap["avg_price"] == pytest.approx(45.0)
         assert book.cash() == pytest.approx(900.0)   # shorts raise cash
 
+    def test_fees_reduce_cash_on_both_sides_never_touch_basis(self, book):
+        """Per-fill fees (brokers that report them): cash moves by
+        -signed_qty*price - fees — a fee costs cash on a BUY and on a
+        SELL — and the position basis stays fee-free."""
+        book.set_cash(1000.0)
+        book.record_fill("SPY", 10, 50.0, fees=1.25)   # -500 - 1.25
+        assert book.cash() == pytest.approx(1000.0 - 500.0 - 1.25)
+        assert (book.snapshot()["positions"]["SPY"]["avg_price"]
+                == pytest.approx(50.0))                # basis fee-free
+        book.record_fill("SPY", -10, 55.0, fees=1.25)  # +550 - 1.25
+        assert book.cash() == pytest.approx(
+            1000.0 - 500.0 - 1.25 + 550.0 - 1.25)
+        assert book.positions() == {}                  # closed clean
+
+    def test_fees_default_zero_is_byte_identical(self, book):
+        book.set_cash(100.0)
+        book.record_fill("SPY", 1, 50.0)
+        assert book.cash() == pytest.approx(50.0)
+
 
 class TestPersistenceAndScoping:
     def test_state_survives_a_new_instance_on_the_same_file(self, tmp_path):

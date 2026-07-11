@@ -89,6 +89,28 @@ class TestReconcile:
         broker = FakeBroker([], cash=1000.01)
         assert reconcile({}, 1000.00, broker)["ok"] is True
 
+    def test_fee_aware_cash_tolerance_widens_cash_only(self):
+        """cash_tolerance= absorbs unreported per-fill fee drift (the
+        operational pattern in brokers.local_book.LocalBook): a $3 cash
+        drift fails the strict default but passes at $5.00 — while a
+        POSITION drift still fails at any cash tolerance."""
+        broker = FakeBroker([], cash=997.00)
+        assert reconcile({}, 1000.00, broker)["ok"] is False  # default $0.01
+        assert reconcile({}, 1000.00, broker,
+                         cash_tolerance=5.00)["ok"] is True
+        # Just past the tolerance still fails.
+        assert reconcile({}, 1002.50, broker,
+                         cash_tolerance=5.00)["ok"] is False
+        # Positions stay strict regardless of cash tolerance.
+        drifted = FakeBroker([{"symbol": "AAPL", "quantity": 10}],
+                             cash=1000.00)
+        result = reconcile({"AAPL": 9}, 1000.00, drifted,
+                           cash_tolerance=5.00)
+        assert result["ok"] is False
+        assert result["mismatches"] == [{
+            "kind": "position", "symbol": "AAPL",
+            "local": 9.0, "broker": 10.0}]
+
     def test_option_position_contracts_with_multiplier(self):
         """Option quantities reconcile in CONTRACTS; the x100 lives in
         market-value math (position_market_value), never in quantity."""

@@ -12,10 +12,12 @@ ledger still match the broker?" and fail closed when it does not.
 
 The book records fills as the broker CONFIRMS them (order_status /
 executor fill reports), never intents — an intent that never filled must
-not appear here. Cash moves by -signed_qty * price per fill; commissions,
-fees, and paper-mode slippage are NOT modeled (the broker does not report
-them per-fill today), which is exactly the class of drift reconciliation
-exists to surface.
+not appear here. Cash moves by -signed_qty * price - fees per fill; the
+``fees`` keyword exists for brokers that report per-fill fees, but
+E*TRADE does not today, so commissions, fees, and paper-mode slippage
+are usually NOT modeled — exactly the class of drift reconciliation
+exists to surface (see the class docstring for the operational pattern
+that absorbs it).
 
 Position keys follow the reconcile convention: plain symbol for stock,
 canonical ``str(Asset)`` for options ("SPY 2026-07-17 $440.0 put").
@@ -44,6 +46,21 @@ ZERO_QTY_TOLERANCE = 1e-9
 
 class LocalBook:
     """Restart-surviving {position, cash} ledger backed by SQLite.
+
+    OPERATIONAL PATTERN — fee/slippage cash drift: brokers rarely report
+    fees per fill (record_fill's ``fees`` kwarg covers the ones that do),
+    so the book's cash drifts from the broker's by fee accrual even when
+    every position is exactly right. The routine is therefore:
+
+      * reconcile with a FEE-AWARE ``cash_tolerance`` (a few dollars,
+        sized to the account's fee run-rate) so routine drift does not
+        false-alarm the kill switch — see brokers.reconcile.reconcile()
+        and LiveTradingSession.run_reconciliation(cash_tolerance=...);
+      * after each VERIFIED-ok reconcile, RE-BASE the cash with
+        ``set_cash(broker_cash)`` so the accrued fee drift never
+        compounds toward the tolerance;
+      * POSITION quantities stay strict — only cash gets a tolerance. A
+        position mismatch is never routine drift.
 
     Args:
         db_path: SQLite path; defaults to env TRADING_DB_PATH, falling
@@ -90,7 +107,7 @@ class LocalBook:
 
     # ------------------------------------------------------------------
     def record_fill(self, symbol: str, signed_qty: float,
-                    price: float) -> None:
+                    price: float, fees: float = 0.0) -> None:
         """Apply one CONFIRMED fill: upsert the position, move the cash.
 
         Args:
@@ -100,16 +117,22 @@ class LocalBook:
             price: per-unit CASH price of the fill. For options the
                 caller passes fill_price * contract multiplier so the
                 cash leg is correct; quantity stays in native contracts.
+            fees: total fees/commissions the broker reported FOR THIS
+                FILL (dollars, always reduces cash). Default 0.0 — most
+                brokers do not report fees per fill; that unreported
+                drift is handled by the fee-aware reconcile + re-base
+                pattern in the class docstring.
 
-        Cash moves by -signed_qty * price (buys spend, sells raise).
-        avg_price: weighted average while adding in the same direction;
-        unchanged while reducing; reset to the fill price when the
-        position flips sign through zero. Rows that reach zero quantity
-        are deleted so positions() mirrors the broker's open-positions
-        view.
+        Cash moves by -signed_qty * price - fees (buys spend, sells
+        raise, fees always cost). avg_price: weighted average while
+        adding in the same direction; unchanged while reducing; reset to
+        the fill price when the position flips sign through zero (fees
+        never touch the basis). Rows that reach zero quantity are
+        deleted so positions() mirrors the broker's open-positions view.
         """
         signed_qty = float(signed_qty)
         price = float(price)
+        fees = float(fees)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -143,12 +166,13 @@ class LocalBook:
                 "INSERT INTO local_cash (env, cash) VALUES (?, ?) "
                 "ON CONFLICT(env) DO UPDATE SET "
                 "cash = local_cash.cash + excluded.cash",
-                (self.env, -signed_qty * price))
+                (self.env, -signed_qty * price - fees))
             conn.commit()
         finally:
             conn.close()
-        logger.info("LocalBook fill: %s %+g @ %.4f (cash %+.2f)",
-                    symbol, signed_qty, price, -signed_qty * price)
+        logger.info("LocalBook fill: %s %+g @ %.4f (cash %+.2f, fees %.2f)",
+                    symbol, signed_qty, price,
+                    -signed_qty * price - fees, fees)
 
     # ------------------------------------------------------------------
     def positions(self) -> Dict[str, float]:

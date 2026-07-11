@@ -545,6 +545,71 @@ class TestReconciliationWiring:
         assert result["ok"] is True
         assert switch.engaged() is False
 
+    def test_single_arg_is_a_caller_bug_not_a_halt(self, rails, tmp_path):
+        """Exactly one of local_positions/local_cash is ambiguous (which
+        half comes from the book?) — ValueError, and NO kill switch:
+        nothing was reconciled, nothing traded on a wrong book."""
+        from brokers.local_book import LocalBook
+        audit, switch = rails
+        book = LocalBook(str(tmp_path / "book.db"), env="sandbox")
+        session = make_session(FakeDesk([]), FakeBroker(), None, audit,
+                               switch, local_book=book)
+        with pytest.raises(ValueError, match="provide both or neither"):
+            session.run_reconciliation(local_positions={})
+        with pytest.raises(ValueError, match="provide both or neither"):
+            session.run_reconciliation(local_cash=100_000.0)
+        assert switch.engaged() is False
+
+    def test_book_read_failure_fails_closed(self, rails):
+        """FAIL-CLOSED rail: a local_book whose reads raise engages the
+        kill switch BEFORE the exception propagates — an unreadable book
+        is indistinguishable from drift (mirrors _check_circuit_breaker)."""
+        audit, switch = rails
+
+        class ExplodingBook:
+            def positions(self):
+                raise RuntimeError("book db gone")
+
+            def cash(self):
+                return 0.0
+
+        session = make_session(FakeDesk([]), FakeBroker(), None, audit,
+                               switch, local_book=ExplodingBook())
+        with pytest.raises(RuntimeError, match="book db gone"):
+            session.run_reconciliation()
+        assert switch.engaged() is True
+
+    def test_reconcile_fn_failure_fails_closed(self, rails):
+        """Same rail for the reconcile itself (broker dark mid-compare):
+        engage the switch, then re-raise."""
+        audit, switch = rails
+
+        def dark_broker_reconcile(local_positions, local_cash, broker):
+            raise ConnectionError("broker unreachable")
+
+        session = make_session(FakeDesk([]), FakeBroker(), None, audit,
+                               switch, reconcile_fn=dark_broker_reconcile)
+        with pytest.raises(ConnectionError, match="broker unreachable"):
+            session.run_reconciliation({}, 100_000.0)
+        assert switch.engaged() is True
+
+    def test_cash_tolerance_passes_through(self, rails, tmp_path):
+        """Fee-aware operational reconcile: a $3 unreported-fee cash
+        drift passes at cash_tolerance=5.00 but fails (and halts) at the
+        strict default — positions unaffected either way."""
+        from brokers.local_book import LocalBook
+        audit, switch = rails
+        book = LocalBook(str(tmp_path / "book.db"), env="sandbox")
+        book.set_cash(100_000.0 - 3.0)  # FakeBroker reports 100k
+        session = make_session(FakeDesk([]), FakeBroker(), None, audit,
+                               switch, local_book=book)
+        assert session.run_reconciliation(cash_tolerance=5.00)["ok"] is True
+        assert switch.engaged() is False
+        # cash_tolerance=None (the default) keeps reconcile's strict $0.01.
+        result = session.run_reconciliation()
+        assert result["ok"] is False
+        assert switch.engaged() is True
+
 
 class TestLocalBookWiring:
     """Step 5 opt-in persistent book: local_book=None is byte-identical
@@ -611,6 +676,59 @@ class TestLocalBookWiring:
         assert result["status"] == "ok"
         assert book.positions() == {"SPY": 4.0}
         assert book.cash() == pytest.approx(1_000.0 - 4 * 50.0)
+
+    def test_direct_path_books_partial_then_cancelled_fill(self, rails,
+                                                           tmp_path):
+        """A partial-then-cancelled order (terminal CANCELLED with real
+        fills attached) books the CONFIRMED partial quantity — those 2
+        units are a real position change, whatever the status says."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.set_cash(1_000.0)
+
+        class PartialCancelBroker(FakeBroker):
+            def order_status(self, order_id):
+                return {"status": "CANCELLED", "filled_quantity": 2,
+                        "avg_fill_price": 50.0}
+
+        intent = DeskIntent(SPY, "BUY", 0.1, "t", quantity=4)
+        session = make_session(FakeDesk([intent]), PartialCancelBroker(),
+                               None, audit, switch, local_book=book)
+        assert session.evaluate_once()["status"] == "ok"
+        assert book.positions() == {"SPY": 2.0}
+        assert book.cash() == pytest.approx(1_000.0 - 2 * 50.0)
+
+    def test_direct_path_books_working_partial_after_nudge(self, rails,
+                                                           tmp_path):
+        """E*TRADE 'PARTIAL' (still working): the second poll's confirmed
+        partial quantity is booked; anything filling after the two-poll
+        window is reconciliation's job (known bound, see docstring)."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.set_cash(1_000.0)
+
+        class PartialAfterNudge(FakeBroker):
+            def __init__(self):
+                super().__init__()
+                self.nudged = False
+
+            def get_portfolio_status(self):
+                self.nudged = True
+                return super().get_portfolio_status()
+
+            def order_status(self, order_id):
+                if not self.nudged:
+                    return {"status": "OPEN", "filled_quantity": 0,
+                            "avg_fill_price": None}
+                return {"status": "PARTIAL", "filled_quantity": 3,
+                        "avg_fill_price": 50.0}
+
+        intent = DeskIntent(SPY, "BUY", 0.1, "t", quantity=4)
+        session = make_session(FakeDesk([intent]), PartialAfterNudge(),
+                               None, audit, switch, local_book=book)
+        assert session.evaluate_once()["status"] == "ok"
+        assert book.positions() == {"SPY": 3.0}
+        assert book.cash() == pytest.approx(1_000.0 - 3 * 50.0)
 
     def test_direct_path_unconfirmed_fill_records_nothing(self, rails,
                                                           tmp_path):

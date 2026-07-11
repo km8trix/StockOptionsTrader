@@ -82,6 +82,20 @@ class ExecutionBroker(ABC):
              'filled_quantity': float, # cumulative units filled so far
              'avg_fill_price': float | None}  # avg price of those fills
 
+        MULTI-LEG DEVIATION (E*TRADE spreads): legs fill as a PACKAGE,
+        so for a multi-leg order the E*TRADE implementation reports
+        package units, not per-leg sums —
+            filled_quantity = min(filledQuantity across legs)
+              (package contracts filled; summing legs would report n*q
+              and make a partial look complete to the poller), and
+            avg_fill_price  = the SIGNED net package price per unit
+              (+ debit paid, NEGATIVE = credit received, matching
+              build_spread_order's convention) — NOT any single leg's
+              price.
+        Consumers averaging or cash-flowing fills must therefore treat
+        avg_fill_price as a signed package net whenever the order id
+        refers to a spread (see brokers.etrade_client.order_status).
+
         Returns None when the broker does not know the order id. This is
         the same contract execution.patient_executor polls (its module
         docstring documents the terminal-status vocabulary) and the one

@@ -248,7 +248,14 @@ def run_paper() -> int:
     audit2 = AuditLog(rails_db, env="sandbox")
     switch2 = KillSwitch(rails_db, audit=audit2)
     session2 = _build_session(broker2, book2, audit2, switch2)
-    recon = session2.run_reconciliation()              # book-aware, no args
+    # Wired-book reconcile with the OPERATIONAL fee-aware cash tolerance
+    # (brokers.local_book.LocalBook class docstring): brokers rarely
+    # report fees per fill, so live cash drifts by fee accrual — routine
+    # reconciles widen the CASH check (positions stay strict) and re-base
+    # with set_cash(broker_cash) after each verified-ok pass. Paper fees
+    # are zero, so $5.00 changes nothing here — the point is exercising
+    # the pattern the live loop runs.
+    recon = session2.run_reconciliation(cash_tolerance=5.00)
     ok = (recon["ok"] is True and recon["mismatches"] == []
           and not switch2.engaged())
     _step(5, "reconcile-across-restart: zero drift", ok,
@@ -262,7 +269,9 @@ def run_paper() -> int:
         conn.commit()
     finally:
         conn.close()
-    recon = session2.run_reconciliation()
+    # Same fee-aware tolerance as step 5: a POSITION mismatch must fail
+    # regardless of how wide the cash check is (positions stay strict).
+    recon = session2.run_reconciliation(cash_tolerance=5.00)
     ok = (recon["ok"] is False and len(recon["mismatches"]) == 1
           and switch2.engaged())
     _step(6, "drift detection engages the kill switch (fail-closed)", ok,
@@ -328,7 +337,13 @@ def run_sandbox() -> int:
             print("[FAIL] no sandbox accounts returned")
             return 12
         account_id_key = accounts[0]["accountIdKey"]
-        broker = LiveEtradeBroker(client, account_id_key)
+        # price_sanity_threshold=None: the $1.00 far limit below is a
+        # DELIBERATE never-marketable probe (>50% from any AAPL quote),
+        # which would trip the default fat-finger guard (PriceSanityError
+        # at 0.5). The sanity guard exists to catch fat fingers on real
+        # orders, not to veto probes that must never fill by design.
+        broker = LiveEtradeBroker(client, account_id_key,
+                                  price_sanity_threshold=None)
         print(f"[PASS] connected: accountIdKey={account_id_key}")
         status = broker.get_portfolio_status()
         print(f"[PASS] portfolio snapshot: cash={status.get('cash')} "
@@ -336,6 +351,7 @@ def run_sandbox() -> int:
         # Far-from-market limit so this NEVER fills; cancelled in finally.
         from core.models import OrderType
         order_id = None
+        cancel_ok = True
         try:
             order_id = broker.place_order(
                 Asset("AAPL", AssetType.STOCK), OrderType.BUY, 1, 1.00)
@@ -344,9 +360,17 @@ def run_sandbox() -> int:
             print(f"[PASS] order_status: {st}")
         finally:
             if order_id is not None:
-                cancelled = broker.cancel_order(order_id)
-                print(f"[{'PASS' if cancelled else 'FAIL'}] cancel: "
-                      f"{cancelled}")
+                # A raise here propagates to the outer handler (exit 13);
+                # a False return is trapped below (exit 14) — either way
+                # a working order we could not kill is NEVER a success.
+                cancel_ok = broker.cancel_order(order_id)
+                print(f"[{'PASS' if cancel_ok else 'FAIL'}] cancel: "
+                      f"{cancel_ok}")
+        if not cancel_ok:
+            print(f"[FAIL] cancel_order({order_id}) returned False — a "
+                  "live working order may still be resting at E*TRADE. "
+                  "Cancel it manually (GUI or E*TRADE web) before rerunning.")
+            return 14
         print("\nSandbox leg complete — transport, order_status and "
               "cancel exercised for real.")
         return 0
