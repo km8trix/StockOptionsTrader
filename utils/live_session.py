@@ -96,6 +96,14 @@ class LiveTradingSession:
             broker's own ``circuit_breaker`` attribute when present
             (LiveEtradeBroker auto-wires one); evaluated at the top of
             every evaluate_once(), fail-closed (module docstring).
+        local_book: optional brokers.local_book.LocalBook (Step 5,
+            OPT-IN — default None changes nothing). When set, every
+            CONFIRMED fill is recorded into the persistent book (the
+            executor path records the report's banked fills; the
+            direct-market path confirms via broker.order_status), and
+            run_reconciliation() called without arguments reconciles
+            book.positions()/book.cash() against the broker — the
+            restart-surviving zero-drift check.
         clock: injectable callable -> aware datetime.
     """
 
@@ -110,6 +118,7 @@ class LiveTradingSession:
                  auth_manager=None,
                  reconcile_fn: Optional[Callable] = None,
                  circuit_breaker=_AUTO,
+                 local_book=None,
                  clock: Optional[Callable[[], datetime]] = None,
                  orchestrator=None,
                  enforce_market_hours: bool = False):
@@ -137,6 +146,8 @@ class LiveTradingSession:
         if circuit_breaker is LiveTradingSession._AUTO:
             circuit_breaker = getattr(broker, "circuit_breaker", None)
         self.circuit_breaker = circuit_breaker
+        # Step 5, OPT-IN (None = byte-identical behavior, pinned in tests).
+        self.local_book = local_book
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         # When True, evaluate_once() refuses to trade outside the NYSE regular
         # session (a manual call off-hours otherwise transmits — the scheduler
@@ -380,7 +391,87 @@ class LiveTradingSession:
             report_payload["error_type"] = report.get("error_type")
         self.audit.append("live_session", "execution_report",
                           report_payload)
+        if self.local_book is not None:
+            self._record_fills_to_book(intent, side, report)
         return report
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _book_key(asset) -> str:
+        """Reconcile-convention position key: plain symbol for stock,
+        canonical str(Asset) for options (brokers.reconcile docstring)."""
+        return (asset.symbol if asset.multiplier == 1 else str(asset))
+
+    def _record_fills_to_book(self, intent, side: str, report: Dict) -> None:
+        """Record CONFIRMED fills from this execution into the local book.
+
+        Records what the broker CONFIRMS, never the intent:
+          * executor path — the report's banked fills (per-slice qty/price;
+            present on every terminal status, including 'partial'/'killed'/
+            'error', because banked fills are real position changes);
+          * direct-market path — broker.order_status(order_id). ANY
+            confirmed filled_quantity > 0 is booked, whatever the status
+            string says — E*TRADE reports 'PARTIAL' while working and a
+            partial-then-cancelled order ends CANCELLED with real fills
+            attached; those units are position changes and must not be
+            dropped on the floor. A status with no fill yet gets one
+            get_portfolio_status() nudge (ABC surface; PaperTrader
+            processes pending fills there, a live broker treats it as a
+            harmless snapshot read) before the second poll. The two-poll
+            window is a KNOWN BOUND: a fill landing after the second
+            poll is missed here and surfaces as drift — reconciliation
+            is the backstop for late fills. Note the direct path is the
+            paper-parity path — live wiring goes through the
+            PatientExecutor (module docstring).
+
+        Cash moves at fill_price x asset.multiplier per unit (options
+        cash-flow the x100 contract multiplier; stock is x1). NEVER
+        raises: a book-recording failure must not halt the session — the
+        resulting drift is exactly what reconciliation exists to catch.
+        """
+        try:
+            sign = 1.0 if side == "BUY" else -1.0
+            key = self._book_key(intent.asset)
+            multiplier = intent.asset.multiplier
+            fills = report.get("fills") or []
+            if fills:
+                for fill in fills:
+                    qty = float(fill.get("qty", 0) or 0)
+                    price = fill.get("price")
+                    if qty > 0 and price is not None:
+                        self.local_book.record_fill(
+                            key, sign * qty, float(price) * multiplier)
+                return
+            order_id = report.get("order_id")
+            if order_id is None:
+                return
+            status = self.broker.order_status(order_id)
+            if not self._confirmed_fill_qty(status):
+                self.broker.get_portfolio_status()
+                status = self.broker.order_status(order_id)
+            qty = self._confirmed_fill_qty(status)
+            price = status.get("avg_fill_price") if status else None
+            if qty > 0 and price is not None:
+                self.local_book.record_fill(
+                    key, sign * qty, float(price) * multiplier)
+            else:
+                logger.warning(
+                    "Local book: no confirmed fill for order %s "
+                    "(status=%s) — any late fill surfaces at "
+                    "reconciliation", order_id,
+                    status.get("status") if status else None)
+        except Exception as e:  # noqa: BLE001 - book must never halt the session
+            logger.error("Local book recording failed (%s): %s — drift "
+                         "surfaces at reconciliation", type(e).__name__, e)
+
+    @staticmethod
+    def _confirmed_fill_qty(status: Optional[Dict]) -> float:
+        """Broker-confirmed filled units in a status dict (0.0 when none).
+        Deliberately status-string-agnostic: partial fills ('PARTIAL',
+        or CANCELLED-after-partial) are real position changes."""
+        if status is None:
+            return 0.0
+        return float(status.get("filled_quantity") or 0)
 
     def _size_from_fraction(self, intent) -> Optional[int]:
         """Dollar sizing fallback when an intent carries no quantity:
@@ -399,11 +490,64 @@ class LiveTradingSession:
         return int(dollars // (price * intent.asset.multiplier))
 
     # ------------------------------------------------------------------
-    def run_reconciliation(self, local_positions: Dict[str, float],
-                           local_cash: float) -> Dict:
+    def run_reconciliation(self,
+                           local_positions: Optional[Dict[str, float]] = None,
+                           local_cash: Optional[float] = None,
+                           cash_tolerance: Optional[float] = None) -> Dict:
         """C19 wiring: reconcile, and on NOT-ok engage the kill switch —
-        a book the broker disagrees with must stop trading immediately."""
-        result = self.reconcile_fn(local_positions, local_cash, self.broker)
+        a book the broker disagrees with must stop trading immediately.
+
+        Called with explicit local_positions AND local_cash this behaves
+        as before (explicit args win over the book). Called with NO
+        arguments it reads the wired local_book (Step 5) — the
+        restart-surviving ledger — and raises ValueError when neither is
+        available (reconciling an implicit empty book would report fake
+        drift or fake cleanliness). Exactly ONE of the two provided is a
+        caller bug: raises ValueError('provide both or neither').
+
+        cash_tolerance=None keeps reconcile's default ($0.01); pass a
+        fee-aware dollar tolerance for routine operational reconciles
+        (brokers rarely report fees per fill — see
+        brokers.local_book.LocalBook).
+
+        FAIL-CLOSED: an exception from the book reads or from
+        reconcile_fn engages the kill switch before re-raising
+        (mirroring _check_circuit_breaker) — a reconciliation that
+        CANNOT run must never be treated as clean.
+        """
+        # Caller-bug guards stay OUTSIDE the fail-closed rail: nothing was
+        # read or reconciled yet, so there is nothing to fail closed on.
+        if (local_positions is None) != (local_cash is None):
+            raise ValueError(
+                "run_reconciliation(): local_positions/local_cash — "
+                "provide both or neither")
+        if local_positions is None and self.local_book is None:
+            raise ValueError(
+                "run_reconciliation() needs explicit local_positions/"
+                "local_cash when no local_book is wired")
+        try:
+            if local_positions is None:
+                local_positions = self.local_book.positions()
+                local_cash = self.local_book.cash()
+            if cash_tolerance is None:
+                # No kwarg: any injected reconcile_fn keeps its signature.
+                result = self.reconcile_fn(local_positions, local_cash,
+                                           self.broker)
+            else:
+                result = self.reconcile_fn(local_positions, local_cash,
+                                           self.broker,
+                                           cash_tolerance=cash_tolerance)
+        except Exception as e:
+            # FAIL-CLOSED (docstring): a book that cannot be read or a
+            # reconcile that cannot run is indistinguishable from drift.
+            logger.error("Reconciliation could not run (%s: %s) — "
+                         "engaging the kill switch", type(e).__name__, e)
+            if self.kill_switch is not None:
+                self.kill_switch.engage(
+                    reason=(f"reconciliation could not run: "
+                            f"{type(e).__name__}: {e}"),
+                    actor="reconciliation")
+            raise
         self.last_reconciliation = result
         self.audit.append("live_session", "reconciliation", {
             "ok": result["ok"],
