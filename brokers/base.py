@@ -69,6 +69,27 @@ class ExecutionBroker(ABC):
         """Cancel a pending order; return True if an order was cancelled."""
 
     @abstractmethod
+    def order_status(self, order_id: str) -> Optional[Dict]:
+        """Status of an order, for fill polling and confirmation.
+
+        Contract (Step 5 — previously duck-typed, satisfied by all
+        implementations; now part of the ABC so the operational loop can
+        rely on it):
+
+            {'status': str,            # 'OPEN' while working; terminal:
+                                       # 'FILLED'/'EXECUTED'/'CANCELLED'/
+                                       # 'REJECTED'/'EXPIRED'
+             'filled_quantity': float, # cumulative units filled so far
+             'avg_fill_price': float | None}  # avg price of those fills
+
+        Returns None when the broker does not know the order id. This is
+        the same contract execution.patient_executor polls (its module
+        docstring documents the terminal-status vocabulary) and the one
+        utils.live_session uses to confirm fills into the persistent
+        local book.
+        """
+
+    @abstractmethod
     def get_portfolio_status(self) -> Dict:
         """Return a snapshot of cash, portfolio value, and open positions."""
 

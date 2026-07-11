@@ -96,6 +96,14 @@ class LiveTradingSession:
             broker's own ``circuit_breaker`` attribute when present
             (LiveEtradeBroker auto-wires one); evaluated at the top of
             every evaluate_once(), fail-closed (module docstring).
+        local_book: optional brokers.local_book.LocalBook (Step 5,
+            OPT-IN — default None changes nothing). When set, every
+            CONFIRMED fill is recorded into the persistent book (the
+            executor path records the report's banked fills; the
+            direct-market path confirms via broker.order_status), and
+            run_reconciliation() called without arguments reconciles
+            book.positions()/book.cash() against the broker — the
+            restart-surviving zero-drift check.
         clock: injectable callable -> aware datetime.
     """
 
@@ -110,6 +118,7 @@ class LiveTradingSession:
                  auth_manager=None,
                  reconcile_fn: Optional[Callable] = None,
                  circuit_breaker=_AUTO,
+                 local_book=None,
                  clock: Optional[Callable[[], datetime]] = None,
                  orchestrator=None,
                  enforce_market_hours: bool = False):
@@ -137,6 +146,8 @@ class LiveTradingSession:
         if circuit_breaker is LiveTradingSession._AUTO:
             circuit_breaker = getattr(broker, "circuit_breaker", None)
         self.circuit_breaker = circuit_breaker
+        # Step 5, OPT-IN (None = byte-identical behavior, pinned in tests).
+        self.local_book = local_book
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         # When True, evaluate_once() refuses to trade outside the NYSE regular
         # session (a manual call off-hours otherwise transmits — the scheduler
@@ -380,7 +391,79 @@ class LiveTradingSession:
             report_payload["error_type"] = report.get("error_type")
         self.audit.append("live_session", "execution_report",
                           report_payload)
+        if self.local_book is not None:
+            self._record_fills_to_book(intent, side, report)
         return report
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _book_key(asset) -> str:
+        """Reconcile-convention position key: plain symbol for stock,
+        canonical str(Asset) for options (brokers.reconcile docstring)."""
+        return (asset.symbol if asset.multiplier == 1 else str(asset))
+
+    def _record_fills_to_book(self, intent, side: str, report: Dict) -> None:
+        """Record CONFIRMED fills from this execution into the local book.
+
+        Records what the broker CONFIRMS, never the intent:
+          * executor path — the report's banked fills (per-slice qty/price;
+            present on every terminal status, including 'partial'/'killed'/
+            'error', because banked fills are real position changes);
+          * direct-market path — broker.order_status(order_id). A paper
+            market order sits pending until the broker processes it, so an
+            unconfirmed status gets one get_portfolio_status() nudge
+            (ABC surface; PaperTrader processes pending fills there, a
+            live broker treats it as a harmless snapshot read) before the
+            second poll. Note the direct path is the paper-parity path —
+            live wiring goes through the PatientExecutor (module
+            docstring).
+
+        Cash moves at fill_price x asset.multiplier per unit (options
+        cash-flow the x100 contract multiplier; stock is x1). NEVER
+        raises: a book-recording failure must not halt the session — the
+        resulting drift is exactly what reconciliation exists to catch.
+        """
+        try:
+            sign = 1.0 if side == "BUY" else -1.0
+            key = self._book_key(intent.asset)
+            multiplier = intent.asset.multiplier
+            fills = report.get("fills") or []
+            if fills:
+                for fill in fills:
+                    qty = float(fill.get("qty", 0) or 0)
+                    price = fill.get("price")
+                    if qty > 0 and price is not None:
+                        self.local_book.record_fill(
+                            key, sign * qty, float(price) * multiplier)
+                return
+            order_id = report.get("order_id")
+            if order_id is None:
+                return
+            status = self.broker.order_status(order_id)
+            if not self._is_filled(status):
+                self.broker.get_portfolio_status()
+                status = self.broker.order_status(order_id)
+            if self._is_filled(status):
+                qty = float(status.get("filled_quantity") or 0)
+                price = status.get("avg_fill_price")
+                if qty > 0 and price is not None:
+                    self.local_book.record_fill(
+                        key, sign * qty, float(price) * multiplier)
+            else:
+                logger.warning(
+                    "Local book: fill for order %s not confirmed "
+                    "(status=%s) — any resulting drift surfaces at "
+                    "reconciliation", order_id,
+                    status.get("status") if status else None)
+        except Exception as e:  # noqa: BLE001 - book must never halt the session
+            logger.error("Local book recording failed (%s): %s — drift "
+                         "surfaces at reconciliation", type(e).__name__, e)
+
+    @staticmethod
+    def _is_filled(status: Optional[Dict]) -> bool:
+        return (status is not None
+                and str(status.get("status") or "").upper()
+                in ("FILLED", "EXECUTED"))
 
     def _size_from_fraction(self, intent) -> Optional[int]:
         """Dollar sizing fallback when an intent carries no quantity:
@@ -399,10 +482,25 @@ class LiveTradingSession:
         return int(dollars // (price * intent.asset.multiplier))
 
     # ------------------------------------------------------------------
-    def run_reconciliation(self, local_positions: Dict[str, float],
-                           local_cash: float) -> Dict:
+    def run_reconciliation(self,
+                           local_positions: Optional[Dict[str, float]] = None,
+                           local_cash: Optional[float] = None) -> Dict:
         """C19 wiring: reconcile, and on NOT-ok engage the kill switch —
-        a book the broker disagrees with must stop trading immediately."""
+        a book the broker disagrees with must stop trading immediately.
+
+        Called with explicit local_positions/local_cash this behaves as
+        before. Called with NO arguments it reads the wired local_book
+        (Step 5) — the restart-surviving ledger — and raises ValueError
+        when neither is available (reconciling an implicit empty book
+        would report fake drift or fake cleanliness).
+        """
+        if local_positions is None or local_cash is None:
+            if self.local_book is None:
+                raise ValueError(
+                    "run_reconciliation() needs explicit local_positions/"
+                    "local_cash when no local_book is wired")
+            local_positions = self.local_book.positions()
+            local_cash = self.local_book.cash()
         result = self.reconcile_fn(local_positions, local_cash, self.broker)
         self.last_reconciliation = result
         self.audit.append("live_session", "reconciliation", {

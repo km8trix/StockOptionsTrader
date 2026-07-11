@@ -544,3 +544,191 @@ class TestReconciliationWiring:
         result = session.run_reconciliation({}, 100_000.0)
         assert result["ok"] is True
         assert switch.engaged() is False
+
+
+class TestLocalBookWiring:
+    """Step 5 opt-in persistent book: local_book=None is byte-identical
+    (pinned — the session never even touches order_status); when set,
+    CONFIRMED fills land in the book and no-arg run_reconciliation reads
+    book.positions()/cash()."""
+
+    @staticmethod
+    def _book(tmp_path):
+        from brokers.local_book import LocalBook
+        return LocalBook(str(tmp_path / "book.db"), env="sandbox")
+
+    def test_default_none_never_touches_order_status(self, rails):
+        """Byte-identity pin: without a local_book the direct path is
+        exactly as before — a broker with a booby-trapped order_status
+        (and get_portfolio_status) still evaluates cleanly."""
+        audit, switch = rails
+
+        class TrappedBroker(FakeBroker):
+            def order_status(self, order_id):
+                raise AssertionError("order_status must not be called")
+
+            def get_portfolio_status(self):
+                raise AssertionError(
+                    "get_portfolio_status must not be called")
+
+        intent = DeskIntent(SPY, "BUY", 0.1, "t", quantity=4)
+        desk = FakeDesk([intent])
+        broker = TrappedBroker()
+        session = make_session(desk, broker, None, audit, switch)
+        assert session.local_book is None
+        result = session.evaluate_once()
+        assert result["status"] == "ok"
+        assert len(broker.orders) == 1
+
+    def test_direct_path_records_confirmed_fill(self, rails, tmp_path):
+        """The direct-market path confirms via order_status; a pending
+        order gets ONE get_portfolio_status nudge (paper-parity: that is
+        where PaperTrader processes fills) before the second poll."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.set_cash(1_000.0)
+
+        class StatusBroker(FakeBroker):
+            def __init__(self):
+                super().__init__()
+                self.processed = False
+
+            def get_portfolio_status(self):
+                self.processed = True
+                return super().get_portfolio_status()
+
+            def order_status(self, order_id):
+                if not self.processed:
+                    return {"status": "OPEN", "filled_quantity": 0,
+                            "avg_fill_price": None}
+                return {"status": "FILLED", "filled_quantity": 4,
+                        "avg_fill_price": 50.0}
+
+        intent = DeskIntent(SPY, "BUY", 0.1, "t", quantity=4)
+        session = make_session(FakeDesk([intent]), StatusBroker(), None,
+                               audit, switch, local_book=book)
+        result = session.evaluate_once()
+        assert result["status"] == "ok"
+        assert book.positions() == {"SPY": 4.0}
+        assert book.cash() == pytest.approx(1_000.0 - 4 * 50.0)
+
+    def test_direct_path_unconfirmed_fill_records_nothing(self, rails,
+                                                          tmp_path):
+        """An order the broker never confirms FILLED must NOT be booked —
+        reconciliation, not optimism, resolves it."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.set_cash(500.0)
+
+        class OpenForeverBroker(FakeBroker):
+            def order_status(self, order_id):
+                return {"status": "OPEN", "filled_quantity": 0,
+                        "avg_fill_price": None}
+
+        intent = DeskIntent(SPY, "BUY", 0.1, "t", quantity=4)
+        session = make_session(FakeDesk([intent]), OpenForeverBroker(), None,
+                               audit, switch, local_book=book)
+        assert session.evaluate_once()["status"] == "ok"
+        assert book.positions() == {}
+        assert book.cash() == 500.0
+
+    def test_executor_path_records_banked_fills_signed(self, rails,
+                                                       tmp_path):
+        """Executor reports carry per-slice fills; a SELL books negative
+        quantity and raises cash."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.record_fill("SPY", 5, 40.0)          # existing long, cash -200
+
+        class SellExecutor(FakeExecutor):
+            def execute(self, side, instrument, quantity, **kwargs):
+                self.calls.append((side, instrument, quantity))
+                return {"status": "filled", "avg_fill": 50.0,
+                        "shortfall_per_unit": 0.0,
+                        "fills": [{"qty": 3, "price": 50.0, "ts": "t"}]}
+
+        intent = DeskIntent(SPY, "SELL", 0.1, "t", quantity=3)
+        session = make_session(FakeDesk([intent]), FakeBroker(),
+                               SellExecutor(), audit, switch,
+                               local_book=book)
+        assert session.evaluate_once()["status"] == "ok"
+        snap = book.snapshot()
+        assert snap["positions"]["SPY"]["quantity"] == 2.0
+        assert snap["cash"] == pytest.approx(-200.0 + 3 * 50.0)
+
+    def test_option_fill_books_contracts_and_multiplied_cash(self, rails,
+                                                             tmp_path):
+        """Options: quantity in native CONTRACTS under the canonical
+        str(Asset) key; cash moves fill_price x100."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        call = Asset("SPY", AssetType.CALL, strike_price=440.0,
+                     expiration_date="2026-07-17")
+
+        class OptionExecutor(FakeExecutor):
+            def execute(self, side, instrument, quantity, **kwargs):
+                return {"status": "filled", "avg_fill": 1.5,
+                        "shortfall_per_unit": 0.0,
+                        "fills": [{"qty": 2, "price": 1.5, "ts": "t"}]}
+
+        intent = DeskIntent(call, "BUY", 0.1, "t", quantity=2)
+        session = make_session(FakeDesk([intent]), FakeBroker(),
+                               OptionExecutor(), audit, switch,
+                               local_book=book)
+        assert session.evaluate_once()["status"] == "ok"
+        assert book.positions() == {str(call): 2.0}
+        assert book.cash() == pytest.approx(-2 * 1.5 * 100)
+
+    def test_book_failure_never_halts_the_session(self, rails, tmp_path):
+        """A book that raises must not stop trading — the drift surfaces
+        at reconciliation instead."""
+        audit, switch = rails
+
+        class BrokenBook:
+            def record_fill(self, *a, **k):
+                raise RuntimeError("disk full")
+
+        class FilledExecutor(FakeExecutor):
+            def execute(self, side, instrument, quantity, **kwargs):
+                return {"status": "filled", "avg_fill": 50.0,
+                        "shortfall_per_unit": 0.0,
+                        "fills": [{"qty": 1, "price": 50.0, "ts": "t"}]}
+
+        intent = DeskIntent(SPY, "BUY", 0.1, "t", quantity=1)
+        session = make_session(FakeDesk([intent]), FakeBroker(),
+                               FilledExecutor(), audit, switch,
+                               local_book=BrokenBook())
+        assert session.evaluate_once()["status"] == "ok"
+
+    def test_no_arg_reconciliation_reads_the_book(self, rails, tmp_path):
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.set_cash(100_000.0)  # matches FakeBroker: no positions, 100k
+        session = make_session(FakeDesk([]), FakeBroker(), None, audit,
+                               switch, local_book=book)
+        result = session.run_reconciliation()
+        assert result["ok"] is True
+        assert switch.engaged() is False
+        # Now drift the book: reconcile fails and engages the switch.
+        book.record_fill("SPY", 5, 10.0)
+        result = session.run_reconciliation()
+        assert result["ok"] is False
+        assert switch.engaged() is True
+
+    def test_no_arg_reconciliation_without_book_raises(self, rails):
+        audit, switch = rails
+        session = make_session(FakeDesk([]), FakeBroker(), None, audit,
+                               switch)
+        with pytest.raises(ValueError, match="local_book"):
+            session.run_reconciliation()
+
+    def test_explicit_args_still_win_over_the_book(self, rails, tmp_path):
+        """Existing callers (GUI routes) pass positions/cash explicitly;
+        the book must not shadow them."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.record_fill("SPY", 99, 1.0)       # book is WRONG on purpose
+        session = make_session(FakeDesk([]), FakeBroker(), None, audit,
+                               switch, local_book=book)
+        result = session.run_reconciliation({}, 100_000.0)
+        assert result["ok"] is True            # explicit args used, not book
