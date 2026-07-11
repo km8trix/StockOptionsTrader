@@ -75,6 +75,31 @@ _INTRADAY_TABLES = {
 _BARS_1M_COLUMNS = ('ticker', 'ts', 'open', 'high', 'low', 'close',
                     'volume', 'trade_count', 'vwap')
 
+#: Option end-of-day bar tables — a THIRD sibling registry (added 2026-07-10
+#: for the VRP existence screen), deliberately separate from both ``_TABLES``
+#: (Sharadar bulk export; ``ingest_table`` keeps rejecting this name) and
+#: ``_INTRADAY_TABLES`` (whose pinned contents stay byte-identical). Source is
+#: the Massive (ex-Polygon) free tier: one reference-contracts call per
+#: monthly selection date plus one per-contract daily-aggregates call
+#: (operator-run ``scripts/ingest_massive_options.py``). Layout: one Parquet
+#: PER UNDERLYING under ``<warehouse>/option_bars_eod/<UNDERLYING>.parquet``.
+#: Same (source, params) value shape as the other registries for
+#: auditability.
+_OPTION_TABLES = {
+    'option_bars_eod': ('MASSIVE/v3/reference/options/contracts '
+                        '+ v2/aggs/ticker/{contract}/range/1/day',
+                        {'adjusted': 'false', 'limit': 50000}),
+}
+
+#: option_bars_eod column contract (writer validates; reader returns all).
+#: ``ts`` is the tz-naive ET SESSION DATE (daily bars, normalized at ingest);
+#: ``expiry``/``selection_date`` are dates too. ``close`` is the day's last
+#: TRADE print — the free tier carries NO quotes/NBBO, so close stands in for
+#: mid everywhere downstream (documented + haircut in scripts/vrp_screen.py).
+_OPTION_BARS_EOD_COLUMNS = ('underlying', 'contract', 'type', 'strike',
+                            'expiry', 'selection_date', 'ts', 'open', 'high',
+                            'low', 'close', 'volume')
+
 #: SHARADAR/EVENTS code for an 8-K Item 2.02 "Results of Operations" filing —
 #: the earnings press release. Announcement dates lead the SF1 10-Q/10-K
 #: datekey by days (large caps) to weeks (small caps).
@@ -650,6 +675,68 @@ class PitWarehouse:
         return self._bars_query(
             ticker, 'CAST(ts AS DATE) >= ? AND CAST(ts AS DATE) <= ?', [s, e],
             table=table)
+
+    # ------------------------------------------------------------------
+    # Option end-of-day bars (option_bars_eod; see _OPTION_TABLES).
+    # Additive 2026-07-10 — nothing above this section changed.
+    # ------------------------------------------------------------------
+    def _option_bars_pq(self, underlying: str) -> str:
+        """Per-underlying Parquet path:
+        ``<warehouse>/option_bars_eod/<UNDERLYING>.parquet``."""
+        return os.path.join(self.warehouse_dir, 'option_bars_eod',
+                            f"{underlying}.parquet")
+
+    def write_option_bars_eod(self, underlying: str, df: pd.DataFrame) -> int:
+        """Write one underlying's option daily bars (OVERWRITES that
+        underlying's Parquet; skip-existing idempotency belongs to the
+        caller, scripts/ingest_massive_options.py). ``df`` must carry the
+        full ``_OPTION_BARS_EOD_COLUMNS`` contract; rows are sorted by
+        (selection_date, contract, ts) and de-duplicated on that key before
+        the write — the key keeps ``selection_date`` so a contract selected
+        in two months would keep both months' tags. An empty frame writes
+        NOTHING (a failed fetch never masquerades as an ingested underlying)
+        and returns 0. Returns the row count written."""
+        missing = [c for c in _OPTION_BARS_EOD_COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"option_bars_eod frame missing columns {missing}")
+        if df.empty:
+            return 0
+        key = ['selection_date', 'contract', 'ts']
+        out = (df.loc[:, list(_OPTION_BARS_EOD_COLUMNS)]
+                 .sort_values(key)
+                 .drop_duplicates(subset=key, keep='first'))
+        path = self._option_bars_pq(underlying)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        con = self._con()
+        con.register('_option_bars_df', out)
+        try:
+            con.execute(f"COPY (SELECT * FROM _option_bars_df) TO '{path}' "
+                        f"(FORMAT PARQUET)")
+        finally:
+            con.unregister('_option_bars_df')
+        return len(out)
+
+    def option_bars_eod(self, underlying: str) -> pd.DataFrame:
+        """Full option_bars_eod frame for one underlying, sorted by
+        (selection_date, contract, ts), with ``expiry``/``selection_date``/
+        ``ts`` as datetime64. Empty frame (same columns) for a
+        never-ingested underlying or a failed query."""
+        cols = list(_OPTION_BARS_EOD_COLUMNS)
+        path = self._option_bars_pq(underlying)
+        if not os.path.exists(path):
+            return pd.DataFrame(columns=cols)
+        try:
+            df = self._con().execute(
+                f"SELECT * FROM read_parquet('{path}') "
+                f"ORDER BY selection_date, contract, ts").fetchdf()
+        except duckdb.Error:
+            logger.warning("option_bars_eod query failed on %s", underlying,
+                           exc_info=True)
+            return pd.DataFrame(columns=cols)
+        for c in ('expiry', 'selection_date', 'ts'):
+            df[c] = pd.to_datetime(df[c])
+        return df
 
     # ------------------------------------------------------------------
     # Ingest — OPERATOR-ONLY, network: bulk-export -> zip -> Parquet
