@@ -83,6 +83,43 @@ def test_health_returns_200_with_status_ok(client):
     assert data == {'status': 'ok', 'service': 'stock-options-trader'}
 
 
+def test_non_testing_app_requires_auth_configuration(monkeypatch):
+    monkeypatch.delenv('APP_AUTH_USERNAME', raising=False)
+    monkeypatch.delenv('APP_AUTH_PASSWORD', raising=False)
+
+    with pytest.raises(RuntimeError, match='APP_AUTH_USERNAME'):
+        create_app()
+
+
+def test_non_testing_app_rejects_missing_auth_password(monkeypatch):
+    monkeypatch.setenv('APP_AUTH_USERNAME', 'operator')
+    monkeypatch.delenv('APP_AUTH_PASSWORD', raising=False)
+
+    with pytest.raises(RuntimeError, match='APP_AUTH_PASSWORD'):
+        create_app()
+
+
+def test_basic_auth_protects_application_but_not_health():
+    app = create_app({
+        'APP_AUTH_USERNAME': 'operator',
+        'APP_AUTH_PASSWORD': 'correct horse battery staple',
+    })
+    protected_client = app.test_client()
+
+    health = protected_client.get('/health')
+    unauthenticated = protected_client.get('/')
+    wrong_password = protected_client.get(
+        '/', headers={'Authorization': 'Basic b3BlcmF0b3I6d3Jvbmc='})
+    authenticated = protected_client.get(
+        '/', auth=('operator', 'correct horse battery staple'))
+
+    assert health.status_code == 200
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.headers['WWW-Authenticate'].startswith('Basic ')
+    assert wrong_password.status_code == 401
+    assert authenticated.status_code == 200
+
+
 def test_unknown_route_returns_404_json(client):
     response = client.get('/this-route-does-not-exist')
     assert response.status_code == 404
@@ -146,40 +183,27 @@ def test_symbol_universe_datalist_rendered(client):
     assert 'data-symbol-chips' in html
 
 
-# ==================== LIVE BROKER UNAVAILABILITY (503) ====================
+# ==================== LEGACY LIVE TRADER ROUTE DISABLED ====================
 
 
-def test_live_trader_create_returns_503_when_broker_unavailable(client, monkeypatch):
-    """Regression: a failed live-broker import must surface as a loud 503."""
+def test_legacy_live_trader_create_is_rejected(client):
+    """Live orders must use the explicit preview/order_ref workflow."""
     import gui.routes.api_trading as api_trading
-
-    sentinel = 'ImportError: synthetic live-broker import failure'
-    monkeypatch.setattr(api_trading, 'LiveEtradeBroker', None)
-    monkeypatch.setattr(api_trading, 'LIVE_BROKER_IMPORT_ERROR', sentinel)
 
     response = client.post(
         '/api/trader/create', json={'trader_id': 't-live', 'mode': 'live'})
 
-    assert response.status_code == 503
-    assert response.get_json() == {
-        'error': 'Live trading unavailable',
-        'reason': sentinel,
-    }
+    assert response.status_code == 400
+    assert 'disabled' in response.get_json()['error'].lower()
+    assert '/api/live/order/preview' in response.get_json()['detail']
+    assert 't-live' not in api_trading.active_traders
 
 
-def test_live_trader_create_503_without_account_id(client, monkeypatch):
-    """Gap 5: refuse a live broker when ETRADE_ACCOUNT_ID_KEY is unset rather
-    than route orders to account 'None'."""
-    import gui.routes.api_live as api_live
-    monkeypatch.setattr(api_live, 'get_auth_manager', lambda: object())
-    monkeypatch.setattr(api_live, 'get_kill_switch', lambda: object())
-    monkeypatch.setattr(api_live, 'get_audit_log', lambda: object())
-    monkeypatch.delenv('ETRADE_ACCOUNT_ID_KEY', raising=False)
-
+def test_unknown_trader_mode_is_rejected(client):
     response = client.post(
-        '/api/trader/create', json={'trader_id': 't-noacct', 'mode': 'live'})
-    assert response.status_code == 503
-    assert 'ETRADE_ACCOUNT_ID_KEY' in response.get_json()['reason']
+        '/api/trader/create', json={'trader_id': 't-bad', 'mode': 'auto'})
+    assert response.status_code == 400
+    assert response.get_json() == {'error': "'mode' must be 'paper'"}
 
 
 def test_wire_daily_loss_gate_attaches_breaker(monkeypatch, tmp_path):
@@ -3466,137 +3490,22 @@ class TestKeepAliveRestartRecovery:
         assert list(tmp_path.rglob('*.db')) == []
 
 
-class TestLiveTraderConstruction:
-    """api_trading's live construction site now goes through the C16 auth
-    manager (Phase 9) — the env-token constructor is gone."""
+class TestPaperOnlyTraderRoute:
+    """The generic trader registry cannot become an alternate live surface."""
 
-    def test_create_live_trader_uses_auth_manager(self, client, monkeypatch):
-        """The broker gets the C16 auth manager PLUS the shared kill switch
-        and audit log — EtradeClient only gates preview/place on a kill
-        switch it was handed, so dropping it here would be a safety hole."""
+    def test_order_rejects_non_paper_registry_entry(self, client):
         import gui.routes.api_trading as api_trading
-        import gui.routes.api_live as api_live
 
-        seen = {}
-
-        class FakeBroker:
-            def __init__(self, auth=None, account_id_key=None,
-                         kill_switch=None, audit=None):
-                seen['auth'] = auth
-                seen['account_id_key'] = account_id_key
-                seen['kill_switch'] = kill_switch
-                seen['audit'] = audit
-
-        sentinel_manager = object()
-        sentinel_kill = FakeKillSwitch()
-        sentinel_audit = FakeAuditLog()
-        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', FakeBroker)
-        monkeypatch.setattr(api_live, 'get_auth_manager',
-                            lambda: sentinel_manager)
-        monkeypatch.setattr(api_live, 'get_kill_switch',
-                            lambda: sentinel_kill)
-        monkeypatch.setattr(api_live, 'get_audit_log',
-                            lambda: sentinel_audit)
-        monkeypatch.setenv('ETRADE_ACCOUNT_ID_KEY', 'ACCT-KEY-1')
-
+        api_trading.active_traders['not-paper'] = object()
         try:
-            response = client.post('/api/trader/create', json={
-                'trader_id': 't-live-ctor', 'mode': 'live'})
-            assert response.status_code == 200
-            assert response.get_json()['mode'] == 'live'
-            assert seen['auth'] is sentinel_manager
-            assert seen['account_id_key'] == 'ACCT-KEY-1'
-            assert seen['kill_switch'] is sentinel_kill
-            assert seen['audit'] is sentinel_audit
+            response = client.post('/api/trader/not-paper/order', json={
+                'symbol': 'SPY', 'action': 'BUY', 'quantity': 1, 'price': 100,
+            })
+            assert response.status_code == 409
+            assert 'paper' in response.get_json()['error'].lower()
+            assert '/api/live/order/preview' in response.get_json()['detail']
         finally:
-            api_trading.active_traders.pop('t-live-ctor', None)
-
-    def test_create_live_trader_503_when_auth_manager_unavailable(
-            self, client, monkeypatch):
-        import gui.routes.api_trading as api_trading
-        import gui.routes.api_live as api_live
-
-        sentinel = 'ImportError: synthetic etrade_auth import failure'
-        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
-        monkeypatch.setattr(api_live, 'get_auth_manager', lambda: None)
-        monkeypatch.setattr(api_live, 'ETRADE_AUTH_IMPORT_ERROR', sentinel)
-
-        response = client.post('/api/trader/create', json={
-            'trader_id': 't-live-noauth', 'mode': 'live'})
-
-        assert response.status_code == 503
-        assert response.get_json() == {
-            'error': 'Live trading unavailable', 'reason': sentinel}
-        assert 't-live-noauth' not in api_trading.active_traders
-
-    def test_create_live_trader_503_when_kill_switch_unavailable(
-            self, client, monkeypatch):
-        """Fail CLOSED: a broker built with kill_switch=None would have no
-        preview/place gate at all (EtradeClient only checks a switch it was
-        handed), so an unavailable kill switch must refuse construction."""
-        import gui.routes.api_trading as api_trading
-        import gui.routes.api_live as api_live
-
-        sentinel = 'ImportError: synthetic kill_switch import failure'
-        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
-        monkeypatch.setattr(api_live, 'get_auth_manager',
-                            lambda: FakeAuthManager())
-        monkeypatch.setattr(api_live, 'get_kill_switch', lambda: None)
-        monkeypatch.setattr(api_live, 'KILL_SWITCH_IMPORT_ERROR', sentinel)
-
-        response = client.post('/api/trader/create', json={
-            'trader_id': 't-live-noks', 'mode': 'live'})
-
-        assert response.status_code == 503
-        assert response.get_json() == {
-            'error': 'Live trading unavailable', 'reason': sentinel}
-        assert 't-live-noks' not in api_trading.active_traders
-
-    def test_create_live_trader_503_when_kill_switch_construction_fails(
-            self, client, monkeypatch):
-        """Construction failure (import fine, KILL_SWITCH_IMPORT_ERROR is
-        None) still 503s with a non-null reason."""
-        import gui.routes.api_trading as api_trading
-        import gui.routes.api_live as api_live
-
-        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
-        monkeypatch.setattr(api_live, 'get_auth_manager',
-                            lambda: FakeAuthManager())
-        monkeypatch.setattr(api_live, 'get_kill_switch', lambda: None)
-        monkeypatch.setattr(api_live, 'KILL_SWITCH_IMPORT_ERROR', None)
-
-        response = client.post('/api/trader/create', json={
-            'trader_id': 't-live-ksctor', 'mode': 'live'})
-
-        assert response.status_code == 503
-        assert response.get_json() == {
-            'error': 'Live trading unavailable',
-            'reason': 'KillSwitch construction failed'}
-        assert 't-live-ksctor' not in api_trading.active_traders
-
-    def test_create_live_trader_503_when_audit_log_unavailable(
-            self, client, monkeypatch):
-        """Fail CLOSED on the audit log too: live orders must never trade
-        unrecorded."""
-        import gui.routes.api_trading as api_trading
-        import gui.routes.api_live as api_live
-
-        sentinel = 'ImportError: synthetic audit import failure'
-        monkeypatch.setattr(api_trading, 'LiveEtradeBroker', object)
-        monkeypatch.setattr(api_live, 'get_auth_manager',
-                            lambda: FakeAuthManager())
-        monkeypatch.setattr(api_live, 'get_kill_switch',
-                            lambda: FakeKillSwitch())
-        monkeypatch.setattr(api_live, 'get_audit_log', lambda: None)
-        monkeypatch.setattr(api_live, 'AUDIT_IMPORT_ERROR', sentinel)
-
-        response = client.post('/api/trader/create', json={
-            'trader_id': 't-live-noaudit', 'mode': 'live'})
-
-        assert response.status_code == 503
-        assert response.get_json() == {
-            'error': 'Live trading unavailable', 'reason': sentinel}
-        assert 't-live-noaudit' not in api_trading.active_traders
+            api_trading.active_traders.pop('not-paper', None)
 
 
 # ==================== LIVE TRADING: ACCOUNTS / QUOTES / ORDER TICKET ===========
@@ -3646,7 +3555,8 @@ class FakeTradeClient:
         }]
 
     def get_quotes(self, symbols):
-        return {s: {'bid': 1.0, 'ask': 1.1, 'last': 1.05} for s in symbols}
+        return {s: {'bid': 99.0, 'ask': 101.0, 'last': 100.0}
+                for s in symbols}
 
     def preview_order(self, account_id_key, order_request):
         self.preview_calls.append((account_id_key, order_request))
@@ -3674,6 +3584,7 @@ def patch_trade(monkeypatch):
     """Inject a connected FakeAuthManager + FakeTradeClient into api_live."""
     import gui.routes.api_live as api_live
 
+    monkeypatch.setenv('ETRADE_ACCOUNT_ID_KEY', 'KEY-ABC')
     fakes = {
         'auth': FakeAuthManager(state='connected'),
         'kill': FakeKillSwitch(),
@@ -3785,7 +3696,8 @@ class TestLiveQuotes:
         assert response.status_code == 200
         body = response.get_json()
         assert body['requested'] == ['SPY', 'AAPL']
-        assert body['quotes']['SPY'] == {'bid': 1.0, 'ask': 1.1, 'last': 1.05}
+        assert body['quotes']['SPY'] == {
+            'bid': 99.0, 'ask': 101.0, 'last': 100.0}
 
     def test_quotes_requires_symbols(self, client, patch_trade):
         response = client.get('/api/live/quotes?symbols=')
@@ -3829,6 +3741,14 @@ class TestLiveOrderTicket:
         assert response.status_code == 409
         assert 'account' in response.get_json()['error']
 
+    def test_preview_503_when_configured_account_missing(
+            self, client, patch_trade, monkeypatch):
+        monkeypatch.delenv('ETRADE_ACCOUNT_ID_KEY', raising=False)
+        response = client.post('/api/live/order/preview', json=self.EQUITY)
+        assert response.status_code == 503
+        assert 'ETRADE_ACCOUNT_ID_KEY' in response.get_json()['reason']
+        assert patch_trade['client'].preview_calls == []
+
     def test_place_uses_cached_request_exactly_once(self, client, patch_trade):
         preview = client.post('/api/live/order/preview',
                               json=self.EQUITY).get_json()
@@ -3848,6 +3768,33 @@ class TestLiveOrderTicket:
         assert calls[0][0] == 'KEY-ABC'
         assert calls[0][1] is built
         assert calls[0][2] == [{'previewId': 555}]
+
+    def test_place_503_without_configured_account_preserves_ref(
+            self, client, patch_trade, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        ref = client.post('/api/live/order/preview',
+                          json=self.EQUITY).get_json()['order_ref']
+        monkeypatch.delenv('ETRADE_ACCOUNT_ID_KEY', raising=False)
+
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': ref})
+        assert response.status_code == 503
+        assert 'ETRADE_ACCOUNT_ID_KEY' in response.get_json()['reason']
+        assert ref in api_live._ORDER_REF_CACHE
+        assert patch_trade['client'].place_calls == []
+
+    def test_place_rejects_ref_after_configured_account_changes(
+            self, client, patch_trade, monkeypatch):
+        ref = client.post('/api/live/order/preview',
+                          json=self.EQUITY).get_json()['order_ref']
+        monkeypatch.setenv('ETRADE_ACCOUNT_ID_KEY', 'NEW-ACCOUNT')
+
+        response = client.post('/api/live/order/place',
+                               json={'order_ref': ref})
+        assert response.status_code == 409
+        assert response.get_json()['error'] == 'account mismatch'
+        assert patch_trade['client'].place_calls == []
 
     def test_order_ref_is_single_use(self, client, patch_trade):
         ref = client.post('/api/live/order/preview',
@@ -4001,18 +3948,28 @@ class TestLiveOrderTicket:
             "'strike' must be a positive number"
         assert patch_trade['client'].preview_calls == []
 
-    @pytest.mark.parametrize('value', ['nan', 'inf', '-inf'])
-    def test_non_finite_limit_price_dropped_to_market(self, client,
-                                                      patch_trade, value):
-        """A non-finite limit_price is treated as absent (-> MARKET order),
-        never carried into the built order as a NaN/Inf limitPrice."""
+    @pytest.mark.parametrize(
+        'value', ['nan', 'inf', '-inf', 'not-a-price', -1, 0, True, []])
+    def test_invalid_explicit_limit_price_is_400(self, client, patch_trade,
+                                                 value):
+        """Bad explicit limits must never silently broaden into MARKET."""
+        body = {'account_id_key': 'KEY-ABC', 'kind': 'equity',
+                'symbol': 'SPY', 'side': 'BUY', 'quantity': 1,
+                'limit_price': value}
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert response.get_json()['error'] == \
+            "'limit_price' must be a positive finite number or blank"
+        assert patch_trade['client'].preview_calls == []
+
+    @pytest.mark.parametrize('value', [None, '', '   '])
+    def test_blank_limit_price_means_market(self, client, patch_trade, value):
         body = {'account_id_key': 'KEY-ABC', 'kind': 'equity',
                 'symbol': 'SPY', 'side': 'BUY', 'quantity': 1,
                 'limit_price': value}
         response = client.post('/api/live/order/preview', json=body)
         assert response.status_code == 200
-        built = patch_trade['client'].preview_calls[0][1]
-        order = built['Order'][0]
+        order = patch_trade['client'].preview_calls[0][1]['Order'][0]
         assert order['priceType'] == 'MARKET'
         assert 'limitPrice' not in order
 
@@ -4026,6 +3983,28 @@ class TestLiveOrderTicket:
         order = patch_trade['client'].preview_calls[0][1]['Order'][0]
         assert order['priceType'] == 'LIMIT'
         assert order['limitPrice'] == 99.50
+
+    def test_equity_fat_finger_is_blocked_before_preview(self, client,
+                                                         patch_trade):
+        body = {'account_id_key': 'KEY-ABC', 'kind': 'equity',
+                'symbol': 'SPY', 'side': 'BUY', 'quantity': 1,
+                'limit_price': 1000}
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert response.get_json()['error'] == 'price sanity check failed'
+        assert 'fat-finger' in response.get_json()['detail']
+        assert patch_trade['client'].preview_calls == []
+
+    def test_option_fat_finger_uses_premium_ceiling(self, client,
+                                                    patch_trade):
+        body = {'account_id_key': 'KEY-ABC', 'kind': 'option',
+                'symbol': 'SPY', 'call_put': 'CALL', 'strike': 100,
+                'expiry': '2026-07-17', 'action': 'BUY_OPEN', 'quantity': 1,
+                'limit_price': 1000}
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert response.get_json()['error'] == 'price sanity check failed'
+        assert patch_trade['client'].preview_calls == []
 
     def test_non_finite_spread_net_price_is_400_not_sent(self, client,
                                                          patch_trade):
@@ -4059,6 +4038,22 @@ class TestLiveOrderTicket:
         assert response.get_json()['preview']['previewIds'] == [555]
         built = patch_trade['client'].preview_calls[0][1]
         assert built['orderType'] == 'SPREADS'
+
+    def test_spread_fat_finger_is_blocked_before_preview(self, client,
+                                                         patch_trade):
+        body = {
+            'account_id_key': 'KEY-ABC', 'kind': 'spread', 'net_price': 440,
+            'legs': [
+                {'symbol': 'SPY', 'call_put': 'PUT', 'strike': 440,
+                 'expiry': '2026-07-17', 'action': 'SELL_OPEN', 'quantity': 1},
+                {'symbol': 'SPY', 'call_put': 'PUT', 'strike': 430,
+                 'expiry': '2026-07-17', 'action': 'BUY_OPEN', 'quantity': 1},
+            ],
+        }
+        response = client.post('/api/live/order/preview', json=body)
+        assert response.status_code == 400
+        assert response.get_json()['error'] == 'price sanity check failed'
+        assert patch_trade['client'].preview_calls == []
 
     def test_spread_rejects_single_leg(self, client, patch_trade):
         body = {
@@ -4114,6 +4109,10 @@ class TestLauncherEnvHygiene:
         import flask
 
         captured = {}
+        # Normal launch is fail-closed unless application-level Basic-auth
+        # credentials are explicitly supplied.
+        monkeypatch.setenv('APP_AUTH_USERNAME', 'launcher-test')
+        monkeypatch.setenv('APP_AUTH_PASSWORD', 'launcher-test-password')
 
         def fake_run(self, *args, **kwargs):
             captured['args'] = args

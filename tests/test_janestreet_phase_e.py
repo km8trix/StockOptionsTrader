@@ -129,10 +129,13 @@ def option_intents(intents):
 # The headline guard: GREEKS GOLDEN byte-identity with defaults
 # ----------------------------------------------------------------------
 #: Captured BEFORE any Phase E change (backend brief) and re-confirmed
-#: AFTER all changes with both features at their defaults. These are the
-#: invariant the whole phase is built around — do NOT regold.
+#: AFTER all changes with both features at their defaults.  The full-report
+#: hash was intentionally re-minted when headline ``total_return`` was fixed to
+#: reconcile to NAV (and therefore include cash commissions); the independent
+#: greeks-series hash stayed unchanged, proving pricing/trading behavior did
+#: not move.  Do not regold for Phase-E feature work.
 GOLDEN_FULL_SHA = (
-    "9ad4c2a0b69a422918fcda3a19d2142943a1b97c8fbc08314e5d2cde2f74a177")
+    "984eea194695abcd035df1ec1e32fe0cf53e76b5d462d9724a813c17e017c20a")
 GOLDEN_GREEKS_SHA = (
     "955bd0621c15f2e565d396ed03fea8134df3dd6dfdbae809567311cdeea1f1f4")
 

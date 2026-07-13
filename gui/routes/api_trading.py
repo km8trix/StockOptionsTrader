@@ -1,40 +1,24 @@
 """
-API routes for Paper Trading, Live Trading, Alerts, and Risk Management.
+API routes for Paper Trading, Alerts, and Risk Management.
 """
 from __future__ import annotations
 
-from flask import Blueprint, request, jsonify
 import logging
 import math
-import os
 import threading
 
-from gui.globals import alert_manager, risk_manager
+from flask import Blueprint, jsonify, request
+
 from brokers.paper_trader import PaperTrader
 from core.models import Asset, AssetType, OrderType
+from gui.globals import alert_manager, risk_manager
 
 logger = logging.getLogger(__name__)
-
-# Any failure to import the live broker must be LOUD: this module previously
-# failed silently on Python 3.9 (``float | None`` syntax raised at import,
-# which a bare ModuleNotFoundError catch never saw). Catch everything, keep
-# the message, and log it at ERROR.
-LIVE_BROKER_IMPORT_ERROR: str | None
-try:
-    from brokers.live_trader import LiveEtradeBroker
-    LIVE_BROKER_IMPORT_ERROR = None
-except Exception as e:  # noqa: BLE001 - import failure of any kind disables live trading
-    LiveEtradeBroker = None
-    LIVE_BROKER_IMPORT_ERROR = f'{type(e).__name__}: {e}'
-    logger.error(
-        'Failed to import LiveEtradeBroker — live trading is unavailable: %s',
-        LIVE_BROKER_IMPORT_ERROR,
-    )
 
 trading_bp = Blueprint('trading', __name__, url_prefix='/api')
 
 # ==================== TRADING SESSIONS ====================
-active_traders = {}
+active_traders: dict[str, PaperTrader] = {}
 # Guards registration only. Under gunicorn --threads, two concurrent
 # create_trader calls could otherwise silently replace a trader mid-mutation.
 # Reads stay lock-free: dict lookup is atomic, and entries are only ever
@@ -43,77 +27,31 @@ _active_traders_lock = threading.Lock()
 
 @trading_bp.route('/trader/create', methods=['POST'])
 def create_trader():
-    """Create a new paper or live trading session"""
+    """Create a paper-trading session.
+
+    Live order entry deliberately has one route only: the guarded
+    ``/api/live/order/preview`` -> ``/api/live/order/place`` workflow.  The
+    former generic trader route used ``LiveEtradeBroker.place_order()``, which
+    previewed and placed in one request and therefore bypassed the GUI's
+    explicit preview confirmation and market-hours check.
+    """
     try:
         data = request.get_json(silent=True) or {}
         trader_id = data.get('trader_id', 'default')
-        mode = data.get('mode', 'paper')
+        mode = str(data.get('mode', 'paper') or '').strip().lower()
         replace = bool(data.get('replace', False))
 
         if mode == 'live':
-            if LiveEtradeBroker is None:
-                return jsonify({
-                    'error': 'Live trading unavailable',
-                    'reason': LIVE_BROKER_IMPORT_ERROR,
-                }), 503
+            return jsonify({
+                'error': 'Legacy live trading sessions are disabled',
+                'detail': 'Use /api/live/order/preview and then '
+                          '/api/live/order/place with the returned order_ref.',
+            }), 400
+        if mode != 'paper':
+            return jsonify({'error': "'mode' must be 'paper'"}), 400
 
-            # Phase 9: the broker authenticates through the shared C16
-            # auth manager (gui/routes/api_live owns the singleton; the
-            # manager reads ETRADE_* config itself) instead of raw env
-            # tokens, and the shared kill switch + audit log MUST ride
-            # along: EtradeClient only gates preview/place on a kill
-            # switch it was given. Imported lazily — api_live and this
-            # module only reference each other inside functions (no
-            # import cycle).
-            from gui.routes.api_live import (
-                AUDIT_IMPORT_ERROR, KILL_SWITCH_IMPORT_ERROR,
-                auth_unavailable_reason, get_audit_log, get_auth_manager,
-                get_kill_switch)
-            auth_manager = get_auth_manager()
-            if auth_manager is None:
-                return jsonify({
-                    'error': 'Live trading unavailable',
-                    'reason': auth_unavailable_reason(),
-                }), 503
-            # Fail CLOSED on the safety surfaces: a live broker built with
-            # kill_switch=None has NO preview/place gate (EtradeClient only
-            # checks a switch it was handed), and audit=None would trade
-            # unrecorded. Match /api/live/status, which already 503s loudly
-            # when the kill switch is unavailable.
-            kill_switch = get_kill_switch()
-            if kill_switch is None:
-                return jsonify({
-                    'error': 'Live trading unavailable',
-                    'reason': (KILL_SWITCH_IMPORT_ERROR
-                               or 'KillSwitch construction failed'),
-                }), 503
-            audit_log = get_audit_log()
-            if audit_log is None:
-                return jsonify({
-                    'error': 'Live trading unavailable',
-                    'reason': (AUDIT_IMPORT_ERROR
-                               or 'AuditLog construction failed'),
-                }), 503
-            # Fail CLOSED on a missing target account: a live broker built with
-            # account_id_key=None would route every order to account 'None'
-            # (a typed E*TRADE rejection), not a real account — refuse it
-            # explicitly rather than rely on that downstream rejection.
-            account_id_key = os.getenv("ETRADE_ACCOUNT_ID_KEY")
-            if not account_id_key:
-                return jsonify({
-                    'error': 'Live trading unavailable',
-                    'reason': 'ETRADE_ACCOUNT_ID_KEY is not set — refusing to '
-                              'build a live broker without a target account',
-                }), 503
-            trader = LiveEtradeBroker(
-                auth=auth_manager,
-                account_id_key=account_id_key,
-                kill_switch=kill_switch,
-                audit=audit_log,
-            )
-        else:
-            initial_capital = float(data.get('initial_capital', 50000))
-            trader = PaperTrader(initial_capital)
+        initial_capital = float(data.get('initial_capital', 50000))
+        trader = PaperTrader(initial_capital)
 
         with _active_traders_lock:
             if trader_id in active_traders and not replace:
@@ -135,7 +73,17 @@ def place_order(trader_id):
     try:
         if trader_id not in active_traders:
             return jsonify({'error': f'Trader {trader_id} not found'}), 404
-            
+
+        trader = active_traders[trader_id]
+        # Defense in depth for long-lived processes/tests that may already
+        # have inserted another broker in the module-level registry.  This
+        # generic route must never become an alternate live-order surface.
+        if not isinstance(trader, PaperTrader):
+            return jsonify({
+                'error': 'This endpoint accepts paper-trading sessions only',
+                'detail': 'Use /api/live/order/preview for live orders.',
+            }), 409
+
         data = request.get_json(silent=True) or {}
         symbol = str(data.get('symbol') or '').strip().upper()
         action = str(data.get('action') or 'BUY').strip().upper()
@@ -163,7 +111,6 @@ def place_order(trader_id):
         if not symbol:
             return jsonify({'error': "'symbol' is required"}), 400
             
-        trader = active_traders[trader_id]
         asset = Asset(symbol, AssetType.STOCK)
         order_type = OrderType.BUY if action == 'BUY' else OrderType.SELL
         

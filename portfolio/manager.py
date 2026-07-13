@@ -126,8 +126,15 @@ class PortfolioManager:
         return self._realized_pnl
     
     def get_total_return(self) -> float:
-        """Get total return including realized and unrealized P&L"""
-        return self.get_realized_pnl() + self.get_portfolio_pnl()
+        """Net dollar return, reconciled directly to account equity.
+
+        ``Trade.pnl`` deliberately records price P&L and excludes cash-only
+        commissions.  Account equity, however, includes every commission,
+        slippage cash flow, option fee, and optional cash yield.  Computing the
+        headline return from NAV therefore keeps it exactly consistent with
+        ``current_value`` and ``total_return_pct``.
+        """
+        return self.get_portfolio_value() - self.initial_capital
     
     def get_max_drawdown(self) -> float:
         """Calculate maximum drawdown with safety safeguards"""

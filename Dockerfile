@@ -23,6 +23,9 @@ COPY brokers/ brokers/
 COPY portfolio/ portfolio/
 COPY backtesting/ backtesting/
 COPY strategies/ strategies/
+COPY desks/ desks/
+COPY analysis/ analysis/
+COPY execution/ execution/
 COPY utils/ utils/
 COPY gui/ gui/
 COPY run_gui.py .

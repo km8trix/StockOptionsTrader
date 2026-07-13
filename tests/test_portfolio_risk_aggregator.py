@@ -131,6 +131,33 @@ class TestGrossLeverage:
         assert approved == []
         assert 'failing closed' in blocked[0][1]
 
+    def test_absolute_stock_quantity_uses_actual_notional_not_fraction_proxy(self):
+        agg = PortfolioRiskAggregator(max_gross_leverage=0.02,
+                                      max_correlation=1.0)
+        absolute = DeskIntent(
+            asset=stock('AAA'), action='SHORT', size_fraction=0.01,
+            quantity=50, reason='absolute override')
+        data = {'AAA': frame([100.0, 100.0, 100.0])}
+
+        approved, blocked = agg.check(
+            [absolute], PortfolioManager(100_000.0), data, DATE)
+
+        assert approved == []
+        assert len(blocked) == 1
+        assert 'gross' in blocked[0][1]
+
+    def test_absolute_stock_quantity_without_price_fails_closed(self):
+        agg = PortfolioRiskAggregator(max_correlation=1.0)
+        absolute = DeskIntent(
+            asset=stock('MISSING'), action='BUY', size_fraction=0.01,
+            quantity=1, reason='absolute override')
+
+        approved, blocked = agg.check(
+            [absolute], PortfolioManager(100_000.0), {}, DATE)
+
+        assert approved == []
+        assert 'cannot be valued' in blocked[0][1]
+
 
 class TestCorrelation:
     def _correlated(self):

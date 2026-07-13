@@ -9,6 +9,7 @@ side effect.
 from __future__ import annotations
 
 import atexit
+import hmac
 import logging
 import os
 
@@ -55,14 +56,33 @@ def create_app(config: dict | None = None) -> Flask:
     """Application factory.
 
     Args:
-        config: Optional mapping applied to ``app.config`` last, so tests
-            can override anything (e.g. ``{'TESTING': True}``).
+        config: Optional mapping applied after environment-backed defaults,
+            so tests can override anything (e.g. ``{'TESTING': True}``).
     """
     if setup_logging is not None:
         setup_logging()
 
     app = Flask(__name__, template_folder='templates', static_folder='static')
-    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-insecure-change-me')
+    app.config.update(
+        SECRET_KEY=os.environ.get('SECRET_KEY', 'dev-insecure-change-me'),
+        APP_AUTH_USERNAME=os.environ.get('APP_AUTH_USERNAME'),
+        APP_AUTH_PASSWORD=os.environ.get('APP_AUTH_PASSWORD'),
+    )
+    # Apply overrides before configuring security. TESTING is deliberately the
+    # only authentication bypass; there is no environment flag that can turn
+    # protection off in a deployed process.
+    if config:
+        app.config.update(config)
+
+    if not app.config['TESTING']:
+        username = app.config.get('APP_AUTH_USERNAME')
+        password = app.config.get('APP_AUTH_PASSWORD')
+        if not isinstance(username, str) or not username:
+            raise RuntimeError(
+                'APP_AUTH_USERNAME must be set outside TESTING mode')
+        if not isinstance(password, str) or not password:
+            raise RuntimeError(
+                'APP_AUTH_PASSWORD must be set outside TESTING mode')
     # Restrict CORS to localhost (and any explicitly configured origins). A
     # bare CORS(app) allows ALL origins, which on a money-moving order API is a
     # CSRF-equivalent exposure. Phase 4 Docker can widen this via CORS_ORIGINS.
@@ -158,6 +178,37 @@ def create_app(config: dict | None = None) -> Flask:
         else:
             g.correlation_id = new_correlation_id()
 
+    @app.before_request
+    def _require_basic_auth():
+        """Protect every surface except the public liveness probe.
+
+        Keeping /health unauthenticated lets Docker and external supervisors
+        distinguish a healthy process without putting application credentials
+        in probe commands. Flask TESTING mode is the sole bypass so production
+        cannot accidentally be launched unauthenticated through an env toggle.
+        """
+        if app.config['TESTING'] or request.path == '/health':
+            return None
+
+        supplied = request.authorization
+        expected_username = app.config['APP_AUTH_USERNAME']
+        expected_password = app.config['APP_AUTH_PASSWORD']
+        valid = (
+            supplied is not None
+            and (supplied.type or '').lower() == 'basic'
+            and hmac.compare_digest(supplied.username or '', expected_username)
+            and hmac.compare_digest(supplied.password or '', expected_password)
+        )
+        if valid:
+            return None
+
+        return Response(
+            'Authentication required',
+            401,
+            {'WWW-Authenticate':
+             'Basic realm="StockOptionsTrader", charset="UTF-8"'},
+        )
+
     @app.after_request
     def _record_request(response):
         response.headers['X-Request-ID'] = get_correlation_id()
@@ -192,10 +243,6 @@ def create_app(config: dict | None = None) -> Flask:
         # Full traceback goes to the server log ONLY — never to the client.
         app.logger.error('Internal server error: %s', error, exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
-
-    # Apply test/override config last so it wins over everything above.
-    if config:
-        app.config.update(config)
 
     return app
 

@@ -45,6 +45,18 @@ OPTIONS IN DESK MODE (Phase 8 — SYNTHETIC PRICING, see desks/options_pricing):
     expiry date — cash settle, x100, no spread cost, no commission, trade
     logged with reason 'expiry settlement'. Desks normally exit before
     expiry; this is the backstop.
+
+SURVIVORSHIP-AWARE STOCK DELISTINGS:
+    When the injected market-data feed exposes ``delisting_date(symbol)``
+    (WarehouseMarketData does), a held stock is force-liquidated at its final
+    observable close on that last listed session. Ordinary provider feeds do
+    not expose the hook and retain their prior behavior.
+
+ABSOLUTE-QUANTITY SAFETY:
+    ``DeskIntent.quantity`` may choose exact shares/contracts, but it cannot
+    enlarge the opening beyond the approved ``size_fraction`` risk budget.
+    The risk layer values exact stock quantities from the latest causal close,
+    and the fill layer enforces the budget again at the traded price.
 """
 
 from __future__ import annotations
@@ -258,6 +270,18 @@ class BacktestEngine:
             logger.warning("Backtest aborted: no data available for %s", symbols)
             return {'error': 'No data available'}
 
+        # Optional survivorship-aware feed contract.  WarehouseMarketData
+        # exposes the final listed session for delisted securities; ordinary
+        # live/provider feeds do not, so their behavior is unchanged.  Resolve
+        # once per run rather than querying the warehouse inside the daily loop.
+        delisting_date = getattr(self.market_data, 'delisting_date', None)
+        self._delisting_dates = {}
+        if callable(delisting_date):
+            for symbol in all_data:
+                final_session = delisting_date(symbol)
+                if final_session is not None:
+                    self._delisting_dates[symbol] = pd.Timestamp(final_session)
+
         # Indicators are prefix-stable (rolling/ewm/diff/shift are forward-
         # only), so computing them ONCE on the full frame and slicing through
         # the simulated date is byte-identical to recomputing on each
@@ -318,6 +342,11 @@ class BacktestEngine:
             if self._desk_mode:
                 self._mark_option_positions(all_data, date)
 
+            # A warehouse-held delisted stock must not remain at its final mark
+            # forever.  Liquidate it at the final observable close (including
+            # normal exit commission) on its last listed session.
+            self._liquidate_delisted_stocks(all_data, date)
+
             # --- PHASE 3: SIGNALS ON DATA THROUGH TODAY, QUEUED FOR TOMORROW ---
             if self.orchestrator is not None:
                 self._run_orchestrator_step(all_data, date)
@@ -376,6 +405,72 @@ class BacktestEngine:
 
         return self._generate_report(benchmark_symbol=benchmark_symbol,
                                      start_date=start_date, end_date=end_date)
+
+    def _liquidate_delisted_stocks(self, all_data: Dict[str, pd.DataFrame],
+                                   date) -> None:
+        """Close warehouse positions on their final listed session.
+
+        This hook is inert for ordinary market-data providers because only the
+        point-in-time warehouse feed exposes ``delisting_date``.  The final
+        usable close is an observable liquidation value; if even that is
+        unavailable the position is conservatively written down to zero.
+        """
+        if not getattr(self, '_delisting_dates', None):
+            return
+        current = pd.Timestamp(date).normalize()
+        for asset in sorted(list(self.portfolio.positions), key=str):
+            if asset.asset_type is not AssetType.STOCK:
+                continue
+            final_session = self._delisting_dates.get(asset.symbol)
+            if final_session is None or current < final_session.normalize():
+                continue
+
+            position = self.portfolio.positions[asset]
+            frame = all_data.get(asset.symbol)
+            exit_price = 0.0
+            if frame is not None and not frame.empty:
+                closes = frame.loc[frame.index <= date, 'close'].dropna()
+                finite = closes[np.isfinite(closes.to_numpy(dtype=float))]
+                if not finite.empty:
+                    exit_price = float(finite.iloc[-1])
+            if exit_price <= 0:
+                logger.warning(
+                    "Delisting liquidation of %s on %s has no usable final "
+                    "close; writing the position down at 0.0",
+                    asset.symbol, date)
+
+            quantity = position.quantity
+            commission = abs(quantity) * exit_price * self.commission
+            if quantity > 0:
+                cash_flow = quantity * exit_price - commission
+                self.portfolio.cash += cash_flow
+                action = 'SELL'
+                flow_key = 'proceeds'
+            else:
+                cash_flow = abs(quantity) * exit_price + commission
+                self.portfolio.cash -= cash_flow
+                action = 'COVER'
+                flow_key = 'cost'
+
+            self.portfolio.close_position(
+                asset, exit_price, quantity, position.timestamp, date)
+            self.portfolio.remove_position(asset)
+            self.pending_intents.pop(asset, None)
+            self.trades_log.append({
+                'date': date,
+                'signal_date': date,
+                'symbol': asset.symbol,
+                'instrument': str(asset),
+                'action': action,
+                'quantity': abs(quantity),
+                'price': exit_price,
+                'commission': commission,
+                flow_key: cash_flow,
+                'reason': 'delisting liquidation',
+            })
+            logger.info(
+                "Delisting liquidation: %s %d %s @ %.4f on %s",
+                action, abs(quantity), asset.symbol, exit_price, date)
 
     def _accrue_cash_yield(self, date) -> None:
         """One day of idle-cash interest: cash += cash * rate(date) / 252.
@@ -664,18 +759,27 @@ class BacktestEngine:
                                "traded price %.4f", signal, str(asset),
                                fill_date, fill_price)
                 return
+            if self.orchestrator is not None:
+                # Orchestrator intents are already account-absolute.
+                size_fraction = intent.get('size_fraction', 0.0)
+            else:
+                size_fraction = (self.desk.capital_allocation
+                                 * intent.get('size_fraction', 0.0))
+            trade_value = (self.portfolio.get_portfolio_value()
+                           * size_fraction)
             quantity = intent.get('quantity')
             if quantity is None:
-                if self.orchestrator is not None:
-                    # Orchestrator intents are already account-absolute.
-                    size_fraction = intent.get('size_fraction', 0.0)
-                else:
-                    size_fraction = (self.desk.capital_allocation
-                                     * intent.get('size_fraction', 0.0))
-                trade_value = (self.portfolio.get_portfolio_value()
-                               * size_fraction)
                 per_contract = max(fill_price, MIN_OPTION_HAIRCUT) * asset.multiplier
                 quantity = int(trade_value / per_contract)
+            else:
+                requested_notional = quantity * fill_price * asset.multiplier
+                if requested_notional > trade_value + 1e-9:
+                    logger.warning(
+                        "Dropping %s intent for %s on %s: absolute quantity "
+                        "requests %.2f notional against %.2f risk budget",
+                        signal, str(asset), fill_date, requested_notional,
+                        trade_value)
+                    return
             if quantity <= 0:
                 logger.warning(
                     "Dropping %s intent for %s on %s: sizes to 0 contracts",
@@ -915,7 +1019,17 @@ class BacktestEngine:
             # Desk intents may carry an absolute share count (Phase 8); it
             # overrides the dollar sizing. Strategy mode never sets it. A
             # re-queued remainder (realistic fills) also carries it.
-            desired = intent.get('quantity') or int(trade_value / base_fill)
+            explicit_quantity = intent.get('quantity')
+            desired = (explicit_quantity if explicit_quantity is not None
+                       else int(trade_value / base_fill))
+
+            if (explicit_quantity is not None and not intent.get('accumulate')
+                    and desired * base_fill > trade_value + 1e-9):
+                logger.warning(
+                    "Dropping BUY intent for %s on %s: absolute quantity "
+                    "requests %.2f notional against %.2f risk budget",
+                    asset.symbol, fill_date, desired * base_fill, trade_value)
+                return None
 
             if desired == 0:
                 logger.warning(
@@ -991,7 +1105,17 @@ class BacktestEngine:
             base_fill = base_price * (1 - slippage)
             portfolio_value = self.portfolio.get_portfolio_value()
             trade_value = portfolio_value * position_size
-            desired = intent.get('quantity') or int(trade_value / base_fill)
+            explicit_quantity = intent.get('quantity')
+            desired = (explicit_quantity if explicit_quantity is not None
+                       else int(trade_value / base_fill))
+
+            if (explicit_quantity is not None and not intent.get('accumulate')
+                    and desired * base_fill > trade_value + 1e-9):
+                logger.warning(
+                    "Dropping SHORT intent for %s on %s: absolute quantity "
+                    "requests %.2f notional against %.2f risk budget",
+                    asset.symbol, fill_date, desired * base_fill, trade_value)
+                return None
 
             if desired == 0:
                 logger.warning(

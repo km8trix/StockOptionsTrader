@@ -14,6 +14,7 @@ Usage:  BacktestEngine(desk=..., market_data=WarehouseMarketData())
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -37,9 +38,14 @@ class WarehouseMarketData(MarketDataHandler):
         self._last_fetch_info[symbol] = {
             'provider': 'pit_warehouse', 'from_cache': True, 'failures': [],
             'start_date': start_date, 'end_date': end_date,
+            'fetched_at': datetime.now(timezone.utc).isoformat(),
         }
         if df is None or df.empty:
             return self._empty_data(symbol)
         self.cache[f"{symbol}_{start_date}_{end_date}"] = df
         self.stock_data[symbol] = df
         return df
+
+    def delisting_date(self, symbol: str):
+        """Final listed session for ``symbol``, or ``None`` when still live."""
+        return self._wh.delisting_date(symbol)

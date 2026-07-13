@@ -73,6 +73,10 @@ class TestDockerfile:
         assert copy_lines, "Dockerfile should contain COPY instructions"
         assert not any(".db" in line for line in copy_lines)
 
+    @pytest.mark.parametrize("runtime_package", ["desks", "analysis", "execution"])
+    def test_copies_runtime_import_packages(self, dockerfile_text, runtime_package):
+        assert f"COPY {runtime_package}/ {runtime_package}/" in dockerfile_text
+
 
 class TestDockerignore:
     @pytest.mark.parametrize(
@@ -99,3 +103,7 @@ class TestComposeFile:
 
     def test_restart_policy(self, compose_text):
         assert "restart: unless-stopped" in compose_text
+
+    def test_host_port_is_published_on_loopback_only(self, compose_text):
+        assert '"127.0.0.1:5001:5001"' in compose_text
+        assert '\n      - "5001:5001"' not in compose_text

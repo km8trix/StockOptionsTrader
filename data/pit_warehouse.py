@@ -195,6 +195,26 @@ class PitWarehouse:
         res = self._query('tickers', sql + " ORDER BY ticker", args)
         return [r[0] for r in res.fetchall()] if res else []
 
+    def delisting_date(self, ticker: str):
+        """Return a ticker's final listed price date, or ``None`` when live.
+
+        Sharadar leaves ``lastpricedate`` null for currently listed securities
+        and records the final tradable session for delisted names.  Exposing the
+        date through the feed lets the backtest engine liquidate a held delisted
+        security at its final observable close instead of carrying a stale mark
+        forever.
+        """
+        res = self._query(
+            'tickers',
+            "SELECT CAST(lastpricedate AS DATE) FROM src "
+            "WHERE ticker = ? LIMIT 1",
+            [ticker],
+        )
+        if not res:
+            return None
+        row = res.fetchone()
+        return self._date(row[0]) if row and row[0] is not None else None
+
     def fundamentals_asof(self, ticker: str, date, *,
                           dimension: str = 'ARQ') -> Optional[Dict]:
         """Latest SF1 row KNOWN on ``date`` — datekey <= date (point-in-time).

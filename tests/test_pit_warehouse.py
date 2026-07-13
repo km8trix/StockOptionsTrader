@@ -77,6 +77,9 @@ def test_universe_survivorship_free(wh):
     # category=None lifts the filter; scalemarketcap scopes size
     assert 'ETF' in w.universe_asof('2020-06-30', category=None)
     assert w.universe_asof('2020-06-30', scalemarketcap=['4 - Mid']) == ['LIVE']
+    assert w.delisting_date('DEAD').isoformat() == '2018-06-30'
+    assert w.delisting_date('LIVE') is None
+    assert w.delisting_date('MISSING') is None
 
 
 # ---------------------------------------------------------------------------

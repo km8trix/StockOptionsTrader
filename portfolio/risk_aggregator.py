@@ -31,10 +31,12 @@ desk and strategy backtests never construct it, so their paths are unchanged.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 
+from core.models import AssetType
 from desks.base import DeskIntent
 from portfolio.manager import PortfolioManager
 from portfolio.risk_manager import RiskManager
@@ -152,14 +154,28 @@ class PortfolioRiskAggregator:
         gross_limit = self.max_gross_leverage * account_capital
         pending: List[DeskIntent] = []
         for intent in sorted(opens, key=lambda i: (i.asset.symbol, i.action)):
-            # Proxy notional = account_capital * size_fraction — the SAME
-            # estimate the per-name apply_risk position-size check uses. For
-            # option intents (Jane Street carries an absolute `quantity`) this
-            # is a deliberate approximation; for a defined-risk condor it
-            # OVER-counts the true premium, erring conservative for a hard
-            # gross cap. Held options ARE measured at exact x100 notional in
-            # _current_gross.
+            # Fractional intents use the account-fraction proxy.  Absolute
+            # STOCK quantities are valued exactly from the latest causal close
+            # so a huge quantity cannot pass behind a tiny size_fraction.  For
+            # option structures the fraction represents defined max-loss risk,
+            # rather than premium/underlying notional, and remains the more
+            # conservative structure-level convention.
             notional = account_capital * intent.size_fraction
+            if (intent.quantity is not None
+                    and intent.asset.asset_type is AssetType.STOCK):
+                frame = all_data.get(intent.asset.symbol)
+                price = None
+                if frame is not None and not frame.empty and 'close' in frame:
+                    candidate = float(frame['close'].iloc[-1])
+                    if math.isfinite(candidate) and candidate > 0:
+                        price = candidate
+                if price is None:
+                    reason = (f"absolute quantity for {intent.asset.symbol} "
+                              "cannot be valued from current data")
+                    self.violations.append(reason)
+                    blocked.append((intent, reason))
+                    continue
+                notional = abs(float(intent.quantity)) * price
             if gross + notional > gross_limit:
                 reason = (f"account gross {gross + notional:,.2f} would exceed "
                           f"the {self.max_gross_leverage:.2f}x limit "

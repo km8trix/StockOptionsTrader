@@ -114,6 +114,21 @@ class TestDefaultByteIdentical:
         assert entry['fallback'] is False
         assert entry['degraded_desks'] == []
 
+    def test_reweight_keeps_internal_risk_book_capital_in_sync(self):
+        class RiskBook:
+            capital_allocation = 0.5
+
+        rw = DynamicReweighter(rebalance_every=21)
+        rw.set_curves({'a': curve(LOW_VOL), 'b': curve(HIGH_VOL)})
+        a, b = StubDesk('a'), StubDesk('b')
+        a.risk_book = RiskBook()
+        b.risk_book = RiskBook()
+
+        weights = rw.on_day([a, b], curve(LOW_VOL)[21][0], day_number=21)
+
+        assert a.risk_book.capital_allocation == pytest.approx(weights['a'])
+        assert b.risk_book.capital_allocation == pytest.approx(weights['b'])
+
 
 # ----------------------------------------------------------------------
 # Performance mode: realized risk-adjusted reallocation

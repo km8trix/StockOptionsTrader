@@ -180,10 +180,12 @@ try:
         build_spread_order,
     )
     from brokers.etrade_auth import EtradeAuthExpired
+    from brokers.live_trader import LiveEtradeBroker, PriceSanityError
     from utils.kill_switch import KillSwitchEngaged
     CLIENT_IMPORT_ERROR = None
 except Exception as e:  # noqa: BLE001
     EtradeClient = None
+    LiveEtradeBroker = None
     build_equity_order = build_option_order = build_spread_order = None
     CLIENT_IMPORT_ERROR = f'{type(e).__name__}: {e}'
     logger.error(
@@ -208,6 +210,9 @@ except Exception as e:  # noqa: BLE001
         pass
 
     class KillSwitchEngaged(Exception):
+        pass
+
+    class PriceSanityError(ValueError):
         pass
 
 live_bp = Blueprint('live', __name__, url_prefix='/api/live')
@@ -1446,6 +1451,25 @@ def _to_int(value):
     return int(f)
 
 
+def _optional_limit_price(params: dict, key: str = 'limit_price'):
+    """Parse an optional positive limit without turning bad input into MKT.
+
+    Missing, JSON null, and blank strings intentionally select a market order.
+    Any other unparseable, non-finite, zero, or negative value is an explicit
+    bad limit and must be rejected rather than silently broadening the order
+    to MARKET.
+    """
+    raw = params.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None, None
+    if isinstance(raw, bool):
+        return None, f"'{key}' must be a positive finite number or blank"
+    value = _to_float(raw)
+    if value is None or value <= 0:
+        return None, f"'{key}' must be a positive finite number or blank"
+    return value, None
+
+
 def _build_order_request(kind: str, params: dict):
     """(order_request, None) on success, or (None, error_message).
 
@@ -1458,13 +1482,15 @@ def _build_order_request(kind: str, params: dict):
             symbol = str(params.get('symbol') or '').strip().upper()
             side = str(params.get('side') or '').strip().upper()
             quantity = _to_int(params.get('quantity'))
-            limit = _to_float(params.get('limit_price'))
+            limit, limit_err = _optional_limit_price(params)
             if not symbol:
                 return None, "'symbol' is required"
             if side not in ('BUY', 'SELL'):
                 return None, "'side' must be BUY or SELL"
             if quantity is None or quantity <= 0:
                 return None, "'quantity' must be a positive integer"
+            if limit_err is not None:
+                return None, limit_err
             return build_equity_order(symbol, side, quantity,
                                       limit_price=limit), None
 
@@ -1475,7 +1501,7 @@ def _build_order_request(kind: str, params: dict):
             expiry = str(params.get('expiry') or '').strip()
             action = str(params.get('action') or '').strip().upper()
             quantity = _to_int(params.get('quantity'))
-            limit = _to_float(params.get('limit_price'))
+            limit, limit_err = _optional_limit_price(params)
             if not symbol:
                 return None, "'symbol' is required"
             if call_put not in ('CALL', 'PUT'):
@@ -1486,6 +1512,8 @@ def _build_order_request(kind: str, params: dict):
                 return None, "'expiry' is required (YYYY-MM-DD)"
             if quantity is None or quantity <= 0:
                 return None, "'quantity' must be a positive integer"
+            if limit_err is not None:
+                return None, limit_err
             return build_option_order(symbol, call_put, strike, expiry,
                                       action, quantity,
                                       limit_price=limit), None
@@ -1583,10 +1611,29 @@ def _market_hours_block(data: dict):
     }), 409
 
 
+def _configured_order_account():
+    """Return the only account live order routes may target, or a 503.
+
+    The GUI client's daily-loss gate is bound to ETRADE_ACCOUNT_ID_KEY.  An
+    order route must therefore fail closed when it is absent instead of
+    accepting an arbitrary request account that the rail is not monitoring.
+    """
+    account_id_key = str(os.environ.get('ETRADE_ACCOUNT_ID_KEY') or '').strip()
+    if account_id_key:
+        return account_id_key, None
+    return None, (jsonify({
+        'error': 'Live order routing is not configured',
+        'reason': 'ETRADE_ACCOUNT_ID_KEY is required for preview and place',
+    }), 503)
+
+
 @live_bp.route('/order/preview', methods=['POST'])
 def live_order_preview():
     """Build + preview an order, caching the built request behind an opaque
     order_ref. PLACE only ever works from a cached, previewed ref."""
+    configured_account, account_err = _configured_order_account()
+    if account_err is not None:
+        return account_err
     client, err = _require_client()
     if err is not None:
         return err
@@ -1597,10 +1644,9 @@ def live_order_preview():
         return jsonify({'error': "'account_id_key' is required"}), 400
     # The daily-loss rail (get_client) monitors the configured
     # ETRADE_ACCOUNT_ID_KEY account; refuse an order for any OTHER account so
-    # the rail and the order can never diverge. (No-op when it is unset — then
-    # no gate is wired anyway.) Place inherits this via the cached order_ref.
-    configured_account = os.environ.get("ETRADE_ACCOUNT_ID_KEY")
-    if configured_account and account_id_key != configured_account:
+    # the rail and the order can never diverge. Missing configuration already
+    # failed closed above. Place inherits this binding via the cached order_ref.
+    if account_id_key != configured_account:
         return jsonify({
             'error': 'account mismatch',
             'detail': 'Live orders must target the configured '
@@ -1617,6 +1663,19 @@ def live_order_preview():
     order_request, build_err = _build_order_request(kind, data)
     if build_err is not None:
         return jsonify({'error': build_err}), 400
+
+    # The order_ref workflow intentionally previews through the typed client
+    # so PLACE can reuse the exact cached request.  Validate that built request
+    # through LiveEtradeBroker first so the GUI ticket retains the broker's
+    # blocking fat-finger rail without collapsing preview + place into one call.
+    try:
+        LiveEtradeBroker(client, configured_account).validate_order_request(
+            order_request)
+    except PriceSanityError as exc:
+        return jsonify({
+            'error': 'price sanity check failed',
+            'detail': str(exc),
+        }), 400
 
     try:
         preview = client.preview_order(account_id_key, order_request)
@@ -1646,6 +1705,9 @@ def live_order_place():
     consumed BEFORE the place call so a successful placement can never be
     replayed; a failed place re-caches nothing (the operator re-previews).
     """
+    configured_account, account_err = _configured_order_account()
+    if account_err is not None:
+        return account_err
     client, err = _require_client()
     if err is not None:
         return err
@@ -1662,6 +1724,12 @@ def live_order_place():
         return jsonify({'error': 'order_ref not found or expired'}), 404
 
     account_id_key = record['account_id_key']
+    if account_id_key != configured_account:
+        return jsonify({
+            'error': 'account mismatch',
+            'detail': 'The previewed order does not target the currently '
+                      'configured ETRADE_ACCOUNT_ID_KEY account.',
+        }), 409
     order_request = record['request']
     preview_ids = record['preview_ids']
     try:

@@ -35,6 +35,15 @@ def _fixture(tmp_path):
     return PitWarehouse(str(tmp_path))
 
 
+def _write_tickers(path):
+    duckdb.connect().execute(
+        f"COPY (SELECT * FROM (VALUES "
+        "('DEAD', DATE '2010-01-01', DATE '2020-01-06'),"
+        "('LIVE', DATE '2010-01-01', NULL)) "
+        "AS t(ticker,firstpricedate,lastpricedate)) "
+        f"TO '{path}' (FORMAT PARQUET)")
+
+
 def test_ohlcv_is_adjusted_and_shaped(tmp_path):
     w = _fixture(tmp_path)
     df = w.ohlcv('AAPL', '2020-01-01', '2020-01-31')
@@ -73,3 +82,48 @@ def test_engine_accepts_injected_market_data(tmp_path):
     # default is still the live handler
     assert isinstance(BacktestEngine(strategy=object()).market_data,
                       MarketDataHandler)
+
+
+def test_engine_liquidates_delisted_holding_at_final_close(tmp_path):
+    _write_sep(tmp_path / "sep.parquet", [
+        ("'DEAD'", "DATE '2020-01-02'", "10.0", "10.0", "10.0", "10.0",
+         "1000.0", "10.0"),
+        ("'DEAD'", "DATE '2020-01-03'", "10.0", "10.0", "10.0", "10.0",
+         "1000.0", "10.0"),
+        ("'DEAD'", "DATE '2020-01-06'", "8.0", "8.0", "8.0", "8.0",
+         "1000.0", "8.0"),
+        # Keeps the union calendar running after DEAD's final session.
+        ("'LIVE'", "DATE '2020-01-02'", "20.0", "20.0", "20.0", "20.0",
+         "1000.0", "20.0"),
+        ("'LIVE'", "DATE '2020-01-03'", "20.0", "20.0", "20.0", "20.0",
+         "1000.0", "20.0"),
+        ("'LIVE'", "DATE '2020-01-06'", "20.0", "20.0", "20.0", "20.0",
+         "1000.0", "20.0"),
+        ("'LIVE'", "DATE '2020-01-07'", "20.0", "20.0", "20.0", "20.0",
+         "1000.0", "20.0"),
+    ])
+    _write_tickers(tmp_path / "tickers.parquet")
+
+    class BuyDead:
+        name = 'buy-dead'
+
+        def generate_signals(self, data, asset):
+            return ('BUY' if asset.symbol == 'DEAD'
+                    and data.index[-1] == pd.Timestamp('2020-01-02')
+                    else 'HOLD')
+
+    feed = WarehouseMarketData(PitWarehouse(str(tmp_path)))
+    engine = BacktestEngine(
+        strategy=BuyDead(), market_data=feed, commission=0.0,
+        slippage_bps=0.0)
+    report = engine.run(
+        ['DEAD', 'LIVE'], '2020-01-01', '2020-01-31',
+        position_size=0.1, benchmark_symbol=None)
+
+    assert 'error' not in report
+    assert all(asset.symbol != 'DEAD' for asset in engine.portfolio.positions)
+    liquidation = [t for t in engine.trades_log
+                   if t.get('reason') == 'delisting liquidation']
+    assert len(liquidation) == 1
+    assert liquidation[0]['date'] == pd.Timestamp('2020-01-06')
+    assert liquidation[0]['price'] == 8.0

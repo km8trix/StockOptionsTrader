@@ -279,7 +279,11 @@ class JaneStreetDesk(Desk):
         # docstring; risk-book contract via register_limit).
         self.risk_book = (risk_book if risk_book is not None
                           else CentralRiskBook(
-                              capital_allocation=capital_allocation))
+                              capital_allocation=capital_allocation,
+                              owner_key=self.key))
+        # An injected book is still desk-internal: bind it to this desk so a
+        # unified fund portfolio cannot consume another desk's risk budget.
+        self.risk_book.owner_key = self.key
         self.risk_book.register_limit('short_vega', self._short_vega_check)
 
         # --- Desk state ---------------------------------------------------

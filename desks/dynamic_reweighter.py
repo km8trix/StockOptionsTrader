@@ -37,7 +37,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import pandas as pd
 
-from desks.capital_allocator import CrossDeskCapitalAllocator
+from desks.capital_allocator import (CrossDeskCapitalAllocator,
+                                     set_desk_capital_allocation)
 
 if TYPE_CHECKING:  # annotation only — avoids a runtime import cycle
     from desks.base import Desk
@@ -191,7 +192,7 @@ class DynamicReweighter:
 
         for desk in desks:
             if desk.key in weights:
-                desk.capital_allocation = weights[desk.key]
+                set_desk_capital_allocation(desk, weights[desk.key])
 
         # fallback is True for EITHER a degenerate-desk equal-weight fallback OR
         # a cov-mode numerical degrade to inverse-vol, so the audit never reads

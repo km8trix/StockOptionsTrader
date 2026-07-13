@@ -10,8 +10,8 @@ from brokers.circuit_breaker import DailyLossCircuitBreaker
 from brokers.etrade_auth import EtradeAuthExpired
 from brokers.etrade_client import (EtradeClient, EtradeOrderRejected,
                                    EtradeRateLimited, EtradeUnavailable,
-                                   build_equity_order, build_spread_order,
-                                   new_client_order_id)
+                                   build_equity_order, build_option_order,
+                                   build_spread_order, new_client_order_id)
 from utils.audit import AuditLog
 from utils.kill_switch import KillSwitch, KillSwitchEngaged
 
@@ -563,6 +563,24 @@ class TestLiveEtradeBroker:
                                OrderType.BUY, 1, 1000.0)  # 10x typo
         # Refused before any order endpoint was hit.
         assert not any("orders/" in c["url"] for c in transport.calls)
+
+    def test_option_sanity_uses_one_sided_premium_ceiling(self, harness):
+        """A normal small option premium is not compared symmetrically to
+        spot, while a gross premium typo is still blocked."""
+        from brokers.live_trader import PriceSanityError
+
+        broker, _transport = self._broker(harness)
+        broker.get_current_price = lambda _s: 100.0
+        normal = build_option_order(
+            'AAPL', 'CALL', 100, '2026-07-17', 'BUY_OPEN', 1,
+            limit_price=2.0)
+        broker.validate_order_request(normal)  # must not raise
+
+        absurd = build_option_order(
+            'AAPL', 'CALL', 100, '2026-07-17', 'BUY_OPEN', 1,
+            limit_price=1000.0)
+        with pytest.raises(PriceSanityError):
+            broker.validate_order_request(absurd)
 
     def test_place_structure_blocks_absurd_net_price(self, harness):
         # Gap 2: structure net price beyond the defined-risk strike ceiling.

@@ -119,6 +119,10 @@ class LiveEtradeBroker(ExecutionBroker):
                  reference_price_fn: Optional[Callable[[str], Optional[float]]]
                  = None,
                  quote_divergence_threshold: float = 0.05):
+        account_id_key = str(account_id_key or '').strip()
+        if not account_id_key:
+            raise ValueError(
+                'account_id_key is required for live order routing')
         if isinstance(auth, EtradeClient) or hasattr(auth, "preview_order"):
             # prebuilt (or fake) client — narrowed by the isinstance/duck check
             self.client: EtradeClient = cast(EtradeClient, auth)
@@ -184,6 +188,59 @@ class LiveEtradeBroker(ExecutionBroker):
                 f"from current {current:.4f} (threshold {threshold * 100:.0f}%)"
                 f" — refusing as a likely fat-finger")
 
+    def _enforce_option_price_sanity(
+            self, symbol: str, call_put: str, strike: float,
+            limit_price: Optional[float]) -> None:
+        """Block a single-option premium beyond a generous theoretical cap.
+
+        Comparing an option premium to its underlying with a symmetric
+        percentage-distance check is not meaningful: a $2 premium on a $100
+        stock is normal, not 98% stale.  For calls, the spot price is the
+        natural no-arbitrage upper reference; for puts, the strike is.  The
+        configured threshold is added as generous headroom so this remains a
+        typo rail rather than an execution model.  When the quote is dark,
+        strike is used as a conservative fallback for both rights.
+        """
+        threshold = self.price_sanity_threshold
+        if threshold is None or limit_price is None:
+            return
+        try:
+            current = self.get_current_price(symbol)
+        except Exception:  # noqa: BLE001 - same fail-open quote policy as EQ
+            current = None
+        if call_put.upper() == 'PUT':
+            basis = strike
+        else:
+            basis = current if current is not None and current > 0 else strike
+        if basis <= 0:
+            return
+        ceiling = basis * (1.0 + threshold)
+        if limit_price > ceiling:
+            raise PriceSanityError(
+                f"Option limit {limit_price:.4f} for {symbol} exceeds the "
+                f"{ceiling:.2f} premium sanity ceiling (basis {basis:.2f}, "
+                f"threshold {threshold * 100:.0f}%) — refusing as a likely "
+                "fat-finger")
+
+    def _enforce_strike_package_sanity(self, strikes: List[float],
+                                       net_price: float) -> None:
+        """Shared quote-free spread check over already-normalized strikes."""
+        threshold = self.price_sanity_threshold
+        if threshold is None:
+            return
+        if not math.isfinite(net_price):
+            raise PriceSanityError(f"Spread net price {net_price} is not finite")
+        if not strikes:
+            return
+        width = max(strikes) - min(strikes)
+        basis = width if width > 0 else max(strikes)
+        ceiling = basis * (1.0 + threshold)
+        if abs(net_price) > ceiling:
+            raise PriceSanityError(
+                f"Spread net price {net_price:.4f} exceeds the {ceiling:.2f} "
+                f"defined-risk ceiling (strike width {width:.2f}, threshold "
+                f"{threshold * 100:.0f}%) — refusing as a likely fat-finger")
+
     def _enforce_structure_sanity(self, legs: List[Dict],
                                   net_price: float) -> None:
         """BLOCK a spread whose net price is non-finite or larger than the
@@ -197,23 +254,49 @@ class LiveEtradeBroker(ExecutionBroker):
         no tight quote-free bound, so they fall back to a looser max-strike
         ceiling that still catches gross 10x-100x typos without false-rejecting
         a legitimate debit."""
-        threshold = self.price_sanity_threshold
-        if threshold is None:
-            return
-        if not math.isfinite(net_price):
-            raise PriceSanityError(f"Spread net price {net_price} is not finite")
         strikes = [leg["asset"].strike_price for leg in legs
                    if getattr(leg.get("asset"), "strike_price", None) is not None]
-        if not strikes:
-            return
-        width = max(strikes) - min(strikes)
-        basis = width if width > 0 else max(strikes)
-        ceiling = basis * (1.0 + threshold)
-        if abs(net_price) > ceiling:
+        self._enforce_strike_package_sanity(strikes, net_price)
+
+    def validate_order_request(self, order_request: Dict) -> None:
+        """Apply the live broker's blocking price rails to a built GUI ticket.
+
+        The GUI previews through :class:`EtradeClient` so it can cache the
+        exact previewed request behind an ``order_ref``.  Calling this method
+        first lets that workflow reuse the same blocking fat-finger policy as
+        broker-driven orders without combining preview and place.
+        """
+        try:
+            order_type = order_request['orderType']
+            order = order_request['Order'][0]
+            if order.get('priceType') == 'MARKET':
+                return
+            limit_price = float(order['limitPrice'])
+            instruments = order['Instrument']
+            if order_type == 'EQ':
+                product = instruments[0]['Product']
+                self._enforce_price_sanity(product['symbol'], limit_price)
+                return
+            if order_type == 'OPTN':
+                product = instruments[0]['Product']
+                self._enforce_option_price_sanity(
+                    product['symbol'], product['callPut'],
+                    float(product['strikePrice']), limit_price)
+                return
+            if order_type == 'SPREADS':
+                strikes = [float(leg['Product']['strikePrice'])
+                           for leg in instruments]
+                self._enforce_strike_package_sanity(strikes, limit_price)
+                return
+        except PriceSanityError:
+            raise
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            # The route only passes requests built by our typed builders, but
+            # fail closed if that contract ever drifts.
             raise PriceSanityError(
-                f"Spread net price {net_price:.4f} exceeds the {ceiling:.2f} "
-                f"defined-risk ceiling (strike width {width:.2f}, threshold "
-                f"{threshold * 100:.0f}%) — refusing as a likely fat-finger")
+                'Unable to validate live order price sanity') from exc
+        raise PriceSanityError(
+            f"Unsupported live order type {order_type!r} for price sanity")
 
     # ------------------------------------------------------------------
     # ExecutionBroker ABC
@@ -228,15 +311,19 @@ class LiveEtradeBroker(ExecutionBroker):
         closes it (SELL_CLOSE). Short option exposure is only ever opened
         as part of a defined-risk structure via place_structure().
         """
-        self._enforce_price_sanity(asset.symbol, limit_price)
         action = "BUY" if order_type == OrderType.BUY else "SELL"
         if asset.asset_type is AssetType.STOCK:
+            self._enforce_price_sanity(asset.symbol, limit_price)
             request = build_equity_order(asset.symbol, action, quantity,
                                          limit_price=limit_price)
         else:
+            assert asset.strike_price is not None  # option assets carry a strike
+            self._enforce_option_price_sanity(
+                asset.symbol,
+                "CALL" if asset.asset_type is AssetType.CALL else "PUT",
+                asset.strike_price, limit_price)
             option_action = ("BUY_OPEN" if order_type == OrderType.BUY
                              else "SELL_CLOSE")
-            assert asset.strike_price is not None  # option assets carry a strike
             request = build_option_order(
                 asset.symbol,
                 "CALL" if asset.asset_type is AssetType.CALL else "PUT",

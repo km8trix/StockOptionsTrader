@@ -78,6 +78,17 @@ class TestPositionAccounting:
         assert pm.cash == pytest.approx(85000.0)
         assert pm.get_portfolio_value() == pytest.approx(85000.0 + 100 * 155.0)
 
+    def test_total_return_reconciles_to_nav_and_includes_cash_commissions(self):
+        pm = PortfolioManager(100000.0)
+        # Flat-price round trip whose only loss is two $10 cash commissions.
+        pm.cash = 99980.0
+        assert pm.get_realized_pnl() == 0.0
+        assert pm.get_portfolio_pnl() == 0.0
+        assert pm.get_total_return() == pytest.approx(-20.0)
+        summary = pm.get_summary()
+        assert summary['total_return'] == pytest.approx(
+            summary['current_value'] - summary['initial_capital'])
+
     def test_unrealized_pnl(self):
         pm = PortfolioManager(100000.0)
         pm.add_position(self._position(quantity=100, entry=150.0, current=155.0))

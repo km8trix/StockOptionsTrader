@@ -168,21 +168,34 @@ Requires Python 3.13 (the dependency pins target it).
 python3.13 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pytest -q     # offline, deterministic suite
-.venv/bin/python run_gui.py       # dev server on http://127.0.0.1:5001
+APP_AUTH_USERNAME=operator APP_AUTH_PASSWORD='replace-with-a-local-secret' \
+  .venv/bin/python run_gui.py      # dev server on http://127.0.0.1:5001
 ```
+
+The launcher intentionally does not auto-load `.env`; supply the two auth
+variables through your shell or secret manager when running locally.
 
 ## Docker
 
 ```bash
+# Authentication is mandatory outside tests. Put unique, high-entropy values
+# in .env alongside the E*TRADE variables; do not commit that file.
+# APP_AUTH_USERNAME=operator
+# APP_AUTH_PASSWORD=<generate-and-store-in-a-password-manager>
+
 # .env must exist in the repo root (E*TRADE credentials; see the table
 # below for the variable names). It is passed to the container at runtime
 # only — never baked into the image.
 docker compose up --build -d
 ```
 
-The app listens on <http://localhost:5001>; container health is probed via
-`GET /health`. The first build downloads several GB of Python dependencies
-(openbb pulls a large tree) — subsequent builds reuse the cached layer.
+The app is published only on host loopback at <http://localhost:5001> and
+requires HTTP Basic authentication. The unauthenticated `GET /health` endpoint
+exposes liveness only and is used by the container health probe. For remote
+access, use an SSH tunnel or an authenticated TLS reverse proxy; do not widen
+the Compose port binding directly. The first build downloads several GB of
+Python dependencies (openbb pulls a large tree) — subsequent builds reuse the
+cached layer.
 
 ### Single-worker constraint (important)
 
@@ -213,6 +226,8 @@ code, images, or compose files.
 | `FLASK_PORT` | `5001` | Bind port |
 | `FLASK_DEBUG` | unset (off) | Dev-server debug mode; never enable in production |
 | `SECRET_KEY` | insecure dev value | Flask session signing key; set a real one in production |
+| `APP_AUTH_USERNAME` | — (required outside tests) | HTTP Basic username protecting the GUI, APIs, static assets, and metrics |
+| `APP_AUTH_PASSWORD` | — (required outside tests) | HTTP Basic password; use a unique, high-entropy value stored only in `.env` |
 | `TRADING_DB_PATH` | `trading_data.db` (image: `/data/trading_data.db`) | SQLite file used by the trade DB, OHLCV cache, and options/IV store |
 | `LOG_LEVEL` | `INFO` | Root logging level |
 | `ETRADE_ENV` | `sandbox` | `sandbox` or `production` — selects the host and which consumer-key pair is read |

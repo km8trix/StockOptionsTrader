@@ -43,6 +43,20 @@ logger = logging.getLogger(__name__)
 #: Float tolerance on the target_gross (<= 1.0) bound.
 _TARGET_TOL = 1e-9
 
+
+def set_desk_capital_allocation(desk: Desk, weight: float) -> None:
+    """Set a desk weight and keep its internal risk-book base in sync.
+
+    Citadel and Jane Street copy their construction-time allocation into a
+    ``CentralRiskBook``. Fund reweighting changes the desk allocation later,
+    so mutating only the outer desk leaves risk checks using stale capital.
+    Desks without a risk book retain the original single assignment.
+    """
+    desk.capital_allocation = weight
+    risk_book = getattr(desk, 'risk_book', None)
+    if risk_book is not None and hasattr(risk_book, 'capital_allocation'):
+        risk_book.capital_allocation = weight
+
 #: Reciprocal-machine-epsilon ceiling on a covariance's condition number, above
 #: which it is treated as singular/ill-conditioned. np.linalg.solve may EITHER
 #: raise LinAlgError OR (depending on the LAPACK build) silently return finite
@@ -668,7 +682,7 @@ class CrossDeskCapitalAllocator:
         weights = self.risk_parity_weights(
             {desk.key: returns_by_desk.get(desk.key, []) for desk in desks})
         for desk in desks:
-            desk.capital_allocation = weights[desk.key]
+            set_desk_capital_allocation(desk, weights[desk.key])
         return weights
 
     # ------------------------------------------------------------------

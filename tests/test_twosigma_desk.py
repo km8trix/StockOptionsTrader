@@ -1157,7 +1157,7 @@ class TestSignalStrengthSizing:
     """Phase 5: opt-in score-excess (|score|) sizing on the shared
     cross-sectional book. Default off -> equal-weight (byte-identical);
     on -> each side's flat budget is split WITHIN the side by |score|,
-    clamped to the equal-weight cap, keeping long gross == short gross."""
+    water-filled through the name cap, keeping long gross == short gross."""
 
     # Symmetric scores: |top-3| mirrors |bottom-3| so the two sides carry
     # the SAME conviction distribution and stay dollar-neutral exactly.
@@ -1186,16 +1186,42 @@ class TestSignalStrengthSizing:
         # Stronger |score| -> more capital, WITHIN each side.
         assert sizes['S00'] > sizes['S01'] > sizes['S02']
         assert sizes['S09'] > sizes['S08'] > sizes['S07']
-        # No leg exceeds the equal-weight cap (conviction never grows gross).
-        assert all(v <= flat + 1e-12 for v in sizes.values())
+        # Concentration can rise above the average, but never the name cap.
+        assert max(sizes.values()) > flat
+        assert all(v <= 0.30 + 1e-12 for v in sizes.values())
 
     def test_dollar_neutrality_preserved(self):
         sizes = self._sizes(size_by_signal_strength=True)
         long_gross = sizes['S00'] + sizes['S01'] + sizes['S02']
         short_gross = sizes['S07'] + sizes['S08'] + sizes['S09']
-        # Symmetric |scores| -> the two sides carry equal gross (net ~ 0).
+        # Each side deploys its intended half-gross exactly.
         assert long_gross == pytest.approx(short_gross)
-        assert long_gross <= 0.5 + 1e-12  # bounded by the equal-weight total
+        assert long_gross == pytest.approx(0.5)
+
+    def test_asymmetric_scores_and_binding_cap_stay_dollar_neutral(self):
+        # Regression: the old min(flat_size, proportional_size) clamp silently
+        # discarded the strong long's rejected allocation. Since the short
+        # scores have a different shape, the two discarded amounts differed
+        # and produced a net book. Water-filling must re-spread both sides to
+        # the same 50% budget, even when the strongest long hits 30%.
+        scores = {
+            'S00': 10.0, 'S01': 2.0, 'S02': 1.0,
+            'S03': 0.04, 'S04': 0.03, 'S05': 0.02, 'S06': 0.01,
+            'S07': -0.10, 'S08': -0.20, 'S09': -0.30,
+        }
+        frames = universe(10)
+        date = frames['S00'].index[0]
+        desk = make_desk(
+            default=scores, quantile=0.3, target_gross=1.0,
+            max_name_size=0.30, size_by_signal_strength=True)
+        out = drive(desk, frames, [date], PortfolioManager(100000.0))[date]
+        longs = [i.size_fraction for i in out if i.action == 'BUY']
+        shorts = [i.size_fraction for i in out if i.action == 'SHORT']
+
+        assert sum(longs) == pytest.approx(0.5)
+        assert sum(shorts) == pytest.approx(0.5)
+        assert max(longs) == pytest.approx(0.30)  # cap actually binds
+        assert all(size <= 0.30 + 1e-12 for size in longs + shorts)
 
 
 class TestUncertaintyScaledSizing:
@@ -1214,7 +1240,7 @@ class TestUncertaintyScaledSizing:
         # The literal acceptance test: two EQUAL-|score| legs on one side, the
         # one the committee disagrees about more is sized SMALLER. Exercises
         # _conviction_sizes directly so the multiplier is isolated from ranking.
-        desk = make_desk(default=monotone_scores(),
+        desk = make_desk(default=monotone_scores(), max_name_size=0.20,
                          shrink_by_disagreement=True, disagreement_lambda=1.0)
         sizes = desk._conviction_sizes(
             ['A', 'B'], {'A': 0.2, 'B': 0.2}, flat_size=0.10,
@@ -1284,21 +1310,22 @@ class TestUncertaintyScaledSizing:
                                       disagreement_lambda=1.0)
         flat = (0.5 * 1.0) / 3
         # The high-disagreement leg on each side is sized SMALLER than its
-        # equal-conviction, low-disagreement peers (which stay at the flat cap).
+        # equal-conviction, low-disagreement peers.
         assert sizes['S00'] < sizes['S01']
         assert sizes['S00'] < sizes['S02']
         assert sizes['S09'] < sizes['S08']
         assert sizes['S09'] < sizes['S07']
-        assert sizes['S01'] == pytest.approx(flat)
-        assert sizes['S08'] == pytest.approx(flat)
-        # No leg grows past the equal-weight cap (shrink never adds gross).
-        assert all(v <= flat + 1e-12 for v in sizes.values())
+        # Rejected allocation is re-spread, so agreed names may exceed the
+        # average while every leg remains below max_name_size.
+        assert sizes['S01'] > flat
+        assert sizes['S08'] > flat
+        assert all(v <= 0.30 + 1e-12 for v in sizes.values())
 
     def test_committee_on_preserves_dollar_neutrality(self):
         sizes = self._committee_sizes(shrink_by_disagreement=True,
                                       disagreement_lambda=1.0)
         long_gross = sizes['S00'] + sizes['S01'] + sizes['S02']
         short_gross = sizes['S07'] + sizes['S08'] + sizes['S09']
-        # Symmetric disagreement -> the two sides shrink identically, so long
-        # gross == short gross (the book stays dollar-neutral).
+        # Both sides retain their full budget (the book stays neutral).
         assert long_gross == pytest.approx(short_gross)
+        assert long_gross == pytest.approx(0.5)

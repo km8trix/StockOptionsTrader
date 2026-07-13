@@ -163,10 +163,11 @@ class CrossSectionalLongShortDesk(Desk):
 
         # Signal-strength sizing (opt-in; default False -> equal-weight, the
         # book is byte-identical). When on, each side's flat budget is
-        # redistributed WITHIN the side in proportion to |alpha score| — the
-        # strongest signal sizes up to the flat cap, weaker ones less. Reuses
-        # the Renaissance stat-arb convention (per-side budgeting keeps long
-        # gross == short gross, so conviction never tilts the book net-long).
+        # redistributed WITHIN the side in proportion to |alpha score|. The
+        # redistribution is capped at max_name_size and water-filled, so the
+        # complete side budget is still deployed even when one strong name
+        # hits the cap. Per-side budgeting keeps long gross == short gross;
+        # conviction changes concentration, never the book's net exposure.
         self.size_by_signal_strength = size_by_signal_strength
 
         # Uncertainty-scaled sizing (opt-in; default False -> byte-identical).
@@ -175,11 +176,10 @@ class CrossSectionalLongShortDesk(Desk):
         # of the committee members' per-symbol scores (a free uncertainty
         # proxy) normalized by the cross-section median; the per-side budget is
         # then renormalized per side exactly like signal-strength sizing: each
-        # side's gross is bounded by its equal-weight budget, and long gross ==
-        # short gross only when disagreement is SYMMETRIC across sides (same
-        # caveat as signal-strength sizing -- asymmetric disagreement tilts the
-        # book just as asymmetric |scores| would). Risk concentrates on the
-        # names the ensemble AGREES on. Needs >= 2 committee members to matter:
+        # side deploys its full equal-weight budget, independently of the
+        # other side's score/disagreement distribution. Risk concentrates on
+        # the names the ensemble AGREES on without tilting the net book. Needs
+        # >= 2 committee members to matter:
         # a single-member committee has zero dispersion everywhere, so the
         # multiplier degrades to 1 (no change). See `_committee_dispersion`.
         if disagreement_lambda < 0.0:
@@ -374,8 +374,9 @@ class CrossSectionalLongShortDesk(Desk):
         # loops fall back to the flat long_size/short_size, byte-identical).
         # With signal-strength sizing on, each side's flat budget is split
         # WITHIN the side in proportion to |score| over the names actually
-        # being opened this rebalance (so each side's gross stays <= the flat
-        # total and long gross == short gross — dollar-neutral).
+        # being opened this rebalance. A capped water-fill deploys the exact
+        # flat total on each side, so asymmetric scores cannot create a net
+        # long/short tilt.
         long_sizes: Dict[str, float] = {}
         short_sizes: Dict[str, float] = {}
         if self.size_by_signal_strength or self.shrink_by_disagreement:
@@ -473,14 +474,14 @@ class CrossSectionalLongShortDesk(Desk):
                           ) -> Dict[str, float]:
         """Per-leg sizes for ONE side's freshly-opened legs.
 
-        Reuses the Renaissance stat-arb convention: the side's flat budget
-        (``flat_size`` per name) is redistributed WITHIN the side in
-        proportion to a per-leg WEIGHT, each leg clamped to
-        ``[floor, flat_size]`` so no leg exceeds the equal-weight cap and the
-        side's gross stays ``<=`` the equal-weight total — which keeps long
-        gross == short gross (the book stays dollar-neutral; conviction only
-        varies sizes WITHIN a side, never across them). A small positive floor
-        keeps every selected leg tradable (``DeskIntent`` requires
+        The side's flat budget (``flat_size`` per name) is redistributed
+        WITHIN the side in proportion to a per-leg WEIGHT. A bounded
+        water-fill clamps each leg to ``[floor, max_name_size]`` and
+        redistributes any amount rejected by the cap until the exact side
+        budget is deployed. This is the important neutrality invariant:
+        asymmetric score distributions may change concentration within each
+        side, but cannot make one side smaller than the other. A small positive
+        floor keeps every selected leg tradable (``DeskIntent`` requires
         ``size_fraction > 0``). All weights zero on a side -> flat so every leg
         still trades.
 
@@ -494,7 +495,10 @@ class CrossSectionalLongShortDesk(Desk):
         """
         if not side_symbols:
             return {}
-        floor = max(flat_size * 0.05, 1e-6)
+        # Never let the tradability floor exceed the per-leg average: very
+        # broad universes can make flat_size smaller than 1e-6, and a larger
+        # floor would itself over-deploy the side budget.
+        floor = min(flat_size, max(flat_size * 0.05, 1e-6))
         if self.size_by_signal_strength:
             weights = {s: abs(float(scores[s])) for s in side_symbols}
         else:
@@ -507,8 +511,54 @@ class CrossSectionalLongShortDesk(Desk):
         if total <= 0.0:
             return {s: flat_size for s in side_symbols}
         budget = flat_size * len(side_symbols)
-        return {s: min(flat_size, max(budget * weights[s] / total, floor))
-                for s in side_symbols}
+        cap = self.max_name_size
+
+        # Start every selected leg at the tradable floor, then allocate the
+        # residual proportionally. If a name hits the position cap, remove it
+        # from the active set and re-spread its rejected dollars. Because
+        # budget <= n * cap and floor <= flat_size, a feasible exact solution
+        # always exists.
+        sizes = {s: floor for s in side_symbols}
+        remaining = budget - floor * len(side_symbols)
+        active = list(side_symbols)
+        tolerance = 1e-15
+        while active and remaining > tolerance:
+            active_weight = sum(weights[s] for s in active)
+            if active_weight <= 0.0:
+                active_weights = {s: 1.0 for s in active}
+                active_weight = float(len(active))
+            else:
+                active_weights = {s: weights[s] for s in active}
+
+            capped = [
+                s for s in active
+                if sizes[s] + remaining * active_weights[s] / active_weight
+                >= cap - tolerance
+            ]
+            if not capped:
+                for s in active:
+                    sizes[s] += (remaining * active_weights[s]
+                                 / active_weight)
+                remaining = 0.0
+                break
+
+            for s in capped:
+                room = max(0.0, cap - sizes[s])
+                sizes[s] = cap
+                remaining -= room
+                active.remove(s)
+
+        # Absorb harmless floating-point residue deterministically without
+        # ever crossing the configured cap.
+        if remaining > 0.0:
+            for s in side_symbols:
+                room = cap - sizes[s]
+                add = min(room, remaining)
+                sizes[s] += add
+                remaining -= add
+                if remaining <= tolerance:
+                    break
+        return sizes
 
     def _committee_dispersion(self, all_data: Dict[str, pd.DataFrame],
                               date) -> Dict[str, float]:

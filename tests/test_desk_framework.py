@@ -128,6 +128,35 @@ class TestApplyRiskPositionSize:
         assert desk.apply_risk([intent], portfolio, {},
                                pd.Timestamp('2023-06-01')) == [intent]
 
+    def test_absolute_stock_quantity_cannot_bypass_fractional_budget(self):
+        desk = NullDesk(capital_allocation=1.0)
+        portfolio = PortfolioManager(initial_capital=100000.0)
+        asset = stock('HUGE')
+        frame = pd.DataFrame(
+            {'close': [100.0]}, index=[pd.Timestamp('2023-06-01')])
+        # Fractional budget is $5,000, but quantity requests $50,000.
+        intent = DeskIntent(asset=asset, action='SHORT', size_fraction=0.05,
+                            quantity=500, reason='bad absolute override')
+
+        assert desk.apply_risk(
+            [intent], portfolio, {'HUGE': frame},
+            pd.Timestamp('2023-06-01')) == []
+        assert any('absolute quantity requests' in note.message
+                   for note in desk.notes)
+
+    def test_absolute_stock_quantity_within_budget_passes(self):
+        desk = NullDesk(capital_allocation=1.0)
+        portfolio = PortfolioManager(initial_capital=100000.0)
+        asset = stock('OK')
+        frame = pd.DataFrame(
+            {'close': [100.0]}, index=[pd.Timestamp('2023-06-01')])
+        intent = DeskIntent(asset=asset, action='BUY', size_fraction=0.05,
+                            quantity=50, reason='bounded absolute size')
+
+        assert desk.apply_risk(
+            [intent], portfolio, {'OK': frame},
+            pd.Timestamp('2023-06-01')) == [intent]
+
 
 class TestApplyRiskStopLoss:
     def test_stop_breach_generates_full_size_sell_with_correct_numbers(self):

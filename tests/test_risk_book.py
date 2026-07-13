@@ -31,13 +31,13 @@ def intent(symbol: str, action: str, size_fraction: float = 0.1
 
 
 def add_position(portfolio: PortfolioManager, symbol: str, quantity: int,
-                 price: float) -> None:
+                 price: float, owners=None) -> None:
     """Add a position with the matching cash adjustment, so portfolio
     value stays consistent (shorts credit cash, longs debit it)."""
     portfolio.cash -= quantity * price
     portfolio.add_position(Position(
         asset=stock(symbol), quantity=quantity, avg_entry_price=price,
-        current_price=price, timestamp=datetime(2023, 1, 2)))
+        current_price=price, timestamp=datetime(2023, 1, 2), owners=owners))
 
 
 def cash_portfolio(value: float = 100_000.0) -> PortfolioManager:
@@ -67,6 +67,31 @@ class TestExposureArithmetic:
         assert exposures['gross'] == pytest.approx(26_000.0)
         assert exposures['net'] == pytest.approx(18_000.0)
         assert exposures['short'] == pytest.approx(4_000.0)
+
+    def test_owner_scoped_book_ignores_other_desks_positions(self):
+        portfolio = cash_portfolio()
+        add_position(portfolio, 'OURS', 100, 100.0, owners=('citadel',))
+        add_position(portfolio, 'THEIRS', -200, 50.0, owners=('other',))
+        add_position(portfolio, 'SHARED', 50, 100.0,
+                     owners=('citadel', 'other'))
+
+        exposures = CentralRiskBook(owner_key='citadel').compute_exposures(
+            portfolio)
+
+        assert exposures['per_symbol'] == {
+            'OURS': 10_000.0, 'SHARED': 5_000.0}
+        assert exposures['gross'] == pytest.approx(15_000.0)
+        assert exposures['net'] == pytest.approx(15_000.0)
+
+    def test_unscoped_book_preserves_standalone_all_positions_behavior(self):
+        portfolio = cash_portfolio()
+        add_position(portfolio, 'TAGGED', 100, 100.0, owners=('other',))
+        add_position(portfolio, 'UNTAGGED', -50, 100.0, owners=None)
+
+        exposures = CentralRiskBook().compute_exposures(portfolio)
+
+        assert exposures['per_symbol'] == {
+            'TAGGED': 10_000.0, 'UNTAGGED': -5_000.0}
 
 
 class TestCumulativeEvaluation:

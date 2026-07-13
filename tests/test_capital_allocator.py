@@ -90,6 +90,20 @@ class TestAllocate:
         orch = FundOrchestrator(desks)
         assert orch.active_capital == pytest.approx(1.0)
 
+    def test_keeps_internal_risk_book_allocation_in_sync(self):
+        class RiskBook:
+            capital_allocation = 1.0
+
+        lo, hi = ScriptedDesk('lo', 1.0), ScriptedDesk('hi', 1.0)
+        lo.risk_book = RiskBook()
+        hi.risk_book = RiskBook()
+
+        weights = CrossDeskCapitalAllocator().allocate(
+            [lo, hi], {'lo': LOW_VOL, 'hi': HIGH_VOL})
+
+        assert lo.risk_book.capital_allocation == pytest.approx(weights['lo'])
+        assert hi.risk_book.capital_allocation == pytest.approx(weights['hi'])
+
 
 class TestReturnsFromEquity:
     def test_basic_returns(self):

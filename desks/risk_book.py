@@ -111,7 +111,8 @@ class CentralRiskBook:
                  short_vega_limit: Optional[float] = None,
                  short_gamma_limit: Optional[float] = None,
                  greeks_aggregator: Optional['PortfolioGreeksAggregator']
-                 = None):
+                 = None,
+                 owner_key: Optional[str] = None):
         if not (0.0 < capital_allocation <= 1.0):
             raise ValueError(
                 f"capital_allocation {capital_allocation} must be in (0, 1]")
@@ -124,6 +125,10 @@ class CentralRiskBook:
         self.max_gross = max_gross
         self.max_symbol = max_symbol
         self.max_net = max_net
+        #: Fund-mode desk identity. When set, owner-tagged positions belonging
+        #: only to other desks are invisible to this book. Untagged positions
+        #: (the standalone path) remain visible for backward compatibility.
+        self.owner_key = owner_key
         # Greeks limits (see module docstring): evaluated as a desk-wide
         # gate when a greeks_aggregator is injected; configured WITHOUT one
         # makes check() fail loudly (_require_greeks_feed), never silently.
@@ -245,6 +250,10 @@ class CentralRiskBook:
                           prices: Optional[Dict[str, float]] = None) -> Dict:
         """Current exposure snapshot from open positions (no pendings).
 
+        When ``owner_key`` is configured, owner-tagged fund positions are
+        included only when that desk is among their owners. Untagged positions
+        remain visible, preserving standalone behavior.
+
         Positions are marked at prices[symbol] when available, else at
         their own current_price, and NETTED per symbol before gross/net/
         short are derived:
@@ -257,6 +266,10 @@ class CentralRiskBook:
         per_symbol: Dict[str, float] = {}
         for asset, position in portfolio.positions.items():
             if position.quantity == 0:
+                continue
+            if (self.owner_key is not None
+                    and position.owners is not None
+                    and self.owner_key not in position.owners):
                 continue
             mark = prices.get(asset.symbol, position.current_price)
             per_symbol[asset.symbol] = (per_symbol.get(asset.symbol, 0.0)

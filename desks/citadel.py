@@ -357,7 +357,11 @@ class CitadelDesk(Desk):
 
         self.risk_book = (risk_book if risk_book is not None
                           else CentralRiskBook(
-                              capital_allocation=capital_allocation))
+                              capital_allocation=capital_allocation,
+                              owner_key=self.key))
+        # An injected book is still desk-internal: bind it to this desk so a
+        # unified fund portfolio cannot consume another desk's risk budget.
+        self.risk_book.owner_key = self.key
 
         # --- Factor-neutrality band (the Phase E sharpening) ------------
         # A FactorRiskModel measures the aggregate book's net loading on the

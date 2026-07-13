@@ -398,6 +398,42 @@ class Desk(ABC):
 
             trade_value = abs(portfolio_value * self.capital_allocation
                               * intent.size_fraction)
+            # An absolute STOCK quantity must not bypass the fractional risk
+            # budget.  Use the latest causally available close to evaluate the
+            # real requested notional; option quantities are structure-sized
+            # by their desk's defined-risk/max-loss model and remain on that
+            # risk-budget convention.
+            if (intent.quantity is not None
+                    and intent.asset.asset_type is AssetType.STOCK):
+                frame = all_data.get(intent.asset.symbol)
+                close = None
+                if frame is not None and not frame.empty and 'close' in frame:
+                    candidate = float(frame['close'].iloc[-1])
+                    if np.isfinite(candidate) and candidate > 0:
+                        close = candidate
+                if close is None:
+                    self.note(
+                        'risk',
+                        f"Blocked {intent.action} {intent.asset.symbol}: "
+                        "absolute quantity cannot be valued from current data",
+                        symbol=intent.asset.symbol, action=intent.action,
+                        quantity=intent.quantity,
+                        **self.risk_note_data(intent.asset))
+                    continue
+                requested_notional = abs(float(intent.quantity)) * close
+                if requested_notional > trade_value + 1e-9:
+                    self.note(
+                        'risk',
+                        f"Blocked {intent.action} {intent.asset.symbol}: "
+                        f"absolute quantity requests {requested_notional:,.2f} "
+                        f"against a {trade_value:,.2f} risk budget",
+                        symbol=intent.asset.symbol, action=intent.action,
+                        quantity=intent.quantity,
+                        requested_notional=requested_notional,
+                        trade_value=trade_value,
+                        **self.risk_note_data(intent.asset))
+                    continue
+                trade_value = requested_notional
             if not self.risk_manager.check_position_size(portfolio_value,
                                                          trade_value):
                 self.note(
