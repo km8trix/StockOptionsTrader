@@ -23,6 +23,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.ensemble import GradientBoostingClassifier
 
 from desks.walk_forward import WalkForwardModel
@@ -51,6 +52,18 @@ class GradientBoostingModel(WalkForwardModel):
             n_estimators=n_estimators, max_depth=max_depth,
             random_state=random_state)
         self._fitted = False
+
+    def checkpoint_spec(self) -> Dict[str, object]:
+        """Identity required to deterministically refit a safe checkpoint."""
+        return {
+            'checkpoint_type': 'gradient-boosting-refit-v1',
+            'feature_columns': list(FEATURE_COLUMNS),
+            # Pin every sklearn hyperparameter, including defaults.  A caller
+            # that mutates the estimator via set_params cannot accidentally
+            # restore as though it were the constructor-default model.
+            'parameters': self._classifier.get_params(deep=False),
+            'sklearn_version': sklearn.__version__,
+        }
 
     # ------------------------------------------------------------------
     # Feature engineering

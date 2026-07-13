@@ -25,6 +25,7 @@ COPY backtesting/ backtesting/
 COPY strategies/ strategies/
 COPY desks/ desks/
 COPY analysis/ analysis/
+COPY deployment/ deployment/
 COPY execution/ execution/
 COPY utils/ utils/
 COPY gui/ gui/

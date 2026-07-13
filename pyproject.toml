@@ -48,7 +48,7 @@ ai = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["core*", "data*", "brokers*", "portfolio*", "backtesting*", "strategies*", "desks*", "analysis*", "execution*", "utils*", "gui*"]
+include = ["core*", "data*", "brokers*", "portfolio*", "backtesting*", "strategies*", "desks*", "analysis*", "deployment*", "execution*", "utils*", "gui*"]
 exclude = ["readme*", "tests*"]
 
 [tool.pytest.ini_options]

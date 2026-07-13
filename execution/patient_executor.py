@@ -113,6 +113,10 @@ _TERMINAL_STATUSES = frozenset({
     "CANCELLED", "CANCELED", "EXECUTED", "FILLED", "REJECTED", "EXPIRED"})
 
 
+class ControlledNotionalEnvelopeError(RuntimeError):
+    """A controlled opening order escaped its durable notional envelope."""
+
+
 def round_tick(price: float) -> float:
     """Round to the $0.01 tick, half-up, with an epsilon so float dust
     (114.74999...) lands on the hand-computable cent.
@@ -166,6 +170,83 @@ class PatientExecutor:
         self._state = threading.Condition(threading.RLock())
         self._active = False
         self._working_order: Optional[Dict] = None
+        # Controlled deployment authorizes notional durably before invoking
+        # the executor.  The one-shot in-memory envelope binds that durable
+        # reservation to the exact logical execution which consumes it.
+        self._controlled_envelopes_required = False
+        self._notional_envelopes: Dict[str, Dict] = {}
+
+    def require_controlled_notional_envelopes(self) -> None:
+        """Require a one-shot durable authorization for every execution.
+
+        This is enabled only by the verified live composition root.  Legacy
+        paper/research callers retain the normal patient-execution contract.
+        Rebinding clears unconsumed process-local capabilities; the durable
+        deployment store can safely reissue one for an idempotent intent.
+        """
+        with self._state:
+            if self._active:
+                raise RuntimeError(
+                    "cannot enable controlled envelopes during execution")
+            self._notional_envelopes.clear()
+            self._controlled_envelopes_required = True
+
+    def arm_controlled_notional_envelope(
+            self, *, execution_id: str, side: str, symbol: str,
+            quantity: int, opening: bool,
+            max_notional: Optional[float]) -> None:
+        """Arm the next exact execution from a persistent authorization.
+
+        Opening notional is a hard aggregate budget across fills and every
+        cancel/replace child.  Exit envelopes deliberately carry no budget:
+        manifest capacity must never prevent reducing an existing position.
+        """
+        identity = str(execution_id or "").strip()
+        normalized_side = str(side or "").strip().upper()
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not identity or normalized_side not in {"BUY", "SELL"}:
+            raise ValueError("invalid controlled execution identity")
+        if not normalized_symbol:
+            raise ValueError("controlled execution symbol is required")
+        if isinstance(quantity, bool) or int(quantity) < 1:
+            raise ValueError("controlled execution quantity must be positive")
+        budget = None
+        if opening:
+            if max_notional is None:
+                raise ValueError(
+                    "opening execution requires a finite notional budget")
+            try:
+                budget = float(max_notional)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "opening execution requires a finite notional budget"
+                ) from error
+            if not math.isfinite(budget) or budget <= 0:
+                raise ValueError(
+                    "opening execution requires a finite notional budget")
+        envelope = {
+            "side": normalized_side,
+            "symbol": normalized_symbol,
+            "quantity": int(quantity),
+            "opening": bool(opening),
+            "max_notional": budget,
+        }
+        with self._state:
+            if not self._controlled_envelopes_required:
+                raise RuntimeError(
+                    "controlled notional envelopes are not enabled")
+            if self._active:
+                raise RuntimeError(
+                    "cannot arm a controlled envelope during execution")
+            pending = self._notional_envelopes.get(identity)
+            if pending is not None and pending != envelope:
+                raise ControlledNotionalEnvelopeError(
+                    "execution id was re-armed with different economics")
+            other = set(self._notional_envelopes) - {identity}
+            if other:
+                raise ControlledNotionalEnvelopeError(
+                    "another controlled execution is awaiting consumption")
+            self._notional_envelopes[identity] = envelope
 
     def stop(self) -> None:
         """Permanently stop this worker and abort in-flight work.
@@ -317,6 +398,29 @@ class PatientExecutor:
                 raise RuntimeError(
                     "PatientExecutor is already working an order — one "
                     "worker, one order")
+            notional_envelope = None
+            if self._controlled_envelopes_required:
+                if execution_id is None:
+                    raise ControlledNotionalEnvelopeError(
+                        "controlled execution has no durable notional envelope")
+                notional_envelope = self._notional_envelopes.pop(
+                    execution_id, None)
+                if notional_envelope is None:
+                    raise ControlledNotionalEnvelopeError(
+                        "controlled execution has no durable notional envelope")
+                actual_symbol = str(
+                    getattr(instrument_or_legs, "symbol", "") or ""
+                ).strip().upper()
+                expected = (
+                    notional_envelope["side"],
+                    notional_envelope["symbol"],
+                    notional_envelope["quantity"],
+                )
+                actual = (side, actual_symbol, int(quantity))
+                if actual != expected:
+                    raise ControlledNotionalEnvelopeError(
+                        "controlled execution differs from its durable "
+                        "authorization")
             self._active = True
             self._cancel_event.clear()
             if not self._stop_event.is_set():
@@ -325,7 +429,7 @@ class PatientExecutor:
         try:
             return self._run(side, instrument_or_legs, quantity,
                              max_minutes, step_interval_s, edge_check, start,
-                             execution_id, closing)
+                             execution_id, closing, notional_envelope)
         finally:
             with self._state:
                 self._working_order = None
@@ -339,7 +443,8 @@ class PatientExecutor:
     def _run(self, side: str, instrument, quantity: int, max_minutes: float,
              step_interval_s: float, edge_check, start: datetime,
              execution_id: Optional[str] = None,
-             closing: bool = False) -> Dict:
+             closing: bool = False,
+             notional_envelope: Optional[Dict] = None) -> Dict:
         deadline_s = max_minutes * 60.0
         quote = self._quote(instrument)
         arrival_mid = round_tick(
@@ -364,10 +469,28 @@ class PatientExecutor:
         order_filled = 0.0
         order_avg: Optional[float] = None
         child_sequence = 0
+        filled_notional = 0.0
+
+        def _check_opening_budget(child_quantity: int,
+                                  child_limit: float) -> None:
+            """Bound aggregate fills plus this child's worst-case debit."""
+            if (not notional_envelope
+                    or not notional_envelope["opening"]):
+                return
+            multiplier = int(getattr(instrument, "multiplier", 1))
+            projected = (filled_notional
+                         + int(child_quantity) * float(child_limit) * multiplier)
+            budget = float(notional_envelope["max_notional"])
+            if (not math.isfinite(projected)
+                    or projected > budget + 1e-9):
+                raise ControlledNotionalEnvelopeError(
+                    "opening child would exceed persistently authorized "
+                    f"notional ({projected:.2f} > {budget:.2f})")
 
         def _place_child(child_quantity: int, child_limit: float) -> str:
             """Place one child with an execution-stable id when supported."""
             nonlocal child_sequence
+            _check_opening_budget(child_quantity, child_limit)
             client_order_id = None
             if execution_id is not None:
                 client_order_id = self._child_client_order_id(
@@ -381,7 +504,7 @@ class PatientExecutor:
             """Bank any new fills on the current order into `fills`.
             Returns the raw status dict (None when the broker no longer
             knows the id) so callers can check for a terminal state."""
-            nonlocal remaining, order_filled, order_avg
+            nonlocal remaining, order_filled, order_avg, filled_notional
             status = self.broker.order_status(order_id)
             if not status:
                 return None
@@ -416,12 +539,25 @@ class PatientExecutor:
                              and isinstance(instrument, (list, tuple)))
                          else (float(cum_avg)
                                if cum_avg is not None else limit))
+            if (notional_envelope
+                    and notional_envelope["opening"]):
+                multiplier = int(getattr(instrument, "multiplier", 1))
+                filled_notional += (
+                    float(delta_qty) * abs(float(delta_price)) * multiplier)
             remaining = quantity - int(round(sum(f["qty"] for f in fills)))
             self._set_working(
                 filled_quantity=quantity - remaining,
                 remaining_quantity=remaining,
                 broker_status=str(status.get("status") or ""),
             )
+            if (notional_envelope
+                    and notional_envelope["opening"]):
+                budget = float(notional_envelope["max_notional"])
+                if (not math.isfinite(filled_notional)
+                        or filled_notional > budget + 1e-9):
+                    raise ControlledNotionalEnvelopeError(
+                        "broker fills exceeded persistently authorized "
+                        f"notional ({filled_notional:.2f} > {budget:.2f})")
             return status
 
         def _finish(status: str) -> Dict:

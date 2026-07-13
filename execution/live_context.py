@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import threading
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Iterator, Optional
@@ -128,6 +129,7 @@ class LiveExecutionContext:
 
         self.session: Optional[LiveTradingSession] = None
         self.scheduler: Optional[LiveScheduler] = None
+        self.verified_deployment = None
         self.last_reconciliation: Optional[Dict] = None
 
         self._condition = threading.Condition(threading.RLock())
@@ -201,10 +203,32 @@ class LiveExecutionContext:
     def configure_session(self, *, portfolio: PortfolioManager, data_fn,
                           desk=None, orchestrator=None,
                           interval_minutes: float = 15,
-                          market_hours=None) -> LiveTradingSession:
+                          market_hours=None,
+                          verified_deployment=None) -> LiveTradingSession:
         """Build (but never start) a session and scheduler over owned parts."""
         if (desk is None) == (orchestrator is None):
             raise ValueError('provide exactly one of desk or orchestrator')
+
+        execution_guard = None
+        if self.identity.env == 'production' and verified_deployment is None:
+            raise ValueError(
+                'production automation requires a verified deployment')
+        if verified_deployment is not None:
+            from deployment.live import VerifiedFoundationDeployment
+            if not isinstance(verified_deployment,
+                              VerifiedFoundationDeployment):
+                raise ValueError('invalid verified deployment capability')
+            if orchestrator is not None:
+                raise ValueError(
+                    'verified Foundation deployment cannot bind an orchestrator')
+            execution_guard = verified_deployment.bind(
+                self, desk, interval_minutes)
+            envelope_binder = getattr(
+                execution_guard, 'bind_executor', None)
+            if not callable(envelope_binder):
+                raise ValueError(
+                    'verified deployment guard cannot bind notional envelopes')
+            envelope_binder(self.executor)
 
         with self.operation('configure_session'):
             previous = self.scheduler
@@ -222,16 +246,25 @@ class LiveExecutionContext:
                 auth_manager=self.auth_manager,
                 local_book=self.local_book,
                 enforce_market_hours=True,
+                execution_guard=execution_guard,
             )
-            scheduler = LiveScheduler(
-                session,
-                market_hours=market_hours,
-                interval_minutes=interval_minutes,
-                audit=self.audit,
-            )
+            scheduler_kwargs = {
+                'market_hours': market_hours,
+                'interval_minutes': interval_minutes,
+                'audit': self.audit,
+            }
+            if verified_deployment is not None:
+                # A controlled production deployment gets one attempt during
+                # its ARMED activation handshake.  Retrying an exception five
+                # times or beginning a second cycle before the controller's
+                # post-cycle reconciliation would leave ambiguous permission.
+                scheduler_kwargs['max_consecutive_errors'] = 1
+                scheduler_kwargs['hold_after_first_cycle'] = True
+            scheduler = LiveScheduler(session, **scheduler_kwargs)
             with self._condition:
                 self.session = session
                 self.scheduler = scheduler
+                self.verified_deployment = verified_deployment
             return session
 
     # ------------------------------------------------------------------
@@ -252,6 +285,12 @@ class LiveExecutionContext:
                 'adapter; underlying quotes are forbidden')
         quote = self.client.get_quotes([instrument.symbol]).get(
             instrument.symbol, {})
+        if self.verified_deployment is not None:
+            from deployment.live import validate_realtime_equity_quote
+            market = validate_realtime_equity_quote(
+                quote, symbol=instrument.symbol,
+                now=datetime.now(timezone.utc))
+            return {"bid": market["bid"], "ask": market["ask"]}
         bid, ask = quote.get('bid'), quote.get('ask')
         if bid is None or ask is None:
             raise ValueError(f'no bid/ask quote for {instrument.symbol}')

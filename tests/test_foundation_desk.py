@@ -19,6 +19,7 @@ import pytest
 from backtesting.backtest_engine import BacktestEngine
 from core.models import Asset, AssetType, Position
 from data.market_data import MarketDataHandler
+from desks.deployment_config import FoundationDeploymentConfig
 from desks.foundation import FoundationDesk
 from desks.walk_forward import WalkForwardController, WalkForwardModel
 from desks.ml_model import GradientBoostingModel
@@ -166,6 +167,21 @@ class TestMomentumSignals:
         assert desk.generate_intents({'SYM': frame}, frame.index[-1],
                                      portfolio) == []
 
+    def test_intents_compare_sessions_not_intraday_wall_clock(self):
+        frame = enriched_frame(cross='up')
+        frame.index = frame.index.tz_localize('America/New_York')
+        intraday = frame.index[-1] + pd.Timedelta(hours=15, minutes=30)
+        portfolio = PortfolioManager(initial_capital=100000.0)
+
+        same_session = FoundationDesk().generate_intents(
+            {'SYM': frame}, intraday, portfolio)
+        next_session = FoundationDesk().generate_intents(
+            {'SYM': frame}, intraday + pd.offsets.BusinessDay(), portfolio)
+
+        assert len(same_session) == 1
+        assert same_session[0].action == 'BUY'
+        assert next_session == []
+
     def test_macd_cross_down_exits_open_position(self):
         desk = FoundationDesk()
         frame = enriched_frame(cross='down')
@@ -264,6 +280,33 @@ class TestTargetNativeSignals:
             'deployment_id': 'foundation-v1',
             'size_fraction': pytest.approx(0.10),
         }
+
+    def test_target_metadata_uses_runtime_deployment_version(self):
+        desk = FoundationDeploymentConfig(
+            strategy_version='foundation-v42').build()
+        frame = enriched_frame(cross='up')
+        portfolio = PortfolioManager(initial_capital=100000.0)
+
+        targets = desk.generate_targets(
+            {'SYM': frame}, frame.index[-1], portfolio, self.snapshot())
+
+        assert targets[0].metadata['deployment_id'] == 'foundation-v42'
+
+    def test_targets_compare_sessions_not_intraday_wall_clock(self):
+        frame = enriched_frame(cross='up')
+        frame.index = frame.index.tz_localize('America/New_York')
+        intraday = frame.index[-1] + pd.Timedelta(hours=15, minutes=30)
+        portfolio = PortfolioManager(initial_capital=100000.0)
+
+        same_session = FoundationDesk(target_mode=True).generate_targets(
+            {'SYM': frame}, intraday, portfolio, self.snapshot())
+        next_session = FoundationDesk(target_mode=True).generate_targets(
+            {'SYM': frame}, intraday + pd.offsets.BusinessDay(), portfolio,
+            self.snapshot())
+
+        assert len(same_session) == 1
+        assert same_session[0].target_quantity == 100
+        assert next_session == []
 
     def test_pending_partial_fill_echoes_effective_target(self):
         desk = FoundationDesk(target_mode=True)

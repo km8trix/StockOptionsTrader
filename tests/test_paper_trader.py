@@ -9,14 +9,18 @@ reached, and the window tests re-stub fetch_stock_data with canned frames.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
 
-from brokers.paper_trader import PaperTrader
+from brokers.paper_trader import (
+    ConcurrentPaperSessionUpdate,
+    PaperTrader,
+)
 from core.models import Asset, AssetType, OrderType, Position
 from data.market_data import MarketDataHandler
 
@@ -152,6 +156,7 @@ class TestCancelOrder:
 
         assert trader.cancel_order(order_id) is True
         assert trader.pending_orders == []
+        assert trader.order_status(order_id)["status"] == "CANCELLED"
 
     def test_cancel_unknown_order_returns_false(self, trader):
         assert trader.cancel_order("ORD-999999") is False
@@ -338,8 +343,11 @@ class TestOrderStatusParity:
     def test_pending_order_reports_open(self, trader):
         oid = trader.place_order(_stock(), OrderType.BUY, 10, limit_price=90.0)
         status = trader.order_status(oid)
-        assert status == {"status": "OPEN", "filled_quantity": 0,
-                          "avg_fill_price": None}
+        assert status["status"] == "OPEN"
+        assert status["filled_quantity"] == 0
+        assert status["avg_fill_price"] is None
+        assert status["transaction_cost"] == 0.0
+        assert status["effective_fill_price"] is None
 
     def test_filled_order_reports_full_quantity_and_price(self, trader):
         oid = trader.place_order(_stock(), OrderType.BUY, 10, limit_price=None)
@@ -348,6 +356,24 @@ class TestOrderStatusParity:
         assert status["status"] == "FILLED"
         assert status["filled_quantity"] == 10
         assert status["avg_fill_price"] == pytest.approx(CURRENT_PRICE)
+        assert status["transaction_cost"] == pytest.approx(1.0)
+        assert status["fees"] == pytest.approx(1.0)
+        assert status["effective_fill_price"] == pytest.approx(100.1)
+        assert status["cash_fill_price"] == pytest.approx(100.1)
+        assert status["cash_flow"] == pytest.approx(-1001.0)
+
+    def test_sell_reports_effective_cash_price_and_cost(self, trader):
+        asset = _stock()
+        _seed_position(trader, asset, quantity=10)
+        oid = trader.place_order(asset, OrderType.SELL, 10, limit_price=None)
+
+        trader.process_orders()
+
+        status = trader.order_status(oid)
+        assert status["avg_fill_price"] == pytest.approx(100.0)
+        assert status["transaction_cost"] == pytest.approx(1.0)
+        assert status["effective_fill_price"] == pytest.approx(99.9)
+        assert status["cash_flow"] == pytest.approx(999.0)
 
     def test_unknown_order_is_none(self, trader):
         assert trader.order_status("ORD-999999") is None
@@ -427,3 +453,179 @@ class TestRejectedOrders:
         st = trader.order_status(oid)
         assert st["status"] == "REJECTED"
         assert trader.pending_orders == []
+
+
+class TestDurablePaperBroker:
+    """The paper broker owns independent, restart-safe execution truth."""
+
+    NOW = datetime(2026, 7, 13, 14, 30, tzinfo=timezone.utc)
+
+    @classmethod
+    def quote(cls, symbol):
+        return {"price": CURRENT_PRICE, "as_of": cls.NOW}
+
+    @classmethod
+    def make(cls, db_path, *, resume=False, **kwargs):
+        return PaperTrader(
+            initial_capital=100_000,
+            db_path=db_path,
+            session_id="foundation-rehearsal-1",
+            resume=resume,
+            clock=lambda: cls.NOW,
+            price_provider=cls.quote,
+            max_price_age_business_days=0,
+            **kwargs,
+        )
+
+    def test_restart_reconstructs_cash_positions_orders_and_counter(
+            self, tmp_path):
+        path = tmp_path / "paper.db"
+        trader = self.make(path)
+
+        filled_id = trader.place_order_with_client_id(
+            _stock(), OrderType.BUY, 10, None, "entry000000000000001")
+        trader.process_orders()
+        cancelled_id = trader.place_order_with_client_id(
+            _stock("MSFT"), OrderType.BUY, 2, 90.0,
+            "resting000000000001")
+        assert trader.cancel_order(cancelled_id) is True
+        rejected_id = trader.place_order(
+            Asset("AAPL", AssetType.CALL, 100.0, "2030-01-17"),
+            OrderType.BUY, 1, 2.5)
+
+        resumed = self.make(path, resume=True)
+
+        assert resumed.portfolio.cash == pytest.approx(98_999.0)
+        position = resumed.portfolio.get_position(_stock())
+        assert position is not None and position.quantity == 10
+        assert resumed.order_status(filled_id)["status"] == "FILLED"
+        assert resumed.order_status(cancelled_id)["status"] == "CANCELLED"
+        assert resumed.order_status(rejected_id)["status"] == "REJECTED"
+        assert resumed.order_status(filled_id)["transaction_cost"] \
+            == pytest.approx(1.0)
+        assert [event["status"] for event in
+                resumed.order_status(filled_id)["status_history"]] \
+            == ["OPEN", "FILLED"]
+        assert [event["status"] for event in
+                resumed.order_status(cancelled_id)["status_history"]] \
+            == ["OPEN", "CANCELLED"]
+        assert resumed.order_id_counter == 3
+        assert resumed.place_order(
+            _stock("NVDA"), OrderType.BUY, 1, 90.0) == "ORD-000004"
+
+    def test_client_order_id_is_idempotent_in_memory_and_after_restart(
+            self, tmp_path):
+        path = tmp_path / "paper.db"
+        trader = self.make(path)
+        client_id = "same0000000000000001"
+
+        first = trader.place_order_with_client_id(
+            _stock(), OrderType.BUY, 3, 90.0, client_id)
+        again = trader.place_order_with_client_id(
+            _stock(), OrderType.BUY, 3, 90.0, client_id)
+
+        assert first == again == "ORD-000001"
+        assert trader.order_id_counter == 1
+        assert len(trader.pending_orders) == 1
+        with pytest.raises(ValueError, match="different order request"):
+            trader.place_order_with_client_id(
+                _stock(), OrderType.BUY, 4, 90.0, client_id)
+
+        resumed = self.make(path, resume=True)
+        assert resumed.place_order_with_client_id(
+            _stock(), OrderType.BUY, 3, 90.0, client_id) == first
+        assert resumed.order_id_counter == 1
+
+    def test_persist_failure_rolls_back_memory_and_disk(
+            self, tmp_path, monkeypatch):
+        path = tmp_path / "paper.db"
+        trader = self.make(path)
+
+        def fail_persist():
+            raise sqlite3.OperationalError("disk unavailable")
+
+        monkeypatch.setattr(trader, "_persist_state", fail_persist)
+        with pytest.raises(sqlite3.OperationalError, match="disk unavailable"):
+            trader.place_order(_stock(), OrderType.BUY, 1, 90.0)
+
+        assert trader.order_id_counter == 0
+        assert trader.pending_orders == []
+        resumed = self.make(path, resume=True)
+        assert resumed.order_id_counter == 0
+        assert resumed.pending_orders == []
+
+    def test_two_writers_cannot_silently_overwrite_the_session(self, tmp_path):
+        path = tmp_path / "paper.db"
+        first = self.make(path)
+        stale = self.make(path, resume=True)
+        first.place_order(_stock(), OrderType.BUY, 1, 90.0)
+
+        with pytest.raises(ConcurrentPaperSessionUpdate, match="changed"):
+            stale.place_order(_stock("MSFT"), OrderType.BUY, 1, 90.0)
+
+        assert stale.order_id_counter == 0
+        assert stale.pending_orders == []
+        current = self.make(path, resume=True)
+        assert current.order_id_counter == 1
+        assert [order.asset.symbol for order in current.pending_orders] \
+            == ["AAPL"]
+
+    def test_new_session_refuses_overwrite_and_resume_requires_existing(
+            self, tmp_path):
+        path = tmp_path / "paper.db"
+        self.make(path)
+        with pytest.raises(ValueError, match="already exists"):
+            self.make(path)
+        with pytest.raises(ValueError, match="does not exist"):
+            PaperTrader(
+                db_path=path, session_id="missing", resume=True,
+                clock=lambda: self.NOW, price_provider=self.quote)
+
+
+class TestStrictPriceProvider:
+    NOW = datetime(2026, 7, 13, 14, 30, tzinfo=timezone.utc)
+
+    def test_fresh_dated_provider_can_fill(self):
+        trader = PaperTrader(
+            clock=lambda: self.NOW,
+            price_provider=lambda symbol: (100.0, self.NOW),
+            max_price_age_business_days=0)
+        order_id = trader.place_order(
+            _stock(), OrderType.BUY, 1, limit_price=None)
+
+        trader.process_orders()
+
+        assert trader.order_status(order_id)["status"] == "FILLED"
+        assert trader.last_price_dates["AAPL"] == self.NOW.date()
+
+    def test_stale_provider_quote_cannot_fill(self, caplog):
+        stale = self.NOW - timedelta(days=3)
+        trader = PaperTrader(
+            clock=lambda: self.NOW,
+            price_provider=lambda symbol: {"price": 100.0, "as_of": stale},
+            max_price_age_business_days=0)
+        order_id = trader.place_order(
+            _stock(), OrderType.BUY, 1, limit_price=None)
+
+        with caplog.at_level(logging.WARNING, logger="brokers.paper_trader"):
+            trader.process_orders()
+
+        assert trader.order_status(order_id)["status"] == "OPEN"
+        assert trader.portfolio.cash == 100_000
+        assert any("Refusing price" in record.message
+                   for record in caplog.records)
+
+    def test_undated_provider_quote_cannot_fill_in_strict_mode(self, caplog):
+        trader = PaperTrader(
+            clock=lambda: self.NOW,
+            price_provider=lambda symbol: 100.0,
+            max_price_age_business_days=0)
+        order_id = trader.place_order(
+            _stock(), OrderType.BUY, 1, limit_price=None)
+
+        with caplog.at_level(logging.WARNING, logger="brokers.paper_trader"):
+            trader.process_orders()
+
+        assert trader.order_status(order_id)["status"] == "OPEN"
+        assert any("Refusing undated price" in record.message
+                   for record in caplog.records)

@@ -1267,6 +1267,17 @@ def scheduler_action():
     if action not in ('start', 'stop'):
         return jsonify(
             {'error': "'action' must be 'start' or 'stop'"}), 400
+    context = get_execution_context(create=False)
+    controlled = (
+        context is not None
+        and getattr(context, 'scheduler', None) is scheduler
+        and getattr(context, 'verified_deployment', None) is not None
+    ) or getattr(scheduler, 'hold_after_first_cycle', False) is True
+    if controlled:
+        return jsonify({
+            'error': 'Controlled Foundation scheduler actions must use '
+                     'FoundationLiveController.start/pause/revoke',
+        }), 409
     interval = data.get('interval_minutes')
     if interval is not None:
         if action != 'start':

@@ -189,15 +189,22 @@ class TestEndpoints:
                         FakeResponse(200, {"QuoteResponse": {"QuoteData": [
                             {"Product": {"symbol": "AAPL",
                                          "securityType": "EQ"},
+                             "dateTimeUTC": 1_529_522_220,
+                             "quoteStatus": "REALTIME",
                              "All": {"bid": 189.95, "ask": 190.05,
                                      "lastTrade": 190.0}},
                             {"Product": {"symbol": "SPY",
                                          "securityType": "EQ"},
+                             "dateTimeUTC": 1_529_522_220,
+                             "quoteStatus": "REALTIME",
                              "All": {"bid": 520.10, "ask": 520.20,
                                      "lastTrade": 520.15}}]}}))
         quotes = client.get_quotes(["AAPL", "SPY"])
-        assert quotes["AAPL"] == {"bid": 189.95, "ask": 190.05,
-                                  "last": 190.0}
+        assert quotes["AAPL"] == {
+            "bid": 189.95, "ask": 190.05, "last": 190.0,
+            "observed_at": "2018-06-20T19:17:00+00:00",
+            "quote_status": "REALTIME",
+        }
         assert quotes["SPY"]["bid"] == 520.10
 
     def test_cancel_order(self, harness):

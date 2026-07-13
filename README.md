@@ -133,9 +133,27 @@ runtime code SHA and parameters before constructing the desk.
 The Trading Floor's legacy `gate_status` remains a research-display badge; it is
 not an execution permission. `_PROMOTED_DESKS` is retained only for that backward-
 compatible UI contract. The immutable promotion registry is the authoritative
-paper/live decision path.
+paper/live decision path. The complete operator workflow for the first narrow
+Foundation strategy—including durable paper execution, reconciliation evidence,
+dual live approvals, activation preflight, limits, and rollback—is in
+[`docs/FOUNDATION_DEPLOYMENT.md`](docs/FOUNDATION_DEPLOYMENT.md).
+Its timing contract is close D to trade D+1: signals stop at the prior completed
+NYSE session, the order uses a fresh quote from the current execution session,
+and a current partial bar never enters the indicators. Paper cycles must be
+prospective and market-hours-only, with sourced quotes no more than five minutes
+old; the provider's observation timestamp is required and the request clock is
+never substituted. Model state is safely checkpointed across the
+one-step-per-process CLI, sealed in the paper artifact, and restored exactly for
+a current-or-prior-session live handoff. Default qualification requires at least
+20 cycles across 15 sessions, a flat completed round trip, and 41 strict
+reconciliation checks. Passing summary counts and failures are independently
+recomputed from the sealed facts. Controlled live orders additionally require a
+timestamped E*TRADE `REALTIME` quote no more than 60 seconds old.
 
-**Current state (2026-06):** `_PROMOTED_DESKS` is empty. The strongest price
+**Current state (2026-07):** `_PROMOTED_DESKS` is empty. The current Foundation
+artifact is `research_only` (negative return, Sharpe about -3.10, PSR/DSR near
+zero, and no BH-significant OOS folds), so the new paper/live lane correctly
+blocks it. The strongest price
 signal — 12-1 momentum (`mom_12_1`) — passes the IC gate (t +2.66 @1d) but the
 desk built on it fails the OOS gate (Sharpe ≈0.20): the edge is real but too
 thin to be risk-efficient after costs and momentum crashes. A `mom_12_1` +

@@ -49,7 +49,8 @@ class FoundationDesk(Desk):
                  rsi_exit: float = 70.0,
                  volume_confirmation_mult: float = 1.2,
                  gate_threshold: float = 0.0,
-                 target_mode: bool = False):
+                 target_mode: bool = False,
+                 deployment_version: Optional[str] = None):
         super().__init__(
             key='foundation',
             name='Foundation Desk',
@@ -66,10 +67,20 @@ class FoundationDesk(Desk):
         self.volume_confirmation_mult = volume_confirmation_mult
         if not isinstance(target_mode, bool):
             raise ValueError("target_mode must be a boolean")
+        if deployment_version is None:
+            # Legacy target-native callers predate artifact-bound deployment
+            # configuration.  Keep their existing stable identity while the
+            # deployment factory always supplies the approved strategy version.
+            deployment_version = 'foundation-v1'
+        if (not isinstance(deployment_version, str)
+                or not deployment_version
+                or deployment_version != deployment_version.strip()):
+            raise ValueError("deployment_version must be a non-empty string")
         # Opt-in while the target-native pipeline is rolled out desk by desk.
         # Keeping the default disabled preserves every legacy caller and golden
         # backtest until promotion is explicit.
         self.target_native_enabled = target_mode
+        self.deployment_version = deployment_version
         # Walk-forward gate: block a momentum long when the model score
         # (P(up)-0.5, centered) is <= gate_threshold. Default 0.0 keeps the
         # historical "strictly positive confidence" gate (byte-identical);
@@ -98,6 +109,29 @@ class FoundationDesk(Desk):
         """Fit events recorded by the desk's walk-forward controller."""
         return self._controller.fits
 
+    def model_checkpoint_state(self) -> dict:
+        """Return the controller's safe JSON-native restart checkpoint."""
+        return self._controller.checkpoint_state()
+
+    def restore_model_checkpoint(self, checkpoint) -> None:
+        """Restore a checkpoint into this newly constructed desk's controller."""
+        self._controller.restore_checkpoint(checkpoint)
+
+    @property
+    def deployment_identity(self):
+        """Immutable promotion identity, or ``None`` for research desks.
+
+        There is deliberately no setter.  The deployment factory binds this
+        once after registry verification; callers cannot later relabel a desk
+        as belonging to another approved artifact.
+        """
+        return getattr(self, '_deployment_identity', None)
+
+    def _bind_deployment_identity(self, identity) -> None:
+        if self.deployment_identity is not None:
+            raise RuntimeError("Foundation deployment identity is already bound")
+        self._deployment_identity = identity
+
     # ------------------------------------------------------------------
     # Intent generation
     # ------------------------------------------------------------------
@@ -121,12 +155,12 @@ class FoundationDesk(Desk):
 
         size_fraction = min(0.10, 1.0 / max(1, len(all_data)))
         intents: List[DeskIntent] = []
-        current_date = pd.Timestamp(date)
+        current_session = pd.Timestamp(date).date()
 
         for symbol, data in all_data.items():
             if len(data) < MIN_HISTORY_DAYS:
                 continue
-            if data.index[-1] != current_date:
+            if pd.Timestamp(data.index[-1]).date() != current_session:
                 continue  # symbol has no bar today; signals would be stale
 
             current = data.iloc[-1]
@@ -241,7 +275,7 @@ class FoundationDesk(Desk):
         size_fraction = min(0.10, 1.0 / max(1, len(all_data)))
         portfolio_nav = portfolio.get_portfolio_value()
         targets: List[TargetPosition] = []
-        current_date = pd.Timestamp(date)
+        current_session = pd.Timestamp(date).date()
 
         def target(asset: Asset, quantity: int, reason: str,
                    fraction: float = size_fraction) -> TargetPosition:
@@ -252,7 +286,7 @@ class FoundationDesk(Desk):
                 strategy=self.key,
                 reason=reason,
                 metadata={
-                    'deployment_id': 'foundation-v1',
+                    'deployment_id': self.deployment_version,
                     'size_fraction': fraction,
                 },
             )
@@ -260,7 +294,7 @@ class FoundationDesk(Desk):
         for symbol, data in all_data.items():
             if len(data) < MIN_HISTORY_DAYS:
                 continue
-            if data.index[-1] != current_date:
+            if pd.Timestamp(data.index[-1]).date() != current_session:
                 continue
 
             current = data.iloc[-1]

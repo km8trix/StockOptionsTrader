@@ -35,6 +35,7 @@ so real sleeps abort instantly on stop()), and ``market_hours``.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, Optional
@@ -61,6 +62,10 @@ class LiveScheduler:
             stop event (instantly interruptible by stop()).
         max_consecutive_errors: consecutive evaluate_once() exceptions
             that trip the 'error_storm' pause (>= 1).
+        hold_after_first_cycle: when True, pause the loop after publishing its
+            first result until release_after_first_cycle() is called.  This is
+            opt-in for controlled deployment activation; default False keeps
+            the legacy cadence unchanged.
         audit: optional utils.audit.AuditLog for lifecycle rows.
     """
 
@@ -70,15 +75,19 @@ class LiveScheduler:
                  clock: Optional[Callable[[], datetime]] = None,
                  sleep_fn: Optional[Callable[[float], None]] = None,
                  max_consecutive_errors: int = 5,
+                 hold_after_first_cycle: bool = False,
                  audit=None):
         if interval_minutes <= 0:
             raise ValueError("interval_minutes must be > 0")
         if max_consecutive_errors < 1:
             raise ValueError("max_consecutive_errors must be >= 1")
+        if not isinstance(hold_after_first_cycle, bool):
+            raise ValueError("hold_after_first_cycle must be boolean")
         self.session = session
         self.market_hours = market_hours or MarketHours()
         self.interval_minutes = interval_minutes
         self.max_consecutive_errors = max_consecutive_errors
+        self.hold_after_first_cycle = hold_after_first_cycle
         self.audit = audit
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep_fn = sleep_fn
@@ -94,6 +103,12 @@ class LiveScheduler:
         self._runs_today = 0
         self._runs_today_date: Optional[date] = None
         self._consecutive_errors = 0
+        # A deployment controller may require proof that the newly-started
+        # loop completed one immediate evaluation before declaring itself
+        # RUNNING.  Legacy callers never need to use this handshake.
+        self._first_cycle_event = threading.Event()
+        self._first_cycle_outcome: Optional[Dict] = None
+        self._first_cycle_release_event = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle (thread-safe, idempotent)
@@ -109,6 +124,9 @@ class LiveScheduler:
             self._running = True
             self._paused_reason = None
             self._consecutive_errors = 0
+            self._first_cycle_event = threading.Event()
+            self._first_cycle_outcome = None
+            self._first_cycle_release_event = threading.Event()
             self._thread = threading.Thread(
                 target=self._run, name="live-scheduler", daemon=True)
             interval = self.interval_minutes
@@ -117,6 +135,38 @@ class LiveScheduler:
                     interval)
         self._audit("scheduler_started", {"interval_minutes": interval})
         return True
+
+    def wait_for_first_cycle(self, timeout: float) -> Dict:
+        """Wait for the first evaluation attempt of the current generation.
+
+        This is an opt-in activation handshake for controlled production
+        deployments.  It does not change the normal scheduler lifecycle or
+        cadence.  The returned mapping is either the session result or a
+        typed scheduler-error result; callers decide which statuses are safe
+        enough to accept.  A closed market causes no evaluation, so it times
+        out instead of being mistaken for a successful activation.
+        """
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(float(timeout)) or float(timeout) <= 0):
+            raise ValueError("first-cycle timeout must be a positive finite number")
+        event = self._first_cycle_event
+        if not event.wait(float(timeout)):
+            raise TimeoutError("scheduler first cycle did not finish in time")
+        with self._lock:
+            outcome = self._first_cycle_outcome
+        if outcome is None:  # pragma: no cover - event/outcome invariant
+            raise RuntimeError("scheduler first-cycle outcome is unavailable")
+        return dict(outcome)
+
+    def release_after_first_cycle(self) -> bool:
+        """Release an opt-in activation hold after a published first result."""
+        with self._lock:
+            if (not self.hold_after_first_cycle
+                    or not self._first_cycle_event.is_set()
+                    or self._first_cycle_release_event.is_set()):
+                return False
+            self._first_cycle_release_event.set()
+            return True
 
     def stop(self, join_timeout: float = 10.0) -> bool:
         """Stop the loop and JOIN the thread. Idempotent: returns False
@@ -127,6 +177,7 @@ class LiveScheduler:
                 logger.info("Scheduler not running; stop() ignored")
                 return False
             self._stop_event.set()
+            self._first_cycle_release_event.set()
         if thread is not threading.current_thread():
             thread.join(timeout=join_timeout)
             if thread.is_alive():  # pragma: no cover - defensive
@@ -174,8 +225,14 @@ class LiveScheduler:
                         self._sleep_until_open(now)
                         continue
                     result = self.session.evaluate_once()
-                except Exception:  # noqa: BLE001 - counted, never silent death
+                except Exception as exc:  # noqa: BLE001 - counted, never silent death
                     logger.exception("Scheduled evaluation failed")
+                    self._record_first_cycle({
+                        "status": "error",
+                        "reason": "evaluation_exception",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    })
                     if self._note_error():
                         self._pause("error_storm")
                         return
@@ -184,11 +241,19 @@ class LiveScheduler:
 
                 ran_at = now
                 self._record_run(ran_at, result)
+                is_first_cycle = self._record_first_cycle(
+                    result if isinstance(result, dict) else {
+                        "status": "error",
+                        "reason": "invalid_session_result",
+                    })
                 if isinstance(result, dict) and result.get("status") == "halted":
                     # The session's rails (kill switch, circuit breaker,
                     # execution error) halted the cycle — automation must
                     # NOT keep retrying against a thrown rail.
                     self._pause(result.get("reason") or "session_halted")
+                    return
+                if (is_first_cycle and self.hold_after_first_cycle
+                        and not self._wait_for_first_cycle_release()):
                     return
                 self._wait_interval(ran_at)
         finally:
@@ -223,6 +288,22 @@ class LiveScheduler:
             self._last_run = ran_at
             self._last_result = result
             self._consecutive_errors = 0
+
+    def _record_first_cycle(self, outcome: Dict) -> bool:
+        """Publish exactly one activation outcome for this start generation."""
+        with self._lock:
+            if self._first_cycle_event.is_set():
+                return False
+            self._first_cycle_outcome = dict(outcome)
+            self._first_cycle_event.set()
+            return True
+
+    def _wait_for_first_cycle_release(self) -> bool:
+        """Hold an accepted first cycle without delaying stop()."""
+        while not self._stop_event.is_set():
+            if self._first_cycle_release_event.wait(0.1):
+                return not self._stop_event.is_set()
+        return False
 
     # ------------------------------------------------------------------
     # Sleeping (chunked <= MAX_SLEEP_CHUNK, responsive to stop())

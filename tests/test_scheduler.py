@@ -380,3 +380,82 @@ class TestLifecycle:
                                              audit=None)
         scheduler._run()  # must not raise anywhere on the audit path
         assert len(session.calls) == 1
+
+
+# ==========================================================================
+# Opt-in controlled-deployment activation handshake
+# ==========================================================================
+
+class TestFirstCycleHandshake:
+    def test_returns_the_first_successful_session_result(self):
+        clock = FakeClock(WED_OPEN)
+        result = {"status": "ok", "reports": [], "generated": 0}
+        session = FakeSession(clock, result=result)
+        scheduler = LiveScheduler(session, interval_minutes=15, clock=clock)
+
+        assert scheduler.start() is True
+        assert scheduler.wait_for_first_cycle(1.0) == result
+        assert scheduler.stop() is True
+
+    def test_surfaces_first_exception_and_one_error_policy_pauses(self):
+        clock = FakeClock(WED_OPEN)
+        session = FakeSession(clock)
+        session.raises = RuntimeError("feed unavailable")
+        scheduler = LiveScheduler(
+            session, interval_minutes=15, clock=clock,
+            max_consecutive_errors=1,
+        )
+
+        assert scheduler.start() is True
+        outcome = scheduler.wait_for_first_cycle(1.0)
+        assert outcome == {
+            "status": "error",
+            "reason": "evaluation_exception",
+            "error_type": "RuntimeError",
+            "error": "feed unavailable",
+        }
+        assert wait_for(
+            lambda: scheduler.status()["paused_reason"] == "error_storm")
+        assert scheduler.status()["running"] is False
+
+    def test_closed_market_times_out_without_an_evaluation(self):
+        clock = FakeClock(SATURDAY)
+        session = FakeSession(clock)
+        scheduler = LiveScheduler(session, interval_minutes=15, clock=clock)
+
+        assert scheduler.start() is True
+        with pytest.raises(TimeoutError, match="first cycle"):
+            scheduler.wait_for_first_cycle(0.02)
+        assert session.calls == []
+        assert scheduler.stop() is True
+
+    def test_opt_in_hold_prevents_a_second_cycle_until_released(self):
+        clock = FakeClock(WED_OPEN)
+        session = FakeSession(clock)
+        scheduler = LiveScheduler(
+            session, interval_minutes=15, clock=clock,
+            hold_after_first_cycle=True,
+        )
+
+        assert scheduler.start() is True
+        assert scheduler.wait_for_first_cycle(1.0)["status"] == "ok"
+        _time.sleep(0.02)
+        assert len(session.calls) == 1
+        assert scheduler.status()["next_run_estimate"] is None
+        assert scheduler.release_after_first_cycle() is True
+        assert scheduler.release_after_first_cycle() is False
+        assert scheduler.stop() is True
+
+    @pytest.mark.parametrize("timeout", [0, -1, float("inf"), True])
+    def test_requires_a_positive_finite_handshake_timeout(self, timeout):
+        scheduler, _, _, _ = make_sync()
+        with pytest.raises(ValueError, match="first-cycle timeout"):
+            scheduler.wait_for_first_cycle(timeout)
+
+    def test_hold_option_is_explicitly_boolean(self):
+        clock = FakeClock(WED_OPEN)
+        with pytest.raises(ValueError, match="hold_after_first_cycle"):
+            LiveScheduler(
+                FakeSession(clock), clock=clock,
+                hold_after_first_cycle=1,
+            )

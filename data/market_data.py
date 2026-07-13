@@ -9,7 +9,7 @@ import os
 
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Union
 from data.cache import OHLCVCache
 
@@ -318,6 +318,79 @@ class MarketDataHandler:
         Returns None if the symbol was never fetched in this process.
         """
         return self._last_fetch_info.get(symbol)
+
+    def fetch_stock_quote(self, symbol: str) -> Optional[dict]:
+        """Fetch one timestamped, non-cached quote observation.
+
+        A request timestamp is not market evidence.  This method therefore
+        returns a quote only when the provider supplies a timestamp for the
+        selected last trade or bid/ask observation.  Untimestamped yfinance
+        snapshots deliberately fail closed for the promotion rehearsal.
+        """
+        symbol = str(symbol).strip().upper()
+        if not symbol or self._index_symbol(symbol) is not None:
+            return None
+        obb = self._get_openbb()
+        if obb is None:
+            return None
+        providers = [name for name in self.providers
+                     if name in {"fmp", "intrinio", "yfinance"}]
+        for provider in providers:
+            try:
+                response = obb.equity.price.quote(
+                    symbol=symbol, provider=provider)
+                rows = getattr(response, "results", None) or []
+                item = next((row for row in rows
+                             if str(getattr(row, "symbol", "")).upper()
+                             == symbol), None)
+                if item is None:
+                    continue
+
+                last = getattr(item, "last_price", None)
+                bid = getattr(item, "bid", None)
+                ask = getattr(item, "ask", None)
+                timestamp = None
+                price = None
+                kind = None
+                if last is not None and np.isfinite(float(last)) \
+                        and float(last) > 0:
+                    price = float(last)
+                    timestamp = getattr(item, "last_timestamp", None)
+                    kind = "last"
+                if price is None and bid is not None and ask is not None:
+                    bid_value, ask_value = float(bid), float(ask)
+                    if (np.isfinite(bid_value) and np.isfinite(ask_value)
+                            and 0 < bid_value <= ask_value):
+                        price = (bid_value + ask_value) / 2.0
+                        timestamp = (
+                            getattr(item, "sip_timestamp", None)
+                            or getattr(item, "participant_timestamp", None)
+                            or getattr(item, "updated_on", None)
+                        )
+                        kind = "midpoint"
+                if price is None or timestamp is None:
+                    logger.warning(
+                        "Quote provider %s returned no timestamped market "
+                        "observation for %s", provider, symbol)
+                    continue
+                observed_at = pd.Timestamp(timestamp).to_pydatetime()
+                # FMP's OpenBB adapter converts its Unix UTC timestamp to a
+                # naive datetime.  The source field is defined as UTC.
+                if observed_at.tzinfo is None \
+                        or observed_at.utcoffset() is None:
+                    observed_at = observed_at.replace(tzinfo=timezone.utc)
+                else:
+                    observed_at = observed_at.astimezone(timezone.utc)
+                return {
+                    "price": price,
+                    "observed_at": observed_at.isoformat(),
+                    "source": f"openbb:{provider}:{kind}",
+                }
+            except Exception as exc:  # noqa: BLE001 - try next provider
+                logger.warning(
+                    "OpenBB quote provider %s failed for %s: %s",
+                    provider, symbol, exc)
+        return None
 
     def _empty_data(self, symbol: str) -> pd.DataFrame:
         """Return a properly-SHAPED empty OHLCV frame when no data is available.

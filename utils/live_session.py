@@ -47,6 +47,8 @@ import re
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Protocol
 
+import pandas as pd
+
 from core.models import Asset, AssetType, OrderType
 from desks.base import DeskIntent
 from portfolio.targets import (
@@ -153,7 +155,8 @@ class LiveTradingSession:
                  local_book=None,
                  clock: Optional[Callable[[], datetime]] = None,
                  orchestrator=None,
-                 enforce_market_hours: bool = False):
+                 enforce_market_hours: bool = False,
+                 execution_guard: Optional[Callable] = None):
         # Fund mode: a FundOrchestrator drives N desks on the shared
         # portfolio. It exposes the read surface the session needs
         # (key/capital_allocation/set_clock) and a step() that returns the
@@ -187,6 +190,13 @@ class LiveTradingSession:
         # gates this for the autonomous loop, but a direct call does not).
         # Default False keeps paper-parity and existing callers unchanged.
         self.enforce_market_hours = enforce_market_hours
+        # Optional final deployment boundary.  It runs after exact quantity
+        # sizing but immediately before any executor/broker call, so immutable
+        # manifest limits sit below strategy code.  Research and legacy paper
+        # sessions leave it unset and remain byte-for-byte on their old path.
+        if execution_guard is not None and not callable(execution_guard):
+            raise TypeError("execution_guard must be callable or None")
+        self.execution_guard = execution_guard
         self.last_reconciliation: Optional[Dict] = None
         self._target_snapshot_version = 0
 
@@ -520,8 +530,27 @@ class LiveTradingSession:
         """Construct exact legacy-shaped intents from a complete target set."""
         reservations = self._reservation_snapshot()
         snapshot = self._target_snapshot(now, reservations)
+        # Backtests observe session D's completed bar and fill on D+1.  The
+        # target-native live/paper path preserves that timing by evaluating the
+        # desk at the newest completed bar handed in while the order snapshot
+        # remains stamped with the actual execution instant ``now``.
+        decision_dates = [pd.Timestamp(frame.index[-1])
+                          for frame in all_data.values()
+                          if frame is not None and not frame.empty]
+        if not decision_dates:
+            # Artifact-bound desks must prove the completed-bar decision input;
+            # silently substituting the wall clock would turn a missing paper or
+            # live snapshot into a same-session signal.  Keep the historical
+            # target-native extension point usable for unbound/custom desks,
+            # whose generate_targets implementations may not consume frames.
+            if getattr(self.desk, "deployment_identity", None) is not None:
+                raise ValueError(
+                    "target-native execution received no market data")
+            decision_date = pd.Timestamp(now)
+        else:
+            decision_date = max(decision_dates)
         targets = tuple(self.desk.generate_targets(
-            all_data, now, self.portfolio, snapshot))
+            all_data, decision_date, self.portfolio, snapshot))
         # Validate/coalesce the whole target set before broker mutation.
         build_order_deltas(targets, snapshot)
         for target in targets:
@@ -532,6 +561,7 @@ class LiveTradingSession:
                 "strategy": target.strategy,
                 "reason": target.reason,
                 "snapshot_version": snapshot.version,
+                "decision_date": decision_date.isoformat(),
             })
         if self._cancel_obsolete_target_orders(
                 targets, snapshot, reservations):
@@ -622,6 +652,13 @@ class LiveTradingSession:
             "quantity": quantity,
         })
         try:
+            if self.execution_guard is not None:
+                self.execution_guard(
+                    intent=intent,
+                    side=side,
+                    quantity=quantity,
+                    now=self._clock(),
+                )
             if self.executor is not None:
                 execution_id = getattr(intent, "intent_id", None)
                 if execution_id is None:
@@ -635,8 +672,16 @@ class LiveTradingSession:
                 # Paper-mode parity path: direct market order.
                 order_type = (OrderType.BUY if side == "BUY"
                               else OrderType.SELL)
-                order_id = self.broker.place_order(intent.asset, order_type,
-                                                   quantity, None)
+                execution_id = getattr(intent, "intent_id", None)
+                idempotent_placer = getattr(
+                    self.broker, "place_order_with_client_id", None)
+                if execution_id is not None and callable(idempotent_placer):
+                    order_id = idempotent_placer(
+                        intent.asset, order_type, quantity, None,
+                        execution_id)
+                else:
+                    order_id = self.broker.place_order(
+                        intent.asset, order_type, quantity, None)
                 report = {"status": "submitted", "order_id": order_id}
         except Exception as e:  # noqa: BLE001 - audited halt, never a crash
             # Second rail under the executor's own mid-work handling
@@ -784,7 +829,14 @@ class LiveTradingSession:
                 self.broker.get_portfolio_status()
                 status = self.broker.order_status(order_id)
             qty = self._confirmed_fill_qty(status)
-            price = status.get("avg_fill_price") if status else None
+            # PaperTrader surfaces both the raw market fill and the effective
+            # cash fill after explicit costs.  Booking the latter makes the
+            # independent broker ledger and LocalBook reconcile to the cent;
+            # live brokers that do not expose it keep the historical raw path.
+            price = (status.get("cash_fill_price",
+                                status.get("effective_fill_price",
+                                           status.get("avg_fill_price")))
+                     if status else None)
             if qty > 0 and price is not None:
                 self.local_book.record_fill(
                     key, sign * qty, float(price) * multiplier)

@@ -471,7 +471,7 @@ class LiveEtradeBroker(ExecutionBroker):
 
     def get_current_price(self, symbol: str) -> float | None:
         """Last trade from a live quote; mid as fallback; None if dark."""
-        quote = self.client.get_quotes([symbol]).get(symbol)
+        quote = self.get_current_quote(symbol)
         if quote is None:
             logger.warning("No live quote for %s", symbol)
             return None
@@ -486,6 +486,11 @@ class LiveEtradeBroker(ExecutionBroker):
             return None
         self._cross_check_price(symbol, price)
         return price
+
+    def get_current_quote(self, symbol: str) -> Dict | None:
+        """Return the normalized quote, retaining freshness metadata."""
+        quote = self.client.get_quotes([symbol]).get(symbol)
+        return dict(quote) if quote is not None else None
 
     def _cross_check_price(self, symbol: str, primary: float) -> None:
         """Compare the primary (E*TRADE) price against the optional second

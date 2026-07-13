@@ -171,6 +171,47 @@ def test_index_symbol_routes_to_index_endpoint(monkeypatch):
     assert any(s == 'AAPL' for (_k, s, _p) in calls)
 
 
+def test_timestamped_quote_preserves_provider_observation_time(monkeypatch):
+    import datetime as dt
+    from types import SimpleNamespace
+
+    item = SimpleNamespace(
+        symbol='AAPL', last_price=190.0,
+        last_timestamp=dt.datetime(2026, 7, 13, 14, 0),
+        bid=189.9, ask=190.1,
+    )
+    endpoint = SimpleNamespace(
+        quote=lambda **_kwargs: SimpleNamespace(results=[item]))
+    fake_obb = SimpleNamespace(
+        equity=SimpleNamespace(price=endpoint))
+    handler = MarketDataHandler(cache=False)
+    handler.providers = ['fmp', 'yfinance']
+    monkeypatch.setattr(handler, '_get_openbb', lambda: fake_obb)
+
+    assert handler.fetch_stock_quote('aapl') == {
+        'price': 190.0,
+        'observed_at': '2026-07-13T14:00:00+00:00',
+        'source': 'openbb:fmp:last',
+    }
+
+
+def test_untimestamped_quote_is_not_promotable_evidence(monkeypatch):
+    from types import SimpleNamespace
+
+    item = SimpleNamespace(
+        symbol='AAPL', last_price=190.0, last_timestamp=None,
+        bid=None, ask=None)
+    endpoint = SimpleNamespace(
+        quote=lambda **_kwargs: SimpleNamespace(results=[item]))
+    handler = MarketDataHandler(cache=False)
+    handler.providers = ['yfinance']
+    monkeypatch.setattr(
+        handler, '_get_openbb',
+        lambda: SimpleNamespace(equity=SimpleNamespace(price=endpoint)))
+
+    assert handler.fetch_stock_quote('AAPL') is None
+
+
 # --- Phase 0: silent-corruption guards -------------------------------------
 
 

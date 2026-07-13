@@ -315,30 +315,99 @@ def create_desk(key: str, capital_allocation: float = 1.0,
 
 def create_deployed_desk(
         key: str, *, artifact_hash: str, promotion_registry,
-        required_level='live_eligible', runtime_code_sha: str,
-        runtime_parameters: Mapping[str, Any],
-        capital_allocation: float = 1.0,
+        required_level='live_eligible', runtime_code_sha: Optional[str] = None,
+        runtime_parameters: Optional[Mapping[str, Any]] = None,
+        capital_allocation: Optional[float] = None,
         model_key: Optional[str] = None) -> Desk:
-    """Instantiate a desk only after verifying its exact approved artifact.
+    """Reconstruct Foundation solely from its exact approved artifact.
 
     ``create_desk`` intentionally remains available for research/backtests.
     Paper/live composition roots must use this boundary instead: the registry
-    verifies an explicit immutable approval and this function additionally
-    rejects code or parameter drift between the artifact and runtime.
+    verifies an explicit immutable approval, then the complete frozen
+    deployment configuration is parsed from ``artifact.parameters`` and built
+    directly.  No caller-provided value participates in construction.
+
+    ``runtime_code_sha`` and ``runtime_parameters`` are deprecated assertion-
+    only compatibility arguments.  Code identity is always resolved
+    internally from a clean git checkout; a supplied SHA must agree as an
+    additional assertion.  ``capital_allocation`` and ``model_key`` likewise
+    only assert equality when supplied; the approved values always win.
     """
     from analysis.promotion import (PromotionLevel, PromotionNotApproved,
                                     canonical_json)
+    from desks.deployment_config import (
+        FoundationDeploymentConfig, FoundationDeploymentIdentity)
+
+    if key != 'foundation':
+        raise PromotionNotApproved(
+            f"deployed construction is not implemented for desk '{key}'")
+
+    level = PromotionLevel(required_level)
 
     artifact = promotion_registry.require_approved(
-        key, artifact_hash, PromotionLevel(required_level))
-    if artifact.code_sha != str(runtime_code_sha):
+        key, artifact_hash, level)
+
+    try:
+        config = FoundationDeploymentConfig.from_mapping(artifact.parameters)
+    except (TypeError, ValueError) as exc:
+        raise PromotionNotApproved(
+            f"approved artifact has invalid Foundation parameters: {exc}") \
+            from exc
+    if config.strategy_version != artifact.strategy_version:
+        raise PromotionNotApproved(
+            'deployment strategy_version does not match the approved artifact')
+
+    # Resolve code identity ourselves on every path.  A caller cannot prove
+    # equivalence by merely echoing the SHA stored in the approved artifact.
+    current_code_sha = _current_clean_code_sha(PromotionNotApproved)
+    if artifact.code_sha != current_code_sha:
         raise PromotionNotApproved(
             'runtime code SHA does not match the approved artifact')
-    if canonical_json(artifact.parameters) != canonical_json(runtime_parameters):
+    if (runtime_code_sha is not None
+            and str(runtime_code_sha) != current_code_sha):
+        raise PromotionNotApproved(
+            'caller code SHA assertion does not match the current runtime')
+
+    if (runtime_parameters is not None
+            and canonical_json(config.to_mapping())
+            != canonical_json(runtime_parameters)):
         raise PromotionNotApproved(
             'runtime parameters do not match the approved artifact')
-    return create_desk(key, capital_allocation=capital_allocation,
-                       model_key=model_key)
+    if (capital_allocation is not None
+            and float(capital_allocation) != config.capital_allocation):
+        raise PromotionNotApproved(
+            'runtime capital_allocation does not match the approved artifact')
+    if model_key is not None and model_key != config.model_key:
+        raise PromotionNotApproved(
+            'runtime model_key does not match the approved artifact')
+
+    desk = config.build()
+    desk._bind_deployment_identity(FoundationDeploymentIdentity(
+        artifact_hash=artifact.artifact_hash,
+        strategy_id=artifact.strategy_id,
+        strategy_version=artifact.strategy_version,
+        required_level=level.value,
+        code_sha=artifact.code_sha,
+        config_hash=config.config_hash,
+    ))
+    return desk
+
+
+def _current_clean_code_sha(error_type=RuntimeError) -> str:
+    """Return the current clean checkout SHA or fail closed.
+
+    Kept as a small seam so packaged deployments can replace the provenance
+    resolver and tests can exercise the internal-identity path without shell
+    mutation.  A dirty or unidentifiable checkout cannot claim equivalence to
+    a committed artifact.
+    """
+    from utils.provenance import _git_dirty, _git_sha
+
+    sha = _git_sha()
+    dirty = _git_dirty()
+    if not sha or dirty is not False:
+        raise error_type('runtime code identity is dirty or unavailable')
+    return sha
 
 
 def create_fund_orchestrator(allocations: Dict[str, float],

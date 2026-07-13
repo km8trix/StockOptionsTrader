@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -3185,6 +3186,23 @@ class TestLiveSchedulerEndpoint:
         assert response.status_code == 200
         assert response.get_json()['running'] is False
         assert patch_scheduler.calls == ['stop']
+
+    def test_controlled_deployment_cannot_bypass_controller(
+            self, client, patch_scheduler, monkeypatch):
+        import gui.routes.api_live as api_live
+
+        context = SimpleNamespace(
+            scheduler=patch_scheduler, verified_deployment=object())
+        monkeypatch.setattr(
+            api_live, 'get_execution_context',
+            lambda create=False: context)
+
+        for action in ('start', 'stop'):
+            response = client.post(
+                '/api/live/scheduler', json={'action': action})
+            assert response.status_code == 409
+            assert 'FoundationLiveController' in response.get_json()['error']
+        assert patch_scheduler.calls == []
 
     @pytest.mark.parametrize('action', [None, '', 'pause', 'restart', 1])
     def test_unknown_action_rejected(self, client, patch_scheduler, action):

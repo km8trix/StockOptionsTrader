@@ -33,7 +33,7 @@ import math
 import random
 import time
 import uuid
-from datetime import date as date_type, datetime
+from datetime import date as date_type, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from brokers.etrade_auth import EtradeAuthExpired, EtradeAuthManager
@@ -406,7 +406,7 @@ class EtradeClient:
         return positions
 
     def get_quotes(self, symbols: List[str]) -> Dict[str, Dict]:
-        """Multi-symbol quotes -> {symbol: {'bid','ask','last'}}."""
+        """Multi-symbol quotes with E*TRADE status and observation time."""
         if not symbols:
             return {}
         joined = ",".join(symbols)
@@ -416,10 +416,23 @@ class EtradeClient:
             symbol = quote_data.get("Product", {}).get("symbol")
             all_block = quote_data.get("All", {})
             if symbol:
+                raw_timestamp = quote_data.get("dateTimeUTC")
+                observed_at = None
+                if raw_timestamp is not None:
+                    try:
+                        seconds = float(raw_timestamp)
+                        if seconds > 10_000_000_000:
+                            seconds /= 1_000.0
+                        observed_at = datetime.fromtimestamp(
+                            seconds, timezone.utc).isoformat()
+                    except (TypeError, ValueError, OSError, OverflowError):
+                        observed_at = None
                 quotes[symbol] = {
                     "bid": all_block.get("bid"),
                     "ask": all_block.get("ask"),
                     "last": all_block.get("lastTrade"),
+                    "observed_at": observed_at,
+                    "quote_status": quote_data.get("quoteStatus"),
                 }
         return quotes
 

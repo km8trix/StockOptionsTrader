@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +19,12 @@ import execution.live_context as live_context_module
 from brokers.etrade_client import build_equity_order
 from brokers.local_book import LocalBook
 from core.models import Asset, AssetType
+from deployment.live import FoundationExecutionGuard
 from execution.live_context import LiveContextClosed, LiveExecutionContext
+from execution.patient_executor import (
+    ControlledNotionalEnvelopeError,
+    PatientExecutor,
+)
 from portfolio.manager import PortfolioManager
 
 
@@ -120,6 +127,43 @@ class FakeExecutor:
         self.stop_calls += 1
 
 
+class NotionalBroker:
+    """Small limit-order fake for controlled notional envelope tests."""
+
+    def __init__(self, *, filled_quantity=0, fill_price=None):
+        self.filled_quantity = filled_quantity
+        self.fill_price = fill_price
+        self.placements = []
+        self.cancelled = set()
+
+    def place_order(self, asset, order_type, quantity, limit_price):
+        order_id = f"ORDER-{len(self.placements) + 1}"
+        self.placements.append({
+            "order_id": order_id,
+            "asset": asset,
+            "order_type": order_type,
+            "quantity": quantity,
+            "limit_price": limit_price,
+        })
+        return order_id
+
+    def order_status(self, order_id):
+        quantity = self.placements[int(order_id.split("-")[-1]) - 1][
+            "quantity"]
+        status = "CANCELLED" if order_id in self.cancelled else "OPEN"
+        if self.filled_quantity >= quantity:
+            status = "EXECUTED"
+        return {
+            "status": status,
+            "filled_quantity": min(self.filled_quantity, quantity),
+            "avg_fill_price": self.fill_price,
+        }
+
+    def cancel_order(self, order_id):
+        self.cancelled.add(order_id)
+        return True
+
+
 def make_context(tmp_path, *, client=None, broker=None, executor=None,
                  book=None, kill_switch=None, audit=None):
     db_path = tmp_path / "live.db"
@@ -209,6 +253,119 @@ class TestConstructionAndQuotes:
         client.quotes = {"SPY": quote}
         with pytest.raises(ValueError, match="quote for SPY"):
             context._equity_quote(SPY)
+
+
+class TestControlledNotionalEnvelope:
+    def test_controlled_executor_requires_exact_one_shot_authorization(self):
+        broker = NotionalBroker()
+        executor = PatientExecutor(
+            broker, lambda _asset: {"bid": 99.0, "ask": 100.0},
+            sleep_fn=lambda _seconds: None,
+        )
+        executor.require_controlled_notional_envelopes()
+
+        with pytest.raises(
+                ControlledNotionalEnvelopeError,
+                match="no durable notional envelope"):
+            executor.execute(
+                "BUY", SPY, 10, execution_id="not-authorized")
+
+        assert broker.placements == []
+
+    def test_guard_reservation_caps_later_patient_quote(self):
+        now = datetime(2026, 7, 13, 14, tzinfo=timezone.utc)
+
+        class Store:
+            def __init__(self):
+                self.calls = []
+
+            def authorize_order(self, _manifest_hash, **economics):
+                self.calls.append(economics)
+                return {
+                    "authorized": True,
+                    "notional": (economics["quantity"]
+                                 * economics["reference_price"]),
+                }
+
+        class QuoteBroker(NotionalBroker):
+            def get_current_quote(self, _symbol):
+                return {
+                    "bid": 99.9,
+                    "ask": 100.0,
+                    "last": 99.95,
+                    "observed_at": now.isoformat(),
+                    "quote_status": "REALTIME",
+                }
+
+        broker = QuoteBroker()
+        store = Store()
+        executor = PatientExecutor(
+            broker, lambda _asset: {"bid": 120.0, "ask": 122.0},
+            clock=lambda: now, sleep_fn=lambda _seconds: None,
+        )
+        guard = FoundationExecutionGuard(
+            SimpleNamespace(manifest_hash="a" * 64), store, broker)
+        guard.bind_executor(executor)
+        guard(
+            intent=SimpleNamespace(
+                asset=SPY, action="BUY", intent_id="opening-1"),
+            side="BUY", quantity=10, now=now,
+        )
+
+        report = executor.execute(
+            "BUY", SPY, 10, execution_id="opening-1")
+
+        assert store.calls[0]["reference_price"] == 100.0
+        assert report["status"] == "error"
+        assert report["error_type"] == "ControlledNotionalEnvelopeError"
+        assert "persistently authorized notional" in report["error"]
+        assert broker.placements == []
+
+    def test_partial_fill_and_replacement_share_one_aggregate_budget(self):
+        quotes = [
+            {"bid": 99.8, "ask": 100.0},
+            {"bid": 103.0, "ask": 104.0},
+        ]
+        broker = NotionalBroker(filled_quantity=2, fill_price=99.9)
+        executor = PatientExecutor(
+            broker,
+            lambda _asset: quotes.pop(0) if len(quotes) > 1 else quotes[0],
+            sleep_fn=lambda _seconds: None,
+        )
+        executor.require_controlled_notional_envelopes()
+        executor.arm_controlled_notional_envelope(
+            execution_id="opening-2", side="BUY", symbol="SPY",
+            quantity=10, opening=True, max_notional=1_000.0,
+        )
+
+        report = executor.execute(
+            "BUY", SPY, 10, max_minutes=1, step_interval_s=0,
+            execution_id="opening-2",
+        )
+
+        assert report["status"] == "error"
+        assert report["fills"][0]["qty"] == 2
+        assert "1007.24 > 1000.00" in report["error"]
+        assert len(broker.placements) == 1
+        assert broker.cancelled == {"ORDER-1"}
+
+    def test_exit_is_not_blocked_by_opening_notional_capacity(self):
+        broker = NotionalBroker(filled_quantity=10, fill_price=200.5)
+        executor = PatientExecutor(
+            broker, lambda _asset: {"bid": 200.0, "ask": 201.0},
+            sleep_fn=lambda _seconds: None,
+        )
+        executor.require_controlled_notional_envelopes()
+        executor.arm_controlled_notional_envelope(
+            execution_id="exit-1", side="SELL", symbol="SPY",
+            quantity=10, opening=False, max_notional=None,
+        )
+
+        report = executor.execute(
+            "SELL", SPY, 10, execution_id="exit-1")
+
+        assert report["status"] == "filled"
+        assert broker.placements[0]["limit_price"] == 200.5
 
 
 class TestWorkingOrdersAndCancellation:
@@ -467,7 +624,71 @@ class TestLifecycleAndAutomation:
         assert built[0].start_calls == 0
         assert built[0].kwargs["interval_minutes"] == 7
         assert built[0].kwargs["market_hours"] is market_hours
+        assert "max_consecutive_errors" not in built[0].kwargs
 
         context.shutdown(timeout=0.25)
         assert built[0].stop_calls == [0.25]
 
+    def test_verified_production_session_pauses_after_one_scheduler_error(
+            self, tmp_path, monkeypatch):
+        built = []
+
+        class CapturingScheduler:
+            def __init__(self, session, **kwargs):
+                self.session = session
+                self.kwargs = kwargs
+                built.append(self)
+
+            def stop(self, join_timeout=10.0):
+                return False
+
+        class FakeVerifiedDeployment:
+            def __init__(self):
+                self.bound_executor = None
+
+            def bind(self, _context, _desk, _interval_minutes):
+                deployment = self
+
+                class Guard:
+                    def __call__(self, **_kwargs):
+                        return None
+
+                    def bind_executor(self, executor):
+                        deployment.bound_executor = executor
+
+                return Guard()
+
+        import deployment.live as deployment_live
+        monkeypatch.setattr(
+            live_context_module, "LiveScheduler", CapturingScheduler)
+        monkeypatch.setattr(
+            deployment_live, "VerifiedFoundationDeployment",
+            FakeVerifiedDeployment)
+
+        db_path = tmp_path / "production-live.db"
+        book = LocalBook(
+            str(db_path), env="production", account_id_key="ACCOUNT-1")
+        context = LiveExecutionContext(
+            auth_manager=FakeAuthManager(db_path, env="production"),
+            client=FakeClient(),
+            kill_switch=FakeKillSwitch(),
+            audit=FakeAudit(),
+            account_id_key="ACCOUNT-1",
+            broker=FakeBroker(),
+            local_book=book,
+            executor=FakeExecutor(),
+        )
+
+        verified = FakeVerifiedDeployment()
+        context.configure_session(
+            portfolio=PortfolioManager(10_000.0),
+            data_fn=lambda: {},
+            desk=object(),
+            verified_deployment=verified,
+        )
+
+        assert len(built) == 1
+        assert verified.bound_executor is context.executor
+        assert built[0].kwargs["max_consecutive_errors"] == 1
+        assert built[0].kwargs["hold_after_first_cycle"] is True
+        context.shutdown()
