@@ -44,10 +44,13 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 import logging
-import math
 import os
+import secrets
 import threading
+import time as _time
 from datetime import datetime, timezone
+
+from gui.routes import live_order_support as _order_support
 
 try:
     from brokers.circuit_breaker import (DailyLossCircuitBreaker,
@@ -181,11 +184,22 @@ try:
     )
     from brokers.etrade_auth import EtradeAuthExpired
     from brokers.live_trader import LiveEtradeBroker, PriceSanityError
+    from execution.live_context import (LiveContextClosed,
+                                        LiveExecutionContext,
+                                        PlacedOrderTrackingError)
+    from execution.live_risk_gate import (
+        ReservationPersistenceError,
+        ReservationStateUnknown,
+        RiskValuationUnavailable,
+        UnsupportedRiskOrder,
+    )
+    from portfolio.risk_reservations import RiskCapacityExceeded
     from utils.kill_switch import KillSwitchEngaged
     CLIENT_IMPORT_ERROR = None
 except Exception as e:  # noqa: BLE001
     EtradeClient = None
     LiveEtradeBroker = None
+    LiveExecutionContext = None
     build_equity_order = build_option_order = build_spread_order = None
     CLIENT_IMPORT_ERROR = f'{type(e).__name__}: {e}'
     logger.error(
@@ -214,6 +228,27 @@ except Exception as e:  # noqa: BLE001
 
     class PriceSanityError(ValueError):
         pass
+
+    class LiveContextClosed(RuntimeError):
+        pass
+
+    class PlacedOrderTrackingError(RuntimeError):
+        order_id = None
+
+    class ReservationPersistenceError(RuntimeError):
+        pass
+
+    class ReservationStateUnknown(RuntimeError):
+        pass
+
+    class RiskValuationUnavailable(RuntimeError):
+        pass
+
+    class UnsupportedRiskOrder(RuntimeError):
+        pass
+
+    class RiskCapacityExceeded(RuntimeError):
+        breaches = []
 
 live_bp = Blueprint('live', __name__, url_prefix='/api/live')
 
@@ -312,6 +347,7 @@ def auth_unavailable_reason() -> str:
 # the cached client is stale and must be rebuilt over the new manager.
 _client = None
 _client_auth_manager = None
+_execution_context = None
 
 
 def get_client():
@@ -348,6 +384,75 @@ def get_client():
                 _client_auth_manager = None
                 return None
     return _client
+
+
+def get_execution_context(create: bool = True):
+    """Canonical live execution graph for the configured account.
+
+    Construction is lazy, performs no network I/O, and starts no thread.  The
+    identity includes the auth-manager object, account, environment, and DB
+    path; changing any of them closes the old graph before a replacement can
+    be returned.
+    """
+    global _execution_context
+    if LiveExecutionContext is None:
+        return None
+    if not create:
+        return _execution_context
+
+    manager = get_auth_manager()
+    client = get_client()
+    account = str(os.environ.get('ETRADE_ACCOUNT_ID_KEY') or '').strip()
+    if manager is None or client is None or not account:
+        return None
+    identity = (
+        os.path.realpath(_live_db_path()),
+        str(getattr(manager, 'env', 'sandbox')).strip().lower(),
+        account,
+        id(manager),
+    )
+    with _singleton_lock:
+        current = _execution_context
+        current_identity = None
+        if current is not None:
+            value = current.identity
+            current_identity = (
+                value.db_path, value.env, value.account_id_key,
+                value.auth_manager_id)
+        if current is not None and current_identity != identity:
+            current.shutdown()
+            _execution_context = None
+        if _execution_context is None:
+            try:
+                _execution_context = LiveExecutionContext(
+                    auth_manager=manager,
+                    client=client,
+                    kill_switch=get_kill_switch(),
+                    audit=get_audit_log(),
+                    account_id_key=account,
+                    db_path=_live_db_path(),
+                )
+            except Exception:
+                logger.error('LiveExecutionContext construction failed',
+                             exc_info=True)
+                _execution_context = None
+        return _execution_context
+
+
+def reset_execution_context(shutdown: bool = True) -> None:
+    """Clear the process context (tests/config rotation/shutdown)."""
+    global _execution_context
+    with _singleton_lock:
+        current = _execution_context
+        _execution_context = None
+    if shutdown and current is not None:
+        current.shutdown()
+
+
+def execution_context_unavailable_reason() -> str:
+    if not os.environ.get('ETRADE_ACCOUNT_ID_KEY'):
+        return 'ETRADE_ACCOUNT_ID_KEY is required'
+    return (CLIENT_IMPORT_ERROR or 'LiveExecutionContext construction failed')
 
 
 def _wire_daily_loss_gate(client) -> None:
@@ -393,11 +498,17 @@ def set_scheduler(scheduler) -> None:
     global _scheduler
     with _singleton_lock:
         _scheduler = scheduler
+        context = _execution_context
+        if context is not None:
+            context.scheduler = scheduler
 
 
 def get_scheduler():
     """The installed LiveScheduler, or None while unconfigured."""
-    return _scheduler
+    if _scheduler is not None:
+        return _scheduler
+    context = get_execution_context(create=False)
+    return getattr(context, 'scheduler', None) if context is not None else None
 
 
 def scheduler_unavailable_reason() -> str:
@@ -475,6 +586,11 @@ def shutdown_background_workers() -> None:
         except Exception:  # noqa: BLE001 - shutdown must never raise
             logger.warning('Error stopping %s during shutdown',
                            type(worker).__name__, exc_info=True)
+    try:
+        reset_execution_context()
+    except Exception:  # noqa: BLE001 - shutdown must never raise
+        logger.warning('Error closing live execution context during shutdown',
+                       exc_info=True)
 
 
 def _start_keepalive_best_effort() -> None:
@@ -603,21 +719,9 @@ def kill_switch_engaged() -> bool:
 
 
 def _find_live_broker():
-    """The active LiveEtradeBroker session, if one exists.
-
-    Looks through api_trading.active_traders (imported lazily — both
-    modules reference each other only inside functions, so there is no
-    import cycle). Returns None when live trading is unavailable or no
-    live session has been created.
-    """
-    from gui.routes import api_trading
-
-    if api_trading.LiveEtradeBroker is None:
-        return None
-    for trader in api_trading.active_traders.values():
-        if isinstance(trader, api_trading.LiveEtradeBroker):
-            return trader
-    return None
+    """The broker owned by the canonical account-bound live context."""
+    context = get_execution_context()
+    return context.broker if context is not None else None
 
 
 def _local_state(broker) -> tuple[dict, float]:
@@ -629,6 +733,13 @@ def _local_state(broker) -> tuple[dict, float]:
     the fail-safe direction (any broker-side position becomes a mismatch
     that engages the kill switch rather than passing silently).
     """
+    context = get_execution_context(create=False)
+    if context is not None and context.broker is broker:
+        snapshot = context.local_book.reconciliation_snapshot()
+        if not snapshot.get('initialized'):
+            raise RuntimeError(
+                'local book is uninitialized; explicit bootstrap is required')
+        return dict(snapshot['positions']), float(snapshot['cash'])
     positions = getattr(broker, 'local_positions', None) or {}
     cash = getattr(broker, 'local_cash', None)
     return dict(positions), float(cash if cash is not None else 0.0)
@@ -698,52 +809,48 @@ def _redact_account_numbers(obj):
 # single-use (consumed on a successful place), TTL-expired, and the cache
 # is size-capped (oldest evicted) so it cannot grow without bound.
 
-import time as _time  # noqa: E402  (local alias; client uses its own time)
-import secrets  # noqa: E402
-
-_ORDER_REF_TTL_S = 300          # 5 minutes
-_ORDER_REF_CACHE_MAX = 256      # cap distinct in-flight previews
+_ORDER_REF_TTL_S = _order_support.ORDER_REF_TTL_S
+_ORDER_REF_CACHE_MAX = _order_support.ORDER_REF_CACHE_MAX
 _ORDER_REF_CACHE: dict = {}     # order_ref -> {request, preview_ids, account_id_key, created}
 
 
 def _prune_order_refs(now: float | None = None) -> None:
-    """Drop expired refs and, if still over cap, the oldest ones. Caller
-    holds _singleton_lock."""
-    now = _time.time() if now is None else now
-    expired = [ref for ref, rec in _ORDER_REF_CACHE.items()
-               if now - rec['created'] > _ORDER_REF_TTL_S]
-    for ref in expired:
-        _ORDER_REF_CACHE.pop(ref, None)
-    if len(_ORDER_REF_CACHE) > _ORDER_REF_CACHE_MAX:
-        # Oldest-first eviction down to the cap.
-        for ref, _rec in sorted(_ORDER_REF_CACHE.items(),
-                                key=lambda kv: kv[1]['created']):
-            if len(_ORDER_REF_CACHE) <= _ORDER_REF_CACHE_MAX:
-                break
-            _ORDER_REF_CACHE.pop(ref, None)
+    """Compatibility wrapper; caller holds ``_singleton_lock``."""
+    _order_support.prune_order_refs(
+        _ORDER_REF_CACHE,
+        now=_time.time() if now is None else now,
+        ttl_s=_ORDER_REF_TTL_S,
+        max_entries=_ORDER_REF_CACHE_MAX,
+    )
 
 
 def _cache_order_ref(account_id_key: str, order_request: dict,
                      preview_ids: list) -> str:
     """Cache a previewed order_request and return its opaque order_ref."""
-    ref = secrets.token_urlsafe(18)
-    with _singleton_lock:
-        _prune_order_refs()
-        _ORDER_REF_CACHE[ref] = {
-            'request': order_request,
-            'preview_ids': preview_ids,
-            'account_id_key': account_id_key,
-            'created': _time.time(),
-        }
-    return ref
+    return _order_support.cache_order_ref(
+        _ORDER_REF_CACHE,
+        _singleton_lock,
+        account_id_key,
+        order_request,
+        preview_ids,
+        clock=_time.time,
+        ref_factory=secrets.token_urlsafe,
+        ttl_s=_ORDER_REF_TTL_S,
+        max_entries=_ORDER_REF_CACHE_MAX,
+    )
 
 
 def _consume_order_ref(ref: str):
     """Pop a non-expired cached order_ref (single-use), or None if missing
     or expired. Caller resolves None into a 404."""
-    with _singleton_lock:
-        _prune_order_refs()
-        return _ORDER_REF_CACHE.pop(ref, None)
+    return _order_support.consume_order_ref(
+        _ORDER_REF_CACHE,
+        _singleton_lock,
+        ref,
+        clock=_time.time,
+        ttl_s=_ORDER_REF_TTL_S,
+        max_entries=_ORDER_REF_CACHE_MAX,
+    )
 
 
 # ==================== STATUS ====================
@@ -764,11 +871,28 @@ def live_status():
         return _unavailable('Kill switch', KILL_SWITCH_IMPORT_ERROR)
     try:
         auth = manager.status()
+        context = get_execution_context(create=False)
+        last_reconciliation = (
+            context.last_reconciliation if context is not None
+            else _last_reconciliation)
+        reservation_health = None
+        if context is not None:
+            snapshotter = getattr(context, 'reservation_snapshot', None)
+            if callable(snapshotter):
+                snapshot = snapshotter()
+                reservations = snapshot.get('reservations') or []
+                reservation_health = {
+                    'active_count': sum(
+                        row.get('status') == 'ACTIVE'
+                        for row in reservations),
+                    'active_totals': snapshot.get('active_totals'),
+                }
         return jsonify({
             'auth': auth,
             'env': auth.get('env'),
             'kill_switch': {'engaged': bool(ks.engaged())},
-            'reconciliation': _last_reconciliation,
+            'reconciliation': last_reconciliation,
+            'reservations': reservation_health,
         })
     except Exception:
         logger.error('Failed to retrieve live status', exc_info=True)
@@ -859,6 +983,9 @@ def auth_disconnect():
     if manager is None:
         return _unavailable('Live trading', auth_unavailable_reason())
     try:
+        # Close/cancel account-bound execution while the OAuth token is still
+        # usable; only then tear down the signing session.
+        reset_execution_context()
         manager.disconnect()
         # The session is gone — stop keeping a dead token warm.
         _stop_keepalive_best_effort()
@@ -964,120 +1091,128 @@ def execution_parity():
 
 @live_bp.route('/reconcile', methods=['POST'])
 def run_reconcile():
-    """Run reconciliation against the active live broker session.
-
-    On mismatches this route engages the kill switch itself (C19: the
-    caller engages on not-ok) and says so in the response, so the UI can
-    show the red mismatch table together with the 'kill switch engaged'
-    note in one round trip.
-    """
+    """Reconcile the persistent account-scoped book against the broker."""
     global _last_reconciliation
     if reconcile is None:
         return _unavailable('Reconciliation', RECONCILE_IMPORT_ERROR)
-    ks = get_kill_switch()
-    if ks is None:
-        return _unavailable('Kill switch', KILL_SWITCH_IMPORT_ERROR)
-
-    broker = _find_live_broker()
-    if broker is None:
-        return jsonify({
-            'error': 'No live broker session',
-            'detail': 'Create a live trading session before reconciling.',
-        }), 409
+    _client, err = _require_client()
+    if err is not None:
+        return err
+    context = get_execution_context()
+    if context is None:
+        return _unavailable('Live execution context',
+                            execution_context_unavailable_reason())
 
     try:
-        local_positions, local_cash = _local_state(broker)
-        result = dict(reconcile(local_positions, local_cash, broker))
-        if not result.get('ok'):
-            mismatches = result.get('mismatches') or []
-            ks.engage(
-                f'Reconciliation mismatch ({len(mismatches)} mismatch(es))',
-                'reconcile',
-            )
-            result['kill_switch_engaged'] = True
-            logger.error('Reconciliation found %d mismatch(es) — kill switch '
-                         'engaged', len(mismatches))
-        else:
-            result['kill_switch_engaged'] = False
+        result = dict(context.run_reconciliation())
+        result['kill_switch_engaged'] = not bool(result.get('ok'))
+        context.last_reconciliation = result
         _last_reconciliation = result
         return jsonify(result)
+    except LiveContextClosed as exc:
+        return jsonify({'error': 'Live execution context unavailable',
+                        'detail': str(exc)}), 409
+    except RuntimeError as exc:
+        if 'uninitialized' in str(exc).lower():
+            return jsonify({
+                'error': 'local book uninitialized',
+                'detail': str(exc),
+            }), 409
+        logger.error('Reconciliation failed', exc_info=True)
+        return jsonify({'error': 'Reconciliation failed'}), 500
     except Exception:
         logger.error('Reconciliation failed', exc_info=True)
         return jsonify({'error': 'Reconciliation failed'}), 500
+
+
+@live_bp.route('/reconcile/bootstrap', methods=['POST'])
+def bootstrap_reconciliation_book():
+    """Explicitly initialize this account's local book from the broker."""
+    _client, err = _require_client()
+    if err is not None:
+        return err
+    context = get_execution_context()
+    if context is None:
+        return _unavailable('Live execution context',
+                            execution_context_unavailable_reason())
+    try:
+        return jsonify(context.bootstrap_local_book())
+    except LiveContextClosed as exc:
+        return jsonify({'error': 'Live execution context unavailable',
+                        'detail': str(exc)}), 409
+    except Exception:
+        logger.error('Local-book bootstrap failed', exc_info=True)
+        return jsonify({'error': 'Local-book bootstrap failed'}), 500
 
 
 # ==================== WORKING ORDERS (patient executor) ====================
 
 @live_bp.route('/orders', methods=['GET'])
 def working_orders():
-    """Patient-executor working orders (additive beyond C20's minimum).
-
-    Shaped to the ExecutionReport/steps contract: each order carries
-    instrument, side, quantity, limit_price, steps (list of repricing
-    steps so far), started_at and remaining_seconds/expires_at. With no
-    live session — or a broker without a patient executor — this degrades
-    to an empty list and the page shows its empty state.
-    """
-    broker = _find_live_broker()
-    orders: list = []
-    if broker is not None:
-        getter = getattr(broker, 'working_orders', None)
-        if callable(getter):
-            try:
-                orders = list(getter())
-            except Exception:
-                logger.error('Failed to list working orders', exc_info=True)
-                return jsonify({'error': 'Failed to list working orders'}), 500
+    """Broker-authoritative working orders plus in-process executor detail."""
+    _client, err = _require_client()
+    if err is not None:
+        return err
+    context = get_execution_context()
+    if context is None:
+        return _unavailable('Live execution context',
+                            execution_context_unavailable_reason())
+    try:
+        orders = list(context.working_orders())
+    except LiveContextClosed as exc:
+        return jsonify({'error': 'Live execution context unavailable',
+                        'detail': str(exc)}), 409
+    except Exception:
+        logger.error('Failed to list working orders', exc_info=True)
+        return jsonify({'error': 'Failed to list working orders'}), 500
     return jsonify({'orders': orders, 'count': len(orders)})
+
+
+@live_bp.route('/risk/reservations', methods=['GET'])
+def risk_reservations():
+    """Durable pending-order capacity for the configured live account."""
+    _client, err = _require_client()
+    if err is not None:
+        return err
+    context = get_execution_context()
+    if context is None:
+        return _unavailable('Live execution context',
+                            execution_context_unavailable_reason())
+    try:
+        return jsonify(context.reservation_snapshot())
+    except LiveContextClosed as exc:
+        return jsonify({'error': 'Live execution context unavailable',
+                        'detail': str(exc)}), 409
+    except Exception:
+        logger.error('Failed to read risk reservations', exc_info=True)
+        return jsonify({'error': 'Failed to read risk reservations'}), 500
 
 
 @live_bp.route('/orders/<order_id>/cancel', methods=['POST'])
 def cancel_working_order(order_id):
-    """Cancel one order. The source depends on whether account_id_key is given:
-      - GUI-placed order (account_id_key present): cancelled via the shared
-        EtradeClient — the SAME client that previewed/placed it. This is the
-        order-ticket cancel path; without it, GUI-placed orders had no
-        cancel route (the broker fallback below never sees them).
-      - patient-executor working order (no account_id_key): cancelled via
-        the live broker session, as before.
-    Cancel stays allowed even while the kill switch is engaged (C17 blocks
-    placement only; the client cancel path skips the pre-trade checks)."""
+    """Cancel through the canonical context's server-configured account."""
     data = request.get_json(silent=True) or {}
     account_id_key = str(data.get('account_id_key')
                          or request.args.get('account_id_key') or '').strip()
-
-    if account_id_key:
-        client, err = _require_client()
-        if err is not None:
-            return err
-        try:
-            cancelled = client.cancel_order(account_id_key, order_id)
-        except Exception as exc:  # noqa: BLE001
-            mapped = _client_error_response(exc)
-            if mapped is not None:
-                return mapped
-            logger.error('Failed to cancel order %s via client', order_id,
-                         exc_info=True)
-            return jsonify({'error': 'Failed to cancel order'}), 500
-        if cancelled:
-            return jsonify({'message': 'Order cancelled', 'order_id': order_id})
-        return jsonify({'error': f'Order {order_id} not found'}), 404
-
-    # No account_id_key: a patient-executor working order on the live broker.
-    broker = _find_live_broker()
-    if broker is None:
-        return jsonify({
-            'error': 'No live broker session',
-            'detail': 'Pass account_id_key to cancel a GUI-placed order, or '
-                      'start a live session to cancel patient-executor '
-                      'working orders.',
-        }), 409
+    configured = str(os.environ.get('ETRADE_ACCOUNT_ID_KEY') or '').strip()
+    if account_id_key and account_id_key != configured:
+        return jsonify({'error': 'account mismatch'}), 409
+    _client, err = _require_client()
+    if err is not None:
+        return err
+    context = get_execution_context()
+    if context is None:
+        return _unavailable('Live execution context',
+                            execution_context_unavailable_reason())
     try:
-        if broker.cancel_order(order_id):
-            return jsonify({'message': 'Order cancelled',
+        if context.cancel_order(order_id):
+            return jsonify({'message': 'Cancellation requested',
                             'order_id': order_id})
         return jsonify({'error': f'Order {order_id} not found'}), 404
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        mapped = _client_error_response(exc)
+        if mapped is not None:
+            return mapped
         logger.error('Failed to cancel working order %s', order_id,
                      exc_info=True)
         return jsonify({'error': 'Failed to cancel order'}), 500
@@ -1261,6 +1396,26 @@ def _client_error_response(exc: Exception):
     the exception is not one we translate (caller raises/500s)."""
     if isinstance(exc, EtradeAuthExpired):
         return jsonify({'error': 'reauthorize'}), 401
+    if isinstance(exc, RiskCapacityExceeded):
+        return jsonify({
+            'error': 'risk limit exceeded',
+            'code': 'RISK_LIMIT_EXCEEDED',
+            'breaches': exc.breaches,
+        }), 409
+    if isinstance(exc, UnsupportedRiskOrder):
+        return jsonify({'error': 'unsupported risk order',
+                        'reason': str(exc)}), 422
+    if isinstance(exc, ReservationPersistenceError):
+        return jsonify({'error': 'reservation persistence failed',
+                        'reason': str(exc),
+                        'kill_switch_engaged': True}), 500
+    if isinstance(exc, ReservationStateUnknown):
+        return jsonify({'error': 'reservation state unknown',
+                        'reason': str(exc),
+                        'kill_switch_engaged': True}), 503
+    if isinstance(exc, RiskValuationUnavailable):
+        return jsonify({'error': 'risk valuation unavailable',
+                        'reason': str(exc)}), 503
     if isinstance(exc, KillSwitchEngaged):
         reason = str(exc)
         label = ('circuit breaker' if 'circuit breaker' in reason.lower()
@@ -1418,169 +1573,38 @@ def live_quotes():
 # -------------------- R5/R6: order ticket --------------------
 
 def _to_float(value):
-    """float(value) or None — never raises. Rejects non-finite values
-    (NaN/Inf): NaN would slip past every ``<= 0`` / ``== 0`` route guard
-    (all NaN comparisons are False) and Inf is never a valid price/strike,
-    so a non-finite input is treated as absent (-> None)."""
-    if value is None or value == '':
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(f):
-        return None
-    return f
+    """Compatibility wrapper for the extracted finite-float parser."""
+    return _order_support.to_float(value)
 
 
 def _to_int(value):
-    """int(value) or None — never raises; rejects floats with a fraction.
-
-    Non-finite inputs are rejected up front: float('inf'/'nan') parses, but
-    ``int(float('inf'))`` raises OverflowError and ``int(float('nan'))``
-    raises ValueError — so the finite check keeps this contract truthful.
-    """
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(f):
-        return None
-    if f != int(f):
-        return None
-    return int(f)
+    """Compatibility wrapper for the extracted exact-integer parser."""
+    return _order_support.to_int(value)
 
 
 def _optional_limit_price(params: dict, key: str = 'limit_price'):
-    """Parse an optional positive limit without turning bad input into MKT.
-
-    Missing, JSON null, and blank strings intentionally select a market order.
-    Any other unparseable, non-finite, zero, or negative value is an explicit
-    bad limit and must be rejected rather than silently broadening the order
-    to MARKET.
-    """
-    raw = params.get(key)
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return None, None
-    if isinstance(raw, bool):
-        return None, f"'{key}' must be a positive finite number or blank"
-    value = _to_float(raw)
-    if value is None or value <= 0:
-        return None, f"'{key}' must be a positive finite number or blank"
-    return value, None
+    """Compatibility wrapper preserving the route's parser monkeypatch seam."""
+    return _order_support.optional_limit_price(
+        params, key, parse_float=_to_float)
 
 
 def _build_order_request(kind: str, params: dict):
-    """(order_request, None) on success, or (None, error_message).
-
-    Validates the kind-specific required fields and delegates to the
-    matching builder. Builder ValueErrors (bad action/strike count/zero
-    net) become the error message — never a 500.
-    """
-    try:
-        if kind == 'equity':
-            symbol = str(params.get('symbol') or '').strip().upper()
-            side = str(params.get('side') or '').strip().upper()
-            quantity = _to_int(params.get('quantity'))
-            limit, limit_err = _optional_limit_price(params)
-            if not symbol:
-                return None, "'symbol' is required"
-            if side not in ('BUY', 'SELL'):
-                return None, "'side' must be BUY or SELL"
-            if quantity is None or quantity <= 0:
-                return None, "'quantity' must be a positive integer"
-            if limit_err is not None:
-                return None, limit_err
-            return build_equity_order(symbol, side, quantity,
-                                      limit_price=limit), None
-
-        if kind == 'option':
-            symbol = str(params.get('symbol') or '').strip().upper()
-            call_put = str(params.get('call_put') or '').strip().upper()
-            strike = _to_float(params.get('strike'))
-            expiry = str(params.get('expiry') or '').strip()
-            action = str(params.get('action') or '').strip().upper()
-            quantity = _to_int(params.get('quantity'))
-            limit, limit_err = _optional_limit_price(params)
-            if not symbol:
-                return None, "'symbol' is required"
-            if call_put not in ('CALL', 'PUT'):
-                return None, "'call_put' must be CALL or PUT"
-            if strike is None or strike <= 0:
-                return None, "'strike' must be a positive number"
-            if not expiry:
-                return None, "'expiry' is required (YYYY-MM-DD)"
-            if quantity is None or quantity <= 0:
-                return None, "'quantity' must be a positive integer"
-            if limit_err is not None:
-                return None, limit_err
-            return build_option_order(symbol, call_put, strike, expiry,
-                                      action, quantity,
-                                      limit_price=limit), None
-
-        if kind == 'spread':
-            legs_in = params.get('legs')
-            net_price = _to_float(params.get('net_price'))
-            if not isinstance(legs_in, list) or len(legs_in) < 2:
-                return None, "'legs' must be a list of at least 2 legs"
-            if net_price is None or net_price == 0:
-                return None, ("'net_price' must be a non-zero number "
-                              '(+credit / -debit)')
-            legs = []
-            for i, leg in enumerate(legs_in):
-                if not isinstance(leg, dict):
-                    return None, f'leg {i} must be an object'
-                sym = str(leg.get('symbol') or '').strip().upper()
-                cp = str(leg.get('call_put') or '').strip().upper()
-                strike = _to_float(leg.get('strike'))
-                expiry = str(leg.get('expiry') or '').strip()
-                action = str(leg.get('action') or '').strip().upper()
-                qty = _to_int(leg.get('quantity'))
-                if not sym:
-                    return None, f'leg {i}: symbol is required'
-                if cp not in ('CALL', 'PUT'):
-                    return None, f'leg {i}: call_put must be CALL or PUT'
-                if strike is None or strike <= 0:
-                    return None, f'leg {i}: strike must be a positive number'
-                if not expiry:
-                    return None, f'leg {i}: expiry is required (YYYY-MM-DD)'
-                if qty is None or qty <= 0:
-                    return None, f'leg {i}: quantity must be a positive integer'
-                legs.append({'symbol': sym, 'call_put': cp, 'strike': strike,
-                             'expiry': expiry, 'action': action,
-                             'quantity': qty})
-            return build_spread_order(legs, net_price), None
-
-        return None, f'unknown kind {kind!r}'
-    except ValueError as e:
-        return None, str(e)
+    """Compatibility wrapper around pure ticket validation/building."""
+    return _order_support.build_order_request(
+        kind,
+        params,
+        equity_builder=build_equity_order,
+        option_builder=build_option_order,
+        spread_builder=build_spread_order,
+        parse_float=_to_float,
+        parse_int=_to_int,
+        parse_limit=_optional_limit_price,
+    )
 
 
 def _preview_summary(preview: dict) -> dict:
-    """Pull the operator-facing numbers out of a PreviewOrderResponse:
-    previewIds plus any estimated cost / margin fields E*TRADE returns.
-    Robust to missing blocks — sandbox previews vary."""
-    preview_ids = [p.get('previewId') for p in preview.get('PreviewIds', [])
-                   if isinstance(p, dict) and p.get('previewId') is not None]
-    summary = {'previewIds': preview_ids}
-    # E*TRADE puts estimates in Order[].{estimatedTotalAmount,
-    # estimatedCommission, ...} and a top-level marginLevelCd /
-    # marginBuyingPower depending on the order type. Pass through whatever
-    # is present without assuming a fixed shape.
-    orders = preview.get('Order') or []
-    if orders and isinstance(orders[0], dict):
-        first = orders[0]
-        for key in ('estimatedTotalAmount', 'estimatedCommission',
-                    'netPrice', 'netbid', 'netask'):
-            if first.get(key) is not None:
-                summary[key] = first[key]
-    for key in ('marginLevelCd', 'dstFlag', 'placedTime',
-                'PreviewIds', 'totalOrderValue', 'totalCommission'):
-        if key == 'PreviewIds':
-            continue
-        if preview.get(key) is not None:
-            summary[key] = preview[key]
-    return summary
+    """Compatibility wrapper around pure preview summarization."""
+    return _order_support.preview_summary(preview)
 
 
 def _market_hours_block(data: dict):
@@ -1637,6 +1661,10 @@ def live_order_preview():
     client, err = _require_client()
     if err is not None:
         return err
+    context = get_execution_context()
+    if context is None:
+        return _unavailable('Live execution context',
+                            execution_context_unavailable_reason())
     data = request.get_json(silent=True) or {}
     account_id_key = str(data.get('account_id_key') or '').strip()
     kind = str(data.get('kind') or '').strip()
@@ -1664,21 +1692,14 @@ def live_order_preview():
     if build_err is not None:
         return jsonify({'error': build_err}), 400
 
-    # The order_ref workflow intentionally previews through the typed client
-    # so PLACE can reuse the exact cached request.  Validate that built request
-    # through LiveEtradeBroker first so the GUI ticket retains the broker's
-    # blocking fat-finger rail without collapsing preview + place into one call.
     try:
-        LiveEtradeBroker(client, configured_account).validate_order_request(
-            order_request)
+        risk_estimate = context.risk_estimate(order_request)
+        preview = context.preview_order(order_request)
     except PriceSanityError as exc:
         return jsonify({
             'error': 'price sanity check failed',
             'detail': str(exc),
         }), 400
-
-    try:
-        preview = client.preview_order(account_id_key, order_request)
     except Exception as exc:  # noqa: BLE001
         mapped = _client_error_response(exc)
         if mapped is not None:
@@ -1692,6 +1713,7 @@ def live_order_preview():
     return jsonify({
         'preview': _preview_summary(preview if isinstance(preview, dict)
                                     else {}),
+        'risk': risk_estimate,
         'order_ref': order_ref,
     })
 
@@ -1711,6 +1733,10 @@ def live_order_place():
     client, err = _require_client()
     if err is not None:
         return err
+    context = get_execution_context()
+    if context is None:
+        return _unavailable('Live execution context',
+                            execution_context_unavailable_reason())
     data = request.get_json(silent=True) or {}
     order_ref = str(data.get('order_ref') or '').strip()
     if not order_ref:
@@ -1733,8 +1759,15 @@ def live_order_place():
     order_request = record['request']
     preview_ids = record['preview_ids']
     try:
-        result = client.place_order(account_id_key, order_request,
-                                    preview_ids)
+        result = context.place_order(order_request, preview_ids)
+    except PlacedOrderTrackingError as exc:
+        logger.critical('Order %s placed but local tracking failed',
+                        exc.order_id, exc_info=True)
+        return jsonify({
+            'error': 'order placed but local tracking failed',
+            'orderId': exc.order_id,
+            'kill_switch_engaged': True,
+        }), 500
     except Exception as exc:  # noqa: BLE001
         mapped = _client_error_response(exc)
         if mapped is not None:

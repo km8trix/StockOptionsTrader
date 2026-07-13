@@ -189,6 +189,30 @@ class TestCorrelation:
                                       all_data, DATE)
         assert len(approved) == 2 and blocked == []
 
+    def test_returns_are_inner_aligned_by_session_date(self):
+        agg = PortfolioRiskAggregator(correlation_window=10)
+        a_dates = pd.to_datetime([
+            '2022-01-03', '2022-01-04', '2022-01-05',
+            '2022-01-06', '2022-01-07'])
+        b_dates = pd.to_datetime([
+            '2022-01-03', '2022-01-05', '2022-01-06',
+            '2022-01-07', '2022-01-10'])
+        all_data = {
+            'AAA': pd.DataFrame(
+                {'close': [100.0, 110.0, 99.0, 108.9, 98.01]},
+                index=a_dates),
+            'BBB': pd.DataFrame(
+                {'close': [100.0, 120.0, 132.0, 118.8, 130.68]},
+                index=b_dates),
+        }
+
+        returns = agg._returns(['AAA', 'BBB'], all_data, DATE)
+
+        # Only Jan 5/6/7 are present in BOTH dated return series. The missing
+        # Jan 4 BBB bar must never shift Jan 5 against AAA Jan 4 by ordinal.
+        assert returns['AAA'] == pytest.approx([-0.10, 0.10, -0.10])
+        assert returns['BBB'] == pytest.approx([0.20, 0.10, -0.10])
+
     def test_short_series_recorded_unevaluated(self):
         agg = PortfolioRiskAggregator(max_correlation=0.8)
         all_data = {'AAA': frame([100, 101]), 'BBB': frame([50, 51])}
@@ -215,10 +239,8 @@ class TestCorrelation:
         assert len(approved) == 2 and blocked == []   # not blocked,
         assert any('correlation' in u for u in agg.unevaluated)  # but recorded
 
-    def test_ragged_series_recorded_unevaluated(self):
-        # Two usable (>=3) series of DIFFERENT lengths -> ragged matrix -> the
-        # cap is recorded as unevaluated (RiskManager's ragged path).
-        agg = PortfolioRiskAggregator(max_correlation=0.5,
+    def test_different_history_lengths_align_on_common_sessions(self):
+        agg = PortfolioRiskAggregator(max_correlation=1.0,
                                       correlation_window=50)
         all_data = {'AAA': frame([100, 101, 102, 103]),
                     'BBB': frame([100, 101, 102, 103, 104, 105, 106])}
@@ -227,7 +249,7 @@ class TestCorrelation:
         approved, blocked = agg.check(intents, PortfolioManager(100_000.0),
                                       all_data, DATE)
         assert len(approved) == 2 and blocked == []
-        assert any('correlation' in u for u in agg.unevaluated)
+        assert not any('ragged' in u for u in agg.unevaluated)
 
 
 class TestSectorAndReport:

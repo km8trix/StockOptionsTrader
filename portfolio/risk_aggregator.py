@@ -91,20 +91,30 @@ class PortfolioRiskAggregator:
     def _returns(self, symbols: Sequence[str],
                  all_data: Dict[str, pd.DataFrame], date
                  ) -> Dict[str, Sequence[float]]:
-        """Trailing-window simple returns per symbol from closes up to `date`
-        (inclusive). Symbols without a usable series are simply omitted;
-        RiskManager.check_correlation records the resulting gap."""
-        out: Dict[str, Sequence[float]] = {}
+        """Session-date-aligned trailing returns through ``date``.
+
+        Computing each symbol independently and stacking by ordinal position
+        pairs different market sessions whenever one name is halted/missing a
+        bar. Build dated return Series first, then inner-align once so every
+        correlation observation represents the same session.
+        """
+        dated: Dict[str, pd.Series] = {}
         for symbol in symbols:
             frame = all_data.get(symbol)
             if frame is None or frame.empty or 'close' not in frame.columns:
                 continue
             closes = frame.loc[frame.index <= pd.Timestamp(date), 'close']
-            closes = closes.dropna().iloc[-(self.correlation_window + 1):]
-            rets = closes.pct_change().dropna()
-            if len(rets) >= 3:
-                out[symbol] = rets.to_numpy()
-        return out
+            rets = closes.dropna().pct_change(fill_method=None).dropna()
+            if not rets.empty:
+                dated[symbol] = rets.rename(symbol)
+        if len(dated) < 2:
+            return {}
+        aligned = pd.concat(dated.values(), axis=1, join='inner').dropna()
+        aligned = aligned.sort_index().iloc[-self.correlation_window:]
+        if len(aligned) < 3:
+            return {}
+        return {symbol: aligned[symbol].to_numpy()
+                for symbol in aligned.columns}
 
     @staticmethod
     def _book_symbols(portfolio: PortfolioManager,
@@ -227,8 +237,15 @@ class PortfolioRiskAggregator:
                 self._risk.unevaluated.append(
                     'sector concentration: positions carry no sector tags')
             return True
+        # RiskManager's legacy annotation keys positions by string, while the
+        # canonical PortfolioManager keys them by Asset. The sector primitive
+        # reads values only; adapt keys without changing its calculation.
+        positions_by_instrument = {
+            str(asset): position
+            for asset, position in portfolio.positions.items()
+        }
         return self._risk.check_portfolio_sector_concentration(
-            portfolio.positions, account_capital)
+            positions_by_instrument, account_capital)
 
     # ------------------------------------------------------------------
     # Reporting

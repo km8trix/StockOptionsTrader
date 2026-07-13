@@ -4,6 +4,8 @@ kill-switch gating, and the daily-loss circuit-breaker boundary."""
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from brokers.circuit_breaker import DailyLossCircuitBreaker
@@ -77,6 +79,7 @@ class FakeAuth:
         self.env = "sandbox"
         self.api_base_url = "https://apisb.etrade.com"
         self.expired_reasons = []
+        self.transport_lock = threading.RLock()
 
     def get_session(self):
         return self.transport
@@ -93,6 +96,49 @@ def harness(tmp_path):
     client = EtradeClient(FakeAuth(transport, db_path), audit=audit,
                           sleep_fn=lambda _s: None)
     return client, transport, audit
+
+
+class RecordingReservationGate:
+    """Small duck-typed gate used to pin placement callback ordering."""
+
+    def __init__(self, fail_before_attempt=None, fail_accepted=None,
+                 fail_order_update=None):
+        self.events = []
+        self.handle = object()
+        self.fail_before_attempt = fail_before_attempt
+        self.fail_accepted = fail_accepted
+        self.fail_order_update = fail_order_update
+
+    def begin(self, account_id_key, order_request):
+        self.events.append(("begin", account_id_key,
+                            order_request["clientOrderId"]))
+        return self.handle
+
+    def before_attempt(self, handle, attempt_number):
+        assert handle is self.handle
+        self.events.append(("before_attempt", attempt_number))
+        if self.fail_before_attempt == attempt_number:
+            raise RuntimeError(f"revalue failed on attempt {attempt_number}")
+
+    def accepted(self, handle, result):
+        assert handle is self.handle
+        self.events.append(("accepted", result["order_id"],
+                            result["recovered"], result["retried"]))
+        if self.fail_accepted is not None:
+            raise self.fail_accepted
+
+    def rejected(self, handle, exc):
+        assert handle is self.handle
+        self.events.append(("rejected", type(exc).__name__))
+
+    def unknown(self, handle, exc):
+        assert handle is self.handle
+        self.events.append(("unknown", type(exc).__name__))
+
+    def order_update(self, order_id, status):
+        self.events.append(("order_update", order_id, dict(status)))
+        if self.fail_order_update is not None:
+            raise self.fail_order_update
 
 
 # ----------------------------------------------------------------------
@@ -203,10 +249,45 @@ class TestEndpoints:
         # net = -1.20 + 0.80 - 1.10 + 0.70 = -0.80 (credit received)
         assert abs(status["avg_fill_price"] - (-0.80)) < 1e-9
 
+    def test_order_status_normalizes_ratio_legs_to_package_units(self,
+                                                                 harness):
+        client, transport, _ = harness
+        # Two packages of a 2:3 ratio are ordered as 4:6 leg contracts.
+        # One package filled means cumulative legs 2:3, not min(...)=2
+        # packages. Net package = -2*1.00 + 3*0.25 = -1.25.
+        legs = [
+            {"orderedQuantity": 4, "filledQuantity": 2,
+             "averageExecutionPrice": 1.00,
+             "orderAction": "SELL_OPEN"},
+            {"orderedQuantity": 6, "filledQuantity": 3,
+             "averageExecutionPrice": 0.25,
+             "orderAction": "BUY_OPEN"},
+        ]
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(200, {"OrdersResponse": {"Order": [{
+                            "orderId": 641, "orderType": "SPREADS",
+                            "OrderDetail": [{"status": "PARTIAL",
+                                             "Instrument": legs}],
+                        }]}}))
+
+        status = client.order_status(ACCOUNT, 641)
+
+        assert status == {"status": "PARTIAL", "filled_quantity": 1.0,
+                          "avg_fill_price": -1.25}
+
     def test_get_retry_backoff_on_5xx_then_success(self, harness):
         client, transport, _ = harness
         sleeps = []
-        client._sleep = sleeps.append
+
+        def record_sleep(delay):
+            # Backoff is outside the critical section: a token renewal may run
+            # before the next retry, whose get_session() then sees fresh state.
+            acquired = client.auth.transport_lock.acquire(blocking=False)
+            assert acquired
+            client.auth.transport_lock.release()
+            sleeps.append(delay)
+
+        client._sleep = record_sleep
         transport.route("get", "/v1/market/quote/SPY.json",
                         FakeResponse(503, text="maintenance"),
                         FakeResponse(503, text="maintenance"),
@@ -435,6 +516,195 @@ class TestPlaceIdempotency:
 
 
 # ----------------------------------------------------------------------
+# Placement reservation lifecycle
+# ----------------------------------------------------------------------
+class TestPlacementReservationHooks:
+    def _request(self):
+        return build_equity_order(
+            "AAPL", "BUY", 10, limit_price=190.0,
+            client_order_id="reservedintent01")
+
+    def _client(self, harness, gate):
+        base_client, transport, audit = harness
+        client = EtradeClient(
+            base_client.auth, audit=audit, reservation_gate=gate,
+            sleep_fn=lambda _s: None)
+        return client, transport, audit
+
+    def test_direct_acceptance_commits_reservation(self, harness):
+        gate = RecordingReservationGate()
+        client, transport, _ = self._client(harness, gate)
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {
+                "OrderIds": [{"orderId": 901}]}}))
+
+        result = client.place_order(
+            ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert result["order_id"] == 901
+        assert gate.events == [
+            ("begin", ACCOUNT, "reservedintent01"),
+            ("before_attempt", 1),
+            ("accepted", 901, False, False),
+        ]
+
+    @pytest.mark.parametrize(
+        ("response", "error_type"),
+        [
+            (FakeResponse(429, text="slow down"), EtradeRateLimited),
+            (FakeResponse(400, {"Error": {"message": "buying power"}}),
+             EtradeOrderRejected),
+        ],
+    )
+    def test_definitive_first_response_releases_reservation(
+            self, harness, response, error_type):
+        gate = RecordingReservationGate()
+        client, transport, _ = self._client(harness, gate)
+        transport.route("post", "orders/place.json", response)
+
+        with pytest.raises(error_type):
+            client.place_order(
+                ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert gate.events[-1] == ("rejected", error_type.__name__)
+        assert all(event[0] != "unknown" for event in gate.events)
+        assert transport.count("post", "place") == 1
+
+    def test_first_ambiguous_send_recovered_commits_without_retry(
+            self, harness):
+        gate = RecordingReservationGate()
+        client, transport, _ = self._client(harness, gate)
+        transport.route("post", "orders/place.json",
+                        FakeResponse(503, text="gateway timeout"))
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(200, {"OrdersResponse": {"Order": [
+                            {"orderId": 902, "clientOrderId":
+                             "reservedintent01"}]}}))
+
+        result = client.place_order(
+            ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert result["recovered"] is True
+        assert gate.events[-1] == ("accepted", 902, True, False)
+        assert [e for e in gate.events if e[0] == "before_attempt"] == [
+            ("before_attempt", 1)]
+        assert transport.count("post", "place") == 1
+
+    def test_safe_retry_revalues_then_commits(self, harness):
+        gate = RecordingReservationGate()
+        client, transport, _ = self._client(harness, gate)
+        transport.route(
+            "post", "orders/place.json",
+            FakeResponse(503, text="gateway timeout"),
+            FakeResponse(200, {"PlaceOrderResponse": {
+                "OrderIds": [{"orderId": 903}]}}))
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(200, {"OrdersResponse": {"Order": []}}))
+
+        result = client.place_order(
+            ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert result["retried"] is True
+        assert [e for e in gate.events if e[0] == "before_attempt"] == [
+            ("before_attempt", 1), ("before_attempt", 2)]
+        assert gate.events[-1] == ("accepted", 903, False, True)
+
+    def test_second_failure_after_ambiguity_marks_unknown(self, harness):
+        gate = RecordingReservationGate()
+        client, transport, _ = self._client(harness, gate)
+        transport.route("post", "orders/place.json",
+                        FakeResponse(503, text="first ambiguous"),
+                        FakeResponse(429, text="retry rejected"))
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(200, {"OrdersResponse": {"Order": []}}))
+
+        with pytest.raises(EtradeRateLimited):
+            client.place_order(
+                ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert gate.events[-1] == ("unknown", "EtradeRateLimited")
+        assert all(event[0] != "rejected" for event in gate.events)
+
+    def test_revalue_failure_before_retry_marks_unknown_without_second_post(
+            self, harness):
+        gate = RecordingReservationGate(fail_before_attempt=2)
+        client, transport, _ = self._client(harness, gate)
+        transport.route("post", "orders/place.json",
+                        FakeResponse(503, text="ambiguous"))
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(200, {"OrdersResponse": {"Order": []}}))
+
+        with pytest.raises(RuntimeError, match="revalue failed"):
+            client.place_order(
+                ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert transport.count("post", "place") == 1
+        assert gate.events[-1] == ("unknown", "RuntimeError")
+
+    def test_first_revalue_failure_releases_without_post(self, harness):
+        gate = RecordingReservationGate(fail_before_attempt=1)
+        client, transport, _ = self._client(harness, gate)
+
+        with pytest.raises(RuntimeError, match="revalue failed"):
+            client.place_order(
+                ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert transport.count("post", "place") == 0
+        assert gate.events[-1] == ("rejected", "RuntimeError")
+
+    def test_recovery_lookup_failure_marks_unknown(self, harness):
+        gate = RecordingReservationGate()
+        client, transport, _ = self._client(harness, gate)
+        transport.route("post", "orders/place.json",
+                        FakeResponse(503, text="ambiguous"))
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(503, text="lookup down"))
+
+        with pytest.raises(EtradeUnavailable):
+            client.place_order(
+                ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert gate.events[-1] == ("unknown", "EtradeUnavailable")
+
+    def test_accepted_callback_failure_escalates_to_unknown(self, harness):
+        gate = RecordingReservationGate(
+            fail_accepted=ValueError("reservation commit failed"))
+        client, transport, audit = self._client(harness, gate)
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {
+                "OrderIds": [{"orderId": 904}]}}))
+
+        with pytest.raises(ValueError, match="reservation commit failed"):
+            client.place_order(
+                ACCOUNT, self._request(), [{"previewId": 11}])
+
+        assert gate.events[-2:] == [
+            ("accepted", 904, False, False),
+            ("unknown", "ValueError"),
+        ]
+        assert [entry["event_type"] for entry in audit.entries()] == [
+            "order_placed"]
+
+    def test_status_callback_failure_propagates_fail_closed(self, harness):
+        gate = RecordingReservationGate(
+            fail_order_update=RuntimeError("reservation status stale"))
+        client, transport, _ = self._client(harness, gate)
+        status = {"status": "PARTIAL", "filled_quantity": 4.0,
+                  "avg_fill_price": 189.75}
+        transport.route("get", f"/v1/accounts/{ACCOUNT}/orders.json",
+                        FakeResponse(200, {"OrdersResponse": {"Order": [
+                            {"orderId": 905, "OrderDetail": [{
+                                "status": status["status"], "Instrument": [{
+                                    "filledQuantity": 4,
+                                    "averageExecutionPrice": 189.75}]}]}]}}))
+
+        with pytest.raises(RuntimeError, match="reservation status stale"):
+            client.order_status(ACCOUNT, 905)
+
+        assert gate.events == [("order_update", "905", status)]
+
+
+# ----------------------------------------------------------------------
 # Kill switch + circuit breaker gating
 # ----------------------------------------------------------------------
 class TestPreTradeGates:
@@ -551,6 +821,33 @@ class TestLiveEtradeBroker:
         sent = transport.calls[-1]["json"]["PlaceOrderRequest"]
         assert sent["orderType"] == "EQ"
         assert sent["PreviewIds"] == [{"previewId": 3}]
+
+    def test_place_order_with_client_id_passes_exact_id_to_builder(
+            self, harness):
+        from core.models import Asset, AssetType, OrderType
+        broker, transport = self._broker(harness)
+        transport.route("post", "orders/preview.json", FakeResponse(
+            200, {"PreviewOrderResponse": {"PreviewIds": [
+                {"previewId": 4}]}}))
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {"OrderIds": [
+                {"orderId": 701}]}}))
+
+        order_id = broker.place_order_with_client_id(
+            Asset("AAPL", AssetType.STOCK), OrderType.BUY, 10, 190.0,
+            "intentchild000000001")
+
+        assert order_id == "701"
+        requests = [
+            call["json"][key]
+            for call in transport.calls
+            for key in ("PreviewOrderRequest", "PlaceOrderRequest")
+            if key in (call.get("json") or {})
+        ]
+        assert len(requests) == 2
+        assert all(
+            request["clientOrderId"] == "intentchild000000001"
+            for request in requests)
 
     def test_place_order_blocks_fat_finger_limit(self, harness):
         # Gap 2: the live broker REFUSES a limit > 50% from the current price.
@@ -674,6 +971,94 @@ class TestLiveEtradeBroker:
         assert all(i["orderedQuantity"] == 2 and i["quantity"] == 2
                    for i in instruments)
         assert sent["Order"][0]["priceType"] == "NET_CREDIT"
+
+    def test_place_structure_close_is_one_order_with_stable_identity(
+            self, harness):
+        from core.models import Asset, AssetType
+        broker, transport = self._broker(harness)
+        transport.route("post", "orders/preview.json", FakeResponse(
+            200, {"PreviewOrderResponse": {"PreviewIds": [
+                {"previewId": 5}]}}))
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {"OrderIds": [
+                {"orderId": 702}]}}))
+        legs = [
+            {"asset": Asset("SPY", AssetType.PUT, 440.0, "2026-07-17"),
+             "action": "SHORT"},
+            {"asset": Asset("SPY", AssetType.PUT, 430.0, "2026-07-17"),
+             "action": "BUY"},
+        ]
+
+        result = broker.place_structure_with_client_id(
+            legs, net_price=-0.60, contracts=2,
+            client_order_id="spreadclose000000001", closing=True)
+
+        assert result == "702"
+        requests = [
+            call["json"][key]
+            for call in transport.calls
+            for key in ("PreviewOrderRequest", "PlaceOrderRequest")
+            if key in (call.get("json") or {})
+        ]
+        assert len(requests) == 2
+        assert all(request["clientOrderId"] == "spreadclose000000001"
+                   for request in requests)
+        placed = requests[-1]
+        assert len(placed["Order"]) == 1
+        instruments = placed["Order"][0]["Instrument"]
+        assert [instrument["orderAction"] for instrument in instruments] == [
+            "BUY_CLOSE", "SELL_CLOSE"]
+        assert all(instrument["orderedQuantity"] == 2
+                   for instrument in instruments)
+        assert placed["Order"][0]["priceType"] == "NET_DEBIT"
+
+    def test_place_structure_preserves_explicit_leg_lifecycle(self, harness):
+        from core.models import Asset, AssetType
+        broker, transport = self._broker(harness)
+        transport.route("post", "orders/preview.json", FakeResponse(
+            200, {"PreviewOrderResponse": {"PreviewIds": [
+                {"previewId": 6}]}}))
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {"OrderIds": [
+                {"orderId": 703}]}}))
+        legs = [
+            {"asset": Asset("SPY", AssetType.PUT, 440.0, "2026-07-17"),
+             "action": "BUY_CLOSE"},
+            {"asset": Asset("SPY", AssetType.PUT, 430.0, "2026-07-17"),
+             "action": "SELL_CLOSE"},
+        ]
+
+        assert broker.place_structure(
+            legs, net_price=-0.55, contracts=1) == "703"
+        sent = transport.calls[-1]["json"]["PlaceOrderRequest"]
+        assert [instrument["orderAction"]
+                for instrument in sent["Order"][0]["Instrument"]] == [
+                    "BUY_CLOSE", "SELL_CLOSE"]
+
+    def test_place_structure_multiplies_package_count_by_leg_ratio(self,
+                                                                    harness):
+        from core.models import Asset, AssetType
+        broker, transport = self._broker(harness)
+        transport.route("post", "orders/preview.json", FakeResponse(
+            200, {"PreviewOrderResponse": {"PreviewIds": [
+                {"previewId": 7}]}}))
+        transport.route("post", "orders/place.json", FakeResponse(
+            200, {"PlaceOrderResponse": {"OrderIds": [
+                {"orderId": 704}]}}))
+        legs = [
+            {"asset": Asset("SPY", AssetType.CALL, 450.0, "2026-07-17"),
+             "action": "SELL_OPEN", "ratio": 2},
+            {"asset": Asset("SPY", AssetType.CALL, 455.0, "2026-07-17"),
+             "action": "BUY_OPEN", "ratio": 3},
+        ]
+
+        assert broker.place_structure(
+            legs, net_price=0.75, contracts=2) == "704"
+
+        instruments = transport.calls[-1]["json"][
+            "PlaceOrderRequest"]["Order"][0]["Instrument"]
+        assert [item["quantity"] for item in instruments] == [4, 6]
+        assert [item["orderedQuantity"] for item in instruments] == [4, 6]
 
     def test_portfolio_status_uses_canonical_option_keys(self, harness):
         broker, transport = self._broker(harness)

@@ -16,9 +16,11 @@ import pandas as pd
 import pytest
 
 from backtesting.backtest_engine import BacktestEngine, MAX_PENDING_DAYS
-from core.models import Asset
+from core.models import Asset, AssetType
 from data.market_data import MarketDataHandler
+from desks.base import Desk, DeskIntent
 from portfolio.manager import PortfolioManager
+from portfolio.targets import TargetPosition
 from strategies.base import Strategy
 
 COMMISSION = 0.001
@@ -43,6 +45,60 @@ class ScriptedStrategy(Strategy):
         if self.sell_date is not None and current_date == self.sell_date:
             return 'SELL'
         return 'HOLD'
+
+
+class _TargetDesk(Desk):
+    """Small target-native desk used to exercise the engine adapter."""
+
+    target_native_enabled = True
+
+    def __init__(self, targets_by_date):
+        super().__init__('target-test', 'Target Test', 'test', '#000000')
+        self.targets_by_date = targets_by_date
+        self.snapshots = []
+        self.risk_batches = []
+
+    def generate_intents(self, all_data, date, portfolio):
+        raise AssertionError('target-native desk used legacy generate_intents')
+
+    def generate_targets(self, all_data, date, portfolio, snapshot):
+        self.snapshots.append(snapshot)
+        quantity = self.targets_by_date(pd.Timestamp(date))
+        return [TargetPosition(
+            Asset('TEST', AssetType.STOCK), quantity,
+            reason=f'target {quantity}',
+            metadata={'size_fraction': 0.1},
+        )]
+
+    def apply_risk(self, intents, portfolio, all_data, date):
+        # These adapter tests isolate target arithmetic. The shared risk path
+        # is separately covered and is still invoked by the engine.
+        self.risk_batches.append(tuple(intents))
+        return intents
+
+
+class _LegacyDesk(Desk):
+    """Legacy intent desk whose target method must remain unreachable."""
+
+    target_native_enabled = False
+
+    def __init__(self):
+        super().__init__('legacy-test', 'Legacy Test', 'test', '#000000')
+        self.first_date = None
+
+    def generate_intents(self, all_data, date, portfolio):
+        if self.first_date is None:
+            self.first_date = pd.Timestamp(date)
+            return [DeskIntent(
+                asset=Asset('TEST', AssetType.STOCK), action='BUY',
+                size_fraction=0.1, reason='legacy', quantity=5)]
+        return []
+
+    def generate_targets(self, *args, **kwargs):
+        raise AssertionError('disabled target path was called')
+
+    def apply_risk(self, intents, portfolio, all_data, date):
+        return intents
 
 
 @pytest.fixture
@@ -448,6 +504,117 @@ class TestEngineModeSelection:
         assert 'trader_notes' not in report
         assert 'walk_forward' not in report
         assert report['strategy'] == 'Scripted Strategy'
+
+
+class TestTargetNativeDeskExecution:
+    """Opt-in target positions account for filled and still-working units."""
+
+    @staticmethod
+    def _run(frame, desk, patch_market_data, **engine_kwargs):
+        patch_market_data({'TEST': frame})
+        engine = BacktestEngine(
+            desk=desk, initial_capital=100000.0, commission=COMMISSION,
+            **engine_kwargs)
+        report = engine.run(
+            ['TEST'], '2023-01-01', '2023-12-31', benchmark_symbol=None)
+        assert 'error' not in report
+        return engine
+
+    def test_repeated_target_preserves_missing_bar_pending_order(
+            self, make_ohlcv, patch_market_data):
+        frame = make_ohlcv(n_days=3, seed=701)
+        dates = frame.index
+        frame.loc[dates[1], ['open', 'close']] = np.nan
+        desk = _TargetDesk(lambda _date: 5)
+
+        engine = self._run(frame, desk, patch_market_data)
+
+        assert [(trade['action'], trade['quantity'])
+                for trade in engine.trades_log] == [('BUY', 5)]
+        # The order queued on day zero waited through the missing bar. A
+        # duplicate/replacement on day one would move signal_date forward.
+        assert engine.trades_log[0]['signal_date'] == dates[0]
+        assert desk.risk_batches[0][0].intent_id.startswith('tp')
+        assert desk.snapshots[1].reserved_deltas == {
+            Asset('TEST', AssetType.STOCK): 5}
+
+    def test_partial_fill_plus_remainder_satisfies_repeated_target(
+            self, patch_market_data):
+        dates = pd.bdate_range('2023-01-02', periods=4)
+        frame = _vol_frame(dates, 100.0, 10)
+        desk = _TargetDesk(lambda _date: 5)
+
+        engine = self._run(
+            frame, desk, patch_market_data, enable_realistic_fills=True,
+            participation_cap=0.1, impact_coef=0.01, adv_window=2)
+
+        assert [trade['quantity'] for trade in engine.trades_log] == [1, 1, 1]
+        assert all(trade['signal_date'] == dates[0]
+                   for trade in engine.trades_log)
+        asset = Asset('TEST', AssetType.STOCK)
+        assert engine.portfolio.get_position(asset).quantity == 3
+        assert engine.pending_intents[asset]['quantity'] == 2
+        assert desk.snapshots[-1].effective_quantity(asset) == 5
+
+    def test_zero_target_cancels_unfilled_buy_without_phantom_sell(
+            self, make_ohlcv, patch_market_data):
+        frame = make_ohlcv(n_days=3, seed=703)
+        dates = frame.index
+        frame.loc[dates[1], ['open', 'close']] = np.nan
+        desk = _TargetDesk(
+            lambda date: 5 if date == dates[0] else 0)
+
+        engine = self._run(frame, desk, patch_market_data)
+
+        assert engine.trades_log == []
+        assert engine.pending_intents == {}
+        assert engine.portfolio.positions == {}
+
+    def test_zero_target_closes_filled_position_exactly(
+            self, make_ohlcv, patch_market_data):
+        frame = make_ohlcv(n_days=4, seed=709)
+        dates = frame.index
+        desk = _TargetDesk(
+            lambda date: 5 if date <= dates[1] else 0)
+
+        engine = self._run(frame, desk, patch_market_data)
+
+        assert [(trade['action'], trade['quantity'])
+                for trade in engine.trades_log] == [('BUY', 5), ('SELL', 5)]
+        assert engine.portfolio.positions == {}
+        assert engine.pending_intents == {}
+
+    def test_changed_target_adds_and_partially_closes_exact_delta(
+            self, make_ohlcv, patch_market_data):
+        frame = make_ohlcv(n_days=6, seed=713)
+        dates = frame.index
+
+        def target(date):
+            if date <= dates[1]:
+                return 5
+            if date <= dates[3]:
+                return 8
+            return 3
+
+        engine = self._run(frame, _TargetDesk(target), patch_market_data)
+
+        assert [(trade['action'], trade['quantity'])
+                for trade in engine.trades_log] == [
+                    ('BUY', 5), ('BUY', 3), ('SELL', 5)]
+        position = engine.portfolio.get_position(
+            Asset('TEST', AssetType.STOCK))
+        assert position.quantity == 3
+
+    def test_disabled_target_flag_keeps_legacy_intent_path(
+            self, make_ohlcv, patch_market_data):
+        frame = make_ohlcv(n_days=3, seed=719)
+        desk = _LegacyDesk()
+
+        engine = self._run(frame, desk, patch_market_data)
+
+        assert [(trade['action'], trade['quantity'])
+                for trade in engine.trades_log] == [('BUY', 5)]
+        assert engine.trades_log[0]['signal_date'] == frame.index[0]
 
 
 class TestDrawdownSeries:

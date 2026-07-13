@@ -562,6 +562,9 @@ class RegimeHMMModel(WalkForwardModel):
         corrections) force a rebuild, never a silently stale posterior.
         The accessors and prefix compares are the validation cost
         (~O(history) memcmp per symbol; trivial next to the kernels)."""
+        model = self._model
+        scaler = self._scaler
+        assert model is not None and scaler is not None
         cache = self._predict_cache
         if cache is None or cache['gen'] != self._fit_generation:
             return self._rebuild_cache(data)
@@ -647,7 +650,7 @@ class RegimeHMMModel(WalkForwardModel):
             return self._rebuild_cache(data, unexpected=True)
 
         # ---- one new row per symbol: extend features incrementally ----
-        col_mean, col_std = self._scaler
+        col_mean, col_std = scaler
         ret_last: Dict[str, np.float64] = {}
         vr_last: Dict[str, np.float64] = {}
         with np.errstate(all='ignore'):  # exactly pandas' wrap
@@ -691,10 +694,10 @@ class RegimeHMMModel(WalkForwardModel):
                 self._fast_disabled_gen = self._fit_generation
                 self._predict_cache = None
                 return None
-            frame_logprob = self._model._compute_log_likelihood(z_row)
+            frame_logprob = model._compute_log_likelihood(z_row)
             if n_feat == 0:
                 _, fwd = _hmmc.forward_log(
-                    self._model.startprob_, self._model.transmat_,
+                    model.startprob_, model.transmat_,
                     frame_logprob)
                 alpha = fwd[-1]
             else:
@@ -702,8 +705,8 @@ class RegimeHMMModel(WalkForwardModel):
                 # this 2-row lattice IS the cached alpha and row 1 is
                 # produced by the same C++ recursion as the full pass.
                 _, fwd = _hmmc.forward_log(
-                    np.ones(self._model.n_components),
-                    self._model.transmat_,
+                    np.ones(model.n_components),
+                    model.transmat_,
                     np.vstack([alpha, frame_logprob[0]]))
                 alpha = fwd[1]
             n_feat += 1
@@ -738,6 +741,9 @@ class RegimeHMMModel(WalkForwardModel):
         (sliding windows, restatements, ragged/duplicated feeds) —
         these feed the sticky-fallback streak; cold starts, refits and
         universe changes do not."""
+        model = self._model
+        scaler = self._scaler
+        assert model is not None and scaler is not None
         if unexpected:
             self._rebuild_streak += 1
         self._predict_cache = None
@@ -772,7 +778,7 @@ class RegimeHMMModel(WalkForwardModel):
                 return None
         features, mkt_raw, close_syms, vol_syms = \
             self._market_features_parts(data)
-        col_mean, col_std = self._scaler
+        col_mean, col_std = scaler
         alpha = None
         n_feat = len(features)
         if n_feat:
@@ -782,9 +788,9 @@ class RegimeHMMModel(WalkForwardModel):
                 # every call from now on — stand aside entirely.
                 self._fast_disabled_gen = self._fit_generation
                 return None
-            frame_logprob = self._model._compute_log_likelihood(z_matrix)
+            frame_logprob = model._compute_log_likelihood(z_matrix)
             _, fwd = _hmmc.forward_log(
-                self._model.startprob_, self._model.transmat_,
+                model.startprob_, model.transmat_,
                 frame_logprob)
             alpha = fwd[-1]
         vol_set = set(vol_syms)
@@ -814,6 +820,7 @@ class RegimeHMMModel(WalkForwardModel):
         }
         if n_feat == 0:
             return {}
+        assert alpha is not None
         return self._posterior_from_alpha(alpha)
 
     def _posterior_from_alpha(self, alpha: np.ndarray) -> Dict:

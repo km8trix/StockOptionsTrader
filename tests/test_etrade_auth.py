@@ -5,6 +5,8 @@ the ETRADE_ALLOW_NETWORK opt-in gate on the default (real) factory."""
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -15,6 +17,7 @@ from brokers.etrade_auth import (ACCESS_TOKEN_URL, ALLOW_NETWORK_ENV_VAR,
                                  EtradeAuthExpired, EtradeAuthManager,
                                  EtradeNotConfigured, EtradeNotConnected,
                                  default_session_factory)
+from brokers.etrade_client import EtradeClient
 from utils.audit import AuditLog
 
 ET = ZoneInfo("America/New_York")
@@ -170,6 +173,116 @@ class TestThreeLeggedFlow:
         assert manager.status()["state"] == "disconnected"
         with pytest.raises(EtradeNotConnected):
             manager.get_session()
+
+
+class TestTransportSerialization:
+    """OAuth mutation and signed API traffic share one reentrant lock."""
+
+    @staticmethod
+    def _accounts_response():
+        return FakeResponse(200, json_data={
+            "AccountListResponse": {"Accounts": {"Account": [
+                {"accountIdKey": "account-key"},
+            ]}},
+        })
+
+    def test_manager_exposes_its_reentrant_lock(self, sandbox_env, tmp_path):
+        manager, _ = make_manager(tmp_path)
+        assert type(manager.transport_lock).__name__ == "RLock"
+        # Public auth methods acquire this lock themselves.  Holding it while
+        # asking for status proves callers can safely compose operations.
+        with manager.transport_lock:
+            assert manager.status()["state"] == "disconnected"
+
+    @pytest.mark.parametrize("operation", ["renew", "disconnect"])
+    def test_lifecycle_waits_for_inflight_api_request(
+            self, sandbox_env, tmp_path, operation):
+        manager, factory = make_manager(tmp_path)
+        connect(manager)
+        request_entered = threading.Event()
+        release_request = threading.Event()
+        lifecycle_started = threading.Event()
+
+        def blocking_accounts():
+            request_entered.set()
+            assert release_request.wait(2.0)
+            return self._accounts_response()
+
+        accounts_url = manager.api_base_url + "/v1/accounts/list.json"
+        factory.routes[accounts_url] = blocking_accounts
+        client = EtradeClient(manager, audit=manager.audit,
+                              sleep_fn=lambda _seconds: None)
+
+        def mutate_lifecycle():
+            lifecycle_started.set()
+            return getattr(manager, operation)()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            request = pool.submit(client.list_accounts)
+            assert request_entered.wait(1.0)
+            lifecycle = pool.submit(mutate_lifecycle)
+            assert lifecycle_started.wait(1.0)
+            try:
+                # The lifecycle thread is running, but cannot enter renew or
+                # disconnect while the signed request owns the shared lock.
+                with pytest.raises(FutureTimeoutError):
+                    lifecycle.result(timeout=0.2)
+            finally:
+                release_request.set()
+            assert request.result(timeout=2.0)[0]["accountIdKey"] == "account-key"
+            result = lifecycle.result(timeout=2.0)
+
+        if operation == "renew":
+            assert result is True
+            assert manager.status()["state"] == "connected"
+        else:
+            assert result is None
+            assert manager.status()["state"] == "disconnected"
+
+    def test_sibling_clients_serialize_requests_on_one_manager(
+            self, sandbox_env, tmp_path):
+        manager, factory = make_manager(tmp_path)
+        connect(manager)
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        call_count = 0
+
+        def blocking_accounts():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                first_entered.set()
+                assert release_first.wait(2.0)
+            else:
+                second_entered.set()
+            return self._accounts_response()
+
+        accounts_url = manager.api_base_url + "/v1/accounts/list.json"
+        factory.routes[accounts_url] = blocking_accounts
+        first_client = EtradeClient(manager, audit=manager.audit,
+                                    sleep_fn=lambda _seconds: None)
+        second_client = EtradeClient(manager, audit=manager.audit,
+                                     sleep_fn=lambda _seconds: None)
+
+        def second_request():
+            second_started.set()
+            return second_client.list_accounts()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(first_client.list_accounts)
+            assert first_entered.wait(1.0)
+            second = pool.submit(second_request)
+            assert second_started.wait(1.0)
+            try:
+                assert not second_entered.wait(0.2)
+            finally:
+                release_first.set()
+            assert first.result(timeout=2.0)
+            assert second.result(timeout=2.0)
+        assert second_entered.is_set()
+        assert call_count == 2
 
 
 class TestRenewal:

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Union, cast
 
@@ -311,11 +312,30 @@ class LiveEtradeBroker(ExecutionBroker):
         closes it (SELL_CLOSE). Short option exposure is only ever opened
         as part of a defined-risk structure via place_structure().
         """
+        return self.place_order_with_client_id(
+            asset, order_type, quantity, limit_price, None)
+
+    def place_order_with_client_id(
+            self, asset: Asset, order_type: OrderType, quantity: int,
+            limit_price: float | None,
+            client_order_id: Optional[str]) -> str:
+        """Preview->place using an explicit idempotency identity.
+
+        ``None`` preserves :meth:`place_order`'s existing builder-generated
+        identity. A supplied id is passed verbatim to both preview and place
+        by :class:`EtradeClient`.
+        """
+        if (client_order_id is not None
+                and re.fullmatch(r"[A-Za-z0-9]{1,20}", client_order_id)
+                is None):
+            raise ValueError(
+                "client_order_id must be 1-20 alphanumeric characters")
         action = "BUY" if order_type == OrderType.BUY else "SELL"
         if asset.asset_type is AssetType.STOCK:
             self._enforce_price_sanity(asset.symbol, limit_price)
             request = build_equity_order(asset.symbol, action, quantity,
-                                         limit_price=limit_price)
+                                         limit_price=limit_price,
+                                         client_order_id=client_order_id)
         else:
             assert asset.strike_price is not None  # option assets carry a strike
             self._enforce_option_price_sanity(
@@ -328,7 +348,8 @@ class LiveEtradeBroker(ExecutionBroker):
                 asset.symbol,
                 "CALL" if asset.asset_type is AssetType.CALL else "PUT",
                 asset.strike_price, asset.expiration_date, option_action,
-                quantity, limit_price=limit_price)
+                quantity, limit_price=limit_price,
+                client_order_id=client_order_id)
         result = self.client.submit_order(self.account_id_key, request)
         logger.info("Live order placed: %s %d %s -> order %s",
                     action, quantity, asset.symbol, result["order_id"])
@@ -348,21 +369,51 @@ class LiveEtradeBroker(ExecutionBroker):
             closing: False maps SHORT->SELL_OPEN / BUY->BUY_OPEN; True
                 flips to BUY_CLOSE / SELL_CLOSE to unwind.
         """
+        return self.place_structure_with_client_id(
+            legs, net_price, contracts, None, closing=closing)
+
+    def place_structure_with_client_id(
+            self, legs: List[Dict], net_price: float, contracts: int,
+            client_order_id: Optional[str], closing: bool = False) -> str:
+        """Place one atomic package with an explicit recovery identity.
+
+        The same client id is threaded through preview and place by
+        :class:`EtradeClient`. Tracker actions (SHORT/BUY) are mapped from
+        ``closing``; already-explicit E*TRADE lifecycle actions are preserved.
+        """
+        if (client_order_id is not None
+                and re.fullmatch(r"[A-Za-z0-9]{1,20}", client_order_id)
+                is None):
+            raise ValueError(
+                "client_order_id must be 1-20 alphanumeric characters")
+        if isinstance(contracts, bool) or not isinstance(contracts, int) \
+                or contracts <= 0:
+            raise ValueError("contracts must be a positive integer")
         self._enforce_structure_sanity(legs, net_price)
         action_map = _CLOSE_ACTIONS if closing else _ENTRY_ACTIONS
         spread_legs = []
         for leg in legs:
             asset: Asset = leg["asset"]
+            raw_action = str(leg["action"]).upper()
+            ratio = leg.get("ratio", 1)
+            if isinstance(ratio, bool) or not isinstance(ratio, int) \
+                    or ratio <= 0:
+                raise ValueError(
+                    "structure leg ratio must be a positive integer")
+            broker_action = (raw_action if raw_action in {
+                "BUY_OPEN", "SELL_OPEN", "BUY_CLOSE", "SELL_CLOSE"}
+                else action_map[raw_action])
             spread_legs.append({
                 "symbol": asset.symbol,
                 "call_put": ("CALL" if asset.asset_type is AssetType.CALL
                              else "PUT"),
                 "strike": asset.strike_price,
                 "expiry": asset.expiration_date,
-                "action": action_map[leg["action"]],
-                "quantity": contracts,
+                "action": broker_action,
+                "quantity": contracts * ratio,
             })
-        request = build_spread_order(spread_legs, net_price)
+        request = build_spread_order(
+            spread_legs, net_price, client_order_id=client_order_id)
         result = self.client.submit_order(self.account_id_key, request)
         logger.info("Live spread placed: %d legs x%d contracts, net %.2f "
                     "-> order %s", len(legs), contracts, net_price,

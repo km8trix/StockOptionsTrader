@@ -41,11 +41,25 @@ class KillSwitch:
                  audit: Optional[AuditLog] = None):
         self.db_path = (db_path or os.environ.get("TRADING_DB_PATH")
                         or "trading_data.db")
+        if self.db_path == ":memory:" or self.db_path.startswith("file:"):
+            raise ValueError(
+                "kill switch requires a filesystem-backed SQLite path; "
+                "in-memory and URI databases are not supported")
         self.audit = audit if audit is not None else AuditLog(self.db_path)
+        if self._canonical_path(self.audit.db_path) != self._canonical_path(
+                self.db_path):
+            raise ValueError(
+                "kill switch and audit log must use the same database")
         self._init_table()
 
+    @staticmethod
+    def _canonical_path(path: str) -> str:
+        return os.path.realpath(os.path.abspath(path))
+
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -96,31 +110,27 @@ class KillSwitch:
 
     def engage(self, reason: str, actor: str) -> None:
         """Engage; an already-engaged switch is a no-op (no double audit)."""
-        if not self._flip(True, reason, actor):
+        if not self._flip(True, reason, actor, "kill_switch_engaged",
+                          {"reason": reason}):
             logger.info("Kill switch already engaged; engage() ignored")
             return
         logger.warning("KILL SWITCH ENGAGED by %s: %s", actor, reason)
-        self.audit.append(actor, "kill_switch_engaged", {"reason": reason})
 
     def disengage(self, actor: str) -> None:
         """Disengage; an already-clear switch is a no-op."""
-        if not self._flip(False, None, actor):
+        if not self._flip(False, None, actor, "kill_switch_disengaged", {}):
             logger.info("Kill switch already clear; disengage() ignored")
             return
         logger.warning("Kill switch disengaged by %s", actor)
-        self.audit.append(actor, "kill_switch_disengaged", {})
 
     def _flip(self, engaged: bool, reason: Optional[str],
-              actor: str) -> bool:
-        """Atomically flip the state; True only when THIS call changed it.
+              actor: str, event_type: str, payload: Dict) -> bool:
+        """Atomically flip and audit; True only when this call changed it.
 
-        The no-op check and the write are ONE update-where-changed inside
-        BEGIN IMMEDIATE — never a read on one connection followed by a
-        write on another. Under multi-worker concurrency (gunicorn) two
-        simultaneous engage() calls therefore resolve to exactly one
-        winner (rowcount 1) and one no-op (rowcount 0), so flips are
-        audited exactly once and engage/disengage cannot interleave into
-        duplicate audit rows.
+        The update-where-changed and hash-chain append share one SQLite
+        transaction.  An append failure therefore rolls the state back, and
+        concurrent callers cannot observe or commit a state without its
+        canonical audit event.
         """
         value = 1 if engaged else 0
         conn = self._connect()
@@ -128,10 +138,21 @@ class KillSwitch:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 "UPDATE kill_switch_state SET engaged = ?, reason = ?, "
-                "actor = ?, flipped_at = datetime('now') "
+                "actor = ?, flipped_at = NULL "
                 "WHERE id = 1 AND engaged != ?",
                 (value, reason, actor, value))
+            changed = cursor.rowcount > 0
+            if changed:
+                timestamp = self.audit._clock().isoformat()
+                conn.execute(
+                    "UPDATE kill_switch_state SET flipped_at = ? "
+                    "WHERE id = 1", (timestamp,))
+                self.audit._append_in_transaction(
+                    conn, actor, event_type, payload, timestamp=timestamp)
             conn.commit()
-            return cursor.rowcount > 0
+            return changed
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()

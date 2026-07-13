@@ -389,8 +389,10 @@ class SequenceModel(WalkForwardModel):
         frame's final row has no next-day close and is dropped (the off-by-one
         the label demands) — that window is the predict-time input instead.
         """
-        empty = (np.empty((0, self.lookback, self._n_features)),
-                 np.empty((0,), dtype=int))
+        empty: Tuple[np.ndarray, np.ndarray] = (
+            np.empty((0, self.lookback, self._n_features)),
+            np.empty((0,), dtype=int),
+        )
         if data is None or data.empty or 'close' not in data.columns:
             return empty
         frame = _feature_frame(data)
@@ -548,7 +550,10 @@ if torch is not None:
             return self.head(last_hidden)
 
 else:  # pragma: no cover - torch-missing fallback so the name always exists
-    _LSTMNet = None  # type: ignore[assignment]
+    # Conditional class definitions are represented as a type by mypy when
+    # torch is installed and as a value assignment when import following is
+    # skipped. Both diagnostics describe this one optional-dependency fallback.
+    _LSTMNet = None  # type: ignore[misc, assignment]
 
 
 __all__ = ['MLPModel', 'SequenceModel', 'FEATURE_COLUMNS']

@@ -17,6 +17,7 @@ harness — so Phases 6-8 can focus on their models.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -27,6 +28,7 @@ from desks.ml_model import GradientBoostingModel
 from desks.walk_forward import WalkForwardController, WalkForwardFit
 from portfolio.manager import PortfolioManager
 from portfolio.risk_manager import RiskManager
+from portfolio.targets import PortfolioSnapshot, TargetPosition
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,8 @@ class FoundationDesk(Desk):
                  rsi_entry_high: float = 70.0,
                  rsi_exit: float = 70.0,
                  volume_confirmation_mult: float = 1.2,
-                 gate_threshold: float = 0.0):
+                 gate_threshold: float = 0.0,
+                 target_mode: bool = False):
         super().__init__(
             key='foundation',
             name='Foundation Desk',
@@ -61,6 +64,12 @@ class FoundationDesk(Desk):
         self.rsi_entry_high = rsi_entry_high
         self.rsi_exit = rsi_exit
         self.volume_confirmation_mult = volume_confirmation_mult
+        if not isinstance(target_mode, bool):
+            raise ValueError("target_mode must be a boolean")
+        # Opt-in while the target-native pipeline is rolled out desk by desk.
+        # Keeping the default disabled preserves every legacy caller and golden
+        # backtest until promotion is explicit.
+        self.target_native_enabled = target_mode
         # Walk-forward gate: block a momentum long when the model score
         # (P(up)-0.5, centered) is <= gate_threshold. Default 0.0 keeps the
         # historical "strictly positive confidence" gate (byte-identical);
@@ -202,3 +211,137 @@ class FoundationDesk(Desk):
                 wf_score=score)
 
         return intents
+
+    # ------------------------------------------------------------------
+    # Target-position generation (opt-in migration path)
+    # ------------------------------------------------------------------
+    def generate_targets(self, all_data: Dict[str, pd.DataFrame], date,
+                         portfolio: PortfolioManager,
+                         snapshot: PortfolioSnapshot) -> List[TargetPosition]:
+        """Return complete desired positions for Foundation-managed stocks.
+
+        Unlike edge-triggered ``DeskIntent`` values, these targets describe
+        end state.  A held or still-working quantity is therefore echoed on
+        ordinary no-signal days and repeated entry crosses.  Only a genuinely
+        flat entry is sized, once, from the causal close and current NAV.
+        """
+        if not isinstance(snapshot, PortfolioSnapshot):
+            raise ValueError("snapshot must be a PortfolioSnapshot")
+
+        if self._controller.maybe_refit(all_data, date):
+            fit = self._controller.fits[-1]
+            self.note(
+                'model',
+                f"Walk-forward refit #{len(self._controller.fits)}: trained "
+                f"on {fit.n_samples} samples ({fit.train_start} .. "
+                f"{fit.train_end})",
+                **fit.to_dict())
+
+        scores = self._controller.predict(all_data, date)
+        size_fraction = min(0.10, 1.0 / max(1, len(all_data)))
+        portfolio_nav = portfolio.get_portfolio_value()
+        targets: List[TargetPosition] = []
+        current_date = pd.Timestamp(date)
+
+        def target(asset: Asset, quantity: int, reason: str,
+                   fraction: float = size_fraction) -> TargetPosition:
+            return TargetPosition(
+                asset=asset,
+                target_quantity=quantity,
+                owner=self.key,
+                strategy=self.key,
+                reason=reason,
+                metadata={
+                    'deployment_id': 'foundation-v1',
+                    'size_fraction': fraction,
+                },
+            )
+
+        for symbol, data in all_data.items():
+            if len(data) < MIN_HISTORY_DAYS:
+                continue
+            if data.index[-1] != current_date:
+                continue
+
+            current = data.iloc[-1]
+            prev = data.iloc[-2]
+            if pd.isna(current['macd']) or pd.isna(current['signal']) \
+                    or pd.isna(current['rsi']):
+                continue
+
+            asset = Asset(symbol=symbol, asset_type=AssetType.STOCK)
+            position = portfolio.get_position(asset)
+            # Preserve the legacy ownership boundary exactly: a position
+            # tagged only to another desk is not managed by Foundation.
+            if position is not None and not self._owns_position(position):
+                continue
+
+            effective_quantity = snapshot.effective_quantity(asset)
+            macd_cross_up = (current['macd'] > current['signal']
+                             and prev['macd'] <= prev['signal'])
+            macd_cross_down = (current['macd'] < current['signal']
+                               and prev['macd'] >= prev['signal'])
+            volume_ratio = (current['volume'] / current['volume_sma']
+                            if current['volume_sma'] > 0 else 0.0)
+
+            # An exit is a complete, explicit flat target, including when
+            # part of the effective holding is represented by a working order.
+            if effective_quantity > 0 and (
+                    macd_cross_down or current['rsi'] > self.rsi_exit):
+                reason = ('MACD cross down' if macd_cross_down
+                          else f"RSI {current['rsi']:.1f} > {self.rsi_exit:.0f}")
+                targets.append(target(
+                    asset,
+                    0,
+                    f"momentum exit: {reason}",
+                    fraction=1.0,
+                ))
+                continue
+
+            # A non-flat effective position is already the desired end state.
+            # This prevents repeated crosses and partial fills from pyramiding.
+            if effective_quantity != 0:
+                targets.append(target(
+                    asset,
+                    effective_quantity,
+                    'maintain existing or pending Foundation position',
+                ))
+                continue
+
+            rsi_in_band = (self.rsi_entry_low <= current['rsi']
+                           <= self.rsi_entry_high)
+            volume_confirmed = (volume_ratio
+                                >= self.volume_confirmation_mult)
+            entry_signal = macd_cross_up and rsi_in_band and volume_confirmed
+            if not entry_signal:
+                targets.append(target(asset, 0, 'no momentum entry signal'))
+                continue
+
+            score = scores.get(symbol) if scores is not None else None
+            if (scores is not None and score is not None
+                    and score <= self.gate_threshold):
+                targets.append(target(
+                    asset,
+                    0,
+                    'momentum entry blocked by walk-forward model',
+                ))
+                continue
+
+            close = float(current['close'])
+            deployment_value = (
+                portfolio_nav * self.capital_allocation * size_fraction
+            )
+            if (not math.isfinite(close) or close <= 0
+                    or not math.isfinite(deployment_value)
+                    or deployment_value <= 0):
+                # Quantity cannot be valued safely; a flat target fails closed.
+                targets.append(target(asset, 0, 'entry sizing unavailable'))
+                continue
+            quantity = int(deployment_value / close)
+            targets.append(target(
+                asset,
+                quantity,
+                'momentum entry target',
+            ))
+
+        return targets

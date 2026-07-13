@@ -70,7 +70,9 @@ deadline distinguishes 'partial' (some fills) from 'timeout' (none).
 Broker protocol (duck-typed; both LiveEtradeBroker and PaperTrader comply
 in full, so paper rehearsal can drive this engine exactly like live):
     place_order(asset, OrderType, quantity, limit_price) -> order_id
-    place_structure(legs, net_price, contracts)          -> order_id
+    place_structure(legs, net_price, contracts, closing=False) -> order_id
+    place_structure_with_client_id(legs, net_price, contracts,
+                                   client_order_id, closing=False) -> order_id
         (only needed when working multi-leg packages)
     cancel_order(order_id) -> bool
     order_status(order_id) -> {'status', 'filled_quantity',
@@ -82,14 +84,16 @@ multi-leg package these are the NET package bid/ask.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import threading
 import time
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
-from core.models import OrderType
+from core.models import Asset, AssetType, OrderType
 from utils.kill_switch import KillSwitch
 
 logger = logging.getLogger(__name__)
@@ -138,55 +142,210 @@ class PatientExecutor:
                  clock: Optional[Callable[[], datetime]] = None,
                  sleep_fn: Callable[[float], None] = time.sleep,
                  kill_switch: Optional[KillSwitch] = None):
+        if not callable(quote_fn):
+            raise TypeError(
+                "quote_fn must be an injected callable returning bid/ask; "
+                "PatientExecutor never derives option or package prices "
+                "from an underlying quote")
         self.broker = broker
         self.quote_fn = quote_fn
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep_fn
+        self._uses_default_sleep = sleep_fn is time.sleep
         self.kill_switch = kill_switch
-        #: set by stop() (or kill-switch engagement) to abort mid-work.
+        #: Permanent lifecycle stop. It is deliberately never cleared by
+        #: execute(): a close/execute race must fail closed.
         self._stop_event = threading.Event()
-        #: one order worked at a time — overlapping execute() calls on a
-        #: single worker are an ambiguity factory.
-        self._busy = threading.Lock()
+        #: Per-order operator cancellation. Unlike stop(), this is cleared
+        #: once that execution has reached a terminal report.
+        self._cancel_event = threading.Event()
+        #: Wakes the default real-time wait immediately on cancel/stop.
+        self._wake_event = threading.Event()
+        #: All public lifecycle/observability state is protected by one
+        #: condition so snapshots and await_idle() cannot observe torn state.
+        self._state = threading.Condition(threading.RLock())
+        self._active = False
+        self._working_order: Optional[Dict] = None
 
     def stop(self) -> None:
-        """Abort the in-flight execution at its next step ('killed')."""
+        """Permanently stop this worker and abort in-flight work.
+
+        ``stop`` is intentionally sticky. Use :meth:`cancel_current` to pull
+        just the active order while keeping the executor reusable.
+        """
         self._stop_event.set()
+        self._wake_event.set()
+
+    def close(self, timeout: Optional[float] = None) -> bool:
+        """Idempotently stop the worker and wait for it to become idle.
+
+        Returns ``False`` only when *timeout* expires while broker-side
+        cancellation/confirmation is still in progress.
+        """
+        self.stop()
+        return self.await_idle(timeout)
+
+    def await_idle(self, timeout: Optional[float] = None) -> bool:
+        """Wait until no execute() call is active; return on timeout."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative or None")
+        with self._state:
+            return self._state.wait_for(lambda: not self._active,
+                                        timeout=timeout)
+
+    def cancel_current(self, order_id: Optional[str] = None) -> bool:
+        """Request cancellation of the active execution.
+
+        The worker thread remains the sole owner of broker polling and the
+        cancel-confirm race. That prevents an API thread from cancelling and
+        replacing concurrently with the execution loop. If *order_id* is
+        supplied it must match the currently working broker order id.
+        """
+        with self._state:
+            if not self._active:
+                return False
+            current_id = (self._working_order or {}).get("order_id")
+            if order_id is not None:
+                if current_id is None or str(order_id) != str(current_id):
+                    return False
+            self._cancel_event.set()
+            self._wake_event.set()
+            if self._working_order is not None:
+                self._working_order["status"] = "cancel_requested"
+            return True
+
+    def working_orders(self) -> List[Dict]:
+        """Return a thread-safe, JSON-safe snapshot of active work.
+
+        A PatientExecutor works at most one order, so the result contains
+        zero or one entries. A list keeps the contract convenient for the
+        live ``/orders`` API and permits future multi-worker aggregation.
+        """
+        with self._state:
+            if self._working_order is None:
+                return []
+            snapshot = deepcopy(self._working_order)
+        expires_at = datetime.fromisoformat(snapshot["expires_at"])
+        snapshot["remaining_seconds"] = max(
+            0.0, (expires_at - self._clock()).total_seconds())
+        return [snapshot]
 
     def _halted(self) -> bool:
         """True when the operator stop or the kill switch forbids work."""
-        return self._stop_event.is_set() or (
+        return (self._stop_event.is_set() or self._cancel_event.is_set() or (
             self.kill_switch is not None and self.kill_switch.engaged())
+        )
+
+    def _wait_step(self, seconds: float) -> None:
+        """Sleep between execution steps, interruptibly in real time.
+
+        Injected sleepers retain their deterministic one-call-per-step
+        behavior for simulations. The default sleeper wakes immediately for
+        stop/cancel and checks a database-backed kill switch at the cancel
+        polling cadence instead of going dark for a full 30-second step.
+        """
+        if not self._uses_default_sleep:
+            self._sleep(seconds)
+            return
+        deadline = time.monotonic() + max(0.0, seconds)
+        while not self._halted():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._wake_event.wait(min(remaining, CANCEL_POLL_S)):
+                return
+
+    def _set_working(self, **updates) -> None:
+        """Atomically update the active-order observability snapshot."""
+        with self._state:
+            if self._working_order is not None:
+                self._working_order.update(deepcopy(updates))
 
     # ------------------------------------------------------------------
     def execute(self, side: str, instrument_or_legs, quantity: int,
                 max_minutes: float = 10, step_interval_s: float = 30,
-                edge_check: Optional[Callable[[], bool]] = None) -> Dict:
-        """Work one order per the module-docstring algorithm."""
+                edge_check: Optional[Callable[[], bool]] = None,
+                execution_id: Optional[str] = None,
+                closing: bool = False) -> Dict:
+        """Work one order per the module-docstring algorithm.
+
+        When *execution_id* is supplied, each child order receives a
+        deterministic client order id. Re-running the same logical execution
+        therefore reuses the same child ids for idempotent broker recovery,
+        while cancel-and-replace children use distinct sequence suffixes.
+        Brokers without the optional capability retain the original placement
+        call unchanged.
+
+        ``closing`` applies only to leg packages and tells the broker to map
+        tracker-shaped SHORT/BUY legs to BUY_CLOSE/SELL_CLOSE. Explicit
+        lifecycle actions embedded in a leg are preserved by LiveEtradeBroker.
+        """
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side {side!r} must be BUY or SELL")
         if quantity <= 0:
             raise ValueError(f"quantity {quantity} must be positive")
-        if not self._busy.acquire(blocking=False):
-            raise RuntimeError(
-                "PatientExecutor is already working an order — one worker, "
-                "one order")
+        is_package = isinstance(instrument_or_legs, (list, tuple))
+        if closing and not is_package:
+            raise ValueError("closing=True is only valid for leg packages")
+        if not math.isfinite(max_minutes) or max_minutes < 0:
+            raise ValueError("max_minutes must be a non-negative finite number")
+        if not math.isfinite(step_interval_s) or step_interval_s < 0:
+            raise ValueError(
+                "step_interval_s must be a non-negative finite number")
+        if execution_id is not None:
+            execution_id = str(execution_id).strip()
+            if not execution_id:
+                raise ValueError("execution_id must be non-empty when supplied")
+        start = self._clock()
+        expires_at = start + timedelta(minutes=max_minutes)
+        initial_snapshot: Dict = {
+            "order_id": None,
+            "instrument": self._instrument_label(instrument_or_legs),
+            "side": side,
+            "quantity": quantity,
+            "filled_quantity": 0.0,
+            "remaining_quantity": quantity,
+            "limit_price": None,
+            "status": "starting",
+            "steps": [],
+            "started_at": start.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "remaining_seconds": max_minutes * 60.0,
+        }
+        with self._state:
+            if self._active:
+                raise RuntimeError(
+                    "PatientExecutor is already working an order — one "
+                    "worker, one order")
+            self._active = True
+            self._cancel_event.clear()
+            if not self._stop_event.is_set():
+                self._wake_event.clear()
+            self._working_order = initial_snapshot
         try:
-            self._stop_event.clear()
             return self._run(side, instrument_or_legs, quantity,
-                             max_minutes, step_interval_s, edge_check)
+                             max_minutes, step_interval_s, edge_check, start,
+                             execution_id, closing)
         finally:
-            self._busy.release()
+            with self._state:
+                self._working_order = None
+                self._active = False
+                self._cancel_event.clear()
+                if not self._stop_event.is_set():
+                    self._wake_event.clear()
+                self._state.notify_all()
 
     # ------------------------------------------------------------------
     def _run(self, side: str, instrument, quantity: int, max_minutes: float,
-             step_interval_s: float, edge_check) -> Dict:
-        start = self._clock()
+             step_interval_s: float, edge_check, start: datetime,
+             execution_id: Optional[str] = None,
+             closing: bool = False) -> Dict:
         deadline_s = max_minutes * 60.0
-        quote = self.quote_fn(instrument)
+        quote = self._quote(instrument)
         arrival_mid = round_tick(
-            (float(quote["bid"]) + float(quote["ask"])) / 2.0)
+            (quote["bid"] + quote["ask"]) / 2.0)
         limit = arrival_mid
+        self._set_working(limit_price=limit)
 
         fills: List[Dict] = []
         steps: List[Dict] = []
@@ -204,6 +363,19 @@ class PatientExecutor:
         order_id: Optional[str] = None
         order_filled = 0.0
         order_avg: Optional[float] = None
+        child_sequence = 0
+
+        def _place_child(child_quantity: int, child_limit: float) -> str:
+            """Place one child with an execution-stable id when supported."""
+            nonlocal child_sequence
+            client_order_id = None
+            if execution_id is not None:
+                client_order_id = self._child_client_order_id(
+                    execution_id, child_sequence)
+            child_sequence += 1
+            return self._place(side, instrument, child_quantity, child_limit,
+                               client_order_id=client_order_id,
+                               closing=closing)
 
         def _poll() -> Optional[Dict]:
             """Bank any new fills on the current order into `fills`.
@@ -222,19 +394,38 @@ class PatientExecutor:
             # average so the fills list carries true per-slice prices.
             if cum_avg is None:
                 delta_price = limit
-            elif order_avg is None or order_filled == 0:
-                delta_price = float(cum_avg)
             else:
-                delta_price = ((cum_qty * float(cum_avg)
-                                - order_filled * order_avg) / delta_qty)
+                cumulative_avg = float(cum_avg)
+                # EtradeClient reports a signed package net (credits are
+                # negative), while the executor works a positive executable
+                # package price on both BUY and SELL paths. Accounting sees
+                # the raw signed status through the reservation callback;
+                # normalize only this execution report/shortfall surface.
+                if isinstance(instrument, (list, tuple)):
+                    cumulative_avg = abs(cumulative_avg)
+                if order_avg is None or order_filled == 0:
+                    delta_price = cumulative_avg
+                else:
+                    delta_price = ((cum_qty * cumulative_avg
+                                    - order_filled * order_avg) / delta_qty)
             fills.append({"qty": delta_qty, "price": round(delta_price, 4),
                           "ts": self._clock().isoformat()})
             order_filled = cum_qty
-            order_avg = float(cum_avg) if cum_avg is not None else limit
+            order_avg = (abs(float(cum_avg))
+                         if (cum_avg is not None
+                             and isinstance(instrument, (list, tuple)))
+                         else (float(cum_avg)
+                               if cum_avg is not None else limit))
             remaining = quantity - int(round(sum(f["qty"] for f in fills)))
+            self._set_working(
+                filled_quantity=quantity - remaining,
+                remaining_quantity=remaining,
+                broker_status=str(status.get("status") or ""),
+            )
             return status
 
         def _finish(status: str) -> Dict:
+            self._set_working(status=status)
             return self._report(status, side, arrival_mid, fills, steps,
                                 quantity)
 
@@ -247,6 +438,7 @@ class PatientExecutor:
             raises, and the mid-work-failure handler turns that into a
             terminal 'error' report: working a replacement while the old
             order may still be live is how quantity double-executes."""
+            self._set_working(status="cancel_requested")
             self.broker.cancel_order(order_id)
             for _ in range(CANCEL_CONFIRM_ATTEMPTS):
                 status = _poll()
@@ -260,8 +452,10 @@ class PatientExecutor:
                 "standing down")
 
         try:
-            order_id = self._place(side, instrument, remaining, limit)
+            order_id = _place_child(remaining, limit)
             steps.append({"ts": self._clock().isoformat(), "limit": limit})
+            self._set_working(order_id=str(order_id), status="working",
+                              limit_price=limit, steps=steps)
             logger.info("Patient %s %d @ mid %.2f (order %s)", side,
                         quantity, limit, order_id)
 
@@ -270,7 +464,7 @@ class PatientExecutor:
                 return _finish("filled")
 
             while True:
-                self._sleep(step_interval_s)
+                self._wait_step(step_interval_s)
                 # 1. operator stop / kill switch — cancel and stand down.
                 if self._halted():
                     _cancel_confirmed()
@@ -294,13 +488,13 @@ class PatientExecutor:
                                 "remaining", remaining)
                     return _finish("partial" if fills else "timeout")
                 # 5. reprice 25% of the remaining distance toward the touch.
-                quote = self.quote_fn(instrument)
+                quote = self._quote(instrument)
                 if side == "BUY":
-                    touch = float(quote["ask"])
+                    touch = quote["ask"]
                     target = round_tick(limit + 0.25 * (touch - limit))
                     new_limit = min(target, touch)
                 else:
-                    touch = float(quote["bid"])
+                    touch = quote["bid"]
                     target = round_tick(limit - 0.25 * (limit - touch))
                     new_limit = max(target, touch)
                 if new_limit != limit:
@@ -308,16 +502,20 @@ class PatientExecutor:
                     if remaining <= 0:
                         return _finish("filled")
                     limit = new_limit
-                    order_id = self._place(side, instrument, remaining,
-                                           limit)
+                    order_id = _place_child(remaining, limit)
                     order_filled, order_avg = 0.0, None
+                    self._set_working(order_id=str(order_id),
+                                      status="working",
+                                      limit_price=limit)
                     _poll()  # marketable replacements can fill instantly
                     if remaining <= 0:
                         steps.append({"ts": self._clock().isoformat(),
                                       "limit": limit})
+                        self._set_working(steps=steps)
                         return _finish("filled")
                 steps.append({"ts": self._clock().isoformat(),
                               "limit": limit})
+                self._set_working(limit_price=limit, steps=steps)
         except Exception as error:  # noqa: BLE001 - terminal report, never a crash
             # MID-WORK FAILURE (module docstring): the midnight-ET auth
             # expiry striking between polls, a dead transport, a gating
@@ -348,17 +546,94 @@ class PatientExecutor:
             return report
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _instrument_label(instrument) -> str:
+        """Stable, JSON-safe label for the working-orders surface."""
+        if isinstance(instrument, (list, tuple)):
+            labels = []
+            for leg in instrument:
+                if isinstance(leg, dict):
+                    action = str(leg.get("action") or "").upper()
+                    asset = leg.get("asset")
+                    labels.append(" ".join(
+                        part for part in (action, str(asset)) if part))
+                else:
+                    labels.append(str(leg))
+            return " / ".join(labels) or "option package"
+        return str(instrument)
+
+    def _quote(self, instrument) -> Dict[str, float]:
+        """Fetch and validate an exact-instrument/package bid/ask.
+
+        The injected callable receives the option Asset itself or the entire
+        leg package. There is deliberately no symbol extraction and no
+        broker ``get_current_price`` fallback: an underlying stock quote is
+        not a valid executable option/package quote.
+        """
+        is_package = isinstance(instrument, (list, tuple))
+        is_option = (isinstance(instrument, Asset)
+                     and instrument.asset_type in
+                     (AssetType.CALL, AssetType.PUT))
+        quote_kind = "option/package" if is_package or is_option else "asset"
+        quote = self.quote_fn(instrument)
+        if not isinstance(quote, dict):
+            raise ValueError(
+                f"injected quote_fn must return a {quote_kind} bid/ask dict")
+        try:
+            bid = float(quote["bid"])
+            ask = float(quote["ask"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"injected quote_fn must return finite {quote_kind} bid/ask"
+            ) from error
+        if (not math.isfinite(bid) or not math.isfinite(ask)
+                or bid < 0 or ask <= 0 or bid > ask):
+            raise ValueError(
+                f"injected quote_fn returned invalid {quote_kind} bid/ask: "
+                f"bid={bid!r}, ask={ask!r}")
+        return {"bid": bid, "ask": ask}
+
     def _place(self, side: str, instrument, quantity: int,
-               limit: float) -> str:
+               limit: float,
+               client_order_id: Optional[str] = None,
+               closing: bool = False) -> str:
         if isinstance(instrument, (list, tuple)):
             # Multi-leg package: SELL works a credit (+net), BUY a debit
             # (-net) per build_spread_order's sign convention.
             net = limit if side == "SELL" else -limit
-            return self.broker.place_structure(list(instrument), net,
-                                               quantity)
+            idempotent_placer = getattr(
+                self.broker, "place_structure_with_client_id", None)
+            if client_order_id is not None and callable(idempotent_placer):
+                return idempotent_placer(
+                    list(instrument), net, quantity, client_order_id,
+                    closing=closing)
+            if closing:
+                return self.broker.place_structure(
+                    list(instrument), net, quantity, closing=True)
+            return self.broker.place_structure(list(instrument), net, quantity)
         order_type = OrderType.BUY if side == "BUY" else OrderType.SELL
+        idempotent_placer = getattr(
+            self.broker, "place_order_with_client_id", None)
+        if client_order_id is not None and callable(idempotent_placer):
+            return idempotent_placer(
+                instrument, order_type, quantity, limit, client_order_id)
         return self.broker.place_order(instrument, order_type, quantity,
                                        limit)
+
+    @staticmethod
+    def _child_client_order_id(execution_id: str, child_sequence: int) -> str:
+        """Return an E*TRADE-safe identity for one execution child.
+
+        Twelve hex characters bind the id to the logical execution; an
+        eight-character hexadecimal sequence makes every replacement within
+        that execution distinct. The result is deterministically 20
+        alphanumeric characters, E*TRADE's documented maximum.
+        """
+        if not 0 <= child_sequence <= 0xFFFFFFFF:
+            raise OverflowError("patient execution child sequence exhausted")
+        execution_digest = hashlib.sha256(
+            execution_id.encode("utf-8")).hexdigest()[:12]
+        return f"{execution_digest}{child_sequence:08x}"
 
     def _report(self, status: str, side: str, arrival_mid: float,
                 fills: List[Dict], steps: List[Dict],

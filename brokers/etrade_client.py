@@ -29,6 +29,7 @@ never transport-retried (that is what the idempotency dance is for).
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 import uuid
@@ -249,6 +250,18 @@ class EtradeClient:
             truthy (True or a dict with 'breached': True) blocks the order
             with KillSwitchEngaged. The daily-loss breaker wiring engages
             the persistent kill switch itself before returning truthy.
+        reservation_gate: optional duck-typed placement reservation owner.
+            ``place_order`` calls ``begin(account_id_key, order_request)``,
+            then ``before_attempt(handle, attempt_number)`` immediately
+            before each possible POST.  A terminal broker outcome is reported
+            through ``accepted(handle, result)``, ``rejected(handle, exc)``,
+            or ``unknown(handle, exc)``.  The gate owns the meaning and
+            persistence of the opaque handle; this client only guarantees the
+            lifecycle ordering around its idempotent placement state machine.
+            If present, ``order_update(str(order_id), status)`` also observes
+            every status dict returned by ``order_status``; its exceptions
+            propagate so callers cannot mistake stale reservation state for a
+            successfully processed broker observation.
         audit: AuditLog for the order-flow trail.
         sleep_fn / rng: injected timing/jitter for the bounded GET retries
             (tests pass no-ops).
@@ -257,17 +270,24 @@ class EtradeClient:
     def __init__(self, auth_manager: EtradeAuthManager,
                  kill_switch: Optional[KillSwitch] = None,
                  circuit_breaker: Optional[Callable[[], object]] = None,
+                 reservation_gate: Optional[Any] = None,
                  audit: Optional[AuditLog] = None,
                  sleep_fn: Callable[[float], None] = time.sleep,
                  rng: Optional[random.Random] = None):
         self.auth = auth_manager
         self.kill_switch = kill_switch
         self.circuit_breaker = circuit_breaker
+        self.reservation_gate = reservation_gate
         self.audit = audit if audit is not None else AuditLog(
             auth_manager.db_path, env=auth_manager.env)
         self._sleep = sleep_fn
         self._rng = rng or random.Random()
         self.base_url = auth_manager.api_base_url
+        # The manager owns this RLock.  Sharing (rather than creating a
+        # client-local lock) makes an API request mutually exclusive with
+        # renew/disconnect and with requests issued by sibling clients over
+        # the same OAuth manager/session.
+        self._transport_lock = auth_manager.transport_lock
 
     # ------------------------------------------------------------------
     # Transport plumbing
@@ -310,10 +330,14 @@ class EtradeClient:
         url = self.base_url + path
         last_error: Optional[Exception] = None
         for attempt in range(MAX_GET_ATTEMPTS):
-            session = self.auth.get_session()
             try:
-                response = session.get(url, params=params)
-                return self._handle_response(response)
+                # Lock one wire attempt, not the complete retry loop.  Backoff
+                # sleeps remain interruptible by renew/disconnect, and the next
+                # attempt picks up the resulting fresh session/state.
+                with self._transport_lock:
+                    session = self.auth.get_session()
+                    response = session.get(url, params=params)
+                    return self._handle_response(response)
             except (EtradeUnavailable, *AMBIGUOUS_TRANSPORT_ERRORS) as e:
                 last_error = e
                 if attempt < MAX_GET_ATTEMPTS - 1:
@@ -331,13 +355,15 @@ class EtradeClient:
               order_endpoint: bool = False) -> Dict:
         """Non-idempotent send — exactly ONE transport attempt, ever.
         Ambiguous-failure recovery is the caller's (place_order's) job."""
-        session = self.auth.get_session()
         url = self.base_url + path
         try:
-            response = getattr(session, method)(url, json=json_body)
+            with self._transport_lock:
+                session = self.auth.get_session()
+                response = getattr(session, method)(url, json=json_body)
+                return self._handle_response(
+                    response, order_endpoint=order_endpoint)
         except AMBIGUOUS_TRANSPORT_ERRORS as e:
             raise EtradeUnavailable(f"{method.upper()} {path} failed: {e}")
-        return self._handle_response(response, order_endpoint=order_endpoint)
 
     # ------------------------------------------------------------------
     # Pre-trade gates (kill switch FIRST, then circuit breaker)
@@ -505,6 +531,55 @@ class EtradeClient:
         payload["PlaceOrderRequest"]["PreviewIds"] = preview_ids
         path = f"/v1/accounts/{account_id_key}/orders/place.json"
 
+        # Reservation begins only after all local validation has succeeded.
+        # No broker POST has occurred at this point.
+        reservation_handle = None
+        if self.reservation_gate is not None:
+            try:
+                reservation_handle = self.reservation_gate.begin(
+                    account_id_key, order_request)
+            except Exception as begin_error:
+                # No opaque handle was returned, but still give the gate a
+                # best-effort rollback notification.  Gates should treat a
+                # ``None`` handle as "begin did not complete".
+                try:
+                    self.reservation_gate.rejected(None, begin_error)
+                except Exception:
+                    logger.exception(
+                        "Reservation gate rejected callback failed after "
+                        "begin failure")
+                raise
+
+        def _notify_preserving(name: str, error: Exception) -> None:
+            """Best-effort terminal callback that never masks *error*."""
+            if self.reservation_gate is None:
+                return
+            try:
+                getattr(self.reservation_gate, name)(reservation_handle,
+                                                     error)
+            except Exception:
+                logger.exception(
+                    "Reservation gate %s callback failed while handling %s",
+                    name, error)
+
+        def _accepted(result: Dict) -> None:
+            """Commit a known acceptance; callback failure becomes unknown."""
+            if self.reservation_gate is None:
+                return
+            try:
+                self.reservation_gate.accepted(reservation_handle, result)
+            except Exception as callback_error:
+                # The broker outcome is known, but the reservation commit is
+                # not.  Escalate rather than releasing capacity that may back
+                # a live order, while preserving the callback's exception.
+                _notify_preserving("unknown", callback_error)
+                raise
+
+        def _before_attempt(attempt_number: int) -> None:
+            if self.reservation_gate is not None:
+                self.reservation_gate.before_attempt(
+                    reservation_handle, attempt_number)
+
         def _attempt() -> Dict:
             response = self._send("post", path, payload, order_endpoint=True)
             placed = response.get("PlaceOrderResponse", {})
@@ -525,11 +600,20 @@ class EtradeClient:
             }
 
         try:
+            _before_attempt(1)
+        except Exception as before_error:
+            # The reservation/revalue hook failed before the first wire send:
+            # broker non-acceptance is certain, so release the reservation.
+            _notify_preserving("rejected", before_error)
+            raise
+
+        try:
             result = _attempt()
         except (EtradeUnavailable, EtradeRateLimited) as first_error:
             if isinstance(first_error, EtradeRateLimited):
                 # 429 is NOT ambiguous: the broker answered "slow down"
                 # and did not accept the order. Surface typed, no dance.
+                _notify_preserving("rejected", first_error)
                 raise
             self.audit.append("etrade_client", "order_place_ambiguous", {
                 "account_id_key": account_id_key,
@@ -540,8 +624,14 @@ class EtradeClient:
                 "Ambiguous place failure for clientOrderId %s: %s — "
                 "querying order status before any retry",
                 client_order_id, first_error)
-            existing = self.find_order_by_client_id(account_id_key,
-                                                    client_order_id)
+            try:
+                existing = self.find_order_by_client_id(
+                    account_id_key, client_order_id)
+            except Exception as lookup_error:
+                # The first send may have succeeded and the recovery query
+                # could not resolve it.  Capacity must remain reserved.
+                _notify_preserving("unknown", lookup_error)
+                raise
             if existing is not None:
                 self.audit.append("etrade_client", "order_place_recovered", {
                     "account_id_key": account_id_key,
@@ -551,9 +641,11 @@ class EtradeClient:
                 logger.info("clientOrderId %s found at broker as order %s; "
                             "NOT retrying", client_order_id,
                             existing.get("orderId"))
-                return {"order_id": existing.get("orderId"),
-                        "response": existing,
-                        "recovered": True, "retried": False}
+                recovered = {"order_id": existing.get("orderId"),
+                             "response": existing,
+                             "recovered": True, "retried": False}
+                _accepted(recovered)
+                return recovered
             self.audit.append("etrade_client", "order_place_retry", {
                 "account_id_key": account_id_key,
                 "client_order_id": client_order_id,
@@ -561,6 +653,7 @@ class EtradeClient:
             logger.info("clientOrderId %s not found at broker; retrying "
                         "exactly once", client_order_id)
             try:
+                _before_attempt(2)
                 result = _attempt()
             except Exception as second_error:
                 self.audit.append("etrade_client", "order_place_failed", {
@@ -568,12 +661,27 @@ class EtradeClient:
                     "client_order_id": client_order_id,
                     "error": str(second_error),
                 })
+                # Even a definitive second-attempt rejection cannot prove the
+                # earlier ambiguous send was not accepted after our lookup.
+                _notify_preserving("unknown", second_error)
                 raise
             result.update({"recovered": False, "retried": True})
             self._audit_placed(account_id_key, client_order_id, result)
+            _accepted(result)
             return result
+        except (EtradeApiError, EtradeAuthExpired) as rejected_error:
+            # All typed non-availability API outcomes here are definitive and
+            # occurred without an earlier ambiguous place attempt.
+            _notify_preserving("rejected", rejected_error)
+            raise
+        except Exception as unknown_error:
+            # A malformed success response or other unexpected post-send
+            # failure is not proof the broker declined the order.
+            _notify_preserving("unknown", unknown_error)
+            raise
         result.update({"recovered": False, "retried": False})
         self._audit_placed(account_id_key, client_order_id, result)
+        _accepted(result)
         return result
 
     def _audit_placed(self, account_id_key: str,
@@ -627,26 +735,70 @@ class EtradeClient:
                 avg_price = (float(inst["averageExecutionPrice"])
                              if inst.get("averageExecutionPrice") is not None
                              else None)
-                return {"status": status, "filled_quantity": filled,
-                        "avg_fill_price": avg_price}
+                result = {"status": status, "filled_quantity": filled,
+                          "avg_fill_price": avg_price}
+                self._reservation_order_update(order_id, result)
+                return result
             # Multi-leg (SPREADS): legs fill as a PACKAGE. Summing leg
             # quantities would report n*q for q package contracts (a partial
             # fill then looks complete to PatientExecutor), and one leg's
             # price is meaningless — report package contracts (min across
             # legs) and the signed NET price (+ for BUY_*, - for SELL_*,
             # matching build_spread_order's credit/debit convention).
-            filled = min(float(inst.get("filledQuantity", 0) or 0)
-                         for inst in instruments)
+            ordered_values = [
+                inst.get("orderedQuantity", inst.get("quantity"))
+                for inst in instruments
+            ]
+            if all(value is None for value in ordered_values):
+                # Some list-order fixtures/providers omit ordered quantities
+                # for equal-ratio packages. Preserve the historical 1:1
+                # interpretation, but never partially guess a ratio set.
+                ratios = [1] * len(instruments)
+            else:
+                if any(value is None for value in ordered_values):
+                    raise ValueError(
+                        "spread status has incomplete ordered quantities")
+                ordered = []
+                for value in ordered_values:
+                    numeric = float(value)
+                    if (not math.isfinite(numeric) or numeric <= 0
+                            or not numeric.is_integer()):
+                        raise ValueError(
+                            "spread ordered quantities must be positive integers")
+                    ordered.append(int(numeric))
+                divisor = ordered[0]
+                for quantity in ordered[1:]:
+                    divisor = math.gcd(divisor, quantity)
+                ratios = [quantity // divisor for quantity in ordered]
+            filled = min(
+                float(inst.get("filledQuantity", 0) or 0) / ratio
+                for inst, ratio in zip(instruments, ratios)
+            )
             net = 0.0
             have_price = False
-            for inst in instruments:
+            for inst, ratio in zip(instruments, ratios):
                 px = inst.get("averageExecutionPrice")
                 if px is None:
                     continue
                 have_price = True
                 sign = 1.0 if str(inst.get("orderAction", "")).startswith(
                     "BUY") else -1.0
-                net += sign * float(px)
-            return {"status": status, "filled_quantity": filled,
-                    "avg_fill_price": net if have_price else None}
+                net += sign * float(px) * ratio
+            result = {"status": status, "filled_quantity": filled,
+                      "avg_fill_price": net if have_price else None}
+            self._reservation_order_update(order_id, result)
+            return result
         return None
+
+    def _reservation_order_update(self, order_id, status: Dict) -> None:
+        """Forward one known broker observation to an optional reservation.
+
+        Gates may leave ``order_update`` undefined when they do not bind
+        reservations to order IDs.  Callback failures intentionally propagate:
+        the caller must not continue as though reservation capacity reflects
+        the status it just observed.
+        """
+        callback = (getattr(self.reservation_gate, "order_update", None)
+                    if self.reservation_gate is not None else None)
+        if callback is not None:
+            callback(str(order_id), status)

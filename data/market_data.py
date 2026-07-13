@@ -273,14 +273,28 @@ class MarketDataHandler:
             self._last_fetch_info[symbol] = info
 
             assert used_provider is not None  # a non-empty fetch has a provider
+            quality = OHLCVCache.assess_coverage(data, start_date, end_date)
             if sqlite_cache is not None:
                 try:
-                    sqlite_cache.store(symbol, data, used_provider,
-                                       start_date, end_date)
+                    stored_quality = sqlite_cache.store(
+                        symbol, data, used_provider, start_date, end_date)
+                    if stored_quality is not None:
+                        quality = stored_quality
                 except Exception as e:
                     logger.warning("OHLCV cache write failed for %s: %s", symbol, e)
 
-            self.cache[cache_key] = data
+            # A provider can return a non-empty but truncated frame. Do not
+            # memoize that frame under the full requested key: the next same
+            # request must retry the provider. SQLite stores only its
+            # conservative observed coverage, so it follows the same rule.
+            if quality is not None and quality.request_complete:
+                self.cache[cache_key] = data
+            else:
+                logger.warning(
+                    "Provider %s returned incomplete history for %s %s..%s; "
+                    "the full request will remain cache-missable",
+                    used_provider, symbol, start_date, end_date,
+                )
             self.stock_data[symbol] = data
             return data
 

@@ -53,7 +53,7 @@ try:
     import lightgbm as lgb
     _LIGHTGBM_IMPORT_ERROR: Optional[str] = None
 except Exception as exc:  # noqa: BLE001 - any import failure disables LightGBM
-    lgb = None
+    lgb = None  # type: ignore[assignment]
     _LIGHTGBM_IMPORT_ERROR = f'{type(exc).__name__}: {exc}'
     logger.warning(
         'lightgbm unavailable (%s) — LightGBMModel will raise on '

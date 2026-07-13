@@ -62,14 +62,14 @@ class AuditLog:
                  clock: Optional[Callable[[], datetime]] = None):
         self.db_path = (db_path or os.environ.get("TRADING_DB_PATH")
                         or "trading_data.db")
-        self.env = env or os.environ.get("ETRADE_ENV", "sandbox")
+        self.env = str(env or os.environ.get("ETRADE_ENV", "sandbox"))
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._init_table()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.execute("PRAGMA busy_timeout=5000")  # ms: wait on lock, don't error
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -106,33 +106,71 @@ class AuditLog:
         seq is computed inside a BEGIN IMMEDIATE transaction so concurrent
         appenders (gunicorn threads) serialize and the chain never forks.
         """
-        payload = dict(payload or {})
-        ts = self._clock().isoformat()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT seq, hash FROM audit_log "
-                "ORDER BY seq DESC LIMIT 1").fetchone()
-            if row is None:
-                seq, prev_hash = 1, GENESIS_HASH
-            else:
-                seq, prev_hash = row["seq"] + 1, row["hash"]
-            row_core = {"seq": seq, "ts": ts, "env": self.env,
-                        "actor": actor, "event_type": event_type,
-                        "payload": payload}
-            conn.execute(
-                "INSERT INTO audit_log "
-                "(seq, ts, env, actor, event_type, payload, prev_hash, hash) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (seq, ts, self.env, actor, event_type,
-                 canonical_json(payload), prev_hash,
-                 _row_hash(prev_hash, row_core)))
+            seq = self._append_in_transaction(
+                conn, actor, event_type, payload)
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
         logger.debug("audit #%d %s/%s", seq, actor, event_type)
         return seq
+
+    def _append_in_transaction(self, conn: sqlite3.Connection, actor: str,
+                               event_type: str, payload: Dict,
+                               timestamp: Optional[str] = None) -> int:
+        """Append using an existing transaction without committing it.
+
+        This internal primitive lets another SQLite-backed invariant write
+        its state and the corresponding audit row as one atomic unit.  The
+        caller owns commit/rollback.  Requiring an active transaction and a
+        connection to this log's database prevents accidental unaudited
+        commits or writes to a lookalike database.
+        """
+        if not conn.in_transaction:
+            raise RuntimeError(
+                "audit append requires an active caller-owned transaction")
+        self._validate_connection_database(conn)
+
+        actor = str(actor)
+        event_type = str(event_type)
+        payload = dict(payload or {})
+        ts = timestamp if timestamp is not None else self._clock().isoformat()
+        row = conn.execute(
+            "SELECT seq, hash FROM audit_log "
+            "ORDER BY seq DESC LIMIT 1").fetchone()
+        if row is None:
+            seq, prev_hash = 1, GENESIS_HASH
+        else:
+            seq, prev_hash = row["seq"] + 1, row["hash"]
+        row_core = {"seq": seq, "ts": ts, "env": self.env,
+                    "actor": actor, "event_type": event_type,
+                    "payload": payload}
+        conn.execute(
+            "INSERT INTO audit_log "
+            "(seq, ts, env, actor, event_type, payload, prev_hash, hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (seq, ts, self.env, actor, event_type,
+             canonical_json(payload), prev_hash,
+             _row_hash(prev_hash, row_core)))
+        return seq
+
+    def _validate_connection_database(self,
+                                      conn: sqlite3.Connection) -> None:
+        """Ensure *conn* writes the same main database as this audit log."""
+        row = conn.execute(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'"
+        ).fetchone()
+        connection_path = row[0] if row is not None else ""
+        expected_path = os.path.realpath(os.path.abspath(self.db_path))
+        actual_path = os.path.realpath(os.path.abspath(connection_path))
+        if not connection_path or actual_path != expected_path:
+            raise ValueError(
+                "transaction connection must use the audit log database")
 
     # ------------------------------------------------------------------
     # Reads

@@ -172,6 +172,7 @@ class VixReversionDesk(Desk):
 
         # --- Round-trip bookkeeping (fills are T+1: observe, don't assume) --
         if has_pos:
+            assert position is not None
             if self._entry_px is None and self._pending_buy:
                 # OUR pending BUY filled — adopt it. A position with no
                 # pending BUY of ours is another desk's (shared fund book):

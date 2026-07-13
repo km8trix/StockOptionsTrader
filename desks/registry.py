@@ -9,7 +9,7 @@ ValueErrors for unknown or not-yet-activated ones (contract C1).
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from desks.aqr import AqrDesk
 from desks.base import Desk
@@ -239,13 +239,11 @@ _DESK_SPECS: Dict[str, Dict] = {
 #: desks reject a non-None ``model_key`` with a clear ValueError.
 _MODEL_SELECTABLE_DESKS = frozenset({'foundation', 'twosigma'})
 
-#: Desk keys that have PASSED both evidence gates — IC (scripts/signal_ic.py)
-#: AND the OOS backtest gate (scripts/desk_backtest.py: return>0, Sharpe>0.5,
-#: Deflated Sharpe>0, no catastrophic regime). list_desks() surfaces this as
-#: each entry's ``gate_status`` ('promoted' if listed here, else 'research').
-#: Empty until a desk earns it; promotion is a one-line addition here. This is
-#: a research-quality status ONLY — "promoted" never means "trades live" (the
-#: GUI's Production workspace is live-execution-only and excludes desks).
+#: Backward-compatible Trading Floor research badges.  This set is never an
+#: execution permission: paper/live construction is governed exclusively by
+#: immutable artifacts in :mod:`analysis.promotion` and
+#: :func:`create_deployed_desk`.  It remains empty until the UI is migrated to
+#: display the richer three-tier decision without changing contract C1.
 _PROMOTED_DESKS: frozenset = frozenset()
 
 
@@ -313,6 +311,34 @@ def create_desk(key: str, capital_allocation: float = 1.0,
                                model_key=model_key, **factory_kwargs)
     return spec['factory'](capital_allocation=capital_allocation,
                            **factory_kwargs)
+
+
+def create_deployed_desk(
+        key: str, *, artifact_hash: str, promotion_registry,
+        required_level='live_eligible', runtime_code_sha: str,
+        runtime_parameters: Mapping[str, Any],
+        capital_allocation: float = 1.0,
+        model_key: Optional[str] = None) -> Desk:
+    """Instantiate a desk only after verifying its exact approved artifact.
+
+    ``create_desk`` intentionally remains available for research/backtests.
+    Paper/live composition roots must use this boundary instead: the registry
+    verifies an explicit immutable approval and this function additionally
+    rejects code or parameter drift between the artifact and runtime.
+    """
+    from analysis.promotion import (PromotionLevel, PromotionNotApproved,
+                                    canonical_json)
+
+    artifact = promotion_registry.require_approved(
+        key, artifact_hash, PromotionLevel(required_level))
+    if artifact.code_sha != str(runtime_code_sha):
+        raise PromotionNotApproved(
+            'runtime code SHA does not match the approved artifact')
+    if canonical_json(artifact.parameters) != canonical_json(runtime_parameters):
+        raise PromotionNotApproved(
+            'runtime parameters do not match the approved artifact')
+    return create_desk(key, capital_allocation=capital_allocation,
+                       model_key=model_key)
 
 
 def create_fund_orchestrator(allocations: Dict[str, float],

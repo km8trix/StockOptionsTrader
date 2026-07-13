@@ -66,7 +66,7 @@ import contextlib
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, cast
 
 import numpy as np
 import pandas as pd
@@ -356,7 +356,7 @@ class ThrottlePolicy:
             # same-seed => byte-identical guarantee airtight, not incidental.)
             self._init_noop_prior()
 
-    def _build_net(self) -> "nn.Module":
+    def _build_net(self) -> "nn.Sequential":
         """Context -> hidden(ReLU) -> single logit."""
         return nn.Sequential(
             nn.Linear(self.n_features, self.hidden_size),
@@ -368,7 +368,7 @@ class ThrottlePolicy:
         """Bias the output logit large+positive so an untrained policy outputs
         ~scale_max (the no-op prior, contract: no learnable signal => no-op)."""
         with torch.no_grad():
-            head = self._net[-1]
+            head = cast("nn.Linear", self._net[-1])
             head.bias.fill_(self.noop_bias)
             # Tiny output weights so the prior dominates before any training.
             head.weight.mul_(0.01)

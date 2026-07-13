@@ -7,6 +7,7 @@ cache clock is injected (now_fn) so time never actually passes.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -119,7 +120,7 @@ class TestStalenessPolicy:
 
     def test_recent_range_fresh_within_max_age(self, cache, clock, make_ohlcv):
         # Range ends on the fetch date itself: not historical, but fresh.
-        df = make_ohlcv(n_days=8, start="2026-06-01")
+        df = make_ohlcv(n_days=9, start="2026-06-01")
         cache.store("SPY", df, "fmp", "2026-06-01", "2026-06-11")
 
         clock.advance(hours=OHLCVCache.CACHE_MAX_AGE_HOURS - 1)
@@ -127,7 +128,7 @@ class TestStalenessPolicy:
         assert cache.get("SPY", "2026-06-01", "2026-06-11") is not None
 
     def test_recent_range_expires_after_max_age(self, cache, clock, make_ohlcv):
-        df = make_ohlcv(n_days=8, start="2026-06-01")
+        df = make_ohlcv(n_days=9, start="2026-06-01")
         cache.store("SPY", df, "fmp", "2026-06-01", "2026-06-11")
 
         clock.advance(hours=OHLCVCache.CACHE_MAX_AGE_HOURS, minutes=1)
@@ -242,6 +243,96 @@ class TestTruncationWarning:
                    for r in caplog.records)
 
 
+class TestCoverageQuality:
+    """Non-empty is not synonymous with complete requested history."""
+
+    def test_truncated_start_claims_only_observed_history(
+            self, cache, make_ohlcv):
+        df = make_ohlcv(n_days=5, start="2023-03-01")
+
+        quality = cache.store(
+            "AAPL", df, "fmp", "2023-01-03", "2023-03-07")
+
+        assert quality is not None
+        assert not quality.request_complete
+        assert quality.reason == "missing_start"
+        assert quality.observed_start.isoformat() == "2023-03-01"
+        assert quality.covered_start.isoformat() == "2023-03-01"
+        # The false full-range hit is gone, but the actually observed range
+        # remains reusable.
+        assert cache.get("AAPL", "2023-01-03", "2023-03-07") is None
+        assert cache.get("AAPL", "2023-03-01", "2023-03-07") is not None
+
+    def test_partial_end_does_not_claim_requested_end(self, cache,
+                                                       make_ohlcv):
+        df = make_ohlcv(n_days=4, start="2023-01-03")  # through Jan 6
+
+        quality = cache.store(
+            "AAPL", df, "fmp", "2023-01-03", "2023-01-09")
+
+        assert quality is not None
+        assert not quality.request_complete
+        assert quality.reason == "missing_end"
+        assert quality.covered_end.isoformat() == "2023-01-06"
+        assert cache.get("AAPL", "2023-01-03", "2023-01-09") is None
+
+    def test_internal_partial_response_claims_no_interval(self, cache,
+                                                           make_ohlcv):
+        df = make_ohlcv(n_days=4, start="2023-01-03")
+        # Keep both requested edges but remove a market session in the middle.
+        df = df.drop(pd.Timestamp("2023-01-05"))
+
+        quality = cache.store(
+            "AAPL", df, "fmp", "2023-01-03", "2023-01-06")
+
+        assert quality is not None
+        assert quality.reason == "missing_interior"
+        assert quality.missing_interior_sessions == 1
+        assert not quality.cache_eligible
+        assert cache.get("AAPL", "2023-01-03", "2023-01-06") is None
+
+    def test_quality_metadata_is_persisted(self, cache, make_ohlcv):
+        df = make_ohlcv(n_days=3, start="2023-01-04")
+        cache.store("AAPL", df, "fmp", "2023-01-03", "2023-01-06")
+
+        conn = sqlite3.connect(cache.db_path)
+        row = conn.execute('''
+            SELECT requested_start_date, requested_end_date,
+                   observed_start_date, observed_end_date,
+                   start_date, end_date, request_complete,
+                   quality_reason, quality_version
+            FROM fetch_coverage
+        ''').fetchone()
+        conn.close()
+
+        assert row == (
+            "2023-01-03", "2023-01-06",
+            "2023-01-04", "2023-01-06",
+            "2023-01-04", "2023-01-06",
+            0, "missing_start", 1,
+        )
+
+    @pytest.mark.parametrize(
+        "requested_start,requested_end,observed",
+        [
+            # Weekend boundary before the Monday session.
+            ("2023-01-07", "2023-01-09", "2023-01-09"),
+            # Good Friday is not an expected US equity-market session.
+            ("2024-03-29", "2024-04-01", "2024-04-01"),
+        ],
+    )
+    def test_non_trading_boundaries_are_legitimate_complete_coverage(
+            self, cache, make_ohlcv, requested_start, requested_end, observed):
+        df = make_ohlcv(n_days=1, start=observed)
+
+        quality = cache.store(
+            "SPY", df, "fmp", requested_start, requested_end)
+
+        assert quality is not None and quality.request_complete
+        result = cache.get("SPY", requested_start, requested_end)
+        assert result is not None and len(result) == 1
+
+
 class TestDbPathResolution:
     def test_env_trading_db_path_honored(self, tmp_path, monkeypatch, make_ohlcv):
         env_db = tmp_path / "env_cache.db"
@@ -253,8 +344,8 @@ class TestDbPathResolution:
         assert env_db.exists()
 
         df = make_ohlcv(n_days=5, start="2023-01-02")
-        cache.store("AAPL", df, "fmp", "2023-01-01", "2023-01-09")
-        assert cache.get("AAPL", "2023-01-01", "2023-01-09") is not None
+        cache.store("AAPL", df, "fmp", "2023-01-01", "2023-01-06")
+        assert cache.get("AAPL", "2023-01-01", "2023-01-06") is not None
 
     def test_explicit_db_path_beats_env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "env.db"))

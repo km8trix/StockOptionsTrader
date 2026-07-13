@@ -43,19 +43,51 @@ the persistent kill switch, so every later cycle halts at the top check.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Protocol
 
-from core.models import OrderType
+from core.models import Asset, AssetType, OrderType
+from desks.base import DeskIntent
+from portfolio.targets import (
+    PortfolioSnapshot,
+    build_order_deltas,
+    filled_quantities_from_portfolio,
+    reserved_deltas_from_risk_snapshot,
+)
+from portfolio.structures import StructureIntent
 from utils.audit import AuditLog
 from utils.kill_switch import KillSwitch
 
-try:
-    from utils.market_hours import MarketHours
-except Exception:  # noqa: BLE001 - market-hours guard is optional
-    MarketHours = None
+class _MarketHoursInstance(Protocol):
+    def is_market_open(self, dt: datetime) -> bool: ...
+
+
+class _MarketHoursFactory(Protocol):
+    def __call__(self) -> _MarketHoursInstance: ...
+
+
+def _load_market_hours() -> Optional[_MarketHoursFactory]:
+    """Load the optional market-hours guard without conflating a type alias."""
+    try:
+        from utils.market_hours import MarketHours
+        return MarketHours
+    except Exception:  # noqa: BLE001 - market-hours guard is optional
+        return None
+
+
+MarketHours = _load_market_hours()
 
 logger = logging.getLogger(__name__)
+
+_OPTION_BOOK_KEY = re.compile(
+    r"^(?P<symbol>\S+) (?P<expiry>\d{4}-\d{2}-\d{2}) "
+    r"\$(?P<strike>[0-9]+(?:\.[0-9]+)?) (?P<right>call|put)$",
+    re.IGNORECASE,
+)
+_TERMINAL_ORDER_STATES = frozenset({
+    "CANCELLED", "CANCELED", "EXECUTED", "FILLED", "REJECTED", "EXPIRED",
+})
 
 
 def _filled_quantity(report: Dict) -> Optional[int]:
@@ -141,7 +173,8 @@ class LiveTradingSession:
         self.kill_switch = kill_switch
         self.auth_manager = auth_manager
         if reconcile_fn is None:
-            from brokers.reconcile import reconcile as reconcile_fn
+            from brokers.reconcile import reconcile as default_reconcile
+            reconcile_fn = default_reconcile
         self.reconcile_fn = reconcile_fn
         if circuit_breaker is LiveTradingSession._AUTO:
             circuit_breaker = getattr(broker, "circuit_breaker", None)
@@ -155,6 +188,7 @@ class LiveTradingSession:
         # Default False keeps paper-parity and existing callers unchanged.
         self.enforce_market_hours = enforce_market_hours
         self.last_reconciliation: Optional[Dict] = None
+        self._target_snapshot_version = 0
 
     @property
     def _driver(self):
@@ -211,6 +245,7 @@ class LiveTradingSession:
         try:
             all_data = self.data_fn()
             self._driver.set_clock(now)
+            structures: List[StructureIntent] = []
             if self.orchestrator is not None:
                 # The orchestrator fans out to its desks, nets, and runs the
                 # one account-wide apply_risk (+ aggregator) internally;
@@ -218,6 +253,18 @@ class LiveTradingSession:
                 # conflict decisions are captured in orchestrator.notes.
                 intents = self.orchestrator.step(all_data, now, self.portfolio)
                 approved = intents
+            elif getattr(self.desk, "target_native_enabled", False):
+                intents, cancellation_requested = self._target_intents(
+                    all_data, now)
+                if cancellation_requested:
+                    return {
+                        "status": "pending",
+                        "reason": "target_order_cancellation_requested",
+                        "timestamp": now.isoformat(),
+                        "generated": 0,
+                        "approved": 0,
+                        "reports": [],
+                    }
             else:
                 intents = self.desk.generate_intents(all_data, now,
                                                      self.portfolio)
@@ -228,10 +275,39 @@ class LiveTradingSession:
                     "size_fraction": intent.size_fraction,
                     "quantity": intent.quantity,
                     "reason": intent.reason,
+                    "intent_id": getattr(intent, "intent_id", None),
                 })
             if self.orchestrator is None:
                 approved = self.desk.apply_risk(intents, self.portfolio,
                                                 all_data, now)
+                structure_generator = getattr(
+                    self.desk, "generate_structure_intents", None)
+                if callable(structure_generator):
+                    generated_structures = structure_generator(
+                        all_data, now, self.portfolio)
+                    structures = list(generated_structures)
+                    if not all(isinstance(item, StructureIntent)
+                               for item in structures):
+                        raise ValueError(
+                            "generate_structure_intents must return "
+                            "StructureIntent values")
+                    for structure in structures:
+                        self.audit.append(
+                            "live_session", "structure_intent", {
+                                "intent_id": structure.intent_id,
+                                "underlying": structure.legs[0].asset.symbol,
+                                "quantity": structure.quantity,
+                                "net_price": structure.net_price,
+                                "max_loss": structure.max_loss,
+                                "greeks": dict(structure.greeks),
+                                "opening": structure.opening,
+                                "legs": [
+                                    {"asset": str(leg.asset),
+                                     "action": leg.action.value,
+                                     "ratio": leg.ratio}
+                                    for leg in structure.legs
+                                ],
+                            })
         except Exception as e:  # noqa: BLE001 - audited halt, never a crash
             self.audit.append("live_session", "session_halted", {
                 "reason": "intent_generation_error",
@@ -278,7 +354,31 @@ class LiveTradingSession:
                 halt_reason = "execution_error"
                 break
 
-        result = {
+        structure_reports: List[Dict] = []
+        if not halted:
+            for structure in structures:
+                if (self.kill_switch is not None
+                        and self.kill_switch.engaged()):
+                    self.audit.append("live_session", "session_halted", {
+                        "reason": "kill_switch_engaged_mid_loop",
+                    })
+                    halted = True
+                    halt_reason = "kill_switch_engaged_mid_loop"
+                    break
+                report = self._execute_structure(structure)
+                structure_reports.append(report)
+                if report.get("status") == "error":
+                    self.audit.append("live_session", "session_halted", {
+                        "reason": "execution_error",
+                        "intent_id": structure.intent_id,
+                        "error": report.get("error"),
+                        "error_type": report.get("error_type"),
+                    })
+                    halted = True
+                    halt_reason = "execution_error"
+                    break
+
+        result: Dict = {
             "status": "halted" if halted else "ok",
             "timestamp": now.isoformat(),
             "generated": len(intents),
@@ -287,7 +387,182 @@ class LiveTradingSession:
         }
         if halted:
             result["reason"] = halt_reason
+        if structures:
+            result["generated_structures"] = len(structures)
+            result["structure_reports"] = structure_reports
         return result
+
+    # ------------------------------------------------------------------
+    # Target-native migration path
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _asset_from_book_key(key: str) -> Asset:
+        """Decode LocalBook's reconciliation key without losing contracts."""
+        text = str(key).strip()
+        match = _OPTION_BOOK_KEY.fullmatch(text)
+        if match is None:
+            if not text or any(character.isspace() for character in text):
+                raise ValueError(f"unsupported local-book position key {key!r}")
+            return Asset(text.upper(), AssetType.STOCK)
+        right = match.group("right").lower()
+        return Asset(
+            match.group("symbol").upper(),
+            AssetType.CALL if right == "call" else AssetType.PUT,
+            float(match.group("strike")),
+            match.group("expiry"),
+        )
+
+    def _reservation_snapshot(self) -> Dict:
+        gate = getattr(getattr(self.broker, "client", None),
+                       "reservation_gate", None)
+        snapshotter = getattr(gate, "snapshot", None)
+        if not callable(snapshotter):
+            return {"reservations": []}
+        snapshot = snapshotter()
+        if not isinstance(snapshot, dict):
+            raise ValueError("reservation gate snapshot must be a mapping")
+        return snapshot
+
+    def _target_snapshot(self, now: datetime,
+                         reservations: Dict) -> PortfolioSnapshot:
+        """Build one filled-plus-working generation for target construction.
+
+        A configured LocalBook is authoritative for live filled quantities and
+        must have been explicitly bootstrapped.  Paper and isolated unit-test
+        sessions keep using PortfolioManager, preserving their old lifecycle.
+        """
+        if self.local_book is not None:
+            initialized = getattr(self.local_book, "is_initialized", None)
+            if callable(initialized) and not initialized():
+                raise RuntimeError(
+                    "target-native execution requires an initialized local book")
+            reader = getattr(self.local_book, "reconciliation_snapshot", None)
+            if not callable(reader):
+                raise ValueError(
+                    "target-native local_book must expose reconciliation_snapshot")
+            book = reader()
+            if not book.get("initialized", True):
+                raise RuntimeError(
+                    "target-native execution requires an initialized local book")
+            filled: Dict[Asset, int] = {}
+            for key, raw_quantity in book.get("positions", {}).items():
+                quantity = float(raw_quantity)
+                if not quantity.is_integer():
+                    raise ValueError(
+                        f"local-book quantity for {key!r} is not a whole unit")
+                if quantity:
+                    asset = self._asset_from_book_key(key)
+                    filled[asset] = filled.get(asset, 0) + int(quantity)
+        else:
+            filled = dict(filled_quantities_from_portfolio(self.portfolio))
+
+        self._target_snapshot_version += 1
+        return PortfolioSnapshot(
+            filled_quantities=filled,
+            reserved_deltas=reserved_deltas_from_risk_snapshot(reservations),
+            version=self._target_snapshot_version,
+            as_of=now,
+        )
+
+    @staticmethod
+    def _target_action(delta) -> str:
+        if delta.signed_quantity > 0:
+            return "COVER" if delta.effective_quantity < 0 else "BUY"
+        return "SELL" if delta.effective_quantity > 0 else "SHORT"
+
+    def _cancel_obsolete_target_orders(self, targets, snapshot,
+                                       reservations: Dict) -> bool:
+        """Request cancellation before a changed target can reverse an order.
+
+        Cancellation remains broker-authoritative: one status observation is
+        applied to the reservation gate, and this evaluation always stops
+        before transmitting a replacement.  A later evaluation re-diffs the
+        confirmed filled + remaining state.
+        """
+        by_asset = {target.asset: target for target in targets}
+        requested = False
+        for reservation in reservations.get("reservations", []):
+            if str(reservation.get("status", "")).upper() != "ACTIVE":
+                continue
+            reserved = reserved_deltas_from_risk_snapshot({
+                "reservations": [reservation],
+            })
+            obsolete_assets = [
+                asset for asset in reserved
+                if asset in by_asset
+                and by_asset[asset].target_quantity
+                != snapshot.effective_quantity(asset)
+            ]
+            if not obsolete_assets:
+                continue
+            for order in reservation.get("orders", []):
+                order_id = str(order.get("order_id") or "").strip()
+                status = str(order.get("status") or "").upper()
+                if not order_id or status in _TERMINAL_ORDER_STATES:
+                    continue
+                accepted = bool(self.broker.cancel_order(order_id))
+                self.audit.append("live_session", "target_order_cancel", {
+                    "order_id": order_id,
+                    "accepted": accepted,
+                    "assets": [str(asset) for asset in obsolete_assets],
+                    "reservation_id": reservation.get("reservation_id"),
+                })
+                # A status call lets reservation-aware brokers record a
+                # cancel/fill race.  Non-terminal confirmation is expected;
+                # the next evaluation observes it again and still cannot place.
+                status_reader = getattr(self.broker, "order_status", None)
+                if callable(status_reader):
+                    status_reader(order_id)
+                requested = True
+        return requested
+
+    def _target_intents(self, all_data: Dict, now: datetime):
+        """Construct exact legacy-shaped intents from a complete target set."""
+        reservations = self._reservation_snapshot()
+        snapshot = self._target_snapshot(now, reservations)
+        targets = tuple(self.desk.generate_targets(
+            all_data, now, self.portfolio, snapshot))
+        # Validate/coalesce the whole target set before broker mutation.
+        build_order_deltas(targets, snapshot)
+        for target in targets:
+            self.audit.append("live_session", "target_position", {
+                "asset": str(target.asset),
+                "target_quantity": target.target_quantity,
+                "owner": target.owner,
+                "strategy": target.strategy,
+                "reason": target.reason,
+                "snapshot_version": snapshot.version,
+            })
+        if self._cancel_obsolete_target_orders(
+                targets, snapshot, reservations):
+            return [], True
+
+        intents = []
+        for delta in build_order_deltas(targets, snapshot):
+            size_fraction = delta.metadata.get("size_fraction")
+            if size_fraction is None:
+                raise ValueError(
+                    f"target for {delta.asset} requires metadata.size_fraction")
+            intent = DeskIntent(
+                asset=delta.asset,
+                action=self._target_action(delta),
+                size_fraction=float(size_fraction),
+                reason=(delta.reason
+                        or f"target position {delta.target_quantity}"),
+                quantity=delta.quantity,
+                intent_id=delta.intent_id,
+            )
+            intents.append(intent)
+            self.audit.append("live_session", "target_order_delta", {
+                "asset": str(delta.asset),
+                "signed_quantity": delta.signed_quantity,
+                "target_quantity": delta.target_quantity,
+                "effective_quantity": delta.effective_quantity,
+                "phase": delta.phase.value,
+                "intent_id": delta.intent_id,
+                "snapshot_version": snapshot.version,
+            })
+        return intents, False
 
     # ------------------------------------------------------------------
     def _check_circuit_breaker(self, now: datetime) -> Optional[Dict]:
@@ -348,7 +623,14 @@ class LiveTradingSession:
         })
         try:
             if self.executor is not None:
-                report = self.executor.execute(side, intent.asset, quantity)
+                execution_id = getattr(intent, "intent_id", None)
+                if execution_id is None:
+                    report = self.executor.execute(
+                        side, intent.asset, quantity)
+                else:
+                    report = self.executor.execute(
+                        side, intent.asset, quantity,
+                        execution_id=execution_id)
             else:
                 # Paper-mode parity path: direct market order.
                 order_type = (OrderType.BUY if side == "BUY"
@@ -391,8 +673,60 @@ class LiveTradingSession:
             report_payload["error_type"] = report.get("error_type")
         self.audit.append("live_session", "execution_report",
                           report_payload)
-        if self.local_book is not None:
+        gate = getattr(getattr(self.broker, 'client', None),
+                       'reservation_gate', None)
+        if (self.local_book is not None
+                and not bool(getattr(gate, 'books_fills', False))):
             self._record_fills_to_book(intent, side, report)
+        return report
+
+    def _execute_structure(self, structure: StructureIntent) -> Dict:
+        """Transmit one canonical package as one patient/broker order."""
+        legs = structure.execution_legs
+        self.audit.append("live_session", "structure_execution_start", {
+            "intent_id": structure.intent_id,
+            "side": structure.side,
+            "quantity": structure.quantity,
+            "closing": structure.closing,
+            "legs": [{"asset": str(item["asset"]),
+                      "action": item["action"],
+                      "ratio": item["ratio"]} for item in legs],
+        })
+        try:
+            if self.executor is not None:
+                report = self.executor.execute(
+                    structure.side,
+                    legs,
+                    structure.quantity,
+                    execution_id=structure.intent_id,
+                    closing=structure.closing,
+                )
+            else:
+                order_id = self.broker.place_structure(
+                    legs,
+                    structure.net_price,
+                    structure.quantity,
+                    closing=structure.closing,
+                )
+                report = {"status": "submitted", "order_id": order_id}
+        except Exception as error:  # noqa: BLE001 - same audited rail as singles
+            report = {"status": "error", "error": str(error),
+                      "error_type": type(error).__name__}
+        payload = {
+            "intent_id": structure.intent_id,
+            "status": report.get("status"),
+            "quantity": structure.quantity,
+            "filled_quantity": _filled_quantity(report),
+            "avg_fill": report.get("avg_fill"),
+            "arrival_mid": report.get("arrival_mid"),
+            "shortfall_per_unit": report.get("shortfall_per_unit"),
+            "closing": structure.closing,
+        }
+        if report.get("status") == "error":
+            payload["error"] = report.get("error")
+            payload["error_type"] = report.get("error_type")
+        self.audit.append(
+            "live_session", "structure_execution_report", payload)
         return report
 
     # ------------------------------------------------------------------
@@ -527,8 +861,11 @@ class LiveTradingSession:
                 "local_cash when no local_book is wired")
         try:
             if local_positions is None:
+                assert self.local_book is not None
                 local_positions = self.local_book.positions()
                 local_cash = self.local_book.cash()
+            assert local_cash is not None
+            assert self.reconcile_fn is not None
             if cash_tolerance is None:
                 # No kwarg: any injected reconcile_fn keeps its signature.
                 result = self.reconcile_fn(local_positions, local_cash,

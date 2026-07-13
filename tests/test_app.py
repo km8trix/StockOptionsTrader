@@ -2475,6 +2475,7 @@ def patch_live(monkeypatch):
     monkeypatch.setattr(api_live, 'get_kill_switch', lambda: fakes['kill'])
     monkeypatch.setattr(api_live, 'get_audit_log', lambda: fakes['audit'])
     monkeypatch.setattr(api_live, '_last_reconciliation', None)
+    monkeypatch.setattr(api_live, '_execution_context', None)
     # Install the keep-alive fake so the connect-time auto-start (and the
     # /keepalive routes) drive it instead of spawning a real daemon thread.
     monkeypatch.setattr(api_live, '_keepalive_scheduler', fakes['keepalive'])
@@ -2503,6 +2504,7 @@ class TestLivePageAndChrome:
             'id="auditBody"', 'id="auditEventType"', 'id="auditVerify"',
             'id="auditPrev"', 'id="auditNext"',
             'id="reconBody"', 'id="btnReconcile"',
+            'id="btnBootstrapBook"',
             'js/live.js',
         ):
             assert marker in html, f'/live missing {marker}'
@@ -2593,11 +2595,13 @@ class TestLiveStatusEndpoint:
 
         assert response.status_code == 200
         body = response.get_json()
-        assert set(body) == {'auth', 'env', 'kill_switch', 'reconciliation'}
+        assert set(body) == {
+            'auth', 'env', 'kill_switch', 'reconciliation', 'reservations'}
         assert body['auth']['state'] == 'disconnected'
         assert body['env'] == 'sandbox'
         assert body['kill_switch'] == {'engaged': False}
         assert body['reconciliation'] is None
+        assert body['reservations'] is None
 
     def test_status_production_env_and_engaged_switch(self, client, patch_live):
         patch_live['auth'].env = 'production'
@@ -2949,23 +2953,35 @@ class TestLiveReconcileEndpoint:
 
     @pytest.fixture()
     def patch_reconcile(self, monkeypatch, patch_live):
-        """Wire a fake reconcile fn + a fake live broker into api_live."""
+        """Wire a canonical fake context into the reconciliation route."""
         import gui.routes.api_live as api_live
 
-        class FakeBroker:
-            local_positions = {'AAPL': 10.0}
-            local_cash = 5000.0
+        seen = {'result': self._ok_result(), 'calls': 0,
+                'bootstrap_calls': 0}
 
-        seen = {'result': self._ok_result(), 'calls': []}
+        class FakeContext:
+            last_reconciliation = None
 
-        def fake_reconcile(local_positions, local_cash, broker):
-            seen['calls'].append((local_positions, local_cash, broker))
-            return seen['result']
+            def run_reconciliation(self):
+                seen['calls'] += 1
+                result = dict(seen['result'])
+                self.last_reconciliation = result
+                if not result['ok']:
+                    patch_live['kill'].engage(
+                        'reconciliation mismatch', 'live_context')
+                return result
 
-        broker = FakeBroker()
-        monkeypatch.setattr(api_live, 'reconcile', fake_reconcile)
-        monkeypatch.setattr(api_live, '_find_live_broker', lambda: broker)
-        seen['broker'] = broker
+            def bootstrap_local_book(self):
+                seen['bootstrap_calls'] += 1
+                return {'positions': {}, 'cash': 1000.0,
+                        'bootstrapped': True}
+
+        context = FakeContext()
+        seen['context'] = context
+        patch_live['auth'].state = 'connected'
+        monkeypatch.setattr(api_live, 'get_client', lambda: object())
+        monkeypatch.setattr(api_live, 'get_execution_context',
+                            lambda create=True: context)
         return {**patch_live, **seen, 'seen': seen}
 
     def test_ok_result_passes_through_and_is_remembered(
@@ -2977,11 +2993,7 @@ class TestLiveReconcileEndpoint:
         assert body['ok'] is True
         assert body['mismatches'] == []
         assert body['kill_switch_engaged'] is False
-        # The broker's local book reached the C19 call.
-        local_positions, local_cash, broker = patch_reconcile['calls'][0]
-        assert local_positions == {'AAPL': 10.0}
-        assert local_cash == pytest.approx(5000.0)
-        assert broker is patch_reconcile['broker']
+        assert patch_reconcile['seen']['calls'] == 1
         # Kill switch untouched; status remembers the result.
         assert patch_reconcile['kill'].events == []
         status = client.get('/api/live/status').get_json()
@@ -3002,21 +3014,24 @@ class TestLiveReconcileEndpoint:
         kind, reason, actor = patch_reconcile['kill'].events[0]
         assert kind == 'engage'
         assert 'mismatch' in reason.lower()
-        assert actor == 'reconcile'
+        assert actor == 'live_context'
         status = client.get('/api/live/status').get_json()
         assert status['kill_switch']['engaged'] is True
         assert status['reconciliation']['kill_switch_engaged'] is True
 
-    def test_409_when_no_live_session(self, client, patch_live, monkeypatch):
+    def test_503_when_context_unavailable(self, client, patch_live,
+                                          monkeypatch):
         import gui.routes.api_live as api_live
 
-        monkeypatch.setattr(api_live, 'reconcile',
-                            lambda *a, **k: self._ok_result())
-        monkeypatch.setattr(api_live, '_find_live_broker', lambda: None)
+        patch_live['auth'].state = 'connected'
+        monkeypatch.setattr(api_live, 'get_client', lambda: object())
+        monkeypatch.setattr(api_live, 'get_execution_context',
+                            lambda create=True: None)
 
         response = client.post('/api/live/reconcile')
-        assert response.status_code == 409
-        assert response.get_json()['error'] == 'No live broker session'
+        assert response.status_code == 503
+        assert response.get_json()['error'] == \
+            'Live execution context unavailable'
 
     def test_503_when_reconcile_unavailable(self, client, monkeypatch):
         import gui.routes.api_live as api_live
@@ -3030,23 +3045,34 @@ class TestLiveReconcileEndpoint:
         assert response.get_json() == {
             'error': 'Reconciliation unavailable', 'reason': sentinel}
 
+    def test_bootstrap_is_explicit_and_context_owned(
+            self, client, patch_reconcile):
+        response = client.post('/api/live/reconcile/bootstrap')
+        assert response.status_code == 200
+        assert response.get_json() == {
+            'positions': {}, 'cash': 1000.0, 'bootstrapped': True}
+        assert patch_reconcile['seen']['bootstrap_calls'] == 1
+
 
 class TestLiveWorkingOrders:
     """GET /api/live/orders + cancel (patient-executor panel)."""
 
-    def test_empty_without_a_live_session(self, client, monkeypatch):
+    @staticmethod
+    def _wire(monkeypatch, context):
         import gui.routes.api_live as api_live
+        monkeypatch.setattr(api_live, '_require_client',
+                            lambda: (object(), None))
+        monkeypatch.setattr(api_live, 'get_execution_context',
+                            lambda create=True: context)
 
-        monkeypatch.setattr(api_live, '_find_live_broker', lambda: None)
+    def test_503_without_a_live_context(self, client, monkeypatch):
+        self._wire(monkeypatch, None)
         response = client.get('/api/live/orders')
 
-        assert response.status_code == 200
-        assert response.get_json() == {'orders': [], 'count': 0}
+        assert response.status_code == 503
 
     def test_orders_pass_through_from_patient_executor(
             self, client, monkeypatch):
-        import gui.routes.api_live as api_live
-
         order = {
             'order_id': 'PX-1', 'instrument': 'AAA 2026-07-17 95P',
             'side': 'SELL', 'quantity': 2, 'limit_price': 1.45,
@@ -3055,44 +3081,54 @@ class TestLiveWorkingOrders:
             'remaining_seconds': 90,
         }
 
-        class FakeBroker:
+        class FakeContext:
             def working_orders(self):
                 return [order]
 
-        monkeypatch.setattr(api_live, '_find_live_broker', lambda: FakeBroker())
+        self._wire(monkeypatch, FakeContext())
         body = client.get('/api/live/orders').get_json()
 
         assert body['count'] == 1
         assert body['orders'] == [order]
 
     def test_cancel_round_trip_and_unknown_id(self, client, monkeypatch):
-        import gui.routes.api_live as api_live
-
         cancelled = []
 
-        class FakeBroker:
+        class FakeContext:
             def cancel_order(self, order_id):
                 cancelled.append(order_id)
                 return order_id == 'PX-1'
 
-        monkeypatch.setattr(api_live, '_find_live_broker', lambda: FakeBroker())
+        self._wire(monkeypatch, FakeContext())
 
         ok = client.post('/api/live/orders/PX-1/cancel')
         assert ok.status_code == 200
-        assert ok.get_json() == {'message': 'Order cancelled',
+        assert ok.get_json() == {'message': 'Cancellation requested',
                                  'order_id': 'PX-1'}
 
         missing = client.post('/api/live/orders/PX-9/cancel')
         assert missing.status_code == 404
         assert cancelled == ['PX-1', 'PX-9']
 
-    def test_cancel_409_without_live_session(self, client, monkeypatch):
-        import gui.routes.api_live as api_live
-
-        monkeypatch.setattr(api_live, '_find_live_broker', lambda: None)
+    def test_cancel_503_without_live_context(self, client, monkeypatch):
+        self._wire(monkeypatch, None)
         response = client.post('/api/live/orders/PX-1/cancel')
-        assert response.status_code == 409
-        assert response.get_json()['error'] == 'No live broker session'
+        assert response.status_code == 503
+
+    def test_reservation_snapshot_comes_from_context(self, client,
+                                                     monkeypatch):
+        class FakeContext:
+            def reservation_snapshot(self):
+                return {
+                    'active_totals': {'gross': 1250.0},
+                    'reservations': [{'reservation_id': 'risk-1',
+                                      'status': 'ACTIVE'}],
+                }
+
+        self._wire(monkeypatch, FakeContext())
+        response = client.get('/api/live/risk/reservations')
+        assert response.status_code == 200
+        assert response.get_json()['active_totals']['gross'] == 1250.0
 
 
 class TestLiveSchedulerEndpoint:
@@ -3517,6 +3553,20 @@ class TestPaperOnlyTraderRoute:
 RAW_ACCOUNT_NUMBER = '83056214'
 
 
+class _PermissiveReservationGate:
+    """Keeps route-shape tests focused; real gate contracts live separately."""
+
+    def estimate(self, order_request):
+        return {
+            'status': 'estimated',
+            'instrument_type': order_request.get('orderType'),
+            'revalidated_on_place': True,
+        }
+
+    def snapshot(self):
+        return {'active_totals': {}, 'reservations': []}
+
+
 class FakeTradeClient:
     """EtradeClient-shaped fake for the accounts/quotes/order-ticket routes."""
 
@@ -3526,6 +3576,7 @@ class FakeTradeClient:
         self.cancel_calls = []
         self.cancel_result = True
         self.cancel_exc = None
+        self.reservation_gate = _PermissiveReservationGate()
         self.accounts = [{
             'accountId': RAW_ACCOUNT_NUMBER,
             'accountIdKey': 'KEY-ABC',
@@ -3552,6 +3603,7 @@ class FakeTradeClient:
         return [{
             'symbol': 'SPY', 'quantity': 10, 'marketValue': 4500.0,
             'totalGain': 250.0, 'accountId': RAW_ACCOUNT_NUMBER,
+            'Product': {'symbol': 'SPY', 'securityType': 'EQ'},
         }]
 
     def get_quotes(self, symbols):
@@ -3595,6 +3647,7 @@ def patch_trade(monkeypatch):
     monkeypatch.setattr(api_live, 'get_kill_switch', lambda: fakes['kill'])
     monkeypatch.setattr(api_live, 'get_audit_log', lambda: fakes['audit'])
     monkeypatch.setattr(api_live, 'get_client', lambda: fakes['client'])
+    monkeypatch.setattr(api_live, '_execution_context', None)
     return fakes
 
 
@@ -3725,6 +3778,9 @@ class TestLiveOrderTicket:
         assert response.status_code == 200
         body = response.get_json()
         assert body['preview']['previewIds'] == [555]
+        assert body['risk'] == {
+            'status': 'estimated', 'instrument_type': 'EQ',
+            'revalidated_on_place': True}
         ref = body['order_ref']
         assert ref and isinstance(ref, str)
         assert ref in api_live._ORDER_REF_CACHE
@@ -4201,18 +4257,10 @@ class TestGetClientNoDeadlock:
 
 
 class TestCancelOrderRouting:
-    """The cancel route has two sources: a GUI-placed order (account_id_key
-    given) cancels via the shared client; a patient-executor working order
-    (no account_id_key) falls back to the live broker. Regression for the
-    gap where GUI-placed orders had no working cancel path."""
+    """Every cancel is account-bound through the canonical live context."""
 
     def test_cancel_with_account_key_uses_client(self, client, patch_trade,
                                                  monkeypatch):
-        import gui.routes.api_live as api_live
-        # The broker path must NOT be taken when an account key is supplied.
-        monkeypatch.setattr(api_live, '_find_live_broker',
-                            lambda: (_ for _ in ()).throw(
-                                AssertionError('broker path used')))
         resp = client.post('/api/live/orders/ORD-LIVE-1/cancel',
                            json={'account_id_key': 'KEY-ABC'})
         assert resp.status_code == 200
@@ -4233,12 +4281,12 @@ class TestCancelOrderRouting:
         # _client_error_response maps EtradeApiError -> 502 (not a 500 leak).
         assert resp.status_code == 502
 
-    def test_cancel_without_account_key_falls_back_to_broker(self, client,
-                                                            patch_trade,
-                                                            monkeypatch):
+    def test_cancel_without_account_key_uses_context(self, client,
+                                                     patch_trade,
+                                                     monkeypatch):
         import gui.routes.api_live as api_live
 
-        class _Broker:
+        class _Context:
             def __init__(self):
                 self.calls = []
 
@@ -4246,12 +4294,12 @@ class TestCancelOrderRouting:
                 self.calls.append(order_id)
                 return True
 
-        broker = _Broker()
-        monkeypatch.setattr(api_live, '_find_live_broker', lambda: broker)
+        context = _Context()
+        monkeypatch.setattr(api_live, 'get_execution_context',
+                            lambda create=True: context)
         resp = client.post('/api/live/orders/WORK-1/cancel', json={})
         assert resp.status_code == 200
-        assert broker.calls == ['WORK-1']
-        # The client cancel path was NOT used.
+        assert context.calls == ['WORK-1']
         assert patch_trade['client'].cancel_calls == []
 
 

@@ -20,6 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
 COMPOSE = REPO_ROOT / "docker-compose.yml"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+DOCKER_SMOKE = REPO_ROOT / "scripts" / "docker_smoke.py"
 
 
 @pytest.fixture(scope="module")
@@ -35,6 +37,16 @@ def dockerignore_text() -> str:
 @pytest.fixture(scope="module")
 def compose_text() -> str:
     return COMPOSE.read_text()
+
+
+@pytest.fixture(scope="module")
+def ci_text() -> str:
+    return CI_WORKFLOW.read_text()
+
+
+@pytest.fixture(scope="module")
+def smoke_text() -> str:
+    return DOCKER_SMOKE.read_text()
 
 
 class TestDockerfile:
@@ -107,3 +119,58 @@ class TestComposeFile:
     def test_host_port_is_published_on_loopback_only(self, compose_text):
         assert '"127.0.0.1:5001:5001"' in compose_text
         assert '\n      - "5001:5001"' not in compose_text
+
+
+class TestBuiltContainerSmoke:
+    def test_stdlib_script_exists_and_is_python_entrypoint(self, smoke_text):
+        assert DOCKER_SMOKE.is_file()
+        assert smoke_text.startswith("#!/usr/bin/env python3")
+        assert 'if __name__ == "__main__"' in smoke_text
+
+    def test_ci_runs_smoke_after_build(self, ci_text):
+        build = "docker build -t stockoptionstrader:ci ."
+        smoke = "python3 scripts/docker_smoke.py --image stockoptionstrader:ci"
+        assert build in ci_text
+        assert smoke in ci_text
+        assert ci_text.index(build) < ci_text.index(smoke)
+
+    def test_uses_isolated_named_data_volume_and_ephemeral_loopback_port(
+            self, smoke_text):
+        assert 'docker("volume", "create", volume)' in smoke_text
+        assert 'type=volume,source={volume},target=/data' in smoke_text
+        assert '"127.0.0.1::5001"' in smoke_text
+
+    def test_exercises_public_health_and_basic_auth(self, smoke_text):
+        assert 'require_status(base_url, "/health", 200)' in smoke_text
+        assert '"Authorization"' in smoke_text
+        assert 'require_status(base_url, path, 401)' in smoke_text
+        assert 'require_status(base_url, path, 200, credentials)' in smoke_text
+
+    def test_exercises_representative_runtime_surfaces(self, smoke_text):
+        for path in ("/", "/live", "/api/strategies", "/api/backtests",
+                     "/api/floor/desks", "/api/live/status"):
+            assert f'"{path}"' in smoke_text
+
+    def test_network_is_disabled_and_live_state_is_checked(self, smoke_text):
+        assert '"ETRADE_ALLOW_NETWORK=0"' in smoke_text
+        assert 'live.get("env") != "sandbox"' in smoke_text
+        assert 'live.get("auth", {}).get("state") != "disconnected"' in smoke_text
+
+    def test_nonroot_volume_and_sqlite_are_verified(self, smoke_text):
+        assert "Path('/data/.ci-write-probe')" in smoke_text
+        assert "PRAGMA quick_check" in smoke_text
+        for table in ("backtests", "etrade_tokens", "kill_switch_state"):
+            assert table in smoke_text
+
+    def test_cleanup_removes_container_before_volume(self, smoke_text):
+        container_cleanup = 'docker("rm", "--force", container'
+        volume_cleanup = 'docker("volume", "rm", "--force", volume'
+        assert container_cleanup in smoke_text
+        assert volume_cleanup in smoke_text
+        assert smoke_text.index(container_cleanup) < smoke_text.index(volume_cleanup)
+
+    def test_fatal_runtime_log_signatures_fail_smoke(self, smoke_text):
+        for marker in ("worker failed to boot", "modulenotfounderror",
+                       "traceback (most recent call last)", "permissionerror",
+                       "unable to open database file"):
+            assert marker in smoke_text

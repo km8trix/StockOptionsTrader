@@ -194,12 +194,14 @@ class StatArbPod(Pod):
 
     def generate_signals(self, all_data: Dict[str, pd.DataFrame],
                          date) -> Dict[str, str]:
-        refit_today = self.controller.maybe_refit(all_data, date)
+        controller = self.controller
+        assert controller is not None
+        refit_today = controller.maybe_refit(all_data, date)
         is_rebalance_day = (pd.Timestamp(date).weekday() == 0) or refit_today
         if not is_rebalance_day:
             return {}
 
-        scores = self.controller.predict(all_data, date)
+        scores = controller.predict(all_data, date)
         if not scores:  # None (never fitted) or {} (model degraded)
             return {}
 

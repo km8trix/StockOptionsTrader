@@ -128,6 +128,37 @@ class TestFetchFlow:
 
         assert fake.calls == ["good", "good"]  # no cross-handler cache
 
+    def test_partial_provider_result_refetches_full_request(
+            self, monkeypatch, shared_cache):
+        # Provider silently starts two sessions late but still returns a
+        # non-empty frame. Neither memory nor SQLite may call this a full hit.
+        fake = FakeOBB({"partial": _bars(start="2023-01-04", n=3)})
+        handler = make_handler(monkeypatch, fake, shared_cache, ["partial"])
+
+        first = handler.fetch_stock_data("AAPL", START, END)
+        second = handler.fetch_stock_data("AAPL", START, END)
+
+        assert len(first) == len(second) == 3
+        assert fake.calls == ["partial", "partial"]
+        assert handler.get_last_fetch_info("AAPL")["from_cache"] is False
+
+        # The narrower range that was truly observed remains a valid cache
+        # hit in a fresh process.
+        fresh = make_handler(monkeypatch, fake, shared_cache, ["partial"])
+        observed = fresh.fetch_stock_data("AAPL", "2023-01-04", END)
+        assert len(observed) == 3
+        assert fake.calls == ["partial", "partial"]
+        assert fresh.get_last_fetch_info("AAPL")["from_cache"] is True
+
+    def test_partial_provider_end_refetches(self, monkeypatch, shared_cache):
+        fake = FakeOBB({"partial": _bars(start=START, n=4)})
+        handler = make_handler(monkeypatch, fake, shared_cache, ["partial"])
+
+        handler.fetch_stock_data("AAPL", START, END)
+        handler.fetch_stock_data("AAPL", START, END)
+
+        assert fake.calls == ["partial", "partial"]
+
 
 class TestDateCanonicalizationEndToEnd:
     """Regression: a strptime-valid but non-padded request ('2023-1-2')

@@ -128,6 +128,12 @@ class DeskIntent:
     netting. The engine stamps them onto the Position it opens (see
     core.models.Position.owners) so each desk's book logic only touches
     positions it owns. Never set outside fund mode.
+
+    intent_id (OPTIONAL, target mode only): a deterministic logical execution
+    identity produced by the target-position delta builder.  Patient-order
+    replacements derive distinct broker client IDs from this stable parent,
+    so a retry or restart cannot silently turn one target delta into duplicate
+    exposure.  Legacy intent producers leave it unset.
     """
     asset: Asset
     action: str
@@ -135,6 +141,7 @@ class DeskIntent:
     reason: str
     quantity: Optional[int] = None
     desk_keys: Optional[tuple] = None
+    intent_id: Optional[str] = None
 
     def __post_init__(self):
         if self.action not in INTENT_ACTIONS:
@@ -148,6 +155,11 @@ class DeskIntent:
             raise ValueError(
                 f"quantity {self.quantity} must be a positive integer "
                 f"(direction comes from the action, never the sign)")
+        if self.intent_id is not None:
+            if not isinstance(self.intent_id, str) or not self.intent_id.strip():
+                raise ValueError(
+                    "intent_id must be a non-empty string when provided")
+            self.intent_id = self.intent_id.strip()
 
 
 class Desk(ABC):
@@ -370,28 +382,28 @@ class Desk(ABC):
                 continue
 
             # No one-step flips (contract C4): close first, open later.
-            position = portfolio.get_position(intent.asset)
-            if intent.action == 'SHORT' and position is not None \
-                    and position.quantity > 0:
+            current_position = portfolio.get_position(intent.asset)
+            if intent.action == 'SHORT' and current_position is not None \
+                    and current_position.quantity > 0:
                 self.note(
                     'risk',
                     f"Blocked SHORT {intent.asset.symbol}: open long of "
-                    f"{position.quantity} shares — flipping in one intent "
+                    f"{current_position.quantity} shares — flipping in one intent "
                     f"is forbidden (SELL first)",
                     symbol=intent.asset.symbol,
-                    position_quantity=position.quantity,
+                    position_quantity=current_position.quantity,
                     action=intent.action,
                     **self.risk_note_data(intent.asset))
                 continue
-            if intent.action == 'BUY' and position is not None \
-                    and position.quantity < 0:
+            if intent.action == 'BUY' and current_position is not None \
+                    and current_position.quantity < 0:
                 self.note(
                     'risk',
                     f"Blocked BUY {intent.asset.symbol}: open short of "
-                    f"{abs(position.quantity)} shares — flipping in one "
+                    f"{abs(current_position.quantity)} shares — flipping in one "
                     f"intent is forbidden (COVER first)",
                     symbol=intent.asset.symbol,
-                    position_quantity=position.quantity,
+                    position_quantity=current_position.quantity,
                     action=intent.action,
                     **self.risk_note_data(intent.asset))
                 continue

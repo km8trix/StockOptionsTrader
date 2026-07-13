@@ -29,6 +29,7 @@ Dep: ``duckdb`` (reads/writes Parquet natively — no pyarrow). Ingest also need
 from __future__ import annotations
 
 import bisect
+import hashlib
 import logging
 import os
 from typing import Dict, List, Optional, Sequence
@@ -162,6 +163,46 @@ class PitWarehouse:
             logger.warning("warehouse query failed on %s", table, exc_info=True)
             return None
 
+    def snapshot_version(
+            self, tables: Optional[Sequence[str]] = None) -> Dict:
+        """Content-address the exact local Parquet source snapshot.
+
+        Hashing is explicit (never on the hot fetch path) and streams files so
+        promotion artifacts can reference immutable source bytes rather than a
+        mutable directory name or timestamp.
+        """
+        selected = sorted(set(tables or _TABLES))
+        unknown = set(selected) - set(_TABLES)
+        if unknown:
+            raise ValueError(f"unknown warehouse tables: {sorted(unknown)}")
+        digest = hashlib.sha256()
+        manifest = []
+        missing = []
+        for table in selected:
+            path = self._pq(table)
+            if not os.path.isfile(path):
+                missing.append(table)
+                continue
+            file_digest = hashlib.sha256()
+            with open(path, 'rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    file_digest.update(chunk)
+            item = {
+                'table': table,
+                'sha256': file_digest.hexdigest(),
+                'bytes': os.path.getsize(path),
+            }
+            manifest.append(item)
+            digest.update(
+                f"{table}:{item['sha256']}:{item['bytes']}\n".encode())
+        return {
+            'version': digest.hexdigest(),
+            'tables': manifest,
+            'complete': not missing,
+            'quality_flags': ([f"missing_table:{table}" for table in missing]
+                              if missing else []),
+        }
+
     @staticmethod
     def _date(d):
         try:
@@ -214,6 +255,54 @@ class PitWarehouse:
             return None
         row = res.fetchone()
         return self._date(row[0]) if row and row[0] is not None else None
+
+    def delisting_action(self, ticker: str) -> Optional[Dict]:
+        """Best available corporate action around the final listed session.
+
+        ACTIONS ``value`` is treated as a per-share cash term only for an
+        acquisition/merger/tender event. Bankruptcy/liquidation without a
+        positive value is an explicit zero recovery. An ordinary delisting
+        with no economic term returns ``None`` so the engine can use the final
+        tradable close and flag that fallback instead of inventing a payout.
+        """
+        final_date = self.delisting_date(ticker)
+        if final_date is None:
+            return None
+        start = (pd.Timestamp(final_date) - pd.Timedelta(days=45)).date()
+        end = (pd.Timestamp(final_date) + pd.Timedelta(days=45)).date()
+        res = self._query(
+            'actions',
+            "SELECT CAST(date AS DATE), action, value, contraticker "
+            "FROM src WHERE ticker = ? AND CAST(date AS DATE) >= ? "
+            "AND CAST(date AS DATE) <= ? ORDER BY CAST(date AS DATE)",
+            [ticker, start, end],
+        )
+        rows = res.fetchall() if res else []
+        for action_date, raw_action, raw_value, contra in reversed(rows):
+            action = str(raw_action or '').strip().lower()
+            value = (float(raw_value)
+                     if raw_value is not None and np.isfinite(float(raw_value))
+                     else None)
+            if any(token in action for token in (
+                    'acquisition', 'merger', 'tender')):
+                if value is None or value <= 0:
+                    continue
+                return {
+                    'date': self._date(action_date),
+                    'action': action,
+                    'payout_per_share': value,
+                    'contraticker': contra,
+                    'quality_flags': ['corporate_action_cash_term'],
+                }
+            if any(token in action for token in ('bankrupt', 'liquidat')):
+                return {
+                    'date': self._date(action_date),
+                    'action': action,
+                    'payout_per_share': max(0.0, value or 0.0),
+                    'contraticker': contra,
+                    'quality_flags': ['corporate_action_zero_recovery'],
+                }
+        return None
 
     def fundamentals_asof(self, ticker: str, date, *,
                           dimension: str = 'ARQ') -> Optional[Dict]:
@@ -390,7 +479,9 @@ class PitWarehouse:
         Sharadar SEP carries raw open/high/low/close plus the adjusted closeadj
         (total return). We adjust O/H/L by the daily closeadj/close factor and set
         close = closeadj, so every traded price is total-return-consistent (no
-        spurious split jumps). Columns match MarketDataHandler.fetch_stock_data
+        spurious split jumps). Volume is adjusted by the inverse price factor,
+        preserving shares-times-price participation across splits. Columns
+        match MarketDataHandler.fetch_stock_data
         (lowercase open/high/low/close/volume); empty frame if un-ingested."""
         cols = ['open', 'high', 'low', 'close', 'volume']
         s, e = self._date(start), self._date(end)
@@ -424,7 +515,12 @@ class PitWarehouse:
             'high': raw['high'].to_numpy(dtype=float) * adj,
             'low': raw['low'].to_numpy(dtype=float) * adj,
             'close': closeadj * scale,
-            'volume': raw['volume'].to_numpy(dtype=float),
+            'volume': np.divide(
+                raw['volume'].to_numpy(dtype=float),
+                adj,
+                out=np.zeros_like(adj, dtype=float),
+                where=adj > 0,
+            ),
         }, index=idx)
         out.index.name = 'date'
         return out
@@ -814,8 +910,11 @@ class PitWarehouse:
             con.execute(
                 f"COPY (SELECT * FROM read_csv_auto('{csv_path}', sample_size=-1)) "
                 f"TO '{out}' (FORMAT PARQUET)")
-            return con.execute(
-                f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+            row = con.execute(
+                f"SELECT count(*) FROM read_parquet('{out}')").fetchone()
+            # SELECT count(*) always returns exactly one aggregate row.
+            assert row is not None
+            return row[0]
 
 
 if __name__ == '__main__':  # operator CLI (networked):

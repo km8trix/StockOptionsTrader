@@ -44,19 +44,29 @@ def _write_tickers(path):
         f"TO '{path}' (FORMAT PARQUET)")
 
 
+def _write_actions(path, rows):
+    values = ",".join("(" + ",".join(row) + ")" for row in rows)
+    duckdb.connect().execute(
+        f"COPY (SELECT * FROM (VALUES {values}) AS "
+        "t(date,action,ticker,value,contraticker)) "
+        f"TO '{path}' (FORMAT PARQUET)")
+
+
 def test_ohlcv_is_adjusted_and_shaped(tmp_path):
     w = _fixture(tmp_path)
     df = w.ohlcv('AAPL', '2020-01-01', '2020-01-31')
     assert list(df.columns) == ['open', 'high', 'low', 'close', 'volume']
     assert isinstance(df.index, pd.DatetimeIndex)
     # REBASED to raw at the window start (close[0]=100): day1 == raw O/H/L/C,
-    # volume untouched. (factor 0.5 * scale 2.0 = 1.0)
+    # volume stays 1000 because the rebased adjustment is 1.0.
     r0 = df.iloc[0]
     assert (r0['open'], r0['high'], r0['low'], r0['close'], r0['volume']) == \
         (100.0, 110.0, 90.0, 100.0, 1000.0)
     # day2: +20% total return preserved (raw closeadj 50->60), rebased to 120
     r1 = df.iloc[1]
-    assert (r1['open'], r1['close']) == (120.0, 120.0)
+    assert (r1['open'], r1['close'], r1['volume']) == (120.0, 120.0, 1000.0)
+    # Adjusted-dollar participation is invariant: raw 2000*60 == 1000*120.
+    assert r1['volume'] * r1['close'] == 2000.0 * 60.0
 
 
 def test_ohlcv_empty_for_unknown_or_uningested(tmp_path):
@@ -73,6 +83,23 @@ def test_adapter_delegates_to_warehouse(tmp_path):
     assert feed.get_last_fetch_info('AAPL')['provider'] == 'pit_warehouse'
     # unknown name -> empty frame (matches MarketDataHandler's _empty_data)
     assert feed.fetch_stock_data('ZZZZ', '2020-01-01', '2020-01-31').empty
+
+
+def test_snapshot_version_is_content_addressed_and_flags_missing(tmp_path):
+    warehouse = _fixture(tmp_path)
+    first = warehouse.snapshot_version(['sep', 'actions'])
+    second = warehouse.snapshot_version(['actions', 'sep'])
+    assert first == second
+    assert first['complete'] is False
+    assert first['quality_flags'] == ['missing_table:actions']
+
+    _write_actions(tmp_path / 'actions.parquet', [
+        ("DATE '2020-01-03'", "'Split'", "'AAPL'", "2.0", "NULL"),
+    ])
+    updated = warehouse.snapshot_version(['sep', 'actions'])
+    assert updated['complete'] is True
+    assert updated['quality_flags'] == []
+    assert updated['version'] != first['version']
 
 
 def test_engine_accepts_injected_market_data(tmp_path):
@@ -127,3 +154,46 @@ def test_engine_liquidates_delisted_holding_at_final_close(tmp_path):
     assert len(liquidation) == 1
     assert liquidation[0]['date'] == pd.Timestamp('2020-01-06')
     assert liquidation[0]['price'] == 8.0
+    assert liquidation[0]['data_quality_flags'] == [
+        'delisting_terms_unavailable']
+
+
+def test_acquisition_cash_term_overrides_final_close(tmp_path):
+    _write_sep(tmp_path / "sep.parquet", [
+        ("'DEAD'", "DATE '2020-01-02'", "10.0", "10.0", "10.0", "10.0",
+         "1000.0", "10.0"),
+        ("'DEAD'", "DATE '2020-01-06'", "8.0", "8.0", "8.0", "8.0",
+         "1000.0", "8.0"),
+        ("'LIVE'", "DATE '2020-01-02'", "20.0", "20.0", "20.0", "20.0",
+         "1000.0", "20.0"),
+        ("'LIVE'", "DATE '2020-01-06'", "20.0", "20.0", "20.0", "20.0",
+         "1000.0", "20.0"),
+        ("'LIVE'", "DATE '2020-01-07'", "20.0", "20.0", "20.0", "20.0",
+         "1000.0", "20.0"),
+    ])
+    _write_tickers(tmp_path / "tickers.parquet")
+    _write_actions(tmp_path / "actions.parquet", [
+        ("DATE '2020-01-06'", "'Acquisition'", "'DEAD'", "12.0", "'BUYER'"),
+    ])
+
+    class BuyDead:
+        name = 'buy-dead-action'
+
+        def generate_signals(self, data, asset):
+            return ('BUY' if asset.symbol == 'DEAD'
+                    and data.index[-1] == pd.Timestamp('2020-01-02')
+                    else 'HOLD')
+
+    feed = WarehouseMarketData(PitWarehouse(str(tmp_path)))
+    engine = BacktestEngine(
+        strategy=BuyDead(), market_data=feed, commission=0.0,
+        slippage_bps=0.0)
+    engine.run(['DEAD', 'LIVE'], '2020-01-01', '2020-01-31',
+               position_size=0.1, benchmark_symbol=None)
+
+    liquidation = [trade for trade in engine.trades_log
+                   if trade.get('reason') == 'delisting liquidation'][0]
+    assert liquidation['price'] == 12.0
+    assert liquidation['payout_source'] == 'acquisition'
+    assert liquidation['data_quality_flags'] == [
+        'corporate_action_cash_term']

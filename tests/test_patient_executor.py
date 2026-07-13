@@ -8,6 +8,8 @@ sides."""
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -65,10 +67,11 @@ class FakeBroker:
                                 "limit": limit_price})
         return order_id
 
-    def place_structure(self, legs, net_price, contracts):
+    def place_structure(self, legs, net_price, contracts, closing=False):
         order_id = self._new_id()
         self.placements.append({"order_id": order_id, "legs": legs,
-                                "net": net_price, "qty": contracts})
+                                "net": net_price, "qty": contracts,
+                                "closing": closing})
         return order_id
 
     def cancel_order(self, order_id):
@@ -87,6 +90,26 @@ class FakeBroker:
             # confirms CANCELLED on the first post-cancel poll.
             status = dict(status, status="CANCELLED")
         return status
+
+
+class ClientIdBroker(FakeBroker):
+    """Capability-aware fake that records explicit client order ids."""
+
+    def place_order_with_client_id(
+            self, asset, order_type, quantity, limit_price,
+            client_order_id):
+        order_id = self.place_order(
+            asset, order_type, quantity, limit_price)
+        self.placements[-1]["client_order_id"] = client_order_id
+        return order_id
+
+    def place_structure_with_client_id(
+            self, legs, net_price, contracts, client_order_id,
+            closing=False):
+        order_id = self.place_structure(
+            legs, net_price, contracts, closing=closing)
+        self.placements[-1]["client_order_id"] = client_order_id
+        return order_id
 
 
 def make_executor(broker, quotes, vt, kill_switch=None):
@@ -126,6 +149,116 @@ class TestImmediateFill:
         assert vt.sleeps == []  # filled before any waiting
         assert broker.placements[0]["limit"] == 1.10
         assert broker.placements[0]["order_type"] == OrderType.BUY
+
+
+class TestExecutionIdentity:
+    def test_same_execution_path_derives_stable_client_order_ids(self):
+        def run_once():
+            vt = VirtualTime()
+            broker = ClientIdBroker(
+                scripts=[[S(5, 1.10, "EXECUTED")]])
+            executor = make_executor(
+                broker, {"bid": 1.00, "ask": 1.20}, vt)
+            report = executor.execute(
+                "BUY", SPY, 5, execution_id="desk-intent-42")
+            assert report["status"] == "filled"
+            return [p["client_order_id"] for p in broker.placements]
+
+        first = run_once()
+        second = run_once()
+        assert first == second
+        assert len(first[0]) == 20
+        assert first[0].isalnum()
+
+    def test_replacement_children_receive_distinct_ids(self):
+        vt = VirtualTime()
+        broker = ClientIdBroker()
+        executor = make_executor(
+            broker, {"bid": 1.00, "ask": 1.20}, vt)
+        report = executor.execute(
+            "BUY", SPY, 5, max_minutes=1, step_interval_s=30,
+            execution_id="desk-intent-42")
+        assert report["status"] == "timeout"
+        ids = [p["client_order_id"] for p in broker.placements]
+        assert len(ids) == 2
+        assert len(set(ids)) == 2
+        assert all(len(value) <= 20 and value.isalnum() for value in ids)
+
+    def test_legacy_broker_keeps_original_place_order_contract(self):
+        vt = VirtualTime()
+        broker = FakeBroker(scripts=[[S(5, 1.10, "EXECUTED")]])
+        executor = make_executor(
+            broker, {"bid": 1.00, "ask": 1.20}, vt)
+        report = executor.execute(
+            "BUY", SPY, 5, execution_id="desk-intent-42")
+        assert report["status"] == "filled"
+        assert "client_order_id" not in broker.placements[0]
+
+    def test_package_replacement_is_atomic_and_has_stable_child_ids(self):
+        legs = [
+            {"asset": Asset("IWM", AssetType.PUT, 195.0, "2026-07-17"),
+             "action": "SHORT"},
+            {"asset": Asset("IWM", AssetType.PUT, 190.0, "2026-07-17"),
+             "action": "BUY"},
+        ]
+
+        def run_once():
+            vt = VirtualTime()
+            broker = ClientIdBroker(scripts=[[
+                S(), S(1, -1.10, "OPEN"), S(1, -1.10, "CANCELLED")],
+                [S(2, -1.08, "EXECUTED")],
+            ])
+            executor = make_executor(
+                broker, {"bid": 1.00, "ask": 1.20}, vt)
+            report = executor.execute(
+                "SELL", legs, 3, max_minutes=1, step_interval_s=30,
+                execution_id="spread-intent-42")
+            return report, broker
+
+        first_report, first_broker = run_once()
+        second_report, second_broker = run_once()
+        assert first_report["status"] == "filled"
+        assert [fill["qty"] for fill in first_report["fills"]] == [1.0, 2.0]
+        assert [fill["price"] for fill in first_report["fills"]] == [1.10, 1.08]
+        assert first_report["avg_fill"] == pytest.approx(1.0866666667)
+        assert [placement["qty"] for placement in first_broker.placements] == [
+            3, 2]
+        assert all(placement["legs"] == legs
+                   for placement in first_broker.placements)
+        first_ids = [placement["client_order_id"]
+                     for placement in first_broker.placements]
+        second_ids = [placement["client_order_id"]
+                      for placement in second_broker.placements]
+        assert first_ids == second_ids
+        assert len(set(first_ids)) == 2
+        assert all(len(value) == 20 and value.isalnum()
+                   for value in first_ids)
+        assert second_report["status"] == "filled"
+
+    def test_package_close_lifecycle_survives_patient_placement(self):
+        vt = VirtualTime()
+        broker = ClientIdBroker(scripts=[[S(2, 0.60, "EXECUTED")]])
+        legs = [
+            {"asset": Asset("IWM", AssetType.PUT, 195.0, "2026-07-17"),
+             "action": "SHORT"},
+            {"asset": Asset("IWM", AssetType.PUT, 190.0, "2026-07-17"),
+             "action": "BUY"},
+        ]
+        report = make_executor(
+            broker, {"bid": 0.50, "ask": 0.70}, vt).execute(
+                "BUY", legs, 2, execution_id="spread-close-42",
+                closing=True)
+        assert report["status"] == "filled"
+        assert broker.placements[0]["closing"] is True
+        assert broker.placements[0]["net"] == -0.60
+        assert broker.placements[0]["qty"] == 2
+
+    def test_closing_flag_is_rejected_for_single_instrument(self):
+        vt = VirtualTime()
+        executor = make_executor(
+            FakeBroker(), {"bid": 1.00, "ask": 1.20}, vt)
+        with pytest.raises(ValueError, match="leg packages"):
+            executor.execute("BUY", SPY, 1, closing=True)
 
 
 class TestRepricingPath:
@@ -503,3 +636,139 @@ class TestMultiLegAndGuards:
             executor.execute("HOLD", SPY, 10)
         with pytest.raises(ValueError):
             executor.execute("BUY", SPY, 0)
+
+
+class TestLifecycleAndObservability:
+    def test_snapshot_cancel_await_idle_and_reuse(self):
+        entered_sleep = threading.Event()
+        release_sleep = threading.Event()
+        broker = FakeBroker(scripts=[[], [S(5, 1.10, "EXECUTED")]])
+
+        def blocking_sleep(_seconds):
+            entered_sleep.set()
+            assert release_sleep.wait(2)
+
+        executor = PatientExecutor(
+            broker, lambda _instrument: {"bid": 1.00, "ask": 1.20},
+            sleep_fn=blocking_sleep)
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(
+            report=executor.execute("BUY", SPY, 5, step_interval_s=30)))
+        worker.start()
+        assert entered_sleep.wait(1)
+
+        assert executor.await_idle(0) is False
+        orders = executor.working_orders()
+        assert len(orders) == 1
+        assert orders[0] == {
+            "order_id": "ORD-1",
+            "instrument": "SPY",
+            "side": "BUY",
+            "quantity": 5,
+            "filled_quantity": 0.0,
+            "remaining_quantity": 5,
+            "limit_price": 1.10,
+            "status": "working",
+            "steps": [{"ts": orders[0]["steps"][0]["ts"], "limit": 1.10}],
+            "started_at": orders[0]["started_at"],
+            "expires_at": orders[0]["expires_at"],
+            "remaining_seconds": pytest.approx(orders[0]["remaining_seconds"]),
+        }
+        # Returned data is a deep snapshot, never the mutable live state.
+        orders[0]["steps"].append({"ts": "tampered", "limit": 999})
+        assert len(executor.working_orders()[0]["steps"]) == 1
+
+        assert executor.cancel_current("wrong-id") is False
+        assert executor.cancel_current("ORD-1") is True
+        assert executor.working_orders()[0]["status"] == "cancel_requested"
+        release_sleep.set()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert result["report"]["status"] == "killed"
+        assert executor.await_idle(0) is True
+        assert executor.working_orders() == []
+        assert executor.cancel_current() is False
+
+        # Per-order cancel is cleared at the terminal report; the worker is
+        # reusable unless its sticky lifecycle stop was requested.
+        second = executor.execute("BUY", SPY, 5)
+        assert second["status"] == "filled"
+
+    def test_close_interrupts_default_sleep_and_is_idempotent(self):
+        placed = threading.Event()
+
+        class NotifyingBroker(FakeBroker):
+            def place_order(self, asset, order_type, quantity, limit_price):
+                order_id = super().place_order(
+                    asset, order_type, quantity, limit_price)
+                placed.set()
+                return order_id
+
+        broker = NotifyingBroker()
+        executor = PatientExecutor(
+            broker, lambda _instrument: {"bid": 1.00, "ask": 1.20})
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(
+            report=executor.execute("BUY", SPY, 5, step_interval_s=60)))
+        worker.start()
+        assert placed.wait(1)
+
+        started = time.monotonic()
+        assert executor.close(timeout=1) is True
+        assert time.monotonic() - started < 1
+        worker.join(1)
+        assert result["report"]["status"] == "killed"
+        assert broker.cancels == ["ORD-1"]
+        assert executor.close(timeout=0) is True  # idempotent
+
+        # execute() cannot erase a prior stop/close and place a new order.
+        after_close = executor.execute("BUY", SPY, 5)
+        assert after_close["status"] == "killed"
+        assert len(broker.placements) == 1
+
+    def test_await_idle_rejects_negative_timeout(self):
+        executor = PatientExecutor(
+            FakeBroker(), lambda _instrument: {"bid": 1.00, "ask": 1.20})
+        with pytest.raises(ValueError, match="non-negative"):
+            executor.await_idle(-0.01)
+
+
+class TestQuoteIsolation:
+    def test_option_and_package_use_exact_injected_quote_subject(self):
+        option = Asset("SPY", AssetType.CALL, 500.0, "2026-07-17")
+        legs = [{"asset": option, "action": "LONG"}]
+        seen = []
+
+        def quote_fn(subject):
+            seen.append(subject)
+            return {"bid": 2.30, "ask": 2.50}
+
+        option_broker = FakeBroker(scripts=[[S(1, 2.40, "EXECUTED")]])
+        option_executor = PatientExecutor(option_broker, quote_fn)
+        assert option_executor.execute("BUY", option, 1)["status"] == "filled"
+        assert seen.pop() is option
+
+        package_broker = FakeBroker(scripts=[[S(1, 2.40, "EXECUTED")]])
+        package_executor = PatientExecutor(package_broker, quote_fn)
+        assert package_executor.execute("SELL", legs, 1)["status"] == "filled"
+        assert seen.pop() is legs
+        assert package_executor.working_orders() == []
+
+    @pytest.mark.parametrize("quote", [
+        None,
+        {"bid": 1.0},
+        {"bid": float("nan"), "ask": 1.0},
+        {"bid": 2.0, "ask": 1.0},
+    ])
+    def test_invalid_option_quote_never_places(self, quote):
+        option = Asset("SPY", AssetType.PUT, 450.0, "2026-07-17")
+        broker = FakeBroker()
+        executor = PatientExecutor(broker, lambda _subject: quote)
+        with pytest.raises(ValueError, match="option/package"):
+            executor.execute("BUY", option, 1)
+        assert broker.placements == []
+        assert executor.working_orders() == []
+
+    def test_quote_fn_is_required_and_must_be_callable(self):
+        with pytest.raises(TypeError, match="quote_fn"):
+            PatientExecutor(FakeBroker(), None)

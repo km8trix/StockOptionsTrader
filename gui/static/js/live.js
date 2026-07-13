@@ -529,17 +529,15 @@ async function cancelWorkingOrder(orderId, btn, accountKey) {
         confirmText: 'Cancel order', variant: 'danger',
     }))) return;
     const restore = btnLoading(btn);
-    // A GUI-placed order is cancelled through the shared client by passing
-    // its account_id_key; a patient-executor working order omits it and the
-    // route falls back to the live broker session.
+    // The server binds every cancellation to the canonical configured account;
+    // the optional key is only an extra mismatch guard for GUI-displayed rows.
     const body = accountKey ? JSON.stringify({ account_id_key: accountKey })
         : undefined;
     try {
         await fetchJSON(
             `/api/live/orders/${encodeURIComponent(orderId)}/cancel`,
             { method: 'POST', body });
-        showToast('info', `Order ${orderId} cancelled.`);
-        if (accountKey) removePlacedOrder(orderId);
+        showToast('info', `Cancellation requested for order ${orderId}.`);
         refreshWorkingOrders();
         loadAudit();
     } catch (_) {
@@ -775,6 +773,31 @@ async function runReconcile() {
         loadParity();  // reconciliation follows trading — refresh fill parity
     } catch (_) {
         // toasted by fetchJSON (covers 409 no-live-session and 503s)
+    } finally {
+        restore();
+    }
+}
+
+async function bootstrapReconciliationBook() {
+    if (!(await confirmModal({
+        title: 'Adopt the broker snapshot?',
+        body: 'Use the current E*TRADE positions and cash as this account’s ' +
+            'initial local book. This is a one-time initialization action; ' +
+            'it does not place or cancel orders.',
+        confirmText: 'Adopt snapshot', variant: 'warning',
+    }))) return;
+    const restore = btnLoading(document.getElementById('btnBootstrapBook'));
+    try {
+        const result = await fetchJSON('/api/live/reconcile/bootstrap', {
+            method: 'POST',
+        });
+        showToast(result.bootstrapped ? 'success' : 'info',
+            result.bootstrapped
+                ? 'Local book initialized from the broker snapshot.'
+                : 'Local book was already initialized; no state was replaced.');
+        await runReconcile();
+    } catch (_) {
+        // toasted by fetchJSON
     } finally {
         restore();
     }
@@ -1199,20 +1222,22 @@ function buildSpreadLegs() {
 }
 
 /** Render the preview summary and the order_ref state. */
-function renderPreviewResult(preview) {
+function renderPreviewResult(preview, risk) {
     const el = document.getElementById('previewResult');
     if (!el) return;
     const ids = (preview && preview.previewIds) || [];
     let text;
     try {
-        text = JSON.stringify(preview || {}, null, 2);
+        text = JSON.stringify({ preview: preview || {}, risk: risk || {} },
+            null, 2);
     } catch (_) {
         text = String(preview);
     }
     el.innerHTML =
         '<div class="preview-ok"><i class="bi bi-check-circle-fill" ' +
         'aria-hidden="true"></i> Previewed — review the estimate, then ' +
-        'Place.</div>' +
+        'Place. Pending-order risk will be revalidated immediately before ' +
+        'transmission.</div>' +
         `<dl class="token-times"><dt>Preview IDs</dt>` +
         `<dd class="num">${escapeHTML(ids.join(', ') || '—')}</dd></dl>` +
         `<pre class="note-data-json">${escapeHTML(text)}</pre>`;
@@ -1274,7 +1299,7 @@ async function previewOrder() {
         const data = await fetchJSON('/api/live/order/preview', {
             method: 'POST', body: JSON.stringify(body),
         });
-        renderPreviewResult(data.preview || {});
+        renderPreviewResult(data.preview || {}, data.risk || {});
         setOrderRef(data.order_ref);
         showToast('success', 'Order previewed — review, then Place.');
         loadAudit(); // preview is audit-logged
@@ -1968,6 +1993,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const btnReconcile = document.getElementById('btnReconcile');
     if (btnReconcile) btnReconcile.addEventListener('click', runReconcile);
+    const btnBootstrapBook = document.getElementById('btnBootstrapBook');
+    if (btnBootstrapBook) {
+        btnBootstrapBook.addEventListener('click', bootstrapReconciliationBook);
+    }
 
     // Account selection: load that account's balances + positions.
     const accountSelect = document.getElementById('accountSelect');

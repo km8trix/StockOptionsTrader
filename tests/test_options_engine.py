@@ -21,6 +21,7 @@ from data.market_data import MarketDataHandler
 from desks.base import Desk, DeskIntent
 from portfolio.manager import PortfolioManager
 from portfolio.risk_manager import RiskManager
+from portfolio.structures import LegAction, StructureIntent, StructureLeg
 
 START = '2023-01-02'
 N_DAYS = 12
@@ -75,6 +76,38 @@ class ScriptedDesk(Desk):
         return self.prices.get(str(asset))
 
 
+class StructureScriptedDesk(ScriptedDesk):
+    """Scripted canonical packages alongside the unchanged legacy surface."""
+
+    def __init__(self, structure_script=None, prices=None):
+        super().__init__(script={}, prices=prices)
+        self.structure_script = {
+            pd.Timestamp(date): structures
+            for date, structures in (structure_script or {}).items()
+        }
+
+    def generate_structure_intents(self, all_data, date, portfolio):
+        return list(self.structure_script.get(pd.Timestamp(date), []))
+
+
+def ratio_call_structure(*, closing=False, long_ratio=2, quantity=2):
+    actions = ((LegAction.BUY_CLOSE, LegAction.SELL_CLOSE)
+               if closing else
+               (LegAction.SELL_OPEN, LegAction.BUY_OPEN))
+    return StructureIntent(
+        legs=(
+            StructureLeg(call(100.0), actions[0], ratio=1),
+            StructureLeg(call(105.0), actions[1], ratio=long_ratio),
+        ),
+        quantity=quantity,
+        net_price=-0.50 if closing else 1.00,
+        max_loss=0.0 if closing else 400.0 * quantity,
+        greeks={"delta": -1.0, "vega": -2.0},
+        reason="atomic ratio call spread",
+        owner="stub",
+    )
+
+
 @pytest.fixture
 def engine_factory(monkeypatch):
     def fake_fetch(self, symbol, start_date, end_date):
@@ -93,6 +126,162 @@ def engine_factory(monkeypatch):
         return engine, report
 
     return run
+
+
+@pytest.fixture
+def structure_engine_factory(monkeypatch):
+    def fake_fetch(self, symbol, start_date, end_date):
+        return flat_frame() if symbol == 'UND' else pd.DataFrame()
+
+    monkeypatch.setattr(MarketDataHandler, 'fetch_stock_data', fake_fetch)
+
+    def run(script, prices, initial_capital=100_000.0,
+            seed_positions=()):
+        desk = StructureScriptedDesk(
+            structure_script=script, prices=prices)
+        engine = BacktestEngine(
+            desk=desk, initial_capital=initial_capital)
+        for position in seed_positions:
+            engine.portfolio.add_position(position)
+        report = engine.run(
+            ['UND'], START, '2023-01-31', benchmark_symbol=None)
+        return engine, report
+
+    return run
+
+
+class TestAtomicStructureBacktest:
+    def test_ratio_package_fills_all_legs_as_one_pending_object(
+            self, structure_engine_factory):
+        package = ratio_call_structure()
+        engine, _ = structure_engine_factory(
+            {DATES[0]: [package]},
+            {str(call(100.0)): 2.00, str(call(105.0)): 0.50})
+
+        assert engine.pending_structures == {}
+        package_trades = [trade for trade in engine.trades_log
+                          if trade.get('package_id') == package.intent_id]
+        assert len(package_trades) == 2
+        assert {trade['date'] for trade in package_trades} == {DATES[1]}
+        assert [trade['action'] for trade in package_trades] == [
+            'SELL_OPEN', 'BUY_OPEN']
+        assert [trade['quantity'] for trade in package_trades] == [2, 4]
+        assert [trade['ratio'] for trade in package_trades] == [1, 2]
+        assert [trade['price'] for trade in package_trades] == pytest.approx([
+            1.95, 0.55])
+        assert engine.portfolio.get_position(call(100.0)).quantity == -2
+        assert engine.portfolio.get_position(call(105.0)).quantity == 4
+        # Short proceeds 390 - 1.30; long debit 220 + 2.60.
+        assert engine.portfolio.cash == pytest.approx(100_166.10)
+
+    def test_package_waits_until_every_leg_is_priceable(
+            self, structure_engine_factory):
+        package = ratio_call_structure()
+        prices = {
+            str(call(100.0)): 2.00,
+            (str(call(105.0)), DATES[2].strftime('%Y-%m-%d')): 0.50,
+        }
+        engine, _ = structure_engine_factory(
+            {DATES[0]: [package]}, prices)
+
+        fills = [trade for trade in engine.trades_log
+                 if trade.get('package_id') == package.intent_id]
+        assert len(fills) == 2
+        assert {trade['date'] for trade in fills} == {DATES[2]}
+        assert engine.portfolio.get_position(call(100.0)).quantity == -2
+        assert engine.portfolio.get_position(call(105.0)).quantity == 4
+
+    def test_insufficient_cash_rejects_entire_open_package(
+            self, structure_engine_factory):
+        package = ratio_call_structure()
+        engine, _ = structure_engine_factory(
+            {DATES[0]: [package]},
+            {str(call(100.0)): 2.00, str(call(105.0)): 0.50},
+            initial_capital=500.0)
+
+        assert engine.portfolio.positions == {}
+        assert engine.portfolio.cash == 500.0
+        assert not [trade for trade in engine.trades_log
+                    if trade.get('package_id') == package.intent_id]
+
+    def test_ratio_package_closes_every_leg_atomically(
+            self, structure_engine_factory):
+        opening = ratio_call_structure()
+        closing = ratio_call_structure(closing=True)
+        prices = {
+            (str(call(100.0)), DATES[1].strftime('%Y-%m-%d')): 2.00,
+            (str(call(105.0)), DATES[1].strftime('%Y-%m-%d')): 0.50,
+            (str(call(100.0)), DATES[3].strftime('%Y-%m-%d')): 1.00,
+            (str(call(105.0)), DATES[3].strftime('%Y-%m-%d')): 0.20,
+        }
+        engine, _ = structure_engine_factory(
+            {DATES[0]: [opening], DATES[2]: [closing]}, prices)
+
+        assert engine.portfolio.positions == {}
+        close_trades = [trade for trade in engine.trades_log
+                        if trade.get('package_id') == closing.intent_id]
+        assert [trade['action'] for trade in close_trades] == [
+            'BUY_CLOSE', 'SELL_CLOSE']
+        assert [trade['quantity'] for trade in close_trades] == [2, 4]
+        assert [trade['price'] for trade in close_trades] == pytest.approx([
+            1.05, 0.15])
+        assert len(engine.portfolio.closed_trades) == 2
+        # Open +166.10; close costs 211.30 and receives 57.40.
+        assert engine.portfolio.cash == pytest.approx(100_012.20)
+
+    def test_invalid_ratio_close_leaves_every_open_leg_untouched(
+            self, structure_engine_factory):
+        opening = ratio_call_structure()
+        invalid_close = ratio_call_structure(closing=True, long_ratio=3)
+        prices = {
+            (str(call(100.0)), DATES[1].strftime('%Y-%m-%d')): 2.00,
+            (str(call(105.0)), DATES[1].strftime('%Y-%m-%d')): 0.50,
+            (str(call(100.0)), DATES[3].strftime('%Y-%m-%d')): 1.00,
+            (str(call(105.0)), DATES[3].strftime('%Y-%m-%d')): 0.20,
+        }
+        engine, _ = structure_engine_factory(
+            {DATES[0]: [opening], DATES[2]: [invalid_close]}, prices)
+
+        assert engine.portfolio.get_position(call(100.0)).quantity == -2
+        assert engine.portfolio.get_position(call(105.0)).quantity == 4
+        assert engine.portfolio.closed_trades == []
+        assert not [trade for trade in engine.trades_log
+                    if trade.get('package_id') == invalid_close.intent_id]
+
+    def test_risk_reducing_close_executes_even_when_cash_turns_negative(
+            self, structure_engine_factory):
+        closing = ratio_call_structure(closing=True)
+        seeded = (
+            Position(call(100.0), -2, 1.95, 1.95, DATES[0]),
+            Position(call(105.0), 4, 0.55, 0.55, DATES[0]),
+        )
+        prices = {
+            (str(call(100.0)), DATES[1].strftime('%Y-%m-%d')): 1.00,
+            (str(call(105.0)), DATES[1].strftime('%Y-%m-%d')): 0.20,
+        }
+        engine, _ = structure_engine_factory(
+            {DATES[0]: [closing]}, prices, initial_capital=10.0,
+            seed_positions=seeded)
+
+        assert engine.portfolio.positions == {}
+        assert len(engine.portfolio.closed_trades) == 2
+        assert engine.portfolio.cash == pytest.approx(-143.90)
+        assert len([trade for trade in engine.trades_log
+                    if trade.get('package_id') == closing.intent_id]) == 2
+
+    def test_final_day_package_is_reported_as_one_pending_signal(
+            self, structure_engine_factory):
+        package = ratio_call_structure()
+        engine, report = structure_engine_factory(
+            {DATES[-1]: [package]}, {})
+
+        assert len(engine.pending_structures) == 1
+        assert report['pending_signals'] == [{
+            'symbol': 'UND',
+            'signal': 'STRUCTURE_OPEN',
+            'signal_date': DATES[-1],
+            'intent_id': package.intent_id,
+        }]
 
 
 class TestOptionFillArithmetic:

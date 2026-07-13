@@ -163,6 +163,8 @@ class MarketHours:
             return False
         open_dt = self.session_open(local.date())
         close_dt = self.session_close(local.date())
+        # is_trading_day() above guarantees both session boundaries exist.
+        assert open_dt is not None and close_dt is not None
         return open_dt <= local < close_dt
 
     def next_market_open(self, dt: datetime) -> datetime:

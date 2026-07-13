@@ -68,7 +68,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date as date_type
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypedDict, cast
 
 import numpy as np
 import pandas as pd
@@ -99,6 +99,22 @@ RECONCILE_GRACE_DAYS = 2
 #: `_mr_zscore_cached` refusal sentinel: fall through to the verbatim
 #: pandas path (distinct from None, which is a real "no z" answer).
 _MR_REFUSE = object()
+
+
+class _RegimePrediction(TypedDict):
+    state: str
+    probs: Dict[str, float]
+
+
+class _PairQuote(TypedDict):
+    a: str
+    b: str
+    beta: float
+    z: float
+
+
+class _PairsPrediction(TypedDict):
+    pairs: List[_PairQuote]
 
 
 @dataclass
@@ -240,7 +256,7 @@ class RenaissanceDesk(Desk):
         # --- Desk state -------------------------------------------------
         #: C5 series: {'date','state','probs'} per day with a fitted model.
         self._regime_series: List[Dict] = []
-        self._current_regime: Optional[Dict] = None
+        self._current_regime: Optional[_RegimePrediction] = None
         #: asset -> {'book','direction','entry_day','pair_key'(pairs only)}
         self._book_positions: Dict[Asset, Dict] = {}
         #: symbol -> book that last emitted an entry intent for it; scopes
@@ -407,16 +423,17 @@ class RenaissanceDesk(Desk):
     def _update_regime(self, all_data: Dict[str, pd.DataFrame], date) -> None:
         """Refresh the regime posterior; record the C5 series entry and
         note state transitions with probabilities."""
-        result = self._regime_controller.predict(all_data, date)
-        if result is None:  # regime model never fitted yet
+        raw_result = self._regime_controller.predict(all_data, date)
+        if raw_result is None:  # regime model never fitted yet
             return
-        if not result:
+        if not raw_result:
             # The controller has fitted but the model has nothing to say
             # ({}: degenerate fit / insufficient features). Fail SAFE to
             # no-regime — the mean-reversion book must go dark rather
             # than keep trading a stale regime estimate.
             self._current_regime = None
             return
+        result = cast(_RegimePrediction, raw_result)
         previous = (self._current_regime['state']
                     if self._current_regime else None)
         state = result['state']
@@ -992,14 +1009,17 @@ class RenaissanceDesk(Desk):
                 book='pairs', pair=f"{pair_key[0]}/{pair_key[1]}",
                 closed_legs=closed)
 
-        prediction = self._pairs_controller.predict(all_data, date)
-        if prediction is None:  # model never fitted: nothing else to do
+        raw_prediction = self._pairs_controller.predict(all_data, date)
+        if raw_prediction is None:  # model never fitted: nothing else to do
             return intents
-        priced = {(p['a'], p['b']): p for p in prediction.get('pairs', [])}
+        prediction = cast(_PairsPrediction, raw_prediction)
+        pair_quotes = prediction.get('pairs', [])
+        priced = {(p['a'], p['b']): p for p in pair_quotes}
 
         # ---- Exits: |z| < exit threshold, or vanished at refit ---------
-        model_pairs = {(p['a'], p['b'])
-                       for p in self._pairs_controller.model.pairs}
+        pairs_model = cast(PairsCointegrationModel,
+                           self._pairs_controller.model)
+        model_pairs = {(p['a'], p['b']) for p in pairs_model.pairs}
         for pair_key in sorted(self._open_pairs):
             info = self._open_pairs[pair_key]
             pair_label = f"{pair_key[0]}/{pair_key[1]}"
@@ -1030,7 +1050,7 @@ class RenaissanceDesk(Desk):
         # ---- Entries: |z| > entry threshold ----------------------------
         if weight <= 0:
             return intents
-        for quote in prediction.get('pairs', []):
+        for quote in pair_quotes:
             pair_key = (quote['a'], quote['b'])
             if pair_key in self._open_pairs:
                 continue

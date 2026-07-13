@@ -160,3 +160,190 @@ class TestKillSwitch:
         engaged_rows = audit.entries(event_type="kill_switch_engaged",
                                      limit=50)
         assert len(engaged_rows) == 1  # one winner, one audit row
+
+    def test_audit_failure_rolls_back_state_and_partial_audit(self, db_path):
+        """A failure after the audit insert still rolls back both writes."""
+        class FailingAudit(AuditLog):
+            def _append_in_transaction(self, conn, actor, event_type,
+                                       payload, timestamp=None):
+                super()._append_in_transaction(
+                    conn, actor, event_type, payload, timestamp=timestamp)
+                raise RuntimeError("injected audit failure")
+
+        audit = FailingAudit(db_path, env="sandbox")
+        switch = KillSwitch(db_path, audit=audit)
+
+        with pytest.raises(RuntimeError, match="injected audit failure"):
+            switch.engage("must roll back", actor="ops")
+
+        assert switch.engaged() is False
+        assert audit.entries(limit=10) == []
+        assert audit.verify_chain() == {"ok": True, "first_bad_seq": None}
+
+    def test_disengage_audit_failure_leaves_switch_engaged(self, db_path):
+        audit = AuditLog(db_path, env="sandbox")
+        switch = KillSwitch(db_path, audit=audit)
+        switch.engage("existing halt", actor="ops")
+
+        original_append = audit._append_in_transaction
+
+        def fail_after_insert(conn, actor, event_type, payload,
+                              timestamp=None):
+            original_append(
+                conn, actor, event_type, payload, timestamp=timestamp)
+            raise RuntimeError("injected audit failure")
+
+        audit._append_in_transaction = fail_after_insert
+        with pytest.raises(RuntimeError, match="injected audit failure"):
+            switch.disengage(actor="ops")
+
+        assert switch.engaged() is True
+        assert [entry["event_type"] for entry in audit.entries()] == [
+            "kill_switch_engaged"]
+        assert audit.verify_chain() == {"ok": True, "first_bad_seq": None}
+
+    def test_rejects_audit_log_on_different_database(self, db_path, tmp_path):
+        other_audit = AuditLog(str(tmp_path / "other.db"))
+        with pytest.raises(ValueError, match="same database"):
+            KillSwitch(db_path, audit=other_audit)
+
+    @pytest.mark.parametrize("unsupported_path", [
+        ":memory:",
+        "file:shared?mode=memory&cache=shared",
+    ])
+    def test_rejects_non_filesystem_database(self, unsupported_path):
+        with pytest.raises(ValueError, match="filesystem-backed"):
+            KillSwitch(unsupported_path)
+
+    def test_flip_state_and_audit_share_one_timestamp(self, db_path):
+        audit = AuditLog(db_path, env="sandbox")
+        switch = KillSwitch(db_path, audit=audit)
+
+        switch.engage("timestamp invariant", actor="ops")
+
+        event = audit.entries(event_type="kill_switch_engaged")[0]
+        assert switch.state()["flipped_at"] == event["ts"]
+
+    def test_noop_flip_does_not_call_audit_clock(self, db_path):
+        clock_calls = 0
+
+        def clock():
+            nonlocal clock_calls
+            clock_calls += 1
+            from datetime import datetime, timezone
+            return datetime.now(timezone.utc)
+
+        audit = AuditLog(db_path, env="sandbox", clock=clock)
+        switch = KillSwitch(db_path, audit=audit)
+        switch.disengage(actor="ops")
+        assert clock_calls == 0
+
+        switch.engage("first", actor="ops")
+        assert clock_calls == 1
+        switch.engage("no-op", actor="ops")
+        assert clock_calls == 1
+
+    def test_database_trigger_audit_failure_rolls_back_state(self, db_path):
+        audit = AuditLog(db_path, env="sandbox")
+        switch = KillSwitch(db_path, audit=audit)
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TRIGGER reject_audit_insert
+            BEFORE INSERT ON audit_log
+            BEGIN
+                SELECT RAISE(ABORT, 'injected audit trigger failure');
+            END
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(sqlite3.IntegrityError,
+                           match="injected audit trigger failure"):
+            switch.engage("must roll back", actor="ops")
+
+        assert switch.engaged() is False
+        assert audit.entries(limit=10) == []
+
+    def test_actor_and_event_are_hashed_as_stored_text(self, db_path):
+        audit = AuditLog(db_path, env=789)
+        audit.append(123, 456, {})
+        event = audit.entries()[0]
+        assert event["env"] == "789"
+        assert event["actor"] == "123"
+        assert event["event_type"] == "456"
+        assert audit.verify_chain() == {"ok": True, "first_bad_seq": None}
+
+    def test_mixed_concurrent_flips_keep_state_and_chain_consistent(
+            self, db_path):
+        audit = AuditLog(db_path, env="sandbox")
+        switch = KillSwitch(db_path, audit=audit)
+        n_threads = 10
+        n_flips = 20
+        barrier = threading.Barrier(n_threads)
+        errors: list = []
+
+        def worker(index):
+            try:
+                barrier.wait()
+                for iteration in range(n_flips):
+                    if (index + iteration) % 2:
+                        switch.engage(
+                            f"race-{index}-{iteration}",
+                            actor=f"worker-{index}")
+                    else:
+                        switch.disengage(actor=f"worker-{index}")
+            except Exception as exc:  # noqa: BLE001 - surfaced via assert
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(n_threads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert audit.verify_chain() == {"ok": True, "first_bad_seq": None}
+        events = [entry["event_type"]
+                  for entry in audit.entries(limit=1000, ascending=True)]
+        assert events
+        assert all(previous != current
+                   for previous, current in zip(events, events[1:]))
+        expected_engaged = events[-1] == "kill_switch_engaged"
+        assert switch.engaged() is expected_engaged
+
+    def test_concurrent_external_appends_and_flips_keep_chain_valid(
+            self, db_path):
+        audit = AuditLog(db_path, env="sandbox")
+        switch = KillSwitch(db_path, audit=audit)
+        n_threads = 8
+        barrier = threading.Barrier(n_threads)
+        errors: list = []
+
+        def worker(index):
+            try:
+                barrier.wait()
+                for iteration in range(12):
+                    if index % 2:
+                        audit.append(
+                            f"auditor-{index}", "heartbeat",
+                            {"iteration": iteration})
+                    elif (index + iteration) % 4:
+                        switch.engage(
+                            f"race-{index}-{iteration}",
+                            actor=f"worker-{index}")
+                    else:
+                        switch.disengage(actor=f"worker-{index}")
+            except Exception as exc:  # noqa: BLE001 - surfaced via assert
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(n_threads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert len(audit.entries(event_type="heartbeat", limit=1000)) == 48
+        assert audit.verify_chain() == {"ok": True, "first_bad_seq": None}

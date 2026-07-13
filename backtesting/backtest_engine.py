@@ -63,19 +63,40 @@ from __future__ import annotations
 
 import logging
 import math
+from copy import deepcopy
+from datetime import timezone
 
 import pandas as pd
 import numpy as np
 import threading
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from core.models import Asset, AssetType, Position
-from desks.base import Desk
+from desks.base import Desk, DeskIntent
 from desks.features import enrich_extended
 from portfolio.manager import PortfolioManager
+from portfolio.mechanics import (
+    AccountMode,
+    AuthorizationDecision,
+    ExposureKind,
+    ExposureRequest,
+    PortfolioMechanics,
+    ShortStockExposure,
+)
+from portfolio.option_lifecycle import (
+    OptionLifecycleEvent,
+    OptionLifecyclePolicy,
+)
+from portfolio.structures import StructureIntent
+from portfolio.targets import (PortfolioSnapshot, build_order_deltas,
+                               filled_quantities_from_portfolio)
 from data.market_data import MarketDataHandler
 from strategies.base import Strategy
-from analysis.research_stats import (benjamini_hochberg, bonferroni_alpha,
-                                     fold_oos_pvalue, fold_oos_tstat)
+from backtesting.reporting import (
+    BacktestReportState,
+    build_benchmark,
+    compute_oos_folds,
+    generate_report,
+)
 
 if TYPE_CHECKING:  # annotation only — avoids any import-order coupling
     from desks.orchestrator import FundOrchestrator
@@ -121,7 +142,11 @@ class BacktestEngine:
                  participation_cap: float = 0.1,
                  adv_window: int = 20,
                  market_data: Optional[MarketDataHandler] = None,
-                 cash_yield=None):
+                 cash_yield=None,
+                 portfolio_mechanics: Optional[PortfolioMechanics] = None,
+                 option_lifecycle_policy: Optional[
+                     OptionLifecyclePolicy] = None,
+                 dividend_fn=None):
         if sum(driver is not None
                for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
@@ -184,6 +209,22 @@ class BacktestEngine:
             series = cash_yield
             cash_yield = lambda date: rate_asof(series, date)  # noqa: E731
         self.cash_yield = cash_yield
+        if (portfolio_mechanics is not None
+                and not isinstance(portfolio_mechanics, PortfolioMechanics)):
+            raise ValueError(
+                "portfolio_mechanics must be a PortfolioMechanics or None")
+        if (option_lifecycle_policy is not None
+                and not isinstance(option_lifecycle_policy,
+                                   OptionLifecyclePolicy)):
+            raise ValueError(
+                "option_lifecycle_policy must be an OptionLifecyclePolicy "
+                "or None")
+        if dividend_fn is not None and not callable(dividend_fn):
+            raise ValueError("dividend_fn must be callable or None")
+        self.portfolio_mechanics = portfolio_mechanics
+        self.option_lifecycle_policy = option_lifecycle_policy
+        self.dividend_fn = dividend_fn
+        self.mechanics_log: List[Dict] = []
         # Injectable price source. Default = live MarketDataHandler (OpenBB).
         # Pass a WarehouseMarketData to run a SURVIVORSHIP-FREE backtest that can
         # hold delisted names (the live feed silently drops them).
@@ -197,6 +238,13 @@ class BacktestEngine:
         # (fraction of the DESK'S capital). A new intent for an asset
         # replaces an older pending one.
         self.pending_intents: Dict[Asset, Dict] = {}
+        # Optional structure-native path. One entry is one indivisible package;
+        # legacy per-asset pending intents remain in the historical mapping
+        # above and never pass through this surface.
+        self.pending_structures: Dict[str, Dict] = {}
+        # Monotonic generation for opt-in target-native desk snapshots.  The
+        # legacy intent path never reads or mutates it.
+        self._target_snapshot_version = 0
 
     @property
     def _desk_mode(self) -> bool:
@@ -305,6 +353,8 @@ class BacktestEngine:
         sorted_dates = sorted(all_dates)
 
         self.pending_intents = {}
+        self.pending_structures = {}
+        self._target_snapshot_version = 0
 
         # Simulate sequential historical trading day by day
         total_days = len(sorted_dates)
@@ -314,6 +364,7 @@ class BacktestEngine:
                 self._settle_expired_options(all_data, date)
 
             # --- PHASE 1: FILL PENDING INTENTS AT TODAY'S OPEN ---
+            self._fill_pending_structures(all_data, date)
             self._fill_pending_intents(all_data, date, position_size)
 
             # --- PHASE 2: MARK POSITIONS TO TODAY'S CLOSE ---
@@ -341,6 +392,8 @@ class BacktestEngine:
                         existing_pos.current_price = close
             if self._desk_mode:
                 self._mark_option_positions(all_data, date)
+                if self.option_lifecycle_policy is not None:
+                    self._process_early_option_lifecycle(all_data, date)
 
             # A warehouse-held delisted stock must not remain at its final mark
             # forever.  Liquidate it at the final observable close (including
@@ -377,6 +430,8 @@ class BacktestEngine:
             # every gate metric downstream of it) includes the interest. ---
             if self.cash_yield is not None:
                 self._accrue_cash_yield(date)
+            if self.portfolio_mechanics is not None:
+                self._accrue_financing(date)
 
             # --- PHASE 4: RECORD SNAPSHOT ---
             self.portfolio.record_snapshot(date)
@@ -439,6 +494,22 @@ class BacktestEngine:
                     "close; writing the position down at 0.0",
                     asset.symbol, date)
 
+            payout_source = 'final_tradable_close'
+            quality_flags = ['delisting_terms_unavailable']
+            payout_reader = getattr(self.market_data, 'delisting_payout', None)
+            if callable(payout_reader):
+                payout = payout_reader(asset.symbol, exit_price)
+                if not isinstance(payout, dict):
+                    raise ValueError(
+                        "delisting_payout must return a mapping")
+                modeled_price = float(payout.get('price'))
+                if not math.isfinite(modeled_price) or modeled_price < 0:
+                    raise ValueError(
+                        f"invalid delisting payout for {asset.symbol}")
+                exit_price = modeled_price
+                payout_source = str(payout.get('source') or 'unknown')
+                quality_flags = list(payout.get('quality_flags') or [])
+
             quantity = position.quantity
             commission = abs(quantity) * exit_price * self.commission
             if quantity > 0:
@@ -467,6 +538,8 @@ class BacktestEngine:
                 'commission': commission,
                 flow_key: cash_flow,
                 'reason': 'delisting liquidation',
+                'payout_source': payout_source,
+                'data_quality_flags': quality_flags,
             })
             logger.info(
                 "Delisting liquidation: %s %d %s @ %.4f on %s",
@@ -485,6 +558,146 @@ class BacktestEngine:
         if self.portfolio.cash > 0:
             self.portfolio.cash += (self.portfolio.cash
                                     * self.cash_yield(date) / 252.0)
+
+    def _mechanics_buying_power(self) -> float:
+        """Available initial buying power under the opt-in account policy."""
+        mechanics = self.portfolio_mechanics
+        if mechanics is None:
+            return max(0.0, self.portfolio.cash)
+        if mechanics.margin_policy.mode is AccountMode.CASH:
+            return max(0.0, self.portfolio.cash)
+        requirement = 0.0
+        for position in self.portfolio.positions.values():
+            quantity = abs(int(position.quantity))
+            if quantity == 0:
+                continue
+            if position.asset.asset_type is AssetType.STOCK:
+                kind = (ExposureKind.LONG_STOCK if position.quantity > 0
+                        else ExposureKind.SHORT_STOCK)
+                multiplier = 1
+            elif position.quantity > 0:
+                kind = ExposureKind.LONG_OPTION
+                multiplier = position.asset.multiplier
+            else:
+                # Naked short options are prohibited on the mechanics path;
+                # conservatively hold their full marked notional if a caller
+                # injects an existing one.
+                requirement += (
+                    quantity * max(0.0, position.current_price)
+                    * position.asset.multiplier)
+                continue
+            if position.current_price <= 0:
+                continue
+            request = ExposureRequest(
+                request_id=f"held:{position.asset}",
+                symbol=position.asset.symbol,
+                kind=kind,
+                quantity=quantity,
+                unit_price=float(position.current_price),
+                contract_multiplier=multiplier,
+            )
+            requirement += mechanics.requirements(request).initial_requirement
+        return max(
+            0.0, self.portfolio.get_portfolio_value() - requirement)
+
+    def _record_authorization(self, authorization, date) -> None:
+        borrow = authorization.borrow
+        self.mechanics_log.append({
+            'date': pd.Timestamp(date),
+            'event': 'pretrade_authorization',
+            'request_id': authorization.request.request_id,
+            'symbol': authorization.request.symbol,
+            'kind': authorization.request.kind.value,
+            'quantity': authorization.request.quantity,
+            'exposure_value': authorization.requirement.exposure_value,
+            'initial_requirement': (
+                authorization.requirement.initial_requirement),
+            'maintenance_requirement': (
+                authorization.requirement.maintenance_requirement),
+            'available_buying_power': authorization.available_buying_power,
+            'approved': authorization.approved,
+            'decision': authorization.decision.value,
+            'reason': authorization.reason,
+            'borrow_rate': (borrow.quote.annual_fee_rate
+                            if borrow is not None and borrow.quote is not None
+                            else None),
+        })
+
+    def _authorize_exposure(
+            self, *, request_id: str, symbol: str, kind: ExposureKind,
+            quantity: int, date, unit_price: Optional[float] = None,
+            contract_multiplier: Optional[int] = None,
+            max_loss_per_package: Optional[float] = None) -> bool:
+        mechanics = self.portfolio_mechanics
+        if mechanics is None:
+            return True
+        request = ExposureRequest(
+            request_id=request_id,
+            symbol=symbol,
+            kind=kind,
+            quantity=int(quantity),
+            unit_price=unit_price,
+            contract_multiplier=contract_multiplier,
+            max_loss_per_package=max_loss_per_package,
+        )
+        already_borrowed = sum(
+            abs(int(position.quantity))
+            for asset, position in self.portfolio.positions.items()
+            if (asset.asset_type is AssetType.STOCK
+                and asset.symbol == symbol and position.quantity < 0)
+        )
+        authorization = mechanics.authorize(
+            request,
+            self._mechanics_buying_power(),
+            as_of=pd.Timestamp(date).date(),
+            already_borrowed_quantity=already_borrowed,
+        )
+        self._record_authorization(authorization, date)
+        return authorization.approved
+
+    def _block_naked_option_short(self, asset: Asset, quantity: int,
+                                  date) -> bool:
+        if self.portfolio_mechanics is None:
+            return False
+        self.mechanics_log.append({
+            'date': pd.Timestamp(date),
+            'event': 'pretrade_authorization',
+            'request_id': f"{pd.Timestamp(date).date()}:{asset}:SHORT",
+            'symbol': asset.symbol,
+            'kind': 'SHORT_OPTION',
+            'quantity': int(quantity),
+            'approved': False,
+            'decision': AuthorizationDecision.ACCOUNT_MODE_PROHIBITED.value,
+            'reason': ('naked short options require an atomic defined-risk '
+                       'package under portfolio mechanics'),
+        })
+        return True
+
+    def _accrue_financing(self, date) -> None:
+        mechanics = self.portfolio_mechanics
+        if mechanics is None:
+            return
+        shorts = [
+            ShortStockExposure(
+                asset.symbol, abs(int(position.quantity)),
+                float(position.current_price))
+            for asset, position in self.portfolio.positions.items()
+            if (asset.asset_type is AssetType.STOCK
+                and position.quantity < 0 and position.current_price > 0)
+        ]
+        accrual = mechanics.accrue(
+            pd.Timestamp(date).date(), self.portfolio.cash, shorts)
+        self.portfolio.cash += accrual.cash_delta
+        self.mechanics_log.append({
+            'date': pd.Timestamp(date),
+            'event': 'financing_accrual',
+            'debit_principal': accrual.debit_principal,
+            'debit_interest': accrual.debit_interest,
+            'borrow_fees': sum(item.fee for item in accrual.borrow_fees),
+            'total_charge': accrual.total_charge,
+            'cash_delta': accrual.cash_delta,
+            'compliance_flags': list(accrual.compliance_flags),
+        })
 
     def _enriched_through(self, symbol: str, date) -> pd.DataFrame:
         """Slice the precomputed indicator frame through `date` (inclusive).
@@ -510,7 +723,10 @@ class BacktestEngine:
         Approved intents are queued as pending fills for the next bar's
         open; BUY records carry the intent's size_fraction.
         """
-        self.desk.set_clock(date)
+        desk = self.desk
+        if desk is None:
+            raise RuntimeError("Desk intent queue requires desk mode")
+        desk.set_clock(date)
 
         enriched: Dict[str, pd.DataFrame] = {}
         for symbol in all_data:
@@ -523,8 +739,15 @@ class BacktestEngine:
         if not enriched:
             return
 
-        intents = self.desk.generate_intents(enriched, date, self.portfolio)
-        approved = self.desk.apply_risk(intents, self.portfolio, enriched, date)
+        if getattr(desk, 'target_native_enabled', False):
+            self._queue_desk_structures(enriched, date)
+            self._queue_desk_targets(enriched, date)
+            return
+
+        self._queue_desk_structures(enriched, date)
+
+        intents = desk.generate_intents(enriched, date, self.portfolio)
+        approved = desk.apply_risk(intents, self.portfolio, enriched, date)
 
         for intent in approved:
             # A new intent for an asset replaces an older pending one.
@@ -537,6 +760,169 @@ class BacktestEngine:
                 # to size_fraction dollar sizing at fill time.
                 'quantity': intent.quantity,
             })
+
+    def _queue_desk_structures(
+            self, enriched: Dict[str, pd.DataFrame], date) -> None:
+        """Queue each optional canonical structure as one pending object.
+
+        Desks without ``generate_structure_intents`` do no additional work,
+        preserving the legacy per-leg path exactly. Re-emitting the same
+        stable intent while it waits for prices preserves its waiting state.
+        """
+        desk = self.desk
+        if desk is None:
+            raise RuntimeError("Structure intent queue requires desk mode")
+        generate = getattr(desk, 'generate_structure_intents', None)
+        if not callable(generate):
+            return
+        structures = generate(enriched, date, self.portfolio)
+        if structures is None:
+            return
+        for structure in structures:
+            if not isinstance(structure, StructureIntent):
+                logger.warning(
+                    "Dropping invalid atomic structure from %s on %s: %r",
+                    desk.key, date, structure)
+                continue
+            intent_id = str(structure.intent_id)
+            existing = self.pending_structures.get(intent_id)
+            if existing is not None:
+                if existing['structure'] != structure:
+                    raise ValueError(
+                        f"structure intent id collision for {intent_id}")
+                continue
+            self.pending_structures[intent_id] = {
+                'structure': structure,
+                'signal_date': date,
+                'days_waiting': 0,
+            }
+
+    def _pending_target_deltas(self) -> Dict[Asset, int]:
+        """Return signed, still-working units from simulated pending orders.
+
+        Target-native orders always carry an exact ``quantity``.  A legacy
+        close can still be represented if a caller enables the target path
+        mid-run; value-sized legacy opens fail closed because their remaining
+        native quantity is unknowable before a fill price exists.
+        """
+        reserved: Dict[Asset, int] = {}
+        signs = {'BUY': 1, 'COVER': 1, 'SELL': -1, 'SHORT': -1}
+        for asset, intent in self.pending_intents.items():
+            signal = intent.get('signal')
+            if signal not in signs:
+                raise ValueError(f"Unsupported pending signal {signal!r}")
+            quantity = intent.get('quantity')
+            if quantity is None:
+                position = self.portfolio.get_position(asset)
+                if signal == 'SELL' and position and position.quantity > 0:
+                    quantity = position.quantity
+                elif signal == 'COVER' and position and position.quantity < 0:
+                    quantity = abs(position.quantity)
+                else:
+                    raise ValueError(
+                        f"Pending {signal} for {asset} has no exact quantity")
+            signed = signs[signal] * int(quantity)
+            reserved[asset] = reserved.get(asset, 0) + signed
+        return reserved
+
+    def _target_snapshot(self, date) -> PortfolioSnapshot:
+        """Build the target contract's filled-plus-working book snapshot."""
+        self._target_snapshot_version += 1
+        timestamp = pd.Timestamp(date)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize(timezone.utc)
+        else:
+            timestamp = timestamp.tz_convert(timezone.utc)
+        return PortfolioSnapshot(
+            filled_quantities=filled_quantities_from_portfolio(self.portfolio),
+            reserved_deltas=self._pending_target_deltas(),
+            version=self._target_snapshot_version,
+            as_of=timestamp.to_pydatetime(),
+        )
+
+    @staticmethod
+    def _intent_action_for_delta(delta) -> str:
+        """Map a signed target delta onto the legacy four-action vocabulary."""
+        if delta.signed_quantity > 0:
+            return 'COVER' if delta.effective_quantity < 0 else 'BUY'
+        return 'SELL' if delta.effective_quantity > 0 else 'SHORT'
+
+    def _queue_desk_targets(self, enriched: Dict[str, pd.DataFrame], date) -> None:
+        """Opt-in target-native desk path with pending-order idempotency.
+
+        The first diff validates/coalesces the target set.  When a changed
+        target supersedes an existing simulated order, that order is canceled
+        before a fresh snapshot and final diff.  This is essential for a zero
+        target: diffing zero against an unfilled BUY reservation must cancel
+        the BUY, not manufacture a SELL against shares never owned.
+        """
+        desk = self.desk
+        if desk is None:
+            raise RuntimeError("Target-native queueing requires desk mode")
+        generate_targets = getattr(desk, 'generate_targets', None)
+        if not callable(generate_targets):
+            raise RuntimeError(
+                "target_native_enabled requires a callable generate_targets")
+
+        snapshot = self._target_snapshot(date)
+        targets = tuple(generate_targets(
+            enriched, date, self.portfolio, snapshot))
+
+        # Validate the complete target set before mutating pending state.
+        build_order_deltas(targets, snapshot)
+        by_asset = {target.asset: target for target in targets}
+        canceled = False
+        for asset in list(self.pending_intents):
+            target = by_asset.get(asset)
+            if (target is not None
+                    and target.target_quantity != snapshot.effective_quantity(asset)):
+                logger.info(
+                    "Canceling simulated pending %s for %s: target changed to %d",
+                    self.pending_intents[asset].get('signal'), str(asset),
+                    target.target_quantity)
+                del self.pending_intents[asset]
+                canceled = True
+
+        if canceled:
+            snapshot = self._target_snapshot(date)
+        deltas = build_order_deltas(targets, snapshot)
+
+        intents: List[DeskIntent] = []
+        intent_ids: Dict[Asset, str] = {}
+        for delta in deltas:
+            size_fraction = delta.metadata.get('size_fraction')
+            if size_fraction is None:
+                raise ValueError(
+                    f"Target for {delta.asset} must provide metadata.size_fraction")
+            intent = DeskIntent(
+                asset=delta.asset,
+                action=self._intent_action_for_delta(delta),
+                size_fraction=float(size_fraction),
+                reason=(delta.reason
+                        or f"target position {delta.target_quantity}"),
+                quantity=delta.quantity,
+                intent_id=delta.intent_id,
+            )
+            intents.append(intent)
+            intent_ids[delta.asset] = delta.intent_id
+
+        approved = desk.apply_risk(
+            intents, self.portfolio, enriched, date)
+        for intent in approved:
+            pending = {
+                'signal': intent.action,
+                'signal_date': date,
+                'days_waiting': 0,
+                'size_fraction': intent.size_fraction,
+                'quantity': intent.quantity,
+                'target_native': True,
+            }
+            intent_id = getattr(intent, 'intent_id', None)
+            if intent_id is None:
+                intent_id = intent_ids.get(intent.asset)
+            if intent_id is not None:
+                pending['intent_id'] = intent_id
+            self._queue_pending_intent(intent.asset, pending)
 
     def _run_orchestrator_step(self, all_data: Dict[str, pd.DataFrame],
                                date) -> None:
@@ -654,6 +1040,225 @@ class BacktestEngine:
                 prior.get('quantity'), asset.symbol, intent.get('signal'))
         self.pending_intents[asset] = intent
 
+    def _structure_model_prices(
+            self, structure: StructureIntent,
+            all_data: Dict[str, pd.DataFrame], date
+            ) -> Optional[Dict[Asset, float]]:
+        """Return all causal leg marks, or ``None`` until all are priceable."""
+        symbol = structure.legs[0].asset.symbol
+        data = all_data.get(symbol)
+        if data is None or date not in data.index:
+            return None
+        row = data.loc[date]
+        spot = row.get('open', float('nan'))
+        if pd.isna(spot):
+            spot = row.get('close', float('nan'))
+        if pd.isna(spot) or not math.isfinite(float(spot)) or float(spot) <= 0:
+            return None
+        history = data[data.index <= date]
+        prices: Dict[Asset, float] = {}
+        for leg in structure.legs:
+            try:
+                model_price = self._price_option(
+                    leg.asset, history, date, spot=float(spot))
+            except Exception as exc:  # noqa: BLE001 - whole package waits
+                logger.warning(
+                    "Atomic structure %s leg %s is not priceable on %s: %s",
+                    structure.intent_id, str(leg.asset), date, exc)
+                return None
+            if model_price is None or not math.isfinite(float(model_price)):
+                return None
+            price = float(model_price)
+            if price < 0:
+                raise ValueError(
+                    f"negative model price for structure leg {leg.asset}")
+            prices[leg.asset] = price
+        return prices
+
+    def _structure_fill_plan(
+            self, structure: StructureIntent,
+            model_prices: Dict[Asset, float], fill_date=None
+            ) -> tuple[List[Dict], float]:
+        """Preflight every leg and return mutations plus aggregate cash delta."""
+        assets = [leg.asset for leg in structure.legs]
+        if len(set(assets)) != len(assets):
+            raise ValueError("atomic structures require unique leg assets")
+
+        plans: List[Dict] = []
+        cash_delta = 0.0
+        total_commission = 0.0
+        for leg in structure.legs:
+            contracts = structure.quantity * leg.ratio
+            buying = leg.action.sign > 0
+            fill_price = self._option_traded_price(
+                model_prices[leg.asset], buying=buying)
+            if not math.isfinite(fill_price) or fill_price <= 0:
+                raise ValueError(
+                    f"non-positive executable price for {leg.asset}")
+            commission = contracts * self.per_contract_commission
+            notional = contracts * fill_price * leg.asset.multiplier
+            leg_cash_delta = (-notional if buying else notional) - commission
+            existing = self.portfolio.get_position(leg.asset)
+
+            if structure.opening:
+                signed_quantity = leg.action.sign * contracts
+                if (existing is not None and existing.quantity != 0
+                        and ((existing.quantity > 0)
+                             != (signed_quantity > 0))):
+                    raise ValueError(
+                        f"opening package conflicts with {leg.asset} position")
+                close_quantity = None
+            else:
+                expected_position_sign = -leg.action.sign
+                if (existing is None or existing.quantity == 0
+                        or (1 if existing.quantity > 0 else -1)
+                        != expected_position_sign
+                        or abs(existing.quantity) < contracts):
+                    raise ValueError(
+                        f"closing package cannot close {contracts} contracts "
+                        f"of {leg.asset}")
+                signed_quantity = None
+                # PortfolioManager.close_position expects the signed quantity
+                # currently held: negative for covering a short, positive for
+                # selling a long.
+                close_quantity = expected_position_sign * contracts
+
+            plans.append({
+                'leg': leg,
+                'contracts': contracts,
+                'fill_price': fill_price,
+                'model_price': model_prices[leg.asset],
+                'commission': commission,
+                'cash_delta': leg_cash_delta,
+                'signed_quantity': signed_quantity,
+                'close_quantity': close_quantity,
+            })
+            cash_delta += leg_cash_delta
+            total_commission += commission
+
+        if not math.isfinite(cash_delta):
+            raise ValueError("atomic structure cash flow is not finite")
+        if structure.opening:
+            required_cash = max(
+                float(structure.max_loss) + total_commission,
+                max(0.0, -cash_delta))
+            if self.portfolio_mechanics is not None:
+                if fill_date is None or not self._authorize_exposure(
+                        request_id=str(structure.intent_id),
+                        symbol=structure.legs[0].asset.symbol,
+                        kind=ExposureKind.DEFINED_RISK_PACKAGE,
+                        quantity=structure.quantity,
+                        date=fill_date,
+                        max_loss_per_package=(
+                            structure.max_loss / structure.quantity)):
+                    raise ValueError(
+                        "portfolio mechanics rejected atomic package")
+            elif self.portfolio.cash + 1e-9 < required_cash:
+                raise ValueError(
+                    f"insufficient cash for atomic package: required "
+                    f"{required_cash:.2f}, available {self.portfolio.cash:.2f}")
+        return plans, cash_delta
+
+    def _commit_structure_fill(
+            self, pending: Dict, plans: List[Dict], cash_delta: float,
+            fill_date) -> None:
+        """Commit positions, cash and trade records as one in-memory unit."""
+        structure: StructureIntent = pending['structure']
+        positions_before = deepcopy(self.portfolio.positions)
+        closed_before = deepcopy(self.portfolio.closed_trades)
+        realized_before = self.portfolio._realized_pnl
+        cash_before = self.portfolio.cash
+        trades_length = len(self.trades_log)
+        try:
+            self.portfolio.cash += cash_delta
+            for plan in plans:
+                leg = plan['leg']
+                existing = self.portfolio.get_position(leg.asset)
+                if structure.opening:
+                    signed_quantity = plan['signed_quantity']
+                    if existing is not None and existing.quantity != 0:
+                        self._accumulate_position(
+                            existing, signed_quantity, plan['fill_price'])
+                    else:
+                        owners = ((structure.owner,)
+                                  if structure.owner is not None else None)
+                        self.portfolio.add_position(Position(
+                            asset=leg.asset, quantity=signed_quantity,
+                            avg_entry_price=plan['fill_price'],
+                            current_price=plan['fill_price'],
+                            timestamp=fill_date, owners=owners))
+                else:
+                    assert existing is not None
+                    self.portfolio.close_position(
+                        leg.asset, plan['fill_price'], plan['close_quantity'],
+                        existing.timestamp, fill_date)
+
+                buying = leg.action.sign > 0
+                cash_amount = abs(
+                    plan['contracts'] * plan['fill_price']
+                    * leg.asset.multiplier
+                    + (plan['commission'] if buying
+                       else -plan['commission']))
+                trade = {
+                    'date': fill_date,
+                    'signal_date': pending['signal_date'],
+                    'symbol': leg.asset.symbol,
+                    'instrument': str(leg.asset),
+                    'action': leg.action.value,
+                    'quantity': plan['contracts'],
+                    'price': plan['fill_price'],
+                    'model_price': plan['model_price'],
+                    'commission': plan['commission'],
+                    'package_id': structure.intent_id,
+                    'package_quantity': structure.quantity,
+                    'ratio': leg.ratio,
+                    'reason': structure.reason,
+                }
+                trade['cost' if buying else 'proceeds'] = cash_amount
+                self.trades_log.append(trade)
+        except Exception:
+            self.portfolio.positions = positions_before
+            self.portfolio.closed_trades = closed_before
+            self.portfolio._realized_pnl = realized_before
+            self.portfolio.cash = cash_before
+            del self.trades_log[trades_length:]
+            raise
+
+    def _fill_pending_structures(
+            self, all_data: Dict[str, pd.DataFrame], date) -> None:
+        """Fill or wait each package; no leg can survive independently."""
+        for intent_id in list(self.pending_structures):
+            pending = self.pending_structures[intent_id]
+            structure: StructureIntent = pending['structure']
+            try:
+                model_prices = self._structure_model_prices(
+                    structure, all_data, date)
+                if model_prices is None:
+                    pending['days_waiting'] += 1
+                    if pending['days_waiting'] >= MAX_PENDING_DAYS:
+                        logger.warning(
+                            "Dropping atomic structure %s (signal %s): not all "
+                            "legs priceable for %d trading days",
+                            intent_id, pending['signal_date'],
+                            pending['days_waiting'])
+                        del self.pending_structures[intent_id]
+                    continue
+                plans, cash_delta = self._structure_fill_plan(
+                    structure, model_prices, date)
+                self._commit_structure_fill(
+                    pending, plans, cash_delta, date)
+                logger.info(
+                    "Filled atomic structure %s: %d packages / %d legs on %s",
+                    intent_id, structure.quantity, len(structure.legs), date)
+            except ValueError as exc:
+                # Invalid package/portfolio/cash state consumes the package as
+                # one rejected object. No mutation occurs because planning is
+                # complete before commit.
+                logger.warning(
+                    "Dropping atomic structure %s on %s: %s",
+                    intent_id, date, exc)
+            del self.pending_structures[intent_id]
+
     def _fill_pending_intents(self, all_data: Dict[str, pd.DataFrame],
                               date, position_size: float) -> None:
         """Fill intents queued on previous days at today's open price.
@@ -746,8 +1351,12 @@ class BacktestEngine:
         signal = intent['signal']
         existing_pos = self.portfolio.get_position(asset)
 
+        target_add = bool(intent.get('target_native') and existing_pos and (
+            (signal == 'BUY' and existing_pos.quantity > 0)
+            or (signal == 'SHORT' and existing_pos.quantity < 0)))
         if signal in ('BUY', 'SHORT') \
-                and (not existing_pos or existing_pos.quantity == 0):
+                and ((not existing_pos or existing_pos.quantity == 0)
+                     or target_add):
             buying = signal == 'BUY'
             fill_price = self._option_traded_price(model_price, buying=buying)
             if fill_price <= 0:
@@ -786,10 +1395,33 @@ class BacktestEngine:
                     signal, str(asset), fill_date)
                 return
 
+            if buying:
+                if not self._authorize_exposure(
+                        request_id=(f"{pd.Timestamp(fill_date).date()}:"
+                                    f"{asset}:BUY"),
+                        symbol=asset.symbol,
+                        kind=ExposureKind.LONG_OPTION,
+                        quantity=int(quantity),
+                        date=fill_date,
+                        unit_price=fill_price,
+                        contract_multiplier=asset.multiplier):
+                    logger.warning(
+                        "Dropping BUY intent for %s on %s: portfolio "
+                        "mechanics rejected exposure", str(asset), fill_date)
+                    return
+            elif self._block_naked_option_short(asset, int(quantity),
+                                                 fill_date):
+                logger.warning(
+                    "Dropping SHORT intent for %s on %s: naked options "
+                    "are prohibited by portfolio mechanics",
+                    str(asset), fill_date)
+                return
+
             commission = quantity * self.per_contract_commission
             if buying:
                 cost = quantity * fill_price * asset.multiplier + commission
-                if self.portfolio.cash < cost:
+                if (self.portfolio_mechanics is None
+                        and self.portfolio.cash < cost):
                     logger.warning(
                         "Dropping BUY intent for %s on %s: insufficient cash "
                         "(needed %.2f, available %.2f)",
@@ -806,10 +1438,14 @@ class BacktestEngine:
                 signed_quantity = -quantity
                 log_extra = {'proceeds': proceeds}
 
-            self.portfolio.add_position(Position(
-                asset=asset, quantity=signed_quantity,
-                avg_entry_price=fill_price, current_price=fill_price,
-                timestamp=fill_date, owners=intent.get('desk_keys')))
+            if target_add:
+                self._accumulate_position(
+                    existing_pos, signed_quantity, fill_price)
+            else:
+                self.portfolio.add_position(Position(
+                    asset=asset, quantity=signed_quantity,
+                    avg_entry_price=fill_price, current_price=fill_price,
+                    timestamp=fill_date, owners=intent.get('desk_keys')))
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset),
@@ -821,13 +1457,17 @@ class BacktestEngine:
 
         elif signal == 'SELL' and existing_pos and existing_pos.quantity > 0:
             fill_price = self._option_traded_price(model_price, buying=False)
-            quantity = existing_pos.quantity
+            if intent.get('target_native') and intent.get('quantity') is not None:
+                quantity = min(int(intent['quantity']), existing_pos.quantity)
+            else:
+                quantity = existing_pos.quantity
             commission = quantity * self.per_contract_commission
             proceeds = quantity * fill_price * asset.multiplier - commission
             self.portfolio.cash += proceeds
             self.portfolio.close_position(asset, fill_price, quantity,
                                           existing_pos.timestamp, fill_date)
-            self.portfolio.remove_position(asset)
+            if not intent.get('target_native'):
+                self.portfolio.remove_position(asset)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset),
@@ -839,13 +1479,17 @@ class BacktestEngine:
         elif signal == 'COVER' and existing_pos and existing_pos.quantity < 0:
             # Buy-to-close the short: debit cash; closes always execute.
             fill_price = self._option_traded_price(model_price, buying=True)
-            quantity = existing_pos.quantity  # negative
+            if intent.get('target_native') and intent.get('quantity') is not None:
+                quantity = -min(int(intent['quantity']), abs(existing_pos.quantity))
+            else:
+                quantity = existing_pos.quantity  # negative
             commission = abs(quantity) * self.per_contract_commission
             cost = abs(quantity) * fill_price * asset.multiplier + commission
             self.portfolio.cash -= cost
             self.portfolio.close_position(asset, fill_price, quantity,
                                           existing_pos.timestamp, fill_date)
-            self.portfolio.remove_position(asset)
+            if not intent.get('target_native'):
+                self.portfolio.remove_position(asset)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset),
@@ -892,12 +1536,15 @@ class BacktestEngine:
                 continue
             position = self.portfolio.positions[asset]
             intrinsic = 0.0
+            spot = 0.0
+            spot_available = False
             data = all_data.get(asset.symbol)
             if data is not None and not data.empty:
                 closes = data.loc[data.index <= pd.Timestamp(expiry),
                                   'close'].dropna()
                 if not closes.empty:
                     spot = float(closes.iloc[-1])
+                    spot_available = True
                     if asset.asset_type is AssetType.CALL:
                         intrinsic = max(0.0, spot - asset.strike_price)
                     else:
@@ -907,6 +1554,20 @@ class BacktestEngine:
                                    "close <= %s; settling at 0.0",
                                    str(asset), expiry)
             quantity = position.quantity
+            if self.option_lifecycle_policy is not None:
+                if not spot_available:
+                    raise ValueError(
+                        f"physical settlement of {asset} requires an "
+                        "underlying close on or before expiry")
+                event = self.option_lifecycle_policy.plan(
+                    asset,
+                    int(quantity),
+                    spot=spot,
+                    effective_date=pd.Timestamp(date).date(),
+                )
+                self._apply_option_lifecycle_event(
+                    event, spot, date)
+                continue
             # Sign-correct both ways: longs are PAID intrinsic, shorts
             # PAY it (quantity carries the sign).
             settlement = quantity * intrinsic * asset.multiplier
@@ -927,13 +1588,144 @@ class BacktestEngine:
                 "Expiry settlement: %s %d %s at intrinsic %.4f on %s",
                 action, abs(quantity), str(asset), intrinsic, date)
 
+    def _apply_option_lifecycle_event(
+            self, event: OptionLifecycleEvent, spot: float, timestamp) -> None:
+        """Atomically remove the option and apply physical stock/strike cash."""
+        option_position = self.portfolio.get_position(event.option)
+        if option_position is None \
+                or option_position.quantity != event.signed_contracts:
+            raise ValueError(
+                "option lifecycle event no longer matches the open position")
+        positions_before = deepcopy(self.portfolio.positions)
+        closed_before = deepcopy(self.portfolio.closed_trades)
+        realized_before = self.portfolio._realized_pnl
+        cash_before = self.portfolio.cash
+        trades_length = len(self.trades_log)
+        mechanics_length = len(self.mechanics_log)
+        try:
+            self.portfolio.close_position(
+                event.option, event.settlement_price,
+                event.signed_contracts, option_position.timestamp, timestamp)
+            self.portfolio.remove_position(event.option)
+            self.portfolio.cash += event.cash_delta
+
+            if event.stock_delta:
+                stock = Asset(event.option.symbol, AssetType.STOCK)
+                existing = self.portfolio.get_position(stock)
+                strike = float(event.option.strike_price)
+                remaining = event.stock_delta
+                if existing is not None and existing.quantity != 0:
+                    same_direction = ((existing.quantity > 0)
+                                      == (remaining > 0))
+                    if same_direction:
+                        self._accumulate_position(existing, remaining, strike)
+                        remaining = 0
+                    else:
+                        close_quantity = ((1 if existing.quantity > 0 else -1)
+                                          * min(abs(existing.quantity),
+                                                abs(remaining)))
+                        self.portfolio.close_position(
+                            stock, strike, close_quantity,
+                            existing.timestamp, timestamp)
+                        remaining += close_quantity
+                if remaining:
+                    self.portfolio.add_position(Position(
+                        asset=stock,
+                        quantity=remaining,
+                        avg_entry_price=strike,
+                        current_price=float(spot),
+                        timestamp=timestamp,
+                        owners=option_position.owners,
+                    ))
+
+            event_row = {
+                'date': pd.Timestamp(timestamp),
+                'event': 'option_lifecycle',
+                'instrument': str(event.option),
+                'contracts': event.signed_contracts,
+                'settlement_price': event.settlement_price,
+                'stock_delta': event.stock_delta,
+                'cash_delta': event.cash_delta,
+                'reason': event.reason.value,
+            }
+            self.mechanics_log.append(event_row)
+            self.trades_log.append({
+                'date': timestamp,
+                'signal_date': timestamp,
+                'symbol': event.option.symbol,
+                'instrument': str(event.option),
+                'action': event.reason.value.upper(),
+                'quantity': abs(event.signed_contracts),
+                'price': event.settlement_price,
+                'stock_delta': event.stock_delta,
+                'cash_delta': event.cash_delta,
+                'reason': event.reason.value,
+            })
+        except Exception:
+            self.portfolio.positions = positions_before
+            self.portfolio.closed_trades = closed_before
+            self.portfolio._realized_pnl = realized_before
+            self.portfolio.cash = cash_before
+            del self.trades_log[trades_length:]
+            del self.mechanics_log[mechanics_length:]
+            raise
+
+    def _process_early_option_lifecycle(
+            self, all_data: Dict[str, pd.DataFrame], date) -> None:
+        """Apply opt-in American early exercise/assignment at today's close."""
+        policy = self.option_lifecycle_policy
+        if policy is None or not policy.enable_early_exercise:
+            return
+        current = pd.Timestamp(date).date()
+        for asset in sorted(list(self.portfolio.positions), key=str):
+            if asset.asset_type not in {AssetType.CALL, AssetType.PUT}:
+                continue
+            expiry = pd.Timestamp(asset.expiration_date).date()
+            days_to_expiry = (expiry - current).days
+            if days_to_expiry <= 0:
+                continue
+            data = all_data.get(asset.symbol)
+            if data is None or date not in data.index:
+                continue
+            spot = float(data.loc[date, 'close'])
+            position = self.portfolio.get_position(asset)
+            if (position is None or not math.isfinite(spot) or spot < 0
+                    or not math.isfinite(float(position.current_price))):
+                continue
+            annual_rate = 0.0
+            if self.cash_yield is not None:
+                annual_rate = float(self.cash_yield(date))
+            dividend = (float(self.dividend_fn(asset.symbol, date))
+                        if self.dividend_fn is not None else 0.0)
+            decision = policy.early_exercise_decision(
+                asset,
+                spot=spot,
+                option_mark=float(position.current_price),
+                days_to_expiry=days_to_expiry,
+                annual_rate=annual_rate,
+                dividend=dividend,
+            )
+            if not decision.exercise:
+                continue
+            event = policy.plan(
+                asset,
+                int(position.quantity),
+                spot=spot,
+                effective_date=current,
+                early=True,
+                option_mark=float(position.current_price),
+                days_to_expiry=days_to_expiry,
+                annual_rate=annual_rate,
+                dividend=dividend,
+            )
+            self._apply_option_lifecycle_event(event, spot, date)
+
     def _accumulate_position(self, position: Position, add_quantity: int,
                              fill_price: float) -> None:
-        """Add to an existing same-direction position (cap-and-requeue
-        remainder), updating the size-weighted average entry price.
+        """Add a remainder or target delta to a same-direction position.
 
         add_quantity is POSITIVE for a long add, NEGATIVE for a short add; the
-        position's sign is preserved. Only ever called under realistic fills.
+        position's sign is preserved.
         """
         old_qty = position.quantity
         new_qty = old_qty + add_quantity
@@ -1012,6 +1804,8 @@ class BacktestEngine:
         if signal == 'BUY' and (
                 (not existing_pos or existing_pos.quantity == 0)
                 or (realistic and intent.get('accumulate')
+                    and existing_pos and existing_pos.quantity > 0)
+                or (intent.get('target_native')
                     and existing_pos and existing_pos.quantity > 0)):
             base_fill = base_price * (1 + slippage)
             portfolio_value = self.portfolio.get_portfolio_value()
@@ -1047,7 +1841,21 @@ class BacktestEngine:
                 fill_price = base_fill
 
             cost = quantity * fill_price * (1 + self.commission)
-            if self.portfolio.cash < cost:
+            if not self._authorize_exposure(
+                    request_id=(f"{pd.Timestamp(fill_date).date()}:"
+                                f"{asset}:BUY"),
+                    symbol=asset.symbol,
+                    kind=ExposureKind.LONG_STOCK,
+                    quantity=int(quantity),
+                    date=fill_date,
+                    unit_price=fill_price,
+                    contract_multiplier=1):
+                logger.warning(
+                    "Dropping BUY intent for %s on %s: portfolio mechanics "
+                    "rejected exposure", asset.symbol, fill_date)
+                return None
+            if (self.portfolio_mechanics is None
+                    and self.portfolio.cash < cost):
                 logger.warning(
                     "Dropping BUY intent for %s on %s: insufficient cash "
                     "(needed %.2f, available %.2f)",
@@ -1074,7 +1882,10 @@ class BacktestEngine:
             return self._requeue_remainder(intent, remainder)
 
         elif signal == 'SELL' and existing_pos and existing_pos.quantity > 0:
-            quantity = existing_pos.quantity
+            if intent.get('target_native') and intent.get('quantity') is not None:
+                quantity = min(int(intent['quantity']), existing_pos.quantity)
+            else:
+                quantity = existing_pos.quantity
             # Closes are not size-capped (a full exit), but pay market impact.
             if realistic:
                 fill_price = base_price * (
@@ -1087,7 +1898,9 @@ class BacktestEngine:
                 asset, fill_price, quantity,
                 existing_pos.timestamp, fill_date
             )
-            self.portfolio.remove_position(asset)
+            if not intent.get('target_native'):
+                # Legacy behavior explicitly removed after close_position.
+                self.portfolio.remove_position(asset)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset), 'action': 'SELL',
@@ -1100,6 +1913,8 @@ class BacktestEngine:
         elif signal == 'SHORT' and self._desk_mode and (
                 (not existing_pos or existing_pos.quantity == 0)
                 or (realistic and intent.get('accumulate')
+                    and existing_pos and existing_pos.quantity < 0)
+                or (intent.get('target_native')
                     and existing_pos and existing_pos.quantity < 0)):
             # A short is a SELL: adverse slippage means a LOWER fill.
             base_fill = base_price * (1 - slippage)
@@ -1132,6 +1947,20 @@ class BacktestEngine:
                 quantity, remainder = desired, 0
                 fill_price = base_fill
 
+            if not self._authorize_exposure(
+                    request_id=(f"{pd.Timestamp(fill_date).date()}:"
+                                f"{asset}:SHORT"),
+                    symbol=asset.symbol,
+                    kind=ExposureKind.SHORT_STOCK,
+                    quantity=int(quantity),
+                    date=fill_date,
+                    unit_price=fill_price,
+                    contract_multiplier=1):
+                logger.warning(
+                    "Dropping SHORT intent for %s on %s: portfolio mechanics "
+                    "rejected exposure", asset.symbol, fill_date)
+                return None
+
             proceeds = quantity * fill_price * (1 - self.commission)
             self.portfolio.cash += proceeds
             if existing_pos and existing_pos.quantity < 0:
@@ -1156,7 +1985,10 @@ class BacktestEngine:
         elif signal == 'COVER' and self._desk_mode \
                 and existing_pos and existing_pos.quantity < 0:
             # A cover is a BUY: adverse slippage means a HIGHER fill.
-            quantity = existing_pos.quantity  # negative
+            if intent.get('target_native') and intent.get('quantity') is not None:
+                quantity = -min(int(intent['quantity']), abs(existing_pos.quantity))
+            else:
+                quantity = existing_pos.quantity  # negative
             # Closes are not size-capped (a full exit), but pay market impact.
             if realistic:
                 fill_price = base_price * (
@@ -1171,7 +2003,9 @@ class BacktestEngine:
                 asset, fill_price, quantity,
                 existing_pos.timestamp, fill_date
             )
-            self.portfolio.remove_position(asset)
+            if not intent.get('target_native'):
+                # Legacy behavior explicitly removed after close_position.
+                self.portfolio.remove_position(asset)
             self.trades_log.append({
                 'date': fill_date, 'signal_date': intent['signal_date'],
                 'symbol': asset.symbol, 'instrument': str(asset), 'action': 'COVER',
@@ -1188,268 +2022,47 @@ class BacktestEngine:
 
     def _build_benchmark(self, benchmark_symbol: str, start_date: str,
                          end_date: str) -> Optional[Dict]:
-        """Buy-and-hold benchmark equity curve over the backtest date range.
-
-        initial_capital is notionally invested at the first available
-        benchmark close in range; the position is marked at each session
-        close, so value[0] == initial_capital by construction. Fetched via
-        self.market_data so the persistent OHLCV cache applies. Returns None
-        (with a WARNING log) on any data failure — the caller must treat the
-        benchmark as strictly optional.
-        """
-        try:
-            data = self.market_data.fetch_stock_data(
-                benchmark_symbol, start_date, end_date)
-            if data is None or data.empty or 'close' not in data.columns:
-                raise ValueError(f"no usable data for {benchmark_symbol}")
-
-            closes = data['close'].dropna()
-            if closes.empty:
-                raise ValueError(f"all closes NaN for {benchmark_symbol}")
-
-            base_close = float(closes.iloc[0])
-            if base_close <= 0:
-                raise ValueError(
-                    f"non-positive base close {base_close} for {benchmark_symbol}")
-
-            initial_capital = self.portfolio.initial_capital
-            equity_curve = [
-                {
-                    'date': ts.strftime('%Y-%m-%d'),
-                    'value': float(close) / base_close * initial_capital,
-                }
-                for ts, close in closes.items()
-            ]
-            return {'symbol': benchmark_symbol, 'equity_curve': equity_curve}
-        except Exception as e:
-            logger.warning("Benchmark %s unavailable (%s..%s): %s",
-                           benchmark_symbol, start_date, end_date, e)
-            return None
+        """Compatibility facade over the optional benchmark service."""
+        return build_benchmark(
+            self.market_data,
+            self.portfolio.initial_capital,
+            benchmark_symbol,
+            start_date,
+            end_date,
+            log=logger,
+        )
 
     def _compute_oos_folds(self, desk, alpha: float = 0.05) -> Dict:
-        """Per-fold out-of-sample significance for a SINGLE-desk run.
-
-        Reconstructs OOS folds by slicing the realized account return stream at
-        the desk's distinct walk-forward fit dates: fold k spans
-        ``[fit_date_k, fit_date_{k+1})`` (the last fold is open-ended). Each
-        fold's returns are scored with a one-sided t-test that the mean OOS
-        return > 0 (fold_oos_tstat / fold_oos_pvalue), and the family of fold
-        p-values is corrected for multiple testing (Bonferroni + BH). Returns
-        with no active model (before the first fit) are excluded.
-
-        HONEST SCOPE: the sliced series is the BLENDED account return (T+1 fill
-        lag, netting, stops) over each window, NOT the isolated P&L of the model
-        refit at fit_date_k. Overlapping train windows over-count independent
-        trials, so the correction is a heuristic upper bound, NOT exact
-        FWER/FDR control. This layer is independent of the deflated-Sharpe
-        n_trials lens and must NOT be combined with it.
-
-        'folds' is [] when the desk has no fits.
-        """
-        fits = list(desk.walk_forward_fits)
-        # Distinct, sorted fit-date boundaries. Read the date via to_dict()
-        # (contract C3) — the SAME serialization the 'walk_forward' report key
-        # uses — so this works for both WalkForwardFit and the TaggedWalkForwardFit
-        # wrapper (which has no .fit_date attribute). to_dict()['fit_date'] is a
-        # 'YYYY-MM-DD' string; parse to a plain date to compare against the
-        # snapshot-derived fold dates.
-        boundaries = sorted({pd.Timestamp(fit.to_dict()['fit_date']).date()
-                             for fit in fits})
-        dated = self.portfolio.get_daily_returns_with_dates()
-
-        folds: List[Dict] = []
-        pvalues: List[Optional[float]] = []
-        for k, start in enumerate(boundaries):
-            end = boundaries[k + 1] if k + 1 < len(boundaries) else None
-            fold_returns = [r for (day, r) in dated
-                            if day >= start and (end is None or day < end)]
-            tstat = fold_oos_tstat(fold_returns)
-            pvalue = fold_oos_pvalue(fold_returns)
-            pvalues.append(pvalue)
-            folds.append({
-                'fit_date': start.strftime('%Y-%m-%d'),
-                'oos_start': start.strftime('%Y-%m-%d'),
-                'oos_end': end.strftime('%Y-%m-%d') if end is not None else None,
-                'n_returns': len(fold_returns),
-                'mean_return': (float(np.mean(fold_returns))
-                                if fold_returns else None),
-                'tstat': tstat,
-                'pvalue': pvalue,
-            })
-
-        bh = benjamini_hochberg(pvalues, alpha)
-        m = bh['m']
-        bonf_alpha = bonferroni_alpha(alpha, m)
-        n_significant_bonferroni = 0
-        for fold, pvalue, rejected_bh in zip(folds, pvalues, bh['rejected_bh']):
-            fold['significant_bh'] = rejected_bh
-            sig_bonf = (pvalue is not None and bonf_alpha is not None
-                        and pvalue <= bonf_alpha)
-            fold['significant_bonferroni'] = sig_bonf
-            if sig_bonf:
-                n_significant_bonferroni += 1
-
-        return {
-            'available': True,
-            'alpha': alpha,
-            'test': 'one-sided (mean OOS return > 0)',
-            'n_folds': len(folds),
-            'n_testable_folds': m,
-            'bonferroni_alpha': bonf_alpha,
-            'bh_threshold': bh['bh_threshold'],
-            'n_significant_bonferroni': n_significant_bonferroni,
-            'n_significant_bh': bh['n_significant_bh'],
-            'folds': folds,
-            'caveat': ('Account-level OOS folds sliced at distinct walk-forward '
-                       'fit dates: blended account returns (T+1 fill lag, '
-                       'netting, stops), not isolated per-model P&L. The first '
-                       'return in each fold is realized under the PRIOR model '
-                       'state (T+1 fill lag), so a boundary return reflects the '
-                       'prior model, not the refit at that boundary. Overlapping '
-                       'refit windows over-count independent trials, so '
-                       'Bonferroni/BH is a heuristic upper bound on '
-                       'multiple-testing severity, NOT exact FWER/FDR control. '
-                       'Independent of the deflated-Sharpe n_trials lens; do not '
-                       'combine.'),
-        }
+        """Compatibility facade over account-level OOS fold analysis."""
+        return compute_oos_folds(self.portfolio, desk, alpha=alpha)
 
     def _generate_report(self, benchmark_symbol: Optional[str] = None,
                          start_date: Optional[str] = None,
                          end_date: Optional[str] = None) -> Dict:
-        """Generate backtest report.
-
-        Strategy-mode reports are unchanged. Desk-mode reports carry the
-        same keys plus 'desk', 'trader_notes' and 'walk_forward'
-        (contract C3); 'strategy' holds the desk name in that mode.
-        """
-        # Deflate the Sharpe for multiple testing by the number of walk-forward
-        # refits (desk/fund mode). This is a conservative PROXY for the true
-        # multiple-testing breadth — overlapping train windows mean it over-
-        # counts independent trials, which biases the deflated Sharpe downward
-        # (the safe direction). Strategy mode has no refits -> n_trials=1 (no
-        # deflation, so deflated_sharpe == psr).
-        n_trials = 1
-        if self._desk_mode:
-            n_trials = max(1, len(self._driver.walk_forward_fits))
-        summary = self.portfolio.get_summary(n_trials=n_trials)
-
-        benchmark = None
-        if benchmark_symbol:
-            benchmark = self._build_benchmark(benchmark_symbol,
-                                              start_date, end_date)
-
-        report = {
-            'strategy': (self.strategy.name if self.strategy is not None
-                         else self._driver.name),
-            'summary': summary,
-            'benchmark': benchmark,
-            'drawdown_series': self.portfolio.get_drawdown_series(),
-            'trades': self.trades_log,
-            'closed_trades': [
-                {
-                    'symbol': trade.asset.symbol,
-                    # Contract C13 (additive): full instrument string —
-                    # stocks are the bare symbol, options the contract.
-                    'instrument': str(trade.asset),
-                    'entry_price': trade.entry_price,
-                    'exit_price': trade.exit_price,
-                    'quantity': trade.quantity,
-                    'pnl': trade.pnl,
-                    'pnl_pct': trade.pnl_pct,
-                    'entry_time': trade.entry_time.strftime('%Y-%m-%d'),
-                    'exit_time': trade.exit_time.strftime('%Y-%m-%d'),
-                }
-                for trade in self.portfolio.closed_trades
-            ],
-            'portfolio_history': self.portfolio.portfolio_history,
-            # Intents still queued when the simulation ended (e.g. signals
-            # generated on the final day, which correctly never fill).
-            'pending_signals': [
-                {
-                    'symbol': asset.symbol,
-                    'signal': intent['signal'],
-                    'signal_date': intent['signal_date'],
-                }
-                for asset, intent in self.pending_intents.items()
-            ],
-        }
-
-        if self._desk_mode:
-            driver = self._driver
-            report['desk'] = {'key': driver.key, 'name': driver.name}
-            report['trader_notes'] = [note.to_dict()
-                                      for note in driver.notes]
-            report['walk_forward'] = [fit.to_dict()
-                                      for fit in driver.walk_forward_fits]
-            # Per-fold OOS significance + multiple-testing (Step 4). Coherent
-            # ONLY for a single desk: one controller -> one fold timeline. In a
-            # fund the desks refit on different cadences over a NETTED book, so
-            # folds are not attributable to any single model -> marked N/A.
-            if self.orchestrator is not None:
-                report['oos_folds'] = {
-                    'available': False,
-                    'reason': ('netted multi-desk fund book — per-fold OOS '
-                               'significance is not attributable to a single '
-                               'model'),
-                }
-            else:
-                # Defense-in-depth: this additive research-integrity feature
-                # runs BEFORE the golden-protected greeks_series/structures keys
-                # below, so it must never be able to abort the rest of the
-                # report. Degrade to the same N/A marker on any failure (the GUI
-                # already handles available=False), mirroring _build_benchmark.
-                try:
-                    report['oos_folds'] = self._compute_oos_folds(self.desk,
-                                                                  alpha=0.05)
-                except Exception as exc:  # noqa: BLE001 - defensive boundary
-                    logger.warning(
-                        "OOS fold computation failed; reporting N/A: %s", exc)
-                    report['oos_folds'] = {
-                        'available': False,
-                        'reason': f'computation failed: {exc}',
-                    }
-            # Contract C5: desks with a regime model expose regime_series;
-            # included only when non-empty (FoundationDesk stays unchanged).
-            regime_series = getattr(driver, 'regime_series', None)
-            if regime_series:
-                report['regime_series'] = list(regime_series)
-            # Contract C8: desks with pod accounting expose pod_history;
-            # included only when non-empty (Foundation/Renaissance reports
-            # stay byte-identical).
-            pod_history = getattr(driver, 'pod_history', None)
-            if pod_history:
-                report['pod_history'] = list(pod_history)
-            # Contract C11: desks with multi-leg options structures
-            # expose structures_report (janestreet only; other desks
-            # lack the attribute, so their reports are byte-identical).
-            structures = getattr(driver, 'structures_report', None)
-            if structures is not None:
-                report['structures'] = list(structures)
-            # Contract C12: daily desk-level portfolio Greeks series.
-            greeks_series = getattr(driver, 'greeks_series', None)
-            if greeks_series is not None:
-                report['greeks_series'] = list(greeks_series)
-            # Fund mode (additive): per-desk roster + capital + conflicts.
-            # Single-desk reports carry NO 'orchestrator' key (byte-identical).
-            if self.orchestrator is not None:
-                report['orchestrator'] = {
-                    'desks': [{'key': d.key, 'name': d.name,
-                               'capital_allocation': d.capital_allocation,
-                               'notes_count': len(d.notes)}
-                              for d in self.orchestrator.desks],
-                    'active_capital': self.orchestrator.active_capital,
-                    'conflicts_resolved': self.orchestrator.conflicts_resolved,
-                }
-                # Dynamic reweighting audit (additive; only when a reweighter
-                # drove this fund). Non-reweighted fund reports are unchanged.
-                if self.reweighter is not None:
-                    report['reweight_log'] = [
-                        {'date': entry['date'].strftime('%Y-%m-%d'),
-                         'day_number': entry['day_number'],
-                         'weights': entry['weights'],
-                         'fallback': entry['fallback'],
-                         'degraded_desks': entry['degraded_desks'],
-                         'degrade_reason': entry['degrade_reason']}
-                        for entry in self.reweighter.rebalance_log]
-
-        return report
+        """Generate the stable report schema from completed engine state."""
+        state = BacktestReportState(
+            strategy=self.strategy,
+            driver=self._driver,
+            desk=self.desk,
+            desk_mode=self._desk_mode,
+            orchestrator=self.orchestrator,
+            reweighter=self.reweighter,
+            portfolio=self.portfolio,
+            trades_log=self.trades_log,
+            pending_intents=self.pending_intents,
+            pending_structures=self.pending_structures,
+            mechanics_enabled=(
+                self.portfolio_mechanics is not None
+                or self.option_lifecycle_policy is not None
+            ),
+            mechanics_log=self.mechanics_log,
+        )
+        return generate_report(
+            state,
+            benchmark_symbol=benchmark_symbol,
+            start_date=start_date,
+            end_date=end_date,
+            benchmark_loader=self._build_benchmark,
+            oos_folds_loader=self._compute_oos_folds,
+            log=logger,
+        )

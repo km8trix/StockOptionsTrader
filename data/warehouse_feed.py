@@ -49,3 +49,27 @@ class WarehouseMarketData(MarketDataHandler):
     def delisting_date(self, symbol: str):
         """Final listed session for ``symbol``, or ``None`` when still live."""
         return self._wh.delisting_date(symbol)
+
+    def delisting_payout(self, symbol: str, final_close: float) -> dict:
+        """Return modeled per-share recovery plus auditable quality flags."""
+        action = self._wh.delisting_action(symbol)
+        if action is not None:
+            return {
+                'price': float(action['payout_per_share']),
+                'source': action['action'],
+                'quality_flags': list(action['quality_flags']),
+                'action_date': (action['date'].isoformat()
+                                if action['date'] is not None else None),
+                'contraticker': action.get('contraticker'),
+            }
+        return {
+            'price': float(final_close),
+            'source': 'final_tradable_close',
+            'quality_flags': ['delisting_terms_unavailable'],
+            'action_date': None,
+            'contraticker': None,
+        }
+
+    def data_snapshot(self, tables=None) -> dict:
+        """Immutable content version for research/promotion artifacts."""
+        return self._wh.snapshot_version(tables)

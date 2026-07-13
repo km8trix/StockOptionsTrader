@@ -58,8 +58,10 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone
-from typing import Callable, Dict, Optional
+from functools import wraps
+from typing import Any, Callable, Dict, Optional, TypeVar, cast
 from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
@@ -93,6 +95,24 @@ ALLOW_NETWORK_ENV_VAR = "ETRADE_ALLOW_NETWORK"
 ALLOW_NETWORK_VALUE = "1"
 
 ET_ZONE = ZoneInfo("America/New_York")
+
+_Method = TypeVar("_Method", bound=Callable[..., Any])
+
+
+def _serialized(method: _Method) -> _Method:
+    """Run an auth/session operation under the manager's transport lock.
+
+    The client deliberately acquires this same lock before calling
+    ``get_session`` and issuing an HTTP request.  An RLock is therefore
+    required: normal request handling re-enters here, as does the 401 path
+    that calls ``mark_expired`` while the client still owns the lock.
+    """
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.transport_lock:
+            return method(self, *args, **kwargs)
+
+    return cast(_Method, locked)
 
 
 class EtradeAuthError(RuntimeError):
@@ -198,6 +218,11 @@ class EtradeAuthManager:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.audit = audit if audit is not None else AuditLog(
             self.db_path, env=self.env, clock=self._clock)
+        # One lock protects both OAuth state/session mutation and every API
+        # request made by EtradeClient.  It is intentionally reentrant because
+        # a request obtains the session through this manager, and the live
+        # daily-loss gate can recursively read balances before an order send.
+        self._transport_lock = threading.RLock()
         #: pending request token: {'oauth_token', 'oauth_token_secret'}
         self._pending: Optional[Dict[str, str]] = None
         self._session = None  # cached signing session for the active token
@@ -278,6 +303,7 @@ class EtradeAuthManager:
         self.audit.append("auth_manager", "auth_expired",
                           {"env": self.env, "reason": reason})
 
+    @_serialized
     def mark_expired(self, reason: str) -> None:
         """Flip the active token to expired (client calls this on a 401
         oauth_problem response). Idempotent; audited once."""
@@ -296,12 +322,23 @@ class EtradeAuthManager:
     def api_base_url(self) -> str:
         return API_BASE_URLS[self.env]
 
+    @property
+    def transport_lock(self):
+        """Shared reentrant lock for OAuth state and signed HTTP traffic.
+
+        EtradeClient uses this exact object; callers composing higher-level
+        execution services may also use it when an operation must not overlap
+        renewal or disconnect.
+        """
+        return self._transport_lock
+
     def _require_configured(self) -> None:
         if not self.configured:
             raise EtradeNotConfigured(
                 "ETRADE_CONSUMER_KEY / ETRADE_CONSUMER_SECRET are not set; "
                 "configure them in the environment (.env) first.")
 
+    @_serialized
     def status(self) -> Dict:
         """State snapshot per contract C16 (never raises — the GUI needs
         to render 'unconfigured' rather than catch exceptions)."""
@@ -338,6 +375,7 @@ class EtradeAuthManager:
             "renewed_at": renewed_at,
         }
 
+    @_serialized
     def start_auth(self) -> str:
         """Leg 1: fetch a request token; return the authorize URL."""
         self._require_configured()
@@ -368,6 +406,7 @@ class EtradeAuthManager:
         return AUTHORIZE_URL_TEMPLATE.format(
             key=self.consumer_key, token=self._pending["oauth_token"])
 
+    @_serialized
     def submit_verifier(self, code: str) -> Dict:
         """Leg 3: exchange the request token + verifier for an access
         token, persist it, and return status()."""
@@ -415,6 +454,7 @@ class EtradeAuthManager:
                     self.env, issued_at)
         return self.status()
 
+    @_serialized
     def renew(self) -> bool:
         """Clear the 2h idle timeout. True on success; False when there is
         nothing renewable (no token / midnight-expired / oauth_problem —
@@ -451,6 +491,7 @@ class EtradeAuthManager:
                            "status_code": response.status_code})
         return False
 
+    @_serialized
     def disconnect(self) -> None:
         """Drop the local token (no remote call — revocation is a
         deliberate manual step the user performs at E*TRADE)."""
@@ -477,6 +518,7 @@ class EtradeAuthManager:
                 resource_owner_secret=row["access_secret"])
         return self._session
 
+    @_serialized
     def get_session(self):
         """Signing session for the ACTIVE token; the EtradeClient calls
         this per request so renewals/re-auth are picked up.

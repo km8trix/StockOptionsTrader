@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import pytest
 
+from brokers.etrade_client import build_equity_order
 from core.models import Asset, AssetType, OrderType
 from desks.base import DeskIntent
 from desks.orchestrator import FundOrchestrator
 from tests.test_fund_orchestrator import ScriptedDesk
 from tests.test_fund_orchestrator import intent as fund_intent
 from tests.test_fund_orchestrator import stock as fund_stock
+from portfolio.manager import PortfolioManager
+from portfolio.targets import TargetPosition
+from portfolio.structures import LegAction, StructureIntent, StructureLeg
 from utils.audit import AuditLog
 from utils.kill_switch import KillSwitch
 from utils.live_session import LiveTradingSession
@@ -250,6 +254,218 @@ class TestIntentFlow:
         assert executor.calls == []
         assert result["reports"] == []
         assert audit.entries(event_type="execution_skipped")
+
+
+class TestTargetNativeFlow:
+    """Opt-in desired-position construction stays idempotent around work."""
+
+    class TargetDesk:
+        key = "target"
+        capital_allocation = 1.0
+        target_native_enabled = True
+
+        def __init__(self, quantity):
+            self.quantity = quantity
+
+        def set_clock(self, now):
+            self.clock = now
+
+        def generate_targets(self, all_data, date, portfolio, snapshot):
+            return [TargetPosition(
+                SPY,
+                self.quantity,
+                owner=self.key,
+                strategy=self.key,
+                reason="desired SPY position",
+                metadata={"size_fraction": 0.10,
+                          "deployment_id": "test-v1"},
+            )]
+
+        def apply_risk(self, intents, portfolio, all_data, date):
+            return list(intents)
+
+    @staticmethod
+    def _active_reservation(quantity=100):
+        request = build_equity_order(
+            "SPY", "BUY", quantity, 50.0, "tp123456789012345678")
+        return {
+            "reservations": [{
+                "reservation_id": "tp123456789012345678",
+                "status": "ACTIVE",
+                "units": quantity,
+                "metadata": {"order_request": request},
+                "orders": [{
+                    "order_id": "ORDER-1",
+                    "status": "OPEN",
+                    "cumulative_filled_units": 0,
+                }],
+            }],
+        }
+
+    def test_delta_identity_reaches_patient_executor(self, rails):
+        audit, switch = rails
+
+        class IdentityExecutor(FakeExecutor):
+            def execute(self, side, instrument, quantity, **kwargs):
+                self.calls.append((side, instrument, quantity, kwargs))
+                return {"status": "filled", "avg_fill": 50.0,
+                        "shortfall_per_unit": 0.0, "fills": []}
+
+        executor = IdentityExecutor()
+        session = LiveTradingSession(
+            desk=self.TargetDesk(100), broker=FakeBroker(),
+            portfolio=PortfolioManager(100_000.0), data_fn=lambda: {},
+            executor=executor, audit=audit, kill_switch=switch)
+
+        result = session.evaluate_once()
+
+        assert result["status"] == "ok"
+        assert executor.calls[0][:3] == ("BUY", SPY, 100)
+        execution_id = executor.calls[0][3]["execution_id"]
+        assert execution_id.startswith("tp") and len(execution_id) == 20
+        assert audit.entries(event_type="target_position")
+        assert audit.entries(event_type="target_order_delta")
+
+    def test_active_reservation_makes_repeated_target_a_noop(self, rails):
+        audit, switch = rails
+
+        class Gate:
+            def snapshot(self):
+                return TestTargetNativeFlow._active_reservation()
+
+        broker = FakeBroker()
+        broker.client = type("Client", (), {"reservation_gate": Gate()})()
+        executor = FakeExecutor()
+        session = LiveTradingSession(
+            desk=self.TargetDesk(100), broker=broker,
+            portfolio=PortfolioManager(100_000.0), data_fn=lambda: {},
+            executor=executor, audit=audit, kill_switch=switch)
+
+        result = session.evaluate_once()
+
+        assert result["status"] == "ok"
+        assert result["generated"] == 0
+        assert executor.calls == []
+
+    def test_changed_target_cancels_work_before_reversal(self, rails):
+        audit, switch = rails
+
+        class Gate:
+            def snapshot(self):
+                return TestTargetNativeFlow._active_reservation()
+
+        class CancelBroker(FakeBroker):
+            def __init__(self):
+                super().__init__()
+                self.cancelled = []
+                self.client = type(
+                    "Client", (), {"reservation_gate": Gate()})()
+
+            def cancel_order(self, order_id):
+                self.cancelled.append(order_id)
+                return True
+
+            def order_status(self, order_id):
+                return {"status": "CANCEL_REQUESTED",
+                        "filled_quantity": 0}
+
+        broker = CancelBroker()
+        executor = FakeExecutor()
+        session = LiveTradingSession(
+            desk=self.TargetDesk(0), broker=broker,
+            portfolio=PortfolioManager(100_000.0), data_fn=lambda: {},
+            executor=executor, audit=audit, kill_switch=switch)
+
+        result = session.evaluate_once()
+
+        assert result["status"] == "pending"
+        assert result["reason"] == "target_order_cancellation_requested"
+        assert broker.cancelled == ["ORDER-1"]
+        assert executor.calls == []
+        assert audit.entries(event_type="target_order_cancel")
+
+
+class TestAtomicStructureFlow:
+    """Canonical packages reach the executor once, never leg by leg."""
+
+    class StructureDesk(FakeDesk):
+        def __init__(self, structure):
+            super().__init__([])
+            self.structure = structure
+
+        def generate_structure_intents(self, all_data, date, portfolio):
+            return [self.structure]
+
+    @staticmethod
+    def _package(*, closing=False):
+        expiry = "2026-08-21"
+        actions = ((LegAction.BUY_CLOSE, LegAction.SELL_CLOSE)
+                   if closing else
+                   (LegAction.SELL_OPEN, LegAction.BUY_OPEN))
+        legs = (
+            StructureLeg(
+                Asset("SPY", AssetType.CALL, 450.0, expiry), actions[0]),
+            StructureLeg(
+                Asset("SPY", AssetType.CALL, 455.0, expiry), actions[1]),
+        )
+        return StructureIntent(
+            legs=legs, quantity=2,
+            net_price=-0.50 if closing else 1.0,
+            max_loss=0.0 if closing else 800.0,
+            greeks={"delta": -2.0, "vega": -15.0},
+            reason="atomic vertical")
+
+    def test_open_package_is_one_execution_with_explicit_actions(self, rails):
+        audit, switch = rails
+
+        class PackageExecutor(FakeExecutor):
+            def execute(self, side, instrument, quantity, **kwargs):
+                self.calls.append((side, instrument, quantity, kwargs))
+                return {"status": "filled", "avg_fill": 1.0,
+                        "shortfall_per_unit": 0.0,
+                        "fills": [{"qty": 2, "price": 1.0}]}
+
+        package = self._package()
+        executor = PackageExecutor()
+        session = LiveTradingSession(
+            desk=self.StructureDesk(package), broker=FakeBroker(),
+            portfolio=PortfolioManager(100_000.0), data_fn=lambda: {},
+            executor=executor, audit=audit, kill_switch=switch)
+
+        result = session.evaluate_once()
+
+        assert result["status"] == "ok"
+        assert result["generated"] == 0
+        assert result["generated_structures"] == 1
+        assert len(executor.calls) == 1
+        side, legs, quantity, kwargs = executor.calls[0]
+        assert side == "SELL" and quantity == 2
+        assert [leg["action"] for leg in legs] == ["SELL_OPEN", "BUY_OPEN"]
+        assert kwargs == {"execution_id": package.intent_id,
+                          "closing": False}
+        assert audit.entries(event_type="structure_execution_report")
+
+    def test_close_package_preserves_close_lifecycle(self, rails):
+        audit, switch = rails
+
+        class PackageExecutor(FakeExecutor):
+            def execute(self, side, instrument, quantity, **kwargs):
+                self.calls.append((side, instrument, quantity, kwargs))
+                return {"status": "filled", "fills": []}
+
+        package = self._package(closing=True)
+        executor = PackageExecutor()
+        session = LiveTradingSession(
+            desk=self.StructureDesk(package), broker=FakeBroker(),
+            portfolio=PortfolioManager(100_000.0), data_fn=lambda: {},
+            executor=executor, audit=audit, kill_switch=switch)
+
+        assert session.evaluate_once()["status"] == "ok"
+        side, legs, _, kwargs = executor.calls[0]
+        assert side == "BUY"
+        assert [leg["action"] for leg in legs] == [
+            "BUY_CLOSE", "SELL_CLOSE"]
+        assert kwargs["closing"] is True
 
 
 class TestKillSwitchHalts:
@@ -773,6 +989,35 @@ class TestLocalBookWiring:
         snap = book.snapshot()
         assert snap["positions"]["SPY"]["quantity"] == 2.0
         assert snap["cash"] == pytest.approx(-200.0 + 3 * 50.0)
+
+    def test_reservation_gate_is_sole_live_fill_booker(self, rails,
+                                                       tmp_path):
+        """A reservation-aware client books each broker cumulative update;
+        the terminal executor report must not apply those fills twice."""
+        audit, switch = rails
+        book = self._book(tmp_path)
+        book.set_cash(1_000.0)
+
+        class FilledExecutor(FakeExecutor):
+            def execute(self, side, instrument, quantity, **kwargs):
+                return {"status": "filled", "avg_fill": 50.0,
+                        "shortfall_per_unit": 0.0,
+                        "fills": [{"qty": 2, "price": 50.0, "ts": "t"}]}
+
+        class ReservationGate:
+            books_fills = True
+
+        broker = FakeBroker()
+        broker.client = type("Client", (), {
+            "reservation_gate": ReservationGate(),
+        })()
+        intent = DeskIntent(SPY, "BUY", 0.1, "t", quantity=2)
+        session = make_session(FakeDesk([intent]), broker,
+                               FilledExecutor(), audit, switch,
+                               local_book=book)
+        assert session.evaluate_once()["status"] == "ok"
+        assert book.positions() == {}
+        assert book.cash() == 1_000.0
 
     def test_option_fill_books_contracts_and_multiplied_cash(self, rails,
                                                              tmp_path):

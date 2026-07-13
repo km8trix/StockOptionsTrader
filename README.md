@@ -113,24 +113,27 @@ Mirrors a classical-quant research shop: hand-engineered, economically-signed pr
 
 **Opt-in knobs:** `alpha=1.0` (ridge), `quantile=0.2`, `target_gross=1.0`, `max_name_size=0.10`, `min_scored=4`.
 
-### Evidence gate & desk promotion
+### Evidence gate & strategy promotion
 
-No desk is treated as a validated strategy until it earns it. A signal becomes a
-**promoted** desk only after passing two gates, in order:
+No strategy is eligible for deployment until it has one immutable, reproducible
+evidence artifact. `analysis.promotion` computes/validates PSR, DSR, OOS fold-BH,
+cost-adjusted return, turnover, and multi-regime requirements under one versioned
+policy. The artifact also pins the data snapshot, universe, parameters, random
+seed, dependency versions, and code SHA; canonical JSON makes identical inputs
+produce the same SHA-256 artifact ID.
 
-1. **IC gate** — `scripts/signal_ic.py` measures leakage-free rank-IC vs forward
-   returns (1/5/21d), IC-IR, t-stat, turnover, and quintile spread. A signal
-   must show stable, significant, same-signed IC at tradeable turnover.
-2. **OOS gate** — `scripts/desk_backtest.py` runs the desk standalone over a
-   multi-regime window and requires total return > 0 **and** Sharpe > 0.5
-   **and** Deflated Sharpe > 0 **and** no catastrophic regime.
+Research evidence and operational approval are separate. `ArtifactStore` writes
+the content-addressed artifact without overwriting, then `PromotionRegistry`
+creates an immutable paper or live approval that references that exact hash.
+Failed or missing evidence cannot be approved, and live approval cannot skip
+paper approval for the same artifact. Paper/live composition must use
+`desks.registry.create_deployed_desk`, which re-verifies the approval plus the
+runtime code SHA and parameters before constructing the desk.
 
-A desk that clears both is promoted by adding its key to
-`desks.registry._PROMOTED_DESKS` (one line). `list_desks()` then reports
-`gate_status: 'promoted'` and the Trading Floor shows a *Gate-passed* badge;
-everything else stays `'research'`. **"Promoted" is a research-quality status
-only** — it never routes a desk into the live-execution Production workspace
-(which excludes desks by design).
+The Trading Floor's legacy `gate_status` remains a research-display badge; it is
+not an execution permission. `_PROMOTED_DESKS` is retained only for that backward-
+compatible UI contract. The immutable promotion registry is the authoritative
+paper/live decision path.
 
 **Current state (2026-06):** `_PROMOTED_DESKS` is empty. The strongest price
 signal — 12-1 momentum (`mom_12_1`) — passes the IC gate (t +2.66 @1d) but the

@@ -58,3 +58,9 @@ jobs:
         # Validates the Dockerfile and that requirements.txt installs cleanly
         # in the slim runtime image.
         run: docker build -t stockoptionstrader:ci .
+
+      - name: Smoke-test built runtime
+        # Starts the real non-root image with isolated credentials + data,
+        # checks Basic Auth and representative pages/APIs, verifies SQLite and
+        # /data are writable, inspects logs, then always removes its resources.
+        run: python3 scripts/docker_smoke.py --image stockoptionstrader:ci

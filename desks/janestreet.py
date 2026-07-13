@@ -91,7 +91,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date as date_type
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -612,8 +612,13 @@ class JaneStreetDesk(Desk):
             return None
         previous = (self._current_regime['state']
                     if self._current_regime else None)
-        state = result['state']
-        probs = {label: float(p) for label, p in result['probs'].items()}
+        # RegimeHMMModel intentionally returns a heterogeneous payload while
+        # WalkForwardController's general model protocol exposes symbol scores.
+        # This desk owns that specialised controller, so narrow its known shape
+        # locally without weakening the shared protocol.
+        state = cast(str, result['state'])
+        raw_probs = cast(Dict[str, float], result['probs'])
+        probs = {label: float(p) for label, p in raw_probs.items()}
         self._current_regime = {'state': state, 'probs': probs}
         self._regime_series.append({
             'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
@@ -645,6 +650,7 @@ class JaneStreetDesk(Desk):
         frame = all_data.get(asset.symbol)
         if not self._has_bar_today(frame, date):
             return None
+        assert frame is not None  # _has_bar_today returned True
         base_iv = self._today_iv.get(asset.symbol)
         if base_iv is None:
             return None
@@ -681,7 +687,9 @@ class JaneStreetDesk(Desk):
                            self._greeks_date)
             return None
         spot, iv, t_years = inputs
-        return black_scholes_greeks(spot, asset.strike_price, t_years, iv,
+        strike = asset.strike_price
+        assert strike is not None  # _leg_inputs accepts option legs only
+        return black_scholes_greeks(spot, strike, t_years, iv,
                                     self.rate, asset.asset_type.value)
 
     def _update_greeks(self, all_data: Dict[str, pd.DataFrame], date,
@@ -745,7 +753,9 @@ class JaneStreetDesk(Desk):
             return {'book': 'regime'}
         if asset.asset_type in (AssetType.CALL, AssetType.PUT):
             owner = self.tracker.leg_owner.get(asset)
-            return {'book': self._structure_books.get(owner, 'vrp')}
+            book = (self._structure_books.get(owner, 'vrp')
+                    if owner is not None else 'vrp')
+            return {'book': book}
         return {'book': 'relative_value'}
 
     # ------------------------------------------------------------------
