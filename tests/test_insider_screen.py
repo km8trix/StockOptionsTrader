@@ -9,7 +9,56 @@ and the cost-netting must charge both legs. Each has a test.
 import numpy as np
 import pandas as pd
 
-from scripts.insider_screen import collect_events, event_study
+from scripts.insider_screen import (
+    collect_events,
+    event_study,
+    resolve_universe,
+    resolve_universe_membership,
+)
+
+
+class _UniverseProvider:
+    def __init__(self):
+        self.calls = []
+
+    def universe_asof(self, date, **kwargs):
+        self.calls.append((pd.Timestamp(date), kwargs))
+        return ['OLD', 'LIVE'] if pd.Timestamp(date).month == 1 else ['LIVE', 'NEW']
+
+
+def test_qualifying_universe_never_uses_current_size_bucket():
+    provider = _UniverseProvider()
+    names = resolve_universe(
+        provider, [pd.Timestamp('2020-01-02'), pd.Timestamp('2020-02-03')])
+    assert names == ['LIVE', 'NEW', 'OLD']
+    assert [kwargs for _, kwargs in provider.calls] == [{}, {}]
+
+
+def test_legacy_current_size_filter_is_explicit_and_reproducible():
+    provider = _UniverseProvider()
+    scale = ['3 - Small', '4 - Mid']
+    resolve_universe(provider, [pd.Timestamp('2020-01-02')], scale)
+    assert provider.calls[0][1] == {'scalemarketcap': scale}
+
+
+def test_collector_enforces_membership_on_each_rebalance_date():
+    dates = [pd.Timestamp('2020-01-02'), pd.Timestamp('2020-02-03')]
+    provider = _UniverseProvider()
+    membership = resolve_universe_membership(provider, dates)
+    idx = pd.bdate_range('2019-10-01', periods=180)
+    prices = pd.Series(np.linspace(10.0, 20.0, len(idx)), index=idx)
+
+    events, _ = collect_events(
+        _StubProvider(prices), ['OLD', 'LIVE', 'NEW'], dates, horizons=[2],
+        lookback=90, price_start='2019-10-01', price_end='2020-06-30',
+        membership_by_date=membership,
+    )
+
+    observed = set(zip(events['date'], events['name']))
+    assert observed == {
+        (dates[0], 'OLD'), (dates[0], 'LIVE'),
+        (dates[1], 'LIVE'), (dates[1], 'NEW'),
+    }
 
 
 class _StubProvider:
@@ -89,11 +138,27 @@ def test_common_market_shock_differences_out():
 
 
 def test_cost_nets_both_legs():
-    stats, _ = event_study(_events(spread_noise=lambda k: 0.005 * np.sin(k)),
-                           [21], cost_bps=30.0)
+    events = _events(spread_noise=lambda k: 0.005 * np.sin(k))
+    gross, _ = event_study(events, [21], cost_bps=0.0)
+    stats, _ = event_study(events, [21], cost_bps=30.0)
     s = stats[0]
     # 30bp/leg round-trip on long AND short = 60bp off the gross spread
     assert abs(s['net_spread'] - (s['gross_spread'] - 0.0060)) < 1e-12
+    assert s['inference_basis'] == 'net'
+    assert s['t'] < gross[0]['t']
+
+
+def test_cost_can_destroy_gross_significance():
+    # A small, stable gross edge is statistically strong before costs but
+    # negative after a deliberately larger executable cost.  BH and p-values
+    # must describe the latter, not the attractive gross series.
+    events = _events(buy_ab=0.004, sell_ab=0.0,
+                     spread_noise=lambda k: 0.0005 * np.sin(k))
+    gross, gross_bh = event_study(events, [21], cost_bps=0.0)
+    net, net_bh = event_study(events, [21], cost_bps=30.0)
+    assert gross[0]['t'] > 3 and gross_bh['rejected_bh'] == [True]
+    assert net[0]['net_spread'] < 0 and net[0]['t'] < 0
+    assert net_bh['rejected_bh'] == [False]
 
 
 def test_too_few_dates_flagged():

@@ -1,0 +1,345 @@
+{
+  "schema_version": "pead_source_qualification_status.v2",
+  "package_id": "pead-vq-source-qualification-v3",
+  "candidate_id": "pead-vq-source-qualification-v3",
+  "recorded_at_utc": "2026-07-14T19:51:46Z",
+  "status": "local_sharadar_event_root_replayed_external_signal_evidence_and_independent_admission_blocked",
+  "frozen_protocol": {
+    "file": "candidate_specification.json",
+    "schema_version": "pead_candidate_specification.v3",
+    "artifact_file_sha256": "5f17bde9c923bef237f099508c40299a815026088471de11c424b5370fbe14c6",
+    "mutated_by_status_update": false,
+    "qualification_transfer_allowed": false
+  },
+  "architecture": {
+    "file": "source_architecture.json",
+    "schema_version": "pead_source_architecture.v2",
+    "status": "implemented_through_cross_partition_signal_index"
+  },
+  "engineering_status": {
+    "resolved": [
+      {
+        "code": "E00_SHARADAR_SOURCE_SEAL_AND_REPLAY_CONTRACT_IMPLEMENTED",
+        "module": "../../data/sharadar_source_evidence.py",
+        "detail": "Immutable SF1, SEP, and TICKERS receipts, typed conversion, exact row-multiset equivalence, three-table source roots, and create-only publication are implemented."
+      },
+      {
+        "code": "E01_DATED_SECURITY_IDENTITY_REPLAY_CONTRACT_IMPLEMENTED",
+        "module": "../../data/sharadar_source_evidence.py",
+        "detail": "Every bound TICKERS row receives one identity or gap disposition and the identity snapshot is rederived from exact bytes."
+      },
+      {
+        "code": "E02_EXHAUSTIVE_EVENT_UNIVERSE_AND_ANNUAL_INDEX_IMPLEMENTED",
+        "module": "../../data/pead_event_universe.py; ../../data/pead_event_universe_index.py",
+        "detail": "Every census row is dispositioned, frozen v1 semantics remain unchanged, v2 retains affected-row exclusions, and ten contiguous annual children are bound into a globally unique root index."
+      },
+      {
+        "code": "E03_CONSENSUS_RAW_BYTE_REPLAY_AND_TRUST_BOUNDARY_IMPLEMENTED",
+        "module": "../../data/pead_consensus_replay.py",
+        "detail": "Closed adapters rebuild consensus from raw bytes under external universe, identity, manifest, metric-profile, and raw-artifact trust sets."
+      },
+      {
+        "code": "E04_INDEPENDENT_SEC_ANNOUNCEMENT_ACTUAL_REPLAY_IMPLEMENTED",
+        "module": "../../data/pead_announcement_evidence.py",
+        "detail": "SEC 8-K Item 2.02 metadata and issuer-exhibit bytes can be replayed into canonical actuals without treating acceptance or retrieval as exact first-public time."
+      },
+      {
+        "code": "E05_CONSERVATIVE_ANNOUNCEMENT_AVAILABILITY_BOUNDARY_IMPLEMENTED",
+        "module": "../../data/pead_announcement_availability.py",
+        "detail": "Historical licensed distributions and prospective checkpointed SEC observations produce only known-public-by bounds and cannot cross evidence classes."
+      },
+      {
+        "code": "E06_TRUST_ROOTED_EVENT_SOURCE_RECONCILIATION_IMPLEMENTED",
+        "module": "../../analysis/pead_source_reconciliation_v2.py",
+        "detail": "One annual universe can be reconciled exhaustively from authoritative consensus replay, SEC actual evidence, conservative availability, exact metric semantics, and bound trust sets."
+      },
+      {
+        "code": "E07_AUTHORITATIVE_SHARADAR_EVENT_REPLAY_IMPLEMENTED",
+        "module": "../../data/pead_sharadar_event_universe_replay.py",
+        "detail": "ARQ-scoped SF1 evidence is streamed into ten v2 children while retaining all revisions and year-qualified fiscal labels, excluding identity/share-class ambiguity, rebuilding the index, and publishing replay plus index atomically."
+      },
+      {
+        "code": "E08_OFFICIAL_SHARADAR_SEMANTICS_RECEIPT_IMPLEMENTED",
+        "module": "../../data/sharadar_semantics_evidence.py; ../../scripts/acquire_sharadar_semantics.py",
+        "detail": "Exact licensed SHARADAR/INDICATORS bytes are acquired without credential leakage, replayed against closed SEP field definitions, and published create-only."
+      },
+      {
+        "code": "E09_MARKET_ACCOUNTING_RECEIPT_IMPLEMENTED",
+        "module": "../../data/pead_market_accounting_evidence.py",
+        "detail": "The authoritative market receipt proves dated lineage, official observed-session timing, the unique strictly prior positive SEP close, closeunadj, exact split factor, and source-row membership without fallback."
+      },
+      {
+        "code": "E10_FINAL_SIGNAL_INPUT_RECONCILIATION_IMPLEMENTED",
+        "module": "../../analysis/pead_signal_input_reconciliation.py",
+        "detail": "Per-child source and market receipts are replayed into exhaustive exact-rational and Decimal-34 signal inputs; edge, paper, and live remain hard false."
+      },
+      {
+        "code": "E11_CROSS_PARTITION_SIGNAL_INPUT_INDEX_IMPLEMENTED",
+        "module": "../../analysis/pead_signal_input_index.py",
+        "detail": "Exactly ten authoritative annual final receipts are bound to the event roots with ordered exhaustive coverage, global event uniqueness, derived aggregate counts, and create-only publication."
+      }
+    ],
+    "pending": []
+  },
+  "artifact_bindings": {
+    "sharadar_tickers_acquisition": {
+      "schema_version": "sharadar_table_acquisition.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/tickers/receipts/d3495b31d3dbe2b179b510a50aae0de56d99c7cced44326bd373a500c5510198.json",
+      "artifact_hash": "d3495b31d3dbe2b179b510a50aae0de56d99c7cced44326bd373a500c5510198",
+      "file_sha256": "ba594c167981aaa1dfe6c4e329932dbe64d74795eb82417c7f78f650e6fec4a8",
+      "raw_zip_sha256": "d404dc2a2be20603ac8421f00a6423c9d3521e27f02869411b352b6511de3ac9",
+      "parquet_sha256": "a1fe0194cb450d4ef28d1b176568d5fde15009dfe6ac79b8b51a8d3dfd664077",
+      "row_count": 17761,
+      "provider_data_snapshot_time": "2026-07-13 23:29:06 UTC",
+      "status": "locally_sealed_not_independently_admitted"
+    },
+    "sharadar_sf1_acquisition": {
+      "schema_version": "sharadar_table_acquisition.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/sf1/receipts/d49226e3eb1b50b54950b02639e836b132126a35c37c2c078219bf2cc776e007.json",
+      "artifact_hash": "d49226e3eb1b50b54950b02639e836b132126a35c37c2c078219bf2cc776e007",
+      "file_sha256": "302375b38c586b6e127c4a6ff47a25100ca7a674e241698e5eef98d2a5697ec1",
+      "raw_zip_sha256": "11b08e92bc09c8b0de48bbc5bc89c6a39b0fd333251ab5de95a4fbc71b42121c",
+      "parquet_sha256": "490e8f20d0913a6f16950ae6fbf5a1fc049cbfee4ca1486e5b67b5309ad30034",
+      "row_count": 676763,
+      "provider_data_snapshot_time": "2026-07-14 16:30:07 UTC",
+      "status": "locally_sealed_not_independently_admitted"
+    },
+    "sharadar_sep_acquisition": {
+      "schema_version": "sharadar_table_acquisition.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/sep/receipts/871594b9e83c1170a2855b7597422ecfdfef08b064e9497cb9ff8f5e4faca847.json",
+      "artifact_hash": "871594b9e83c1170a2855b7597422ecfdfef08b064e9497cb9ff8f5e4faca847",
+      "file_sha256": "b338f113f9297343cfab0338dd62a6da0ea8c3932d9ac7d0d4c97c843dba2332",
+      "raw_zip_sha256": "52d0a610f36eade971050b9c91105f5628792e29cfe11b7b79eef2c500679fbe",
+      "parquet_sha256": "0c0bb87ccb278670866008ea5bac14915073e7e13b9a03a47f75d4dae72d4622",
+      "row_count": 46175588,
+      "provider_data_snapshot_time": "2026-07-14 15:26:54 UTC",
+      "status": "locally_sealed_not_independently_admitted"
+    },
+    "sharadar_source_snapshot": {
+      "schema_version": "pead_sharadar_source_snapshot.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/snapshots/24f1341f9196d34bcab4d7a9a4a87d4885a9c5a78945953cee7aa764bfa17d79.json",
+      "artifact_hash": "24f1341f9196d34bcab4d7a9a4a87d4885a9c5a78945953cee7aa764bfa17d79",
+      "file_sha256": "129e565ce01aa96a1e53251ee10db4ee7a32342dc489a5026479f5308d4e083b",
+      "created_at_utc": "2026-07-14T18:32:36Z",
+      "table_row_counts": {"sf1": 676763, "sep": 46175588, "tickers": 17761},
+      "status": "locally_sealed_not_independently_admitted"
+    },
+    "security_identity_snapshot": {
+      "schema_version": "pead_security_identity_snapshot.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/identities/2abad245fb6d987359cddbd2600603a05de2aa85c9c54fb9515b44715bfaffa3.json",
+      "artifact_hash": "2abad245fb6d987359cddbd2600603a05de2aa85c9c54fb9515b44715bfaffa3",
+      "file_sha256": "6d71e5727a13d5b6138467d4d0b593746075300e2edba72d327a0dfd33ce5ed0",
+      "created_at_utc": "2026-07-14T18:45:54Z",
+      "source_row_count": 17761,
+      "identity_count": 17761,
+      "identity_gap_count": 0,
+      "status": "locally_replayed_not_independently_admitted"
+    },
+    "annual_event_universe_partitions": {
+      "schema_version": "pead_event_universe.v2",
+      "container_file": "../../pit_warehouse/source_snapshots/sharadar/event_replays/f693d6b909cb74309ffb0e479c142cef213f1d836770d06a3e961281c61812e8.json",
+      "partition_ids": ["2015", "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024"],
+      "artifact_hashes": [
+        "5c4bc6257f5a6e53ebd18f52b13e03db699151265bc95b44db888e6821d24005",
+        "17d9fae03d2f8998a10d6d27223c9d05a2fdd47138e119ecebdafe5aa8310821",
+        "7a9c4d36c617fd7fd6d54261b08a8ac2e29cf3c96f404b217f102d9b3e1d173f",
+        "3e5c302592b3797be71c1cd706f528f9fb015f7eb6a406aff0347205ec2471a7",
+        "2fa83c29736376888ed7750edf99d4f93bba3f73b4bd78d802ab8b0de6280682",
+        "8c27af3af236fb365510c1d012dfefda90db4df531fdc7ea5857faa98456c5cd",
+        "3eb0a132230bbc260cda031aa073ef249f0fd3b19c3af92e029ea31dabab0870",
+        "2c6ee555aec7a096408e39d92ce9c3ac78216665d25261b9f8861f96a24b465e",
+        "1302b1e31328b18efb93026337ef41e25c2188b4f47023dcbfcaad8258e1b1f7",
+        "2cdd5f6f3b28e5cb12e1844c65c9679f0102ad65f179e6bab32223f25ec52c9e"
+      ],
+      "source_record_counts": [20379, 20092, 20063, 20265, 20509, 22449, 25920, 25340, 23599, 16352],
+      "expected_event_counts": [18938, 18711, 18503, 18703, 18809, 19221, 22465, 23323, 21598, 15233],
+      "identity_gap_counts": [971, 908, 1012, 995, 1078, 2112, 2066, 995, 983, 664],
+      "status": "locally_replayed_not_independently_admitted"
+    },
+    "sharadar_event_universe_replay": {
+      "schema_version": "pead_sharadar_event_universe_replay.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/event_replays/f693d6b909cb74309ffb0e479c142cef213f1d836770d06a3e961281c61812e8.json",
+      "artifact_hash": "f693d6b909cb74309ffb0e479c142cef213f1d836770d06a3e961281c61812e8",
+      "file_sha256": "829e5232e47af85a60e74612f529df2a3a3783ddfd1f154cc5ccf9cb4ca0a324",
+      "created_at_utc": "2026-07-14T19:21:10Z",
+      "source_record_count": 214968,
+      "expected_event_count": 195504,
+      "identity_gap_count": 11784,
+      "additional_revision_count": 7680,
+      "construction_code_sha256": "4e6712debddb3989cdd4b20b6b908a249e779a264495091585c081cdd12d2e54",
+      "status": "locally_replayed_not_independently_admitted"
+    },
+    "event_universe_index": {
+      "schema_version": "pead_event_universe_index.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/event_universe_indexes/cf1e022be1b769f0341066ccdb3b619f226fec53036300cc9091b3959e789a68.json",
+      "artifact_hash": "cf1e022be1b769f0341066ccdb3b619f226fec53036300cc9091b3959e789a68",
+      "file_sha256": "559e6bc10b4a2e2908ce566cdca2cb83628bb62f39669177d1ebe860b4fdd30a",
+      "partition_count": 10,
+      "expected_event_count": 195504,
+      "status": "locally_replayed_not_independently_admitted"
+    },
+    "sharadar_semantics_source_receipt": {
+      "schema_version": "sharadar_semantics_source_receipt.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/semantics/receipts/ad46c70a015896afb4c8dc19c7b7446c8272cdf59c346e12b5cd7eb861537222.json",
+      "artifact_hash": "ad46c70a015896afb4c8dc19c7b7446c8272cdf59c346e12b5cd7eb861537222",
+      "file_sha256": "b32249bffaabb6abbdf6d260b102b5f40688bc7ec54b395c1dcdf9f55da7ae25",
+      "raw_response_sha256": "9ad2c847f3e5262a626d2970fe0ee15d74268b05368b82c70a0cf0ec9d371cdb",
+      "captured_at_utc": "2026-07-14T19:14:56.259993Z",
+      "status": "locally_sealed_not_independently_admitted"
+    },
+    "sep_semantic_profile": {
+      "schema_version": "pead_sep_semantic_profile.v1",
+      "file": "../../pit_warehouse/source_snapshots/sharadar/semantics/profiles/c00f24e9b1f42ba71e1c6bd6332632dfbc5a5b190a950423d14291accca6a031.json",
+      "artifact_hash": "c00f24e9b1f42ba71e1c6bd6332632dfbc5a5b190a950423d14291accca6a031",
+      "file_sha256": "a905e8bf0fd1e18ac443316a35b79fec122df27c7390fe4e86bee2683af258c2",
+      "datatable_metadata_sha256": "087905540cc47c243ce9f1b5251f7d30f304db3331023e478303a66d6771b0cf",
+      "status": "locally_sealed_not_independently_admitted"
+    },
+    "nyse_session_close_calendar": {
+      "schema_version": "nyse_session_close_calendar.v1",
+      "file": "../pead_vq_locked_replication_v1/nyse_session_close_calendar.json",
+      "artifact_hash": "5e68b8f6a4ea6960dafcc43fa30ebafed94dff3b5310b3bc4364316703f9254f",
+      "file_sha256": "6c69e799b3693c0936739fcc77082375076bb1933396e40ecfd81ac6c76fcf7b",
+      "coverage": {"start": "2014-01-01", "end": "2025-12-31"},
+      "status": "repository_preserved_not_independently_admitted"
+    },
+    "nyse_session_close_source_receipt": {
+      "schema_version": "nyse_session_close_source_receipt.v1",
+      "file": "../pead_vq_locked_replication_v1/nyse_session_close_sources/receipt.json",
+      "artifact_hash": "3d3a1f3d5a87c1c17daf3bcdd60d6beba9d27c88d92f20db4dc1dceba5246afb",
+      "file_sha256": "7c7e74de6494a757f676104b0037c311c3d877c2d56bc4449f2536b4bbe2e905",
+      "status": "repository_preserved_not_independently_admitted"
+    },
+    "development_consensus_entitlement_audit": {
+      "schema_version": "zacks_pead_snapshot.v1",
+      "file": "../pead_vq_locked_replication_v1/earnings_announcements/snapshots/d242c3343a2b2c3a877e71b4a2c78217164db176d69cbd7c9d4866cb65b93901.json",
+      "artifact_hash": "d242c3343a2b2c3a877e71b4a2c78217164db176d69cbd7c9d4866cb65b93901",
+      "file_sha256": "c9c1463fe4e6f75008e7b05aff724879fac6cafd5295a60d1795a454f3bab7bd",
+      "captured_at_utc": "2026-07-13T21:48:03.565653Z",
+      "zacks_eeh_row_count": 7952,
+      "zacks_eeh_min_obs_date": "2018-01-01",
+      "zacks_eeh_max_obs_date": "2018-12-26",
+      "zacks_mt_row_count": 29,
+      "status": "development_only_sample_limited_not_qualifying"
+    },
+    "consensus_raw_artifacts": {
+      "schema_version": "provider_native_bytes",
+      "artifact_hash": null,
+      "status": "qualifying_full_window_license_or_entitlement_absent"
+    },
+    "consensus_replay_partitions": {
+      "schema_version": "pead_consensus_normalization_replay.v1",
+      "artifact_hash": null,
+      "status": "not_built_without_full_window_bytes_and_independent_roots"
+    },
+    "announcement_evidence_partitions": {
+      "schema_version": "pead_announcement_evidence.v1",
+      "artifact_hash": null,
+      "status": "complete_independent_sec_corpus_absent"
+    },
+    "announcement_availability_partitions": {
+      "schema_version": "pead_announcement_availability.v1",
+      "artifact_hash": null,
+      "status": "licensed_historical_distribution_evidence_absent"
+    },
+    "event_source_reconciliation_partitions": {
+      "schema_version": "pead_source_reconciliation.v2",
+      "artifact_hash": null,
+      "status": "implemented_not_built_without_consensus_actual_and_availability_evidence"
+    },
+    "market_accounting_receipt_partitions": {
+      "schema_version": "pead_market_accounting_evidence.v1",
+      "artifact_hash": null,
+      "status": "implemented_not_built_without_event_source_reconciliations_and_independent_roots"
+    },
+    "final_signal_input_reconciliation_partitions": {
+      "schema_version": "pead_signal_input_reconciliation.v1",
+      "artifact_hash": null,
+      "status": "implemented_not_built_without_source_and_market_receipts"
+    },
+    "final_signal_input_index": {
+      "schema_version": "pead_signal_input_index.v1",
+      "artifact_hash": null,
+      "status": "implemented_not_built_without_ten_authoritative_final_receipts"
+    }
+  },
+  "local_operator_admissions": {
+    "independent_review": false,
+    "candidate_specification_sha256": "5f17bde9c923bef237f099508c40299a815026088471de11c424b5370fbe14c6",
+    "event_universe_construction_code_sha256": "4e6712debddb3989cdd4b20b6b908a249e779a264495091585c081cdd12d2e54",
+    "sharadar_source_snapshot_sha256": "24f1341f9196d34bcab4d7a9a4a87d4885a9c5a78945953cee7aa764bfa17d79",
+    "security_identity_snapshot_sha256": "2abad245fb6d987359cddbd2600603a05de2aa85c9c54fb9515b44715bfaffa3",
+    "sharadar_event_replay_sha256": "f693d6b909cb74309ffb0e479c142cef213f1d836770d06a3e961281c61812e8",
+    "event_universe_index_sha256": "cf1e022be1b769f0341066ccdb3b619f226fec53036300cc9091b3959e789a68",
+    "sep_semantic_profile_sha256": "c00f24e9b1f42ba71e1c6bd6332632dfbc5a5b190a950423d14291accca6a031",
+    "nyse_calendar_sha256": "5e68b8f6a4ea6960dafcc43fa30ebafed94dff3b5310b3bc4364316703f9254f",
+    "status": "sufficient_for_local_structural_replay_not_independent_qualification"
+  },
+  "external_trust_registry_bindings": {
+    "sharadar_acquisition_roots": null,
+    "sharadar_source_snapshot_roots": null,
+    "event_universe_roots": null,
+    "identity_snapshot_roots": null,
+    "candidate_specification_roots": null,
+    "event_universe_construction_code_roots": null,
+    "sep_semantic_profile_roots": null,
+    "nyse_calendar_roots": null,
+    "consensus_source_manifest_roots": null,
+    "consensus_metric_profile_roots": null,
+    "consensus_raw_artifact_roots": null,
+    "announcement_evidence_roots": null,
+    "licensed_distribution_manifest_roots": null,
+    "licensed_distribution_record_roots": null,
+    "prospective_checkpoint_roots": null,
+    "status": "no_independent_registry_entries_bound"
+  },
+  "external_data_and_evidence_blockers": [
+    {
+      "code": "Q02_LICENSED_POINT_IN_TIME_CONSENSUS_INCOMPLETE",
+      "detail": "The current Zacks entitlement audit is limited to a 2018 development slice. No qualifying raw 2014-2024 consensus history, reviewed source manifests, metric profiles, or independent exact-byte roots cover the 195,504-event target."
+    },
+    {
+      "code": "Q03_INDEPENDENT_SEC_ACTUAL_CORPUS_ABSENT",
+      "detail": "No exhaustive SEC 8-K Item 2.02 and issuer-exhibit corpus supplies canonical actual EPS and exact metric/share-basis dispositions for the frozen annual event universes."
+    },
+    {
+      "code": "Q04_HISTORICAL_DISTRIBUTION_EVIDENCE_ABSENT",
+      "detail": "No licensed release-distribution archive, reviewed provider manifest roots, and independently trusted exact records establish historical known-public-by bounds. Retrospective SEC retrieval is not a substitute."
+    },
+    {
+      "code": "Q05_PROSPECTIVE_CHECKPOINT_INFRASTRUCTURE_NOT_STARTED",
+      "detail": "No precommitted prospective universe, observer deployment, or external append-only checkpoint registry is active. This does not block historical architecture work but blocks prospective evidence claims."
+    },
+    {
+      "code": "Q06_INDEPENDENT_TRUST_REGISTRY_ADMISSION_ABSENT",
+      "detail": "The local Sharadar, identity, event, SEP-semantics, NYSE calendar, specification, and code hashes have not been independently reviewed and admitted by a controlled external registry. Local operator allowlists prove replay consistency, not independence."
+    }
+  ],
+  "downstream_evidence_blockers": [
+    "no authoritative source, market, final-signal, or cross-partition signal receipts exist because the independent signal lanes are incomplete",
+    "no independent implementation replication has run on source-qualified inputs",
+    "no cost-net result has survived the frozen eight-cell statistical family",
+    "no separately committed prospective ledger exists",
+    "borrow, locate, impact, capacity, financing, and calibrated execution evidence are unqualified",
+    "independent reviewer attestation and explicit deployment approvals are absent"
+  ],
+  "qualification": {
+    "local_sharadar_source_structurally_qualified": true,
+    "local_identity_structurally_qualified": true,
+    "local_event_universe_structurally_replayed": true,
+    "event_universe_qualified": false,
+    "consensus_replay_qualified": false,
+    "announcement_actuals_qualified": false,
+    "announcement_availability_qualified": false,
+    "event_source_qualified": false,
+    "market_accounting_qualified": false,
+    "signal_input_qualified": false,
+    "research_consumption_allowed": false,
+    "historical_replication_allowed": false,
+    "prospective_accumulation_allowed": false,
+    "edge_claim_allowed": false,
+    "paper_execution_allowed": false,
+    "live_deployment_allowed": false
+  },
+  "next_credible_action": "Give an independent reviewer the exact local source, identity, specification, construction-code, event-replay, SEP-semantics, and NYSE calendar roots for controlled registry admission; in parallel obtain a full-window point-in-time consensus entitlement and a coverage quote against the frozen event manifest, then acquire exhaustive SEC actual and licensed distribution evidence before building any research-consumable receipt."
+}

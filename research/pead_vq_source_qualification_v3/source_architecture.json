@@ -1,0 +1,310 @@
+{
+  "schema_version": "pead_source_architecture.v2",
+  "package_id": "pead-vq-source-qualification-v3",
+  "candidate_id": "pead-vq-source-qualification-v3",
+  "status": "engineering_complete_local_sharadar_evidence_sealed_external_signal_evidence_blocked",
+  "frozen_protocol": {
+    "file": "candidate_specification.json",
+    "schema_version": "pead_candidate_specification.v3",
+    "mutation_allowed": false,
+    "qualification_transfer_allowed": false
+  },
+  "objective": "Produce independently replayable PEAD signal inputs from an exhaustive event census, licensed point-in-time consensus, independent SEC announcement actuals, conservative known-public-by activation, and separately verified Sharadar market evidence.",
+  "source_separation": {
+    "sharadar_market_accounting_lane": {
+      "source_family": "Sharadar",
+      "permitted_roles": [
+        "SF1 ARQ event-census lineage without using SF1 values as signal actuals",
+        "dated CIK, permaticker, ticker, listing, and delisting identity",
+        "SEP split-normalized denominator and contemporaneous closeunadj evidence",
+        "dated market capitalization and size inputs",
+        "corporate-action and terminal-return evidence only after separate semantic qualification"
+      ],
+      "forbidden_roles": [
+        "PEAD actual EPS",
+        "analyst consensus",
+        "analyst count",
+        "consensus vintage availability",
+        "announcement activation time"
+      ]
+    },
+    "licensed_consensus_lane": {
+      "source_family": "licensed point-in-time estimates provider",
+      "permitted_roles": [
+        "raw historical consensus observations",
+        "analyst counts",
+        "provider as-of dates and trusted availability fields",
+        "provider metric and security identifiers"
+      ],
+      "forbidden_roles": [
+        "independent announcement actual",
+        "announcement activation",
+        "market denominator"
+      ]
+    },
+    "independent_announcement_lane": {
+      "source_family": "SEC 8-K Item 2.02 filing metadata and issuer exhibit bytes plus independent availability evidence",
+      "permitted_roles": [
+        "reported actual and exact metric semantics from preserved SEC issuer-exhibit bytes",
+        "conservative known-public-by upper bound from a closed availability adapter"
+      ],
+      "forbidden_roles": [
+        "exact global first-public claim",
+        "consensus expectation",
+        "market denominator"
+      ]
+    }
+  },
+  "implemented_contracts": {
+    "sharadar_acquisition_and_identity": {
+      "module": "../../data/sharadar_source_evidence.py",
+      "implemented": true,
+      "schemas": [
+        "sharadar_table_acquisition.v1",
+        "sharadar_row_equivalence.v1",
+        "sharadar_source_record.v1",
+        "pead_sharadar_source_snapshot.v1",
+        "pead_security_identity_snapshot.v1",
+        "pead_security_identity.v1"
+      ],
+      "authoritative_boundary": "Reopen immutable SF1, SEP, and TICKERS acquisition receipts and exact source bytes, replay CSV-to-Parquet row equivalence, and rederive dated identity from bound TICKERS bytes.",
+      "qualification_without_source_bytes": false
+    },
+    "sharadar_official_semantics": {
+      "module": "../../data/sharadar_semantics_evidence.py",
+      "implemented": true,
+      "schemas": [
+        "sharadar_semantics_source_receipt.v1"
+      ],
+      "authoritative_boundary": "Reopen the exact licensed SHARADAR/INDICATORS response and require the closed official definitions for SEP ticker, date, close, and closeunadj.",
+      "credential_material_in_artifact_allowed": false
+    },
+    "event_census_and_child_universe": {
+      "module": "../../data/pead_event_universe.py",
+      "implemented": true,
+      "schemas": [
+        "pead_event_census_receipt.v1",
+        "pead_event_universe.v1",
+        "pead_event_universe.v2"
+      ],
+      "authoritative_boundary": "Account for every source-census row exactly once as expected_event, identity_gap, or out_of_scope. Frozen v1 retains its original global identity-gap blocker; v2 retains each affected-row exclusion while requiring a complete nonempty census and unrelated expected events.",
+      "v1_semantics_mutated": false
+    },
+    "sharadar_event_universe_replay": {
+      "module": "../../data/pead_sharadar_event_universe_replay.py",
+      "implemented": true,
+      "schemas": [
+        "pead_sharadar_event_universe_replay.v1",
+        "pead_sharadar_event_census.v1",
+        "pead_event_universe.v2",
+        "pead_event_universe_index.v1"
+      ],
+      "authoritative_boundary": "Reopen SF1 and TICKERS evidence, use ARQ as the frozen quarterly scope, retain every source revision and provider fiscal-period label, refuse share-class guesses, rebuild ten children and their root index, and require externally supplied specification and construction-code roots.",
+      "structural_validation_is_authoritative": false
+    },
+    "annual_event_universe_index": {
+      "module": "../../data/pead_event_universe_index.py",
+      "implemented": true,
+      "schemas": [
+        "pead_event_universe_index.v1",
+        "pead_event_universe_partition_policy.v1"
+      ],
+      "authoritative_boundary": "Bind all nonempty calendar-year children, require contiguous target coverage, common roots, and globally unique event IDs.",
+      "source_provenance_boundary": false
+    },
+    "normalized_consensus": {
+      "module": "../../data/pead_consensus_evidence.py",
+      "implemented": true,
+      "schemas": [
+        "pead_consensus_evidence.v1"
+      ],
+      "authoritative_without_raw_replay": false
+    },
+    "consensus_normalization_replay": {
+      "module": "../../data/pead_consensus_replay.py",
+      "implemented": true,
+      "schemas": [
+        "pead_consensus_normalization_replay.v1",
+        "pead_consensus_source_manifest.v1",
+        "pead_consensus_metric_profile.v1"
+      ],
+      "closed_adapters": [
+        "nasdaq_data_link_zacks_eeh.v1",
+        "provider_neutral_json.v1",
+        "provider_neutral_csv.v1"
+      ],
+      "authoritative_boundary": "Reopen exact licensed raw bytes and rebuild the raw-row ledger and normalized consensus evidence under five independently supplied hash allowlists.",
+      "structural_validation_is_authoritative": false
+    },
+    "announcement_actual_evidence": {
+      "module": "../../data/pead_announcement_evidence.py",
+      "implemented": true,
+      "schemas": [
+        "pead_announcement_evidence.v1"
+      ],
+      "authoritative_boundary": "Replay preserved SEC 8-K Item 2.02 metadata and issuer-exhibit bytes into a canonical actual while retaining EDGAR acceptance separately from availability.",
+      "exact_first_public_claim_allowed": false
+    },
+    "announcement_availability": {
+      "module": "../../data/pead_announcement_availability.py",
+      "implemented": true,
+      "schemas": [
+        "pead_announcement_availability.v1",
+        "licensed_release_distribution_manifest.v1",
+        "licensed_release_distribution_record.v1",
+        "external_append_only_checkpoint_receipt.v1",
+        "pead_sha256_trust_root_set.v1"
+      ],
+      "closed_adapters": {
+        "historical_reconstruction": "licensed_release_distribution.v1",
+        "prospective": "sec_https_positive_observation.v1"
+      },
+      "authoritative_boundary": "Replay evidence-class-specific availability evidence and derive only a conservative known-public-by upper bound under external trust roots.",
+      "cross_class_relabel_allowed": false
+    },
+    "event_source_reconciliation": {
+      "module": "../../analysis/pead_source_reconciliation_v2.py",
+      "implemented": true,
+      "schemas": [
+        "pead_source_reconciliation.v2",
+        "pead_source_reconciliation_policy.v2",
+        "pead_sha256_trust_root_set.v1"
+      ],
+      "authoritative_boundary": "For one child universe, invoke consensus raw replay, validate externally trusted SEC actual and availability evidence, enforce exact metric semantics and conservative prior-date selection, and rebuild one disposition per event.",
+      "research_consumable": false
+    },
+    "market_accounting_receipt": {
+      "module": "../../data/pead_market_accounting_evidence.py",
+      "implemented": true,
+      "schemas": [
+        "pead_sep_semantic_profile.v1",
+        "pead_market_accounting_evidence.v1",
+        "pead_market_accounting_policy.v1"
+      ],
+      "authoritative_boundary": "Replay Sharadar source, identity, event lineage, source reconciliation, SEP semantic profile, and official NYSE source evidence; select the unique latest positive SEP row strictly before activation with no fallback.",
+      "final_signal_receipt_required": true
+    },
+    "final_signal_input_reconciliation": {
+      "module": "../../analysis/pead_signal_input_reconciliation.py",
+      "implemented": true,
+      "schemas": [
+        "pead_signal_input_reconciliation.v1",
+        "pead_signal_input_reconciliation_policy.v1"
+      ],
+      "authoritative_boundary": "Replay one child source and market receipt, prove common identity/share basis, compute the frozen signal with exact rational and Decimal-34 math, and accept or exclude every child event.",
+      "edge_claim_allowed": false
+    },
+    "cross_partition_signal_input_index": {
+      "module": "../../analysis/pead_signal_input_index.py",
+      "implemented": true,
+      "schemas": [
+        "pead_signal_input_index.v1",
+        "pead_signal_input_index_policy.v1"
+      ],
+      "authoritative_boundary": "Replay and bind exactly ten annual final receipts to the authoritative event replay/index, enforce ordered exhaustive coverage and global uniqueness, and aggregate only derived counts and blocker identities.",
+      "edge_claim_allowed": false
+    }
+  },
+  "annual_event_partition_plan": {
+    "partition_key": "event_key.fiscal_period_end calendar year",
+    "child_schema_version": "pead_event_universe.v2",
+    "root_schema_version": "pead_event_universe_index.v1",
+    "policy_schema_version": "pead_event_universe_partition_policy.v1",
+    "target_window": {
+      "start": "2015-01-01",
+      "end": "2024-09-30"
+    },
+    "partitions": [
+      {"partition_id": "2015", "start": "2015-01-01", "end": "2015-12-31"},
+      {"partition_id": "2016", "start": "2016-01-01", "end": "2016-12-31"},
+      {"partition_id": "2017", "start": "2017-01-01", "end": "2017-12-31"},
+      {"partition_id": "2018", "start": "2018-01-01", "end": "2018-12-31"},
+      {"partition_id": "2019", "start": "2019-01-01", "end": "2019-12-31"},
+      {"partition_id": "2020", "start": "2020-01-01", "end": "2020-12-31"},
+      {"partition_id": "2021", "start": "2021-01-01", "end": "2021-12-31"},
+      {"partition_id": "2022", "start": "2022-01-01", "end": "2022-12-31"},
+      {"partition_id": "2023", "start": "2023-01-01", "end": "2023-12-31"},
+      {"partition_id": "2024", "start": "2024-01-01", "end": "2024-09-30"}
+    ],
+    "child_rules": [
+      "ARQ is the sole quarterly source scope; provider fiscalperiod is diagnostic",
+      "each annual source intersection is represented exactly once",
+      "each child is nonempty and qualification_allowed",
+      "every source-census row receives exactly one disposition",
+      "identity gaps exclude only affected rows and never authorize share-class guessing",
+      "expected events are determined before consensus or announcement availability is inspected",
+      "event IDs are unique within and across children"
+    ],
+    "downstream_rule": "Produce source, market, and final signal receipts per child and authoritatively bind all ten final receipts in pead_signal_input_index.v1.",
+    "final_cross_partition_receipt": "pead_signal_input_index.v1"
+  },
+  "trust_boundaries": {
+    "external_allowlists_are_verifier_inputs": true,
+    "embedded_self_asserted_trust_qualifies": false,
+    "local_operator_admission_is_independent_review": false,
+    "consensus_replay_allowlists": [
+      "trusted_event_universe_sha256s",
+      "trusted_identity_snapshot_sha256s",
+      "trusted_source_manifest_sha256s",
+      "trusted_metric_profile_sha256s",
+      "trusted_raw_artifact_sha256s"
+    ],
+    "announcement_availability_allowlists": [
+      "trusted_provider_manifest_sha256s",
+      "trusted_provider_record_sha256s",
+      "trusted_checkpoint_sha256s"
+    ],
+    "sharadar_event_replay_allowlists": [
+      "trusted_candidate_specification_sha256s",
+      "trusted_construction_code_sha256s"
+    ],
+    "market_accounting_allowlists": [
+      "trusted_candidate_specification_sha256s",
+      "trusted_construction_code_sha256s",
+      "trusted_sharadar_source_snapshot_sha256s",
+      "trusted_security_identity_snapshot_sha256s",
+      "trusted_sharadar_event_replay_sha256s",
+      "trusted_source_reconciliation_sha256s",
+      "trusted_sep_semantic_profile_sha256s",
+      "trusted_nyse_calendar_sha256s",
+      "trusted_nyse_source_receipt_sha256s"
+    ],
+    "final_signal_allowlists": [
+      "trusted_candidate_specification_sha256s",
+      "trusted_construction_code_sha256s",
+      "trusted_signal_reconciliation_code_sha256s",
+      "trusted_source_reconciliation_sha256s",
+      "trusted_market_accounting_evidence_sha256s"
+    ],
+    "cross_partition_allowlists": [
+      "trusted_signal_input_reconciliation_sha256s",
+      "trusted_candidate_specification_sha256s",
+      "trusted_construction_code_sha256s",
+      "trusted_signal_reconciliation_code_sha256s"
+    ],
+    "binding_rule": "Every allowlist is canonically sorted, hashed as pead_sha256_trust_root_set.v1, and bound into the consuming receipt.",
+    "trust_registry_owner": "independent reviewer or controlled external registry, not the artifact producer"
+  },
+  "remaining_engineering_contracts": {},
+  "immutability": {
+    "preserved_raw_bytes": "SHA-256 over exact bytes",
+    "structured_artifacts": "SHA-256 over schema-declared canonical JSON payload",
+    "strict_json": true,
+    "duplicate_keys_allowed": false,
+    "placeholder_digests_allowed": false,
+    "overwrite_allowed": false,
+    "authoritative_publication_default": true,
+    "rule_change_policy": "Any source, universe, activation, signal, portfolio, statistical-family, or qualification-boundary change requires a new versioned package."
+  },
+  "claim_boundary": {
+    "architecture_documentation_allowed": true,
+    "local_source_artifact_recording_allowed": true,
+    "event_source_qualification_allowed": false,
+    "research_consumption_allowed": false,
+    "historical_replication_allowed": false,
+    "prospective_accumulation_allowed": false,
+    "edge_claim_allowed": false,
+    "paper_execution_allowed": false,
+    "live_deployment_allowed": false
+  }
+}

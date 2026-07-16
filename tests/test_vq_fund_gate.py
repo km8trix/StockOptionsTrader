@@ -95,11 +95,27 @@ def test_default_risk_parity_construction_unchanged(stubbed, monkeypatch):
     assert callable(kwargs['orchestrator_factory'])
     assert captured['run'] == (('AAA', 'BBB'), '2015-01-01', '2024-12-31',
                                None)
-    assert (summary, gate) == (_REPORT['summary'], {'psr': 0.5})
+    assert summary == _REPORT['summary']
+    assert gate['psr'] == 0.5
+    assert gate['qualifying'] is False
+    assert gate['passed'] is False
+    assert gate['diagnostic_passed'] is None
+    assert gate['universe_membership_model'] == 'static_retrieval_union'
     assert n_trades == 2 and n_names == 2
     assert deploy == {'mean': pytest.approx(0.7),
                       'median': pytest.approx(0.8),
                       'min': pytest.approx(0.5)}
+
+
+def test_static_union_gate_cannot_surface_as_promotion_evidence():
+    diagnostic = {'passed': True, 'psr': 0.99}
+    gate = vfg._mark_retrieval_union_nonqualifying(diagnostic)
+
+    assert diagnostic == {'passed': True, 'psr': 0.99}
+    assert gate['diagnostic_passed'] is True
+    assert gate['passed'] is False
+    assert gate['qualifying'] is False
+    assert gate['nonqualifying_reasons']
 
 
 def test_static_builds_engine_with_no_reweighter(stubbed, monkeypatch):

@@ -1,0 +1,227 @@
+{
+    "artifact_hash": "622e9987d86bec5a0c36ea507ee8b87579f255c985e3f550f24e5aff40cc7f38",
+    "payload": {
+        "accounting": {
+            "borrow": "not_modeled",
+            "capital_sharing": "none_each_cohort_has_independent_normalized_nav",
+            "cash_yield": "zero",
+            "distribution_holding_interval": "entry_date_exclusive_exit_date_inclusive",
+            "distribution_payment": "not_modeled_candidate_receivable_never_settled_cash",
+            "distribution_reinvestment": false,
+            "financing": "not_modeled",
+            "initial_nav": "1",
+            "margin_and_short_proceeds": "synthetic_unrestricted_normalized_cash_no_broker_claim",
+            "mark_price": "SEP.close_split_normalized",
+            "one_way_fee_rate_per_trade_per_leg": "0.003",
+            "quantity_basis": "signed_split_normalized_share_equivalent_not_broker_shares",
+            "round_trip_long_short_cohort_fee": "0.012",
+            "terminal_nav_identity": "settled_cash_plus_candidate_distribution_receivable_plus_zero_market_value",
+            "trade_price": "exact_SEP.close_on_global_observed_session"
+        },
+        "candidate_id": "pead-vq-locked-replication-v1",
+        "claim_boundary": {
+            "bounded_claim": "two_distinct_implementations_reconcile_exhaustive_development_sample_daily_modeled_money_paths",
+            "does_not_establish": [
+                "authoritative_cash_distribution_semantics",
+                "borrow_or_locate_availability",
+                "broker_execution_or_fill_quality",
+                "capacity_or_market_impact",
+                "financing_or_margin_economics",
+                "full_eight_cell_candidate_family_coverage",
+                "full_historical_replication",
+                "paper_execution",
+                "prospective_edge",
+                "qualification",
+                "tradeable_edge"
+            ]
+        },
+        "component_reconciliation": {
+            "cohort_key_fields": [
+                "cohort_id",
+                "formation_date",
+                "horizon_sessions",
+                "sequence",
+                "checkpoint",
+                "session_date"
+            ],
+            "constituent_key_fields": [
+                "cohort_id",
+                "formation_date",
+                "horizon_sessions",
+                "sequence",
+                "checkpoint",
+                "session_date",
+                "m_ticker",
+                "permaticker",
+                "source_event_key"
+            ],
+            "exact_fields": [
+                "checkpoint",
+                "leg",
+                "rank",
+                "price_split_normalized",
+                "target",
+                "order",
+                "position",
+                "applied_distribution_action_keys",
+                "sequence",
+                "open_position_count"
+            ],
+            "expected_coverage": {
+                "cohort_daily_states": 688,
+                "daily_constituent_states": 3784,
+                "distribution_action_applications": 61
+            },
+            "money_absolute_tolerance": "0.000000000000000005",
+            "money_fields": [
+                "order_cash_flow",
+                "distribution_accrual_today",
+                "signed_distribution_balance",
+                "market_value",
+                "fee_today",
+                "price_pnl",
+                "net_pnl_contribution",
+                "settled_cash",
+                "gross_long_market_value",
+                "gross_short_market_value",
+                "nav",
+                "checkpoint_fees",
+                "cumulative_fees",
+                "daily_pnl",
+                "cumulative_pnl"
+            ],
+            "purpose": "prevent_aggregate_agreement_from_hiding_compensating_per_name_or_action_attribution_errors"
+        },
+        "decimal_policy": {
+            "calculation_precision": 50,
+            "money_serialization_decimals": 18,
+            "quantity_serialization_decimals": 24,
+            "rounding": "ROUND_HALF_EVEN",
+            "rounding_stage": "serialization_only"
+        },
+        "development_sample_input_binding": {
+            "combined_data_snapshot_hash": "0c047827948d9de2ac60ee8d753cca79c0499f6e789d520524feedb2291a15cc",
+            "daily_input_snapshot_hash": "d0b6b6ee3d42696b80528ac58c8c95d3adabfc83f294a1521d654125ba721f52",
+            "economic_return_inputs_hash": "c30e57998d475818c64dcf47bbc4f92e91ef584e65ffbe64d4591451254927ad",
+            "expected_key_manifest_hash": "933431159894ca481cf10d99a83915f2f0d73aab3014293626127bb480e0d67f",
+            "independent_reference_comparison_hash": "926ed1a9a9e91c2e04a04b4ca431d17d4313db04cc313925ed1cbefb1937ec8e",
+            "modeled_execution_ledger_hash": "b38f4f8b654b23e3046c236a046f24ba3cf597c02c143f13435f8a87e4f45cdc",
+            "research_manifest_binding_hash": "8348e851a0d77a1bc9069059acffe4c19f4e579591a1fe0446be9caba1981e40",
+            "source_report_core_hash": "94374850901408dba8ae7c2f428af66effeaf81461194baab67ee1946bc6ce92",
+            "source_report_file_sha256": "e2ae42ee3f6fad49748f23a40869e3b2461113fb31f4cb9016033e8560d678b7",
+            "warehouse_snapshot_hash": "7067cea26762257a8cbf9e8c89ad684aaf2e3bcb3b0964e2fc26d554c6cdd919"
+        },
+        "development_sample_expected_coverage": {
+            "admitted_pooled_cohorts": 16,
+            "daily_selected_constituent_checkpoints": 3784,
+            "exhaustive_formation_checkpoints": 330,
+            "generic_observation_keys": 4114,
+            "selected_constituent_paths": 88
+        },
+        "generic_projection": {
+            "eligibility": "exact_boolean",
+            "fields": {
+                "cash": "cohort_settled_cash_excluding_distribution_receivable",
+                "fees": "cohort_cumulative_modeled_fees",
+                "order": "constituent_split_normalized_share_equivalent_order",
+                "pnl": "cohort_nav_minus_initial_nav",
+                "position": "constituent_post_checkpoint_split_normalized_share_equivalent_position",
+                "rank": "one_based_full_formation_cross_section_rank",
+                "signal": "frozen_eps_surprise_scaled_by_split_normalized_close",
+                "target": "signed_initial_nav_fraction_zero_for_unselected_and_post_exit"
+            },
+            "key_fields": [
+                "candidate_id",
+                "slice",
+                "cohort_id",
+                "formation_date",
+                "horizon_sessions",
+                "checkpoint",
+                "session_date",
+                "ticker",
+                "m_ticker",
+                "permaticker",
+                "source_event_key"
+            ],
+            "numeric_tolerances": {
+                "cash": {
+                    "absolute": 1e-12,
+                    "relative": 1e-12
+                },
+                "fees": {
+                    "absolute": 1e-15,
+                    "relative": 1e-12
+                },
+                "order": {
+                    "absolute": 1e-15,
+                    "relative": 1e-12
+                },
+                "pnl": {
+                    "absolute": 1e-12,
+                    "relative": 1e-12
+                },
+                "position": {
+                    "absolute": 1e-15,
+                    "relative": 1e-12
+                },
+                "rank": {
+                    "absolute": 0.0,
+                    "relative": 0.0
+                },
+                "signal": {
+                    "absolute": 1e-12,
+                    "relative": 1e-12
+                },
+                "target": {
+                    "absolute": 1e-15,
+                    "relative": 1e-12
+                }
+            }
+        },
+        "independence": {
+            "generic_reconciliation_is_nested_not_sufficient_for_pead_acceptance": true,
+            "primary_implementation_id": "pead-primary-daily-ledger-v2",
+            "primary_source": "validated_primary_report_and_modeled_execution_ledger",
+            "reference_implementation_id": "pead-independent-event-driven-v2",
+            "reference_source": "validated_independent_reference_signal_output",
+            "separate_money_calculation_files_required": true
+        },
+        "schedule": {
+            "checkpoint_labels": [
+                "formation_target",
+                "entry_close",
+                "mark_close",
+                "exit_close"
+            ],
+            "daily_path": "every_global_observed_SEP_session_from_entry_through_exit_inclusive",
+            "entry": "next_global_observed_SEP_session_after_formation",
+            "exit": "exactly_horizon_global_observed_SEP_sessions_after_entry",
+            "formation": "first_observed_SEP_session_of_month"
+        },
+        "schema_version": "pead_daily_money_path_protocol.v2",
+        "selection": {
+            "horizons_sessions": [
+                21,
+                63
+            ],
+            "minimum_names": 10,
+            "names_per_leg": "floor(0.2*eligible_names)",
+            "rank": "ascending_signal_then_ascending_stable_m_ticker",
+            "slice": "pooled",
+            "tails": "lowest_short_highest_long",
+            "target_per_selected_name": "signed_one_over_names_per_leg"
+        },
+        "state_equations": {
+            "candidate_distribution_receivable": "prior_receivable_plus_sum(pre_checkpoint_position_held_from_prior_session_close_times_candidate_distribution_amount_on_session_before_any_exit_close_order)",
+            "checkpoint_event_order": "accrue_entry_exclusive_exit_inclusive_distributions_then_execute_close_orders_then_mark_post_trade_state",
+            "cumulative_fees": "prior_fees_plus_sum_absolute_target_times_0.003_for_each_entry_or_exit",
+            "daily_pnl": "nav_minus_prior_nav",
+            "distribution_accrual_quantity": "start_of_checkpoint_held_quantity_zero_on_entry_and_pre_liquidation_quantity_on_exit",
+            "market_value": "sum(post_checkpoint_position_times_session_close)",
+            "nav": "settled_cash_plus_candidate_distribution_receivable_plus_market_value",
+            "order_cash_flow": "negative_sum(order_times_session_close)",
+            "position": "prior_position_plus_order",
+            "settled_cash": "prior_settled_cash_plus_order_cash_flow_minus_checkpoint_fees"
+        }
+    }
+}

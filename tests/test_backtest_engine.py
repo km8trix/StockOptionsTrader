@@ -768,6 +768,108 @@ class TestRealisticFills:
             100.0 * (1 + DEFAULT_SLIPPAGE_BPS / 10000.0))  # no impact
         assert asset not in engine.pending_intents  # nothing re-queued
 
+    def test_missing_adv_keeps_legacy_uncapped_fill_by_default(self):
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 10000).drop(columns=['volume'])
+        asset = self._asset()
+        engine = self._engine(enable_realistic_fills=True)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[4], 'days_waiting': 0,
+            'quantity': 5000}
+
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        assert engine.reject_fills_without_adv is False
+        assert engine.trades_log[0]['quantity'] == 5000
+        assert engine.trades_log[0]['price'] == pytest.approx(
+            100.0 * (1 + DEFAULT_SLIPPAGE_BPS / 10000.0))
+        assert asset not in engine.pending_intents
+
+    def test_fail_closed_missing_adv_defers_then_expires_intent(self):
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 10000).drop(columns=['volume'])
+        asset = self._asset()
+        engine = self._engine(
+            enable_realistic_fills=True, reject_fills_without_adv=True)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[0], 'days_waiting': 0,
+            'quantity': 5000}
+
+        for date in dates[1:MAX_PENDING_DAYS]:
+            engine._fill_pending_intents(
+                {'AAA': frame}, date, position_size=0.1)
+
+        assert engine.trades_log == []
+        assert engine.pending_intents[asset]['days_waiting'] \
+            == MAX_PENDING_DAYS - 1
+
+        engine._fill_pending_intents(
+            {'AAA': frame}, dates[MAX_PENDING_DAYS], position_size=0.1)
+
+        assert engine.trades_log == []
+        assert asset not in engine.pending_intents
+
+    @pytest.mark.parametrize('invalid_volume', [float('inf'), -1.0, 0.0])
+    def test_fail_closed_rejects_invalid_adv(self, invalid_volume):
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, invalid_volume)
+        asset = self._asset()
+        engine = self._engine(
+            enable_realistic_fills=True, reject_fills_without_adv=True)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[4], 'days_waiting': 0,
+            'quantity': 5000}
+
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        assert engine.trades_log == []
+        assert engine.pending_intents[asset]['days_waiting'] == 1
+
+    def test_fail_closed_valid_adv_still_caps_and_fills(self):
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 10000)
+        asset = self._asset()
+        engine = self._engine(
+            enable_realistic_fills=True, impact_coef=0.1,
+            participation_cap=0.01, adv_window=5,
+            reject_fills_without_adv=True)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[4], 'days_waiting': 0,
+            'quantity': 5000}
+
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        assert engine.trades_log[0]['quantity'] == 100
+        assert engine.pending_intents[asset]['quantity'] == 4900
+
+    def test_fail_closed_sub_share_capacity_defers_then_expires(self):
+        dates = pd.bdate_range('2023-01-02', periods=6)
+        frame = _vol_frame(dates, 100.0, 5)  # 10% of ADV is half a share
+        asset = self._asset()
+        engine = self._engine(
+            enable_realistic_fills=True, participation_cap=0.1, adv_window=5,
+            reject_fills_without_adv=True)
+        engine.pending_intents[asset] = {
+            'signal': 'BUY', 'signal_date': dates[0], 'days_waiting': 0,
+            'quantity': 5000}
+
+        for date in dates[1:MAX_PENDING_DAYS]:
+            engine._fill_pending_intents(
+                {'AAA': frame}, date, position_size=0.1)
+
+        assert engine.trades_log == []
+        assert engine.pending_intents[asset]['days_waiting'] \
+            == MAX_PENDING_DAYS - 1
+
+        engine._fill_pending_intents(
+            {'AAA': frame}, dates[MAX_PENDING_DAYS], position_size=0.1)
+
+        assert engine.trades_log == []
+        assert asset not in engine.pending_intents
+
     def test_thin_adv_cap_floors_at_one_share(self):
         # Review fix (HIGH): int(participation_cap*ADV) rounds to 0 for thin
         # names; the cap is floored at 1 so the order trickles, never dumps.
@@ -859,6 +961,73 @@ class TestRealisticFills:
         assert trade['action'] == 'SELL'
         assert trade['quantity'] == 500
         assert trade['price'] == pytest.approx(expected_price)
+        assert engine.portfolio.get_position(asset) is None
+        assert asset not in engine.pending_intents
+
+    def test_fail_closed_sell_caps_exit_and_requeues_remainder(self):
+        from core.models import Position
+        dates = pd.bdate_range('2023-01-02', periods=8)
+        frame = _vol_frame(dates, 100.0, 10000)
+        asset = self._asset()
+        engine = self._engine(
+            enable_realistic_fills=True, impact_coef=0.1,
+            participation_cap=0.01, adv_window=5,
+            reject_fills_without_adv=True)
+        engine.portfolio.add_position(Position(
+            asset=asset, quantity=250, avg_entry_price=90.0,
+            current_price=100.0, timestamp=dates[0]))
+        engine.pending_intents[asset] = {
+            'signal': 'SELL', 'signal_date': dates[4], 'days_waiting': 0}
+
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        assert engine.trades_log[0]['quantity'] == 100
+        assert engine.portfolio.get_position(asset).quantity == 150
+        remainder = engine.pending_intents[asset]
+        assert remainder['quantity'] == 150
+        assert remainder['accumulate'] is False
+        assert remainder['liquidity_remainder'] is True
+
+        for date in dates[6:]:
+            engine._fill_pending_intents(
+                {'AAA': frame}, date, position_size=0.1)
+        assert [trade['quantity'] for trade in engine.trades_log] \
+            == [100, 100, 50]
+        assert engine.portfolio.get_position(asset) is None
+        assert asset not in engine.pending_intents
+
+    def test_fail_closed_cover_caps_exit_and_requeues_remainder(self):
+        from core.models import Position
+        dates = pd.bdate_range('2023-01-02', periods=8)
+        frame = _vol_frame(dates, 100.0, 10000)
+        asset = self._asset()
+        engine = BacktestEngine(
+            desk=_LegacyDesk(), initial_capital=10_000_000.0,
+            commission=COMMISSION, enable_realistic_fills=True,
+            impact_coef=0.1, participation_cap=0.01, adv_window=5,
+            reject_fills_without_adv=True)
+        engine.portfolio.add_position(Position(
+            asset=asset, quantity=-250, avg_entry_price=110.0,
+            current_price=100.0, timestamp=dates[0]))
+        engine.pending_intents[asset] = {
+            'signal': 'COVER', 'signal_date': dates[4], 'days_waiting': 0}
+
+        engine._fill_pending_intents({'AAA': frame}, dates[5],
+                                     position_size=0.1)
+
+        assert engine.trades_log[0]['quantity'] == 100
+        assert engine.portfolio.get_position(asset).quantity == -150
+        remainder = engine.pending_intents[asset]
+        assert remainder['quantity'] == 150
+        assert remainder['accumulate'] is False
+        assert remainder['liquidity_remainder'] is True
+
+        for date in dates[6:]:
+            engine._fill_pending_intents(
+                {'AAA': frame}, date, position_size=0.1)
+        assert [trade['quantity'] for trade in engine.trades_log] \
+            == [100, 100, 50]
         assert engine.portfolio.get_position(asset) is None
         assert asset not in engine.pending_intents
 

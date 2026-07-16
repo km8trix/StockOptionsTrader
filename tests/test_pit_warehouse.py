@@ -10,7 +10,13 @@ import duckdb
 import pandas as pd
 import pytest
 
-from data.pit_warehouse import PitWarehouse
+from data.pit_warehouse import (
+    PitWarehouse,
+    SecurityLifecycleError,
+    WarehouseQueryError,
+    WarehouseSchemaError,
+    WarehouseTableMissingError,
+)
 
 
 def _write(path, columns, rows):
@@ -58,14 +64,22 @@ def test_universe_survivorship_free(wh):
     w, tmp = wh
     cols = [('ticker', 'VARCHAR'), ('firstpricedate', 'DATE'),
             ('lastpricedate', 'DATE'), ('category', 'VARCHAR'),
-            ('scalemarketcap', 'VARCHAR')]
+            ('scalemarketcap', 'VARCHAR'), ('isdelisted', 'VARCHAR'),
+            ('permaticker', 'BIGINT')]
     _write(tmp / "tickers.parquet", cols, [
         # live across 2020, delisted 2018 (must appear in a 2017 universe), and
         # not-yet-listed until 2021 (must NOT appear in a 2020 universe).
-        ("'LIVE'", "DATE '2010-01-01'", "NULL", "'Domestic Common Stock'", "'4 - Mid'"),
-        ("'DEAD'", "DATE '2010-01-01'", "DATE '2018-06-30'", "'Domestic Common Stock'", "'2 - Micro'"),
-        ("'NEW'", "DATE '2021-01-01'", "NULL", "'Domestic Common Stock'", "'4 - Mid'"),
-        ("'ETF'", "DATE '2010-01-01'", "NULL", "'ETF'", "'6 - Mega'"),
+        ("'LIVE'", "DATE '2010-01-01'", "DATE '2026-07-10'",
+         "'Domestic Common Stock'", "'4 - Mid'", "'N'", "1001"),
+        ("'DEAD'", "DATE '2010-01-01'", "DATE '2018-06-30'",
+         "'Domestic Common Stock'", "'2 - Micro'", "'Y'", "1002"),
+        ("'NEW'", "DATE '2021-01-01'", "DATE '2026-07-10'",
+         "'Domestic Common Stock'", "'4 - Mid'", "'N'", "1003"),
+        ("'ETF'", "DATE '2010-01-01'", "DATE '2026-07-10'", "'ETF'",
+         "'6 - Mega'", "'N'", "1004"),
+    ])
+    _write(tmp / "sep.parquet", [('ticker', 'VARCHAR'), ('date', 'DATE')], [
+        ("'DEAD'", "DATE '2018-06-30'"),
     ])
     u2017 = w.universe_asof('2017-06-30')
     assert 'DEAD' in u2017          # survivorship-free: delisted name kept for live span
@@ -80,6 +94,156 @@ def test_universe_survivorship_free(wh):
     assert w.delisting_date('DEAD').isoformat() == '2018-06-30'
     assert w.delisting_date('LIVE') is None
     assert w.delisting_date('MISSING') is None
+
+
+# ---------------------------------------------------------------------------
+# security_lifecycle — strict identity and delisting evidence
+# ---------------------------------------------------------------------------
+def test_security_lifecycle_validates_identity_status_and_final_sep_date(wh):
+    w, tmp = wh
+    columns = [
+        ('ticker', 'VARCHAR'), ('permaticker', 'BIGINT'),
+        ('isdelisted', 'VARCHAR'), ('lastpricedate', 'DATE'),
+    ]
+    _write(tmp / 'tickers.parquet', columns, [
+        ("'DEAD'", '1001', "'Y'", "DATE '2020-01-06'"),
+        ("'LIVE'", '1002', "'N'", "DATE '2026-07-10'"),
+    ])
+    _write(tmp / 'sep.parquet',
+           [('ticker', 'VARCHAR'), ('date', 'DATE')], [
+               ("'DEAD'", "DATE '2020-01-03'"),
+               ("'DEAD'", "DATE '2020-01-06'"),
+           ])
+
+    dead = w.security_lifecycle('DEAD')
+    assert dead == {
+        'ticker': 'DEAD',
+        'permaticker': 1001,
+        'isdelisted': 'Y',
+        'lastpricedate': pd.Timestamp('2020-01-06').date(),
+        'sep_lastpricedate': pd.Timestamp('2020-01-06').date(),
+    }
+    live = w.security_lifecycle('LIVE')
+    assert live['isdelisted'] == 'N'
+    assert live['lastpricedate'] == pd.Timestamp('2026-07-10').date()
+    assert live['sep_lastpricedate'] is None
+
+
+@pytest.mark.parametrize(('rows', 'message'), [
+    ([
+        ("'DEAD'", '1001', "'Y'", "DATE '2020-01-06'"),
+        ("'DEAD'", '1002', "'Y'", "DATE '2020-01-06'"),
+    ], 'exactly one'),
+    ([("'DEAD'", '1001', "'true'", "DATE '2020-01-06'")],
+     'literal N or Y'),
+    ([("'DEAD'", 'NULL', "'Y'", "DATE '2020-01-06'")],
+     'invalid permaticker'),
+    ([("'DEAD'", '1001', "'Y'", 'NULL')], 'lastpricedate'),
+])
+def test_security_lifecycle_rejects_invalid_tickers_rows(wh, rows, message):
+    w, tmp = wh
+    _write(tmp / 'tickers.parquet', [
+        ('ticker', 'VARCHAR'), ('permaticker', 'BIGINT'),
+        ('isdelisted', 'VARCHAR'), ('lastpricedate', 'DATE'),
+    ], rows)
+
+    with pytest.raises(SecurityLifecycleError, match=message):
+        w.security_lifecycle('DEAD')
+
+
+def test_security_lifecycle_rejects_missing_schema_and_final_date_mismatch(wh):
+    w, tmp = wh
+    _write(tmp / 'tickers.parquet', [
+        ('ticker', 'VARCHAR'), ('isdelisted', 'VARCHAR'),
+        ('lastpricedate', 'DATE'),
+    ], [
+        ("'DEAD'", "'Y'", "DATE '2020-01-06'"),
+    ])
+    with pytest.raises(SecurityLifecycleError, match='permaticker'):
+        w.security_lifecycle('DEAD')
+
+    (tmp / 'tickers.parquet').unlink()
+    _write(tmp / 'tickers.parquet', [
+        ('ticker', 'VARCHAR'), ('permaticker', 'BIGINT'),
+        ('isdelisted', 'VARCHAR'), ('lastpricedate', 'DATE'),
+    ], [
+        ("'DEAD'", '1001', "'Y'", "DATE '2020-01-06'"),
+    ])
+    _write(tmp / 'sep.parquet',
+           [('ticker', 'VARCHAR'), ('date', 'DATE')], [
+               ("'DEAD'", "DATE '2020-01-03'"),
+           ])
+    with pytest.raises(SecurityLifecycleError, match='does not match'):
+        w.security_lifecycle('DEAD')
+    # The convenience method cannot accidentally treat contradictory evidence
+    # as a proven delisting.
+    assert w.delisting_date('DEAD') is None
+
+
+def test_security_currency_is_a_strict_separate_identity_read(wh):
+    w, tmp = wh
+    _write(
+        tmp / 'tickers.parquet',
+        [('ticker', 'VARCHAR'), ('currency', 'VARCHAR')],
+        [("'AAPL'", "'usd'")],
+    )
+    assert w.security_currency('AAPL') == {
+        'ticker': 'AAPL',
+        'currency': 'USD',
+    }
+    with pytest.raises(WarehouseSchemaError, match='exactly one'):
+        w.security_currency('MSFT')
+
+
+def test_corporate_action_slice_is_exact_ordered_and_semantics_free(wh):
+    w, tmp = wh
+    columns = [
+        ('date', 'DATE'), ('action', 'VARCHAR'), ('ticker', 'VARCHAR'),
+        ('name', 'VARCHAR'), ('value', 'DOUBLE'),
+        ('contraticker', 'VARCHAR'), ('contraname', 'VARCHAR'),
+    ]
+    _write(tmp / 'actions.parquet', columns, [
+        ("DATE '2020-01-05'", "'acquisitionby'", "'ABC'", "'ABC Corp'",
+         '50000.0', "'XYZ'", "'XYZ Corp'"),
+        ("DATE '2020-01-03'", "'dividend'", "'ABC'", "'ABC Corp'",
+         '0.25', 'NULL', 'NULL'),
+        ("DATE '2020-01-03'", "'dividend'", "'OTHER'", "'Other Corp'",
+         '0.50', 'NULL', 'NULL'),
+    ])
+
+    assert w.corporate_actions_for_tickers(
+        ['ABC'], '2020-01-01', '2020-01-31'
+    ) == [
+        {
+            'date': '2020-01-03',
+            'action': 'dividend',
+            'ticker': 'ABC',
+            'name': 'ABC Corp',
+            'value': 0.25,
+            'contraticker': None,
+            'contraname': None,
+        },
+        {
+            'date': '2020-01-05',
+            'action': 'acquisitionby',
+            'ticker': 'ABC',
+            'name': 'ABC Corp',
+            # This remains generic vendor metadata; the reader does not call it
+            # per-share settlement consideration.
+            'value': 50000.0,
+            'contraticker': 'XYZ',
+            'contraname': 'XYZ Corp',
+        },
+    ]
+
+    with pytest.raises(WarehouseSchemaError, match='unique'):
+        w.corporate_actions_for_tickers(
+            ['ABC', 'ABC'], '2020-01-01', '2020-01-31'
+        )
+    with pytest.raises(WarehouseSchemaError, match='ordered'):
+        w.corporate_actions_for_tickers(
+            ['ABC'], '2020-02-01', '2020-01-31'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -108,19 +272,92 @@ def test_fundamentals_point_in_time(wh):
 def test_prices_range_and_field(wh):
     w, tmp = wh
     cols = [('ticker', 'VARCHAR'), ('date', 'DATE'), ('close', 'DOUBLE'),
-            ('closeadj', 'DOUBLE')]
+            ('closeadj', 'DOUBLE'), ('closeunadj', 'DOUBLE')]
     _write(tmp / "sep.parquet", cols, [
-        ("'AAPL'", "DATE '2020-01-02'", "100.0", "50.0"),
-        ("'AAPL'", "DATE '2020-01-03'", "101.0", "50.5"),
-        ("'AAPL'", "DATE '2020-02-01'", "110.0", "55.0"),
+        ("'AAPL'", "DATE '2020-01-02'", "100.0", "50.0", "99.0"),
+        ("'AAPL'", "DATE '2020-01-03'", "101.0", "50.5", "100.0"),
+        ("'AAPL'", "DATE '2020-02-01'", "110.0", "55.0", "109.0"),
     ])
     s = w.prices('AAPL', '2020-01-01', '2020-01-31')
     assert list(s.index) == [pd.Timestamp('2020-01-02'), pd.Timestamp('2020-01-03')]
     assert list(s.values) == [50.0, 50.5]          # closeadj by default (total return)
     assert s.name == 'AAPL'
     assert list(w.prices('AAPL', '2020-01-01', '2020-01-31', field='close').values) == [100.0, 101.0]
-    # bad field falls back to closeadj, not an error
-    assert list(w.prices('AAPL', '2020-01-02', '2020-01-02', field='bogus').values) == [50.0]
+    assert list(w.prices(
+        'AAPL', '2020-01-01', '2020-01-31',
+        field='closeunadj').values) == [99.0, 100.0]
+    with pytest.raises(ValueError, match='unsupported price field'):
+        w.prices('AAPL', '2020-01-02', '2020-01-02', field='bogus')
+    with pytest.raises(ValueError, match='unsupported price field'):
+        w.prices_bulk(
+            ['AAPL'], '2020-01-02', '2020-01-02', field='bogus')
+
+
+def test_prices_strict_returns_exact_field_without_date_shift(wh):
+    w, tmp = wh
+    cols = [('ticker', 'VARCHAR'), ('date', 'DATE'),
+            ('closeadj', 'DOUBLE'), ('closeunadj', 'DOUBLE')]
+    _write(tmp / 'sep.parquet', cols, [
+        ("'AAPL'", "DATE '2020-01-02'", "50.0", "99.0"),
+        ("'AAPL'", "DATE '2020-01-03'", "50.5", "100.0"),
+    ])
+
+    adjusted = w.prices_strict(
+        'AAPL', '2020-01-02', '2020-01-02', 'closeadj')
+    unadjusted = w.prices_strict(
+        'AAPL', '2020-01-02', '2020-01-02', 'closeunadj')
+    assert adjusted.iloc[0] == 50.0
+    assert unadjusted.iloc[0] == 99.0
+    assert not adjusted.equals(unadjusted)
+
+    # Exact-date reads never pull the prior or following observed session.
+    assert w.prices_strict(
+        'AAPL', '2020-01-04', '2020-01-04', 'closeunadj').empty
+
+
+def test_prices_strict_distinguishes_missing_query_and_schema_failures(wh):
+    w, tmp = wh
+    with pytest.raises(WarehouseTableMissingError, match='sep'):
+        w.prices_strict(
+            'AAPL', '2020-01-02', '2020-01-02', 'closeunadj')
+
+    (tmp / 'sep.parquet').write_bytes(b'not parquet')
+    with pytest.raises(WarehouseQueryError, match='query failed'):
+        w.prices_strict(
+            'AAPL', '2020-01-02', '2020-01-02', 'closeunadj')
+
+    (tmp / 'sep.parquet').unlink()
+    _write(tmp / 'sep.parquet',
+           [('ticker', 'VARCHAR'), ('date', 'DATE'), ('closeadj', 'DOUBLE')], [
+               ("'AAPL'", "DATE '2020-01-02'", "50.0"),
+           ])
+    with pytest.raises(WarehouseSchemaError, match='closeunadj'):
+        w.prices_strict(
+            'AAPL', '2020-01-02', '2020-01-02', 'closeunadj')
+
+
+@pytest.mark.parametrize('bad_value', ['NULL', "CAST('NaN' AS DOUBLE)"])
+def test_prices_strict_rejects_non_finite_values(wh, bad_value):
+    w, tmp = wh
+    _write(tmp / 'sep.parquet',
+           [('ticker', 'VARCHAR'), ('date', 'DATE'), ('closeadj', 'DOUBLE')], [
+               ("'AAPL'", "DATE '2020-01-02'", bad_value),
+           ])
+
+    with pytest.raises(WarehouseSchemaError, match='non-finite|non-numeric'):
+        w.prices_strict('AAPL', '2020-01-02', '2020-01-02', 'closeadj')
+
+
+def test_prices_strict_rejects_duplicate_dates(wh):
+    w, tmp = wh
+    _write(tmp / 'sep.parquet',
+           [('ticker', 'VARCHAR'), ('date', 'DATE'), ('closeadj', 'DOUBLE')], [
+               ("'AAPL'", "DATE '2020-01-02'", "50.0"),
+               ("'AAPL'", "DATE '2020-01-02'", "51.0"),
+           ])
+
+    with pytest.raises(WarehouseSchemaError, match='sorted and unique'):
+        w.prices_strict('AAPL', '2020-01-02', '2020-01-02', 'closeadj')
 
 
 # ---------------------------------------------------------------------------

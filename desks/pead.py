@@ -14,9 +14,9 @@ The desk pulls the quarterly EPS table ONCE per run and slices it to
 later filing (pinned by test). Optional ``band`` restricts the book to one PIT
 market-cap tercile (data/size_buckets.py — never scalemarketcap).
 
-FIXED factor: committee=[] so walk_forward_fits=[] and validation runs at
-n_trials=1 (no deflation) — honest, the rule is pre-specified in
-docs/vix_pead_desks_spec.md. Wide RiskManager (the signal is monthly; a 2%
+FIXED factor: committee=[] so walk_forward_fits=[]. Historical validation used
+n_trials=1, which is not qualifying; future DSR uses program-wide breadth from
+the append-only research ledger. Wide RiskManager (the signal is monthly; a 2%
 price stop would churn it). Scores are cached per calendar month (the base
 calls _alpha_scores daily) — including a cached None, which keeps the book
 flat until the month rolls even if filings land mid-month. That is the same
@@ -29,7 +29,9 @@ names are still priced (survivorship-free).
 PRE-REGISTERED SURGE VARIANTS (2026-07-10, both opt-in, defaults
 byte-identical; rules and constants declared HERE before any variant
 backtest ran — 2 trials this round, no further variant joins after seeing
-results). SURGE = the standardized revenue-growth surprise
+results). These declarations predate the sealed ledger and remain development
+provenance, not a qualifying preregistration. SURGE = the standardized
+revenue-growth surprise
 (Jegadeesh-Livnat 2006, who found earnings+revenue surprise jointly beat
 either alone): sue_table(column='revenue') over a SEPARATE
 fundamentals_quarterly(fields=('revenue',)) pull. Separate, not a joint

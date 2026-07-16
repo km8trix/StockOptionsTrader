@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "candidate_id": "issuance-midcap-ls-v1",
+  "candidate_family": "net-share-issuance",
+  "candidate_author": "stock-options-trader-research-program",
+  "development_source_id": "sharadar-local-pit-warehouse",
+  "code_sha": "bd0737414138896100c295cc58743e258616003a",
+  "warehouse_snapshot_hash": "2214115395c777e554eb425b795102ad69cbf6301dacb13d91604122f9628455",
+  "required_tables": [
+    "actions",
+    "daily",
+    "sep",
+    "sf1",
+    "tickers"
+  ],
+  "candidate_specification": {
+    "artifact_file": "candidate_specification.json",
+    "artifact_sha256": "d5de4ff1cb4014bdd22fccef387014ae3b5c9a66c1e7ed4aa1edcf417b4dd76e",
+    "status": "draft"
+  },
+  "development_window": {
+    "start": "2015-01-01",
+    "end": "2024-09-30"
+  },
+  "historical_inventory": {
+    "manifest_file": "historical_trial_inventory.json",
+    "manifest_sha256": "bcc913ce17a1186a4d491a2f14bfb73ea4e9b20ddc34025cc3800ef8a7f57101",
+    "known_attempt_ids": [],
+    "complete": false,
+    "includes_failed_and_abandoned": false,
+    "attested_by": null,
+    "attested_at": null
+  },
+  "independent_review": {
+    "report_file": null,
+    "report_sha256": null,
+    "reviewer": null,
+    "independent": false,
+    "approved": false,
+    "reviewed_at": null,
+    "scopes": [],
+    "reviewed_subject_sha256": null,
+    "reviewed_candidate_specification_sha256": null
+  },
+  "independent_data": {
+    "manifest_file": null,
+    "manifest_sha256": null,
+    "source_id": null,
+    "independent_of_development": false,
+    "point_in_time": false,
+    "coverage_start": null,
+    "coverage_end": null,
+    "reviewed_by": null
+  },
+  "borrow_evidence": {
+    "shorting_required": true,
+    "status": "pending",
+    "manifest_file": null,
+    "manifest_sha256": null,
+    "locates_complete": false,
+    "fees_complete": false,
+    "financing_complete": false,
+    "coverage_start": null,
+    "coverage_end": null,
+    "non_applicability_reason": null
+  },
+  "cost_evidence": {
+    "manifest_file": null,
+    "manifest_sha256": null,
+    "commissions_complete": false,
+    "spreads_complete": false,
+    "slippage_complete": false,
+    "impact_complete": false,
+    "financing_complete": false,
+    "capacity_complete": false,
+    "coverage_start": null,
+    "coverage_end": null,
+    "capital_levels": [],
+    "calibrated_at": null
+  },
+  "holdout_plan": {
+    "mode": "prospective_acquisition",
+    "start": null,
+    "end": null,
+    "source_id": null,
+    "data_manifest_file": null,
+    "data_manifest_sha256": null,
+    "acquisition_plan_file": null,
+    "acquisition_plan_sha256": null,
+    "access_log_file": null,
+    "access_log_sha256": null,
+    "contamination_review_file": null,
+    "contamination_review_sha256": null,
+    "reviewed_by": null,
+    "uncontaminated": false,
+    "outcome_accessed": false,
+    "sealed": false,
+    "sealed_location": null
+  }
+}

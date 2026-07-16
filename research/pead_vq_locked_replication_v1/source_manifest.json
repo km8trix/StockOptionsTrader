@@ -1,0 +1,266 @@
+{
+  "access_audit": {
+    "audited_on": "2026-07-13",
+    "credential_environment_variable": "NASDAQ_DATA_LINK_API_KEY",
+    "credential_value_recorded": false,
+    "result": "credential accepted but historical access is sample-limited",
+    "sample_coverage": {
+      "ZACKS/EEH": {
+        "aapl_obs_date_max": "2018-12-21",
+        "aapl_obs_date_min": "2018-01-01",
+        "aapl_period_end_max": "2023-09-30",
+        "aapl_period_end_min": "2017-12-31",
+        "aapl_rows": 533
+      },
+      "ZACKS/ES": {
+        "aapl_period_end_max": "2018-12-31",
+        "aapl_period_end_min": "2018-03-31",
+        "aapl_report_date_max": "2019-01-29",
+        "aapl_report_date_min": "2018-05-01",
+        "aapl_rows": 4
+      },
+      "ZACKS/SEH": {
+        "aapl_obs_date_max": "2018-12-19",
+        "aapl_obs_date_min": "2018-01-02",
+        "aapl_period_end_max": "2024-09-30",
+        "aapl_period_end_min": "2017-12-31",
+        "aapl_rows": 482
+      },
+      "ZACKS/SS": {
+        "aapl_period_end_max": "2018-12-31",
+        "aapl_period_end_min": "2018-03-31",
+        "aapl_report_date_max": "2019-01-29",
+        "aapl_report_date_min": "2018-05-01",
+        "aapl_rows": 4
+      }
+    }
+  },
+  "candidate_id": "pead-vq-locked-replication-v1",
+  "independence": {
+    "claim": "independent source reconstruction relative to Sharadar SF1 filing values",
+    "limitation": "The same Zacks source supplies actuals, timestamps, and consensus. SEC or issuer releases must independently corroborate event identity, release availability, and reported actuals; SEC does not provide analyst consensus."
+  },
+  "official_sources": [
+    "https://docs.data.nasdaq.com/docs/data-organization",
+    "https://docs.data.nasdaq.com/docs/in-depth-usage-1",
+    "https://data.nasdaq.com/api/v3/datatables/ZACKS/EA/metadata.json",
+    "https://data.nasdaq.com/api/v3/datatables/ZACKS/EEH/metadata.json",
+    "https://data.nasdaq.com/api/v3/datatables/ZACKS/ES/metadata.json",
+    "https://data.nasdaq.com/api/v3/datatables/ZACKS/MT/metadata.json",
+    "https://data.nasdaq.com/api/v3/datatables/ZACKS/SEH/metadata.json",
+    "https://data.nasdaq.com/api/v3/datatables/ZACKS/SS/metadata.json",
+    "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+    "https://www.sec.gov/info/edgar/forms/form8-k.pdf"
+  ],
+  "schema_version": "pead_source_manifest.v1",
+  "snapshot_contract": {
+    "artifact_hash": null,
+    "artifact_hash_rule": "SHA-256 of the canonical JSON serialization of payload; populated only after the artifact exists",
+    "artifact_status": "not_created",
+    "exact_wrapper": {
+      "artifact_hash": null,
+      "payload": {
+        "candidate_id": "pead-vq-locked-replication-v1",
+        "captured_at": "<trusted UTC timestamp>",
+        "coverage": {},
+        "evidence_class": "development_sample or historical_replication or prospective_signal",
+        "requested_window": {},
+        "schema_version": "zacks_pead_snapshot.v1",
+        "source_id": "nasdaq-data-link-zacks",
+        "tables": {}
+      }
+    },
+    "table_contract": {
+      "canonical_request": "request URL and parameters with credentials removed",
+      "columns": "ordered list of exact provider columns",
+      "provider_metadata": "provider refresh/snapshot metadata and pagination receipts",
+      "response_sha256": "SHA-256 of preserved raw response bytes",
+      "rows": "list of mappings from exact column names to raw provider values"
+    }
+  },
+  "source": {
+    "delivery": "Nasdaq Data Link Tables API",
+    "provider": "Nasdaq Data Link",
+    "source_id": "nasdaq-data-link-zacks",
+    "upstream_publisher": "Zacks Investment Research"
+  },
+  "status": "access_verified_sample_only_unsealed",
+  "tables": {
+    "ZACKS/EA": {
+      "qualification_role": "prospective schedule only; never substitutes for historical announcement actuals",
+      "required_columns": [
+        "m_ticker",
+        "ticker",
+        "comp_name",
+        "comp_name_2",
+        "exchange",
+        "currency_code",
+        "per_end_date_fr0",
+        "per_end_date_qr1",
+        "eps_mean_est_qr1",
+        "street_mean_est_qr1",
+        "exp_rpt_date_qr1",
+        "exp_rpt_date_qr2",
+        "exp_rpt_date_fr1",
+        "exp_rpt_date_fr2",
+        "late_last_flag",
+        "late_last_desc",
+        "source_flag",
+        "source_desc",
+        "time_of_day_code",
+        "time_of_day_desc",
+        "per_end_date_qr0",
+        "eps_act_qr0",
+        "per_end_date_qrm3",
+        "eps_act_qrm3"
+      ],
+      "role": "expected earnings announcement schedule and time-of-day context"
+    },
+    "ZACKS/EEH": {
+      "qualification_role": "required point-in-time EPS consensus vintage",
+      "required_columns": [
+        "m_ticker",
+        "ticker",
+        "comp_name",
+        "exchange",
+        "currency_code",
+        "per_end_date",
+        "per_type",
+        "per_fisc_year",
+        "per_fisc_qtr",
+        "per_cal_year",
+        "per_cal_qtr",
+        "obs_date",
+        "eps_mean_est",
+        "eps_median_est",
+        "eps_cnt_est",
+        "eps_high_est",
+        "eps_low_est",
+        "eps_std_dev_est",
+        "eps_cnt_est_rev_up",
+        "eps_cnt_est_rev_down"
+      ],
+      "role": "historical EPS consensus vintages"
+    },
+    "ZACKS/ES": {
+      "qualification_role": "required announcement actual and timestamp",
+      "required_columns": [
+        "m_ticker",
+        "ticker",
+        "comp_name",
+        "comp_name_2",
+        "exchange",
+        "currency_code",
+        "per_end_date",
+        "per_type",
+        "act_rpt_date",
+        "eps_mean_est",
+        "eps_act",
+        "eps_amt_diff_surp",
+        "eps_pct_diff_surp",
+        "eps_std_dev_est",
+        "eps_cnt_est",
+        "eps_act_zacks_adj",
+        "per_code",
+        "per_fisc_year",
+        "per_fisc_qtr",
+        "per_cal_year",
+        "per_cal_qtr",
+        "act_rpt_time",
+        "act_rpt_code",
+        "act_rpt_desc"
+      ],
+      "role": "historical EPS announcement actuals, consensus cross-check, date, time, and BTO/DTM/AMC code"
+    },
+    "ZACKS/MT": {
+      "qualification_role": "required identity bridge",
+      "required_columns": [
+        "m_ticker",
+        "ticker",
+        "comp_name",
+        "comp_name_2",
+        "exchange",
+        "currency_code",
+        "ticker_type",
+        "active_ticker_flag",
+        "comp_url",
+        "sic_4_code",
+        "sic_4_desc",
+        "zacks_x_ind_code",
+        "zacks_x_ind_desc",
+        "zacks_x_sector_code",
+        "zacks_x_sector_desc",
+        "zacks_m_ind_code",
+        "zacks_m_ind_desc",
+        "per_end_month_nbr",
+        "mr_split_date",
+        "mr_split_factor",
+        "comp_cik",
+        "country_code",
+        "country_name",
+        "comp_type",
+        "optionable_flag",
+        "sp500_member_flag",
+        "asset_type"
+      ],
+      "role": "stable Zacks identity and CIK bridge; ticker alone is not a historical key"
+    },
+    "ZACKS/SEH": {
+      "qualification_role": "required source-completeness and revenue diagnostic vintage",
+      "required_columns": [
+        "m_ticker",
+        "ticker",
+        "comp_name",
+        "comp_name_2",
+        "exchange",
+        "currency_code",
+        "per_end_date",
+        "per_type",
+        "per_code",
+        "per_fisc_year",
+        "per_fisc_qtr",
+        "per_cal_year",
+        "per_cal_qtr",
+        "obs_date",
+        "sales_mean_est",
+        "sales_median_est",
+        "sales_cnt_est",
+        "sales_high_est",
+        "sales_low_est",
+        "sales_std_dev_est"
+      ],
+      "role": "historical sales consensus vintages"
+    },
+    "ZACKS/SS": {
+      "qualification_role": "required source-completeness and revenue diagnostic actual",
+      "required_columns": [
+        "m_ticker",
+        "ticker",
+        "comp_name",
+        "comp_name_2",
+        "exchange",
+        "currency_code",
+        "per_end_date",
+        "per_type",
+        "per_code",
+        "per_fisc_year",
+        "per_fisc_qtr",
+        "per_cal_year",
+        "per_cal_qtr",
+        "act_rpt_date",
+        "last_rev_date",
+        "sales_act",
+        "sales_act_zacks_adj",
+        "sales_mean_est",
+        "sales_amt_diff_surp",
+        "sales_pct_diff_surp",
+        "sales_cnt_est",
+        "sales_std_dev_est",
+        "act_rpt_time",
+        "act_rpt_code",
+        "act_rpt_desc"
+      ],
+      "role": "historical sales actuals, consensus cross-check, revision date, and announcement timing"
+    }
+  }
+}

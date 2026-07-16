@@ -51,24 +51,33 @@ class WarehouseMarketData(MarketDataHandler):
         return self._wh.delisting_date(symbol)
 
     def delisting_payout(self, symbol: str, final_close: float) -> dict:
-        """Return modeled per-share recovery plus auditable quality flags."""
+        """Return the non-qualifying final-close fallback and action metadata.
+
+        SHARADAR/ACTIONS does not provide a verified per-share settlement term,
+        so its reported value must never override the last observed close.  A
+        future independently sourced settlement ledger can be checked before
+        this fallback without weakening the current fail-closed contract.
+        """
         action = self._wh.delisting_action(symbol)
-        if action is not None:
-            return {
-                'price': float(action['payout_per_share']),
-                'source': action['action'],
-                'quality_flags': list(action['quality_flags']),
-                'action_date': (action['date'].isoformat()
-                                if action['date'] is not None else None),
-                'contraticker': action.get('contraticker'),
-            }
-        return {
+        payout = {
             'price': float(final_close),
             'source': 'final_tradable_close',
             'quality_flags': ['delisting_terms_unavailable'],
             'action_date': None,
             'contraticker': None,
         }
+        if action is not None:
+            payout.update({
+                'quality_flags': list(dict.fromkeys(
+                    payout['quality_flags'] + action['quality_flags'])),
+                'action_date': (action['date'].isoformat()
+                                if action['date'] is not None else None),
+                'action': action['action'],
+                'contraticker': action.get('contraticker'),
+                'reported_value': action.get('reported_value'),
+                'value_semantics': action.get('value_semantics'),
+            })
+        return payout
 
     def data_snapshot(self, tables=None) -> dict:
         """Immutable content version for research/promotion artifacts."""

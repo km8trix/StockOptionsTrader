@@ -17,7 +17,7 @@ risk — not performance claims; the platform does not promise returns.
 
 ## Architecture
 
-StockOptionsTrader is a multi-desk quant-trading **simulation** platform that mimics the *process* of Citadel, Jane Street, Renaissance, Two Sigma, and AQR — combining AI trading (ML + neural nets) with quant trading (statistical and factor models). It models how these firms construct portfolios and allocate risk; it does **not** promise or imply returns. Every risky change is validated through a research-integrity gate (Deflated/Probabilistic Sharpe + multiple-testing correction) and defaults to byte-identical current behavior. The platform is **backtest/simulation-first** and never routes a live order without explicit, deliberate wiring — there is no live order path in the autonomy layer at all.
+StockOptionsTrader is a multi-desk quant-trading **simulation** platform that mimics the *process* of Citadel, Jane Street, Renaissance, Two Sigma, and AQR — combining AI trading (ML + neural nets) with quant trading (statistical and factor models). It models how these firms construct portfolios and allocate risk; it does **not** promise or imply returns. Deployment eligibility is governed by a research-integrity gate (Deflated/Probabilistic Sharpe + multiple-testing correction), and changes default to byte-identical current behavior. The platform is **backtest/simulation-first** and never routes a live order without explicit, deliberate wiring — there is no live order path in the autonomy layer at all.
 
 ### System overview
 
@@ -115,10 +115,19 @@ Mirrors a classical-quant research shop: hand-engineered, economically-signed pr
 
 ### Evidence gate & strategy promotion
 
+No strategy currently has qualifying evidence of a tradeable edge. The
+credibility standard, including frozen protocols, trial accounting, full
+point-in-time universes, net-return inference, independent replication, and
+sealed holdouts, is documented in
+[`docs/RESEARCH_CREDIBILITY.md`](docs/RESEARCH_CREDIBILITY.md). Historical screen
+results remain useful provenance, but are not promotion evidence until rerun
+under that standard.
+
 No strategy is eligible for deployment until it has one immutable, reproducible
-evidence artifact. `analysis.promotion` computes/validates PSR, DSR, OOS fold-BH,
+evidence artifact. `analysis.promotion` computes/validates aggregate PSR and DSR,
 cost-adjusted return, turnover, and multi-regime requirements under one versioned
-policy. The artifact also pins the data snapshot, universe, parameters, random
+policy; calendar-fold BH is retained as a stability diagnostic rather than a
+survivor-selection gate. The artifact also pins the data snapshot, universe, parameters, random
 seed, dependency versions, and code SHA; canonical JSON makes identical inputs
 produce the same SHA-256 artifact ID.
 
@@ -154,13 +163,59 @@ timestamped E*TRADE `REALTIME` quote no more than 60 seconds old.
 artifact is `research_only` (negative return, Sharpe about -3.10, PSR/DSR near
 zero, and no BH-significant OOS folds), so the new paper/live lane correctly
 blocks it. The strongest price
-signal — 12-1 momentum (`mom_12_1`) — passes the IC gate (t +2.66 @1d) but the
-desk built on it fails the OOS gate (Sharpe ≈0.20): the edge is real but too
-thin to be risk-efficient after costs and momentum crashes. A `mom_12_1` +
+signal in the legacy screen — 12-1 momentum (`mom_12_1`) — reported a positive
+IC (t +2.66 @1d), but the desk built on it fails the OOS gate (Sharpe ≈0.20).
+A `mom_12_1` +
 `reversal_5` hybrid was also tested (`scripts/proto_hybrid_desk.py`) and rejected
-— `reversal_5` has real edge but ~79% turnover makes it un-tradeable at daily
-cadence (costs win). The six firm-style desks below are research/backtesting
-tools, not validated production strategies.
+— its historical reversal result has ~79% turnover and fails after modeled daily
+costs. Historical PEAD, issuance, value, quality, and insider survivor counts are
+also exploratory. Their legacy desk drivers pass a retrieval-only union of
+dated members to a static-universe engine, so those drivers now emit
+`qualifying=false` and force `passed=false` even when a statistical diagnostic
+would pass. They require a qualifying rerun that enforces exact point-in-time
+eligibility at every signal date, with inference on net returns. None
+establishes a tradeable edge. The six firm-style desks below are
+research/backtesting tools, not validated production strategies.
+
+The credibility rerun has now stopped `issuance-midcap-ls-v1` at development.
+Using observed SEP month-start sessions, dated relative size, T+1 entry, raw
+cost-net HAC inference, and a 120bp long/short round trip, none of its eight
+pooled/size-by-horizon tests survived Benjamini-Hochberg. The full dated
+inference arrays are preserved in
+`research/issuance_midcap_ls_v1/development_falsification.json`; this negative
+result must not be relabelled as a holdout or tuned into a passing variant.
+
+The locked PEAD development package now also contains an exact-session
+[v7 replay-accepted primary report](research/pead_vq_locked_replication_v1/development_sample_report_v7.json),
+[v5 independent signal/economic comparison](research/pead_vq_locked_replication_v1/independent_reference_comparison_v5.json),
+and a deterministic
+[modeled cohort ledger](research/pead_vq_locked_replication_v1/modeled_execution_ledger_v1.json).
+The ledger reconstructs targets, split-normalized quantities, fixed fees,
+dividend accruals, cash, and P&L. A frozen
+[daily money-path receipt](research/pead_vq_locked_replication_v1/daily_money_path_reconciliation_v3.json)
+now reconciles two disjoint implementations across all 4,114 expected pooled
+development checkpoints with zero generic discrepancies. It also reconciles
+3,784 per-name states, 688 cohort states, and all 61 distribution applications
+at the component level with zero discrepancies. Distributions remain signed
+receivable-or-payable balances rather than settled cash because authoritative
+payment dates and value semantics are missing. This is modeled accounting, not broker or paper
+evidence; the sample remains too short for inference and no PEAD edge is
+established.
+
+The next PEAD target is separately versioned under
+[`research/pead_vq_source_qualification_v2/`](research/pead_vq_source_qualification_v2/README.md)
+so the sealed v1 development artifacts remain untouched. It fixes Sharadar's
+role to market, universe, identity, and return accounting; requires a licensed
+point-in-time consensus artifact plus independently archived SEC/issuer actual
+and availability evidence; and admits no event until an exhaustive frozen event
+manifest reconciles across all source lanes. The event-universe, consensus,
+announcement, and replayed announcement/consensus reconciliation contracts are
+implemented. The final Sharadar identity/denominator and signal-input receipts
+remain intentionally absent; the upstream receipt cannot call normalized rows
+source-qualified until raw consensus extraction and external binding bytes are
+replayed, and SEC acceptance is not treated as a proved first-public timestamp.
+PEAD paper and live promotion fail closed because no strategy-specific
+authoritative verifier is registered.
 
 ### Autonomy layer (Phase F)
 
@@ -173,7 +228,7 @@ Two cooperating layers sit around the fund — both conservative and gated.
 ### Cross-cutting engineering disciplines
 
 - **Leakage-proof seam.** `WalkForwardController._slice_through` slices every frame to `index <= simulation date` before any model fit or predict, and re-slices in `predict` even if the caller pre-sliced. Fit data is additionally capped to the trailing `train_window_days` (252). Models hold no data beyond fitted parameters, so future leakage is impossible by construction.
-- **Research-integrity gate.** Risky changes are validated by Deflated/Probabilistic Sharpe plus OOS-fold multiple-testing correction (Bonferroni/BH) before they are trusted — the autonomy layer in particular is research-gated and never auto-enabled.
+- **Research-integrity gate.** Deployment candidates must pass the preregistered aggregate net-return, Deflated/Probabilistic Sharpe, economic, capacity, and replication gates; BH controls selection across the declared hypothesis family, while calendar years remain diagnostics. The autonomy layer is research-gated and never auto-enabled.
 - **Determinism.** Seeded RNG, CPU-only, and `_deterministic_torch` give reproducible runs and **byte-identical goldens**; the HMM and ML models are seeded specifically to block local-optima drift.
 - **Opt-in / additive pattern.** Every sharpening feature defaults to the prior behavior (e.g. `max_factor_exposure=None`, `vol_skew_slope=None`, `sizing_modulator=None`, `weighting='risk_parity'`). Turning a knob off recovers byte-identical legacy output, so new risk is always opt-in.
 
@@ -259,7 +314,8 @@ code, images, or compose files.
 | `ETRADE_CONSUMER_KEY` / `_SECRET` | — | Generic fallback consumer key/secret (used only if the env-prefixed pair is unset) |
 | `ETRADE_ACCOUNT_ID_KEY` | — | E*TRADE account id key (anchors the daily-loss gate + account-match guard) |
 
-> **Live trading:** launch with **`./start.sh`** (it sources `.env`; the app
+> **Live trading:** launch with **`./start.sh`** (it explicitly parses `.env`
+> as non-interpolated data; the app
 > never auto-loads it). The OAuth **access token/secret are obtained via the
 > connect flow and stored in SQLite — they are not read from `.env`.** Full
 > walkthrough (sandbox → production, the gates, daily re-auth, troubleshooting)

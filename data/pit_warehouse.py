@@ -29,14 +29,42 @@ Dep: ``duckdb`` (reads/writes Parquet natively — no pyarrow). Ingest also need
 from __future__ import annotations
 
 import bisect
+from datetime import datetime, timezone
 import hashlib
 import logging
 import os
-from typing import Dict, List, Optional, Sequence
+from pathlib import Path
+import shutil
+import tempfile
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import duckdb
 import numpy as np
 import pandas as pd
+
+from data.corporate_action_evidence import (
+    ACTIONS_RECEIPT_FILE,
+    ActionsEvidenceError,
+    archive_raw_zip,
+    atomic_write_json,
+    build_actions_acquisition_document,
+    expected_datatable_metadata,
+    inspect_actions_parquet,
+    inspect_actions_zip,
+    validate_actions_evidence,
+)
+from data.session_close_calendar import load_session_close_calendar_evidence
+from data.sharadar_source_evidence import (
+    CANDIDATE_TABLES,
+    SharadarSourceEvidenceError,
+    build_pead_sharadar_source_snapshot,
+    build_sharadar_table_acquisition_document,
+    convert_sharadar_zip_to_parquet,
+    load_sharadar_table_acquisition,
+    normalize_datatable_metadata,
+    publish_pead_sharadar_source_snapshot,
+    publish_sharadar_table_acquisition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +134,30 @@ _OPTION_BARS_EOD_COLUMNS = ('underlying', 'contract', 'type', 'strike',
 #: datekey by days (large caps) to weeks (small caps).
 EARNINGS_EVENT_CODE = '22'
 
-_PRICE_FIELDS = ('closeadj', 'close', 'open', 'high', 'low', 'volume')
+_PRICE_FIELDS = (
+    'closeadj', 'closeunadj', 'close', 'open', 'high', 'low', 'volume',
+)
 _DAILY_FIELDS = ('marketcap', 'pe', 'pb', 'ps', 'ev', 'evebit', 'evebitda')
+
+
+class WarehouseReadError(ValueError):
+    """Base class for a strict local-warehouse read contract failure."""
+
+
+class WarehouseTableMissingError(WarehouseReadError):
+    """A strict read was requested from a table that is not present."""
+
+
+class WarehouseQueryError(WarehouseReadError):
+    """DuckDB could not read or query a required warehouse table."""
+
+
+class WarehouseSchemaError(WarehouseReadError):
+    """A required warehouse column or value violates its contract."""
+
+
+class SecurityLifecycleError(WarehouseReadError):
+    """TICKERS/SEP cannot prove one internally consistent lifecycle."""
 
 
 def _default_warehouse_dir() -> str:
@@ -125,8 +175,11 @@ def _default_warehouse_dir() -> str:
 class PitWarehouse:
     """Offline DuckDB-over-Parquet Sharadar warehouse (see module docstring)."""
 
-    def __init__(self, warehouse_dir: Optional[str] = None):
+    def __init__(
+            self, warehouse_dir: Optional[str] = None,
+            session_close_calendar_path: Optional[str] = None):
         self.warehouse_dir = warehouse_dir or _default_warehouse_dir()
+        self.session_close_calendar_path = session_close_calendar_path
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
 
     # ------------------------------------------------------------------
@@ -162,6 +215,50 @@ class PitWarehouse:
         except duckdb.Error:
             logger.warning("warehouse query failed on %s", table, exc_info=True)
             return None
+
+    def _query_strict(self, table: str, sql: str, params: list):
+        """Run a warehouse query without collapsing evidence failures.
+
+        The ordinary readers intentionally preserve their historical
+        empty-on-missing behavior.  Research qualification cannot use that
+        behavior because an absent Parquet file and a legitimately empty
+        ticker/date result mean different things.  Strict readers route through
+        this helper so callers can distinguish both cases.
+        """
+        if not self._have(table):
+            raise WarehouseTableMissingError(
+                f"required warehouse table is missing: {table}")
+        escaped_path = self._pq(table).replace("'", "''")
+        full = sql.replace('src', f"read_parquet('{escaped_path}')")
+        try:
+            return self._con().execute(full, params)
+        except duckdb.Error as exc:
+            raise WarehouseQueryError(
+                f"warehouse query failed on {table}: {exc}") from exc
+
+    def _strict_schema(self, table: str, required: Sequence[str]) -> Dict[str, str]:
+        """Return an exact-case schema and require every named column."""
+        result = self._query_strict(
+            table, "DESCRIBE SELECT * FROM src", [])
+        rows = result.fetchall()
+        names = [str(row[0]) for row in rows]
+        if len(names) != len(set(names)):
+            raise WarehouseSchemaError(
+                f"{table} contains duplicate column names")
+        schema = {str(row[0]): str(row[1]).upper() for row in rows}
+        missing = [column for column in required if column not in schema]
+        if missing:
+            raise WarehouseSchemaError(
+                f"{table} is missing required columns: {missing}")
+        return schema
+
+    @staticmethod
+    def _price_field(field: str) -> str:
+        if field not in _PRICE_FIELDS:
+            raise ValueError(
+                f"unsupported price field {field!r}; expected one of "
+                f"{list(_PRICE_FIELDS)}")
+        return field
 
     def snapshot_version(
             self, tables: Optional[Sequence[str]] = None) -> Dict:
@@ -203,6 +300,187 @@ class PitWarehouse:
                               if missing else []),
         }
 
+    def corporate_action_evidence(self, start, end) -> Dict:
+        """Revalidate the active ACTIONS evidence for a required date window.
+
+        Unlike the compatibility readers, this research boundary never treats
+        a missing or malformed table as an empty result.  The receipt,
+        immutable raw ZIP, converted Parquet, schema, hashes, and requested
+        coverage must all validate or :class:`ActionsEvidenceError` is raised.
+        """
+        required_start = self._date(start)
+        required_end = self._date(end)
+        if required_start is None or required_end is None:
+            raise ActionsEvidenceError(
+                "required ACTIONS evidence dates must be valid")
+        return validate_actions_evidence(
+            self.warehouse_dir,
+            required_start=required_start.isoformat(),
+            required_end=required_end.isoformat(),
+        )
+
+    def corporate_actions_for_tickers(
+            self, tickers: Sequence[str], start, end) -> List[Dict]:
+        """Return an exact, strictly read corporate-action slice.
+
+        This is the research-grade companion to
+        :meth:`corporate_action_evidence`.  The evidence method proves the
+        immutable source bytes; this method exposes the rows needed to account
+        for distributions and to detect unsupported holder-affecting events.
+        It deliberately returns the generic vendor ``value`` without assigning
+        economic semantics to it.  In particular, callers must never use this
+        reader to infer terminal merger or delisting proceeds.
+
+        Missing tables, schema drift, malformed rows, or ambiguous input dates
+        raise instead of becoming an empty action history.  A genuinely empty
+        result for a valid ticker/date request remains an empty list.
+        """
+        required_start = self._date(start)
+        required_end = self._date(end)
+        if (
+            required_start is None
+            or required_end is None
+            or required_start > required_end
+        ):
+            raise WarehouseSchemaError(
+                "corporate-action slice requires an ordered date window")
+        if isinstance(tickers, (str, bytes)):
+            raise WarehouseSchemaError(
+                "corporate-action tickers must be a sequence of symbols")
+        normalized: List[str] = []
+        for raw_ticker in tickers:
+            if not isinstance(raw_ticker, str):
+                raise WarehouseSchemaError(
+                    "corporate-action ticker must be text")
+            ticker = raw_ticker.strip().upper()
+            if not ticker or ticker != raw_ticker:
+                raise WarehouseSchemaError(
+                    "corporate-action tickers must be canonical uppercase text")
+            normalized.append(ticker)
+        if len(normalized) != len(set(normalized)):
+            raise WarehouseSchemaError(
+                "corporate-action tickers must be unique")
+        if not normalized:
+            return []
+
+        self._strict_schema(
+            'actions',
+            (
+                'date', 'action', 'ticker', 'name', 'value',
+                'contraticker', 'contraname',
+            ),
+        )
+        placeholders = ','.join('?' for _ in normalized)
+        result = self._query_strict(
+            'actions',
+            "SELECT CAST(date AS DATE), action, ticker, name, value, "
+            "contraticker, contraname FROM src "
+            f"WHERE ticker IN ({placeholders}) "
+            "AND CAST(date AS DATE) >= ? AND CAST(date AS DATE) <= ? "
+            "ORDER BY ticker, CAST(date AS DATE), action, name, "
+            "contraticker, contraname",
+            [*normalized, required_start, required_end],
+        )
+        requested = set(normalized)
+        rows: List[Dict] = []
+        identities = set()
+        for raw_row in result.fetchall():
+            (
+                raw_date, raw_action, raw_ticker, raw_name, raw_value,
+                raw_contraticker, raw_contraname,
+            ) = raw_row
+            action_date = self._date(raw_date)
+            ticker = str(raw_ticker) if raw_ticker is not None else ''
+            action = str(raw_action) if raw_action is not None else ''
+            name = str(raw_name) if raw_name is not None else ''
+            if (
+                action_date is None
+                or not required_start <= action_date <= required_end
+                or ticker not in requested
+                or not action.strip()
+                or action != action.strip()
+                or not name.strip()
+                or name != name.strip()
+            ):
+                raise WarehouseSchemaError(
+                    "corporate-action slice contains a malformed key")
+            value = None
+            if raw_value is not None:
+                if isinstance(raw_value, bool):
+                    raise WarehouseSchemaError(
+                        "corporate-action value must be numeric or null")
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise WarehouseSchemaError(
+                        "corporate-action value must be numeric or null") from exc
+                if not np.isfinite(value):
+                    raise WarehouseSchemaError(
+                        "corporate-action value must be finite")
+                if value == 0.0:
+                    value = 0.0
+            contra_ticker = (
+                None if raw_contraticker is None else str(raw_contraticker)
+            )
+            contra_name = None if raw_contraname is None else str(raw_contraname)
+            for label, value_text in (
+                ('contraticker', contra_ticker), ('contraname', contra_name)
+            ):
+                if value_text is not None and (
+                    not value_text.strip() or value_text != value_text.strip()
+                ):
+                    raise WarehouseSchemaError(
+                        f"corporate-action {label} must be canonical text or null")
+            identity = (
+                action_date, ticker, name, action, contra_name, contra_ticker,
+            )
+            if identity in identities:
+                raise WarehouseSchemaError(
+                    "corporate-action slice contains a duplicate primary key")
+            identities.add(identity)
+            rows.append({
+                'date': action_date.isoformat(),
+                'action': action,
+                'ticker': ticker,
+                'name': name,
+                'value': value,
+                'contraticker': contra_ticker,
+                'contraname': contra_name,
+            })
+        return rows
+
+    def market_sessions(self, start, end) -> pd.DatetimeIndex:
+        """Observed US-equity sessions in SEP between ``start`` and ``end``.
+
+        Research formation dates must come from the data actually being
+        evaluated.  ``pandas.bdate_range`` knows weekdays but not exchange
+        holidays (or one-off closures), which can silently assign a monthly
+        rebalance to a day with no prices, volume, or dated market cap.  The
+        union of SEP dates is the warehouse's authoritative session calendar.
+        """
+        lo, hi = self._date(start), self._date(end)
+        if lo is None or hi is None or lo > hi:
+            return pd.DatetimeIndex([], name='date')
+        result = self._query(
+            'sep',
+            "SELECT DISTINCT CAST(date AS DATE) AS session FROM src "
+            "WHERE CAST(date AS DATE) >= ? AND CAST(date AS DATE) <= ? "
+            "ORDER BY session",
+            [lo, hi],
+        )
+        rows = result.fetchall() if result else []
+        return pd.DatetimeIndex([row[0] for row in rows], name='date')
+
+    def market_session_close_calendar(self) -> Dict:
+        """Return immutable NYSE close-time evidence for research validation.
+
+        The provider deliberately does not interpret this document.  Primary
+        and independent reference implementations each validate its content
+        address, source coverage, early-close rows, and required date range
+        before deriving any visibility cutoff.
+        """
+        return load_session_close_calendar_evidence(self.session_close_calendar_path)
+
     @staticmethod
     def _date(d):
         try:
@@ -236,34 +514,150 @@ class PitWarehouse:
         res = self._query('tickers', sql + " ORDER BY ticker", args)
         return [r[0] for r in res.fetchall()] if res else []
 
-    def delisting_date(self, ticker: str):
-        """Return a ticker's final listed price date, or ``None`` when live.
+    def security_lifecycle(self, ticker: str) -> Dict:
+        """Return one strictly validated TICKERS/SEP lifecycle.
 
-        Sharadar leaves ``lastpricedate`` null for currently listed securities
-        and records the final tradable session for delisted names.  Exposing the
-        date through the feed lets the backtest engine liquidate a held delisted
-        security at its final observable close instead of carrying a stale mark
-        forever.
+        A qualifying lifecycle needs exactly one TICKERS identity row, a
+        positive permanent identifier, literal ``Y``/``N`` delisting evidence,
+        and an explicit ``lastpricedate``.  For a delisted security the claimed
+        final date must also be the final observed SEP session.  Any missing or
+        contradictory evidence raises :class:`SecurityLifecycleError`; it is
+        never converted into a live-security assumption here.
         """
-        res = self._query(
+        try:
+            self._strict_schema(
+                'tickers',
+                ('ticker', 'permaticker', 'isdelisted', 'lastpricedate'),
+            )
+            result = self._query_strict(
+                'tickers',
+                "SELECT ticker, permaticker, "
+                "CAST(isdelisted AS VARCHAR), lastpricedate FROM src "
+                "WHERE ticker = ?",
+                [ticker],
+            )
+            rows = result.fetchall()
+        except WarehouseReadError as exc:
+            raise SecurityLifecycleError(
+                f"cannot validate lifecycle for {ticker!r}: {exc}") from exc
+
+        if len(rows) != 1:
+            raise SecurityLifecycleError(
+                f"expected exactly one TICKERS row for {ticker!r}; "
+                f"found {len(rows)}")
+        row_ticker, raw_permaticker, raw_status, raw_last_price = rows[0]
+
+        if isinstance(raw_permaticker, bool):
+            raise SecurityLifecycleError(
+                f"invalid permaticker for {ticker!r}: {raw_permaticker!r}")
+        try:
+            permaticker = int(raw_permaticker)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SecurityLifecycleError(
+                f"invalid permaticker for {ticker!r}: "
+                f"{raw_permaticker!r}") from exc
+        try:
+            exact_permaticker = float(raw_permaticker) == permaticker
+        except (TypeError, ValueError, OverflowError):
+            exact_permaticker = str(raw_permaticker) == str(permaticker)
+        if permaticker <= 0 or not exact_permaticker:
+            raise SecurityLifecycleError(
+                f"invalid permaticker for {ticker!r}: {raw_permaticker!r}")
+
+        status = str(raw_status) if raw_status is not None else None
+        if status not in ('N', 'Y'):
+            raise SecurityLifecycleError(
+                f"isdelisted must be literal N or Y for {ticker!r}; "
+                f"found {raw_status!r}")
+        last_price_date = self._date(raw_last_price)
+        if last_price_date is None:
+            raise SecurityLifecycleError(
+                f"lastpricedate is required for {ticker!r}")
+
+        sep_last_price_date = None
+        if status == 'Y':
+            try:
+                self._strict_schema('sep', ('ticker', 'date'))
+                result = self._query_strict(
+                    'sep',
+                    "SELECT MAX(CAST(date AS DATE)) FROM src "
+                    "WHERE ticker = ?",
+                    [ticker],
+                )
+                row = result.fetchone()
+            except WarehouseReadError as exc:
+                raise SecurityLifecycleError(
+                    f"cannot validate final SEP date for {ticker!r}: "
+                    f"{exc}") from exc
+            sep_last_price_date = self._date(row[0]) if row else None
+            if sep_last_price_date != last_price_date:
+                raise SecurityLifecycleError(
+                    f"TICKERS lastpricedate {last_price_date} does not match "
+                    f"SEP max date {sep_last_price_date} for {ticker!r}")
+
+        return {
+            'ticker': str(row_ticker),
+            'permaticker': permaticker,
+            'isdelisted': status,
+            'lastpricedate': last_price_date,
+            'sep_lastpricedate': sep_last_price_date,
+        }
+
+    def security_currency(self, ticker: str) -> Dict:
+        """Return the exact listing currency for economic cash accounting.
+
+        ACTIONS has no currency column.  A cash distribution therefore cannot
+        safely be combined with a USD research book unless the corresponding
+        TICKERS identity independently proves its currency.  This strict reader
+        keeps that evidence separate from :meth:`security_lifecycle` so the
+        established lifecycle contract remains backward compatible.
+        """
+        if not isinstance(ticker, str) or not ticker or ticker != ticker.strip():
+            raise WarehouseSchemaError("security currency requires a canonical ticker")
+        self._strict_schema('tickers', ('ticker', 'currency'))
+        rows = self._query_strict(
             'tickers',
-            "SELECT CAST(lastpricedate AS DATE) FROM src "
-            "WHERE ticker = ? LIMIT 1",
+            "SELECT ticker, currency FROM src WHERE ticker = ?",
             [ticker],
-        )
-        if not res:
+        ).fetchall()
+        if len(rows) != 1:
+            raise WarehouseSchemaError(
+                f"expected exactly one TICKERS currency row for {ticker!r}; "
+                f"found {len(rows)}")
+        row_ticker, raw_currency = rows[0]
+        currency = str(raw_currency) if raw_currency is not None else ''
+        if row_ticker != ticker or not currency or currency != currency.strip():
+            raise WarehouseSchemaError(
+                f"invalid TICKERS currency evidence for {ticker!r}")
+        return {'ticker': ticker, 'currency': currency.upper()}
+
+    def delisting_date(self, ticker: str):
+        """Return the proven final listed date, or fail closed to ``None``.
+
+        Call :meth:`security_lifecycle` when the caller must distinguish a live
+        security from missing or contradictory lifecycle evidence.
+        """
+        try:
+            lifecycle = self.security_lifecycle(ticker)
+        except SecurityLifecycleError:
+            logger.warning(
+                "security lifecycle validation failed for %s",
+                ticker,
+                exc_info=True,
+            )
             return None
-        row = res.fetchone()
-        return self._date(row[0]) if row and row[0] is not None else None
+        return (lifecycle['lastpricedate']
+                if lifecycle['isdelisted'] == 'Y' else None)
 
     def delisting_action(self, ticker: str) -> Optional[Dict]:
-        """Best available corporate action around the final listed session.
+        """Classify a corporate action near the final listed session.
 
-        ACTIONS ``value`` is treated as a per-share cash term only for an
-        acquisition/merger/tender event. Bankruptcy/liquidation without a
-        positive value is an explicit zero recovery. An ordinary delisting
-        with no economic term returns ``None`` so the engine can use the final
-        tradable close and flag that fallback instead of inventing a payout.
+        Sharadar ACTIONS ``value`` is reported event metadata, not a verified
+        per-share settlement term (large acquisition rows can contain total
+        deal values).  Preserve it for auditability but never expose it as a
+        payout or infer zero recovery from it.  A trusted, independently sourced
+        terminal-settlement ledger is required before execution may model the
+        action's economics.
         """
         final_date = self.delisting_date(ticker)
         if final_date is None:
@@ -280,27 +674,25 @@ class PitWarehouse:
         rows = res.fetchall() if res else []
         for action_date, raw_action, raw_value, contra in reversed(rows):
             action = str(raw_action or '').strip().lower()
-            value = (float(raw_value)
-                     if raw_value is not None and np.isfinite(float(raw_value))
-                     else None)
+            try:
+                value = float(raw_value) if raw_value is not None else None
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and not np.isfinite(value):
+                value = None
             if any(token in action for token in (
-                    'acquisition', 'merger', 'tender')):
-                if value is None or value <= 0:
-                    continue
+                    'acquisition', 'merger', 'tender', 'bankrupt',
+                    'liquidat')):
                 return {
                     'date': self._date(action_date),
                     'action': action,
-                    'payout_per_share': value,
+                    'reported_value': value,
+                    'value_semantics': 'vendor_reported_value_not_per_share',
                     'contraticker': contra,
-                    'quality_flags': ['corporate_action_cash_term'],
-                }
-            if any(token in action for token in ('bankrupt', 'liquidat')):
-                return {
-                    'date': self._date(action_date),
-                    'action': action,
-                    'payout_per_share': max(0.0, value or 0.0),
-                    'contraticker': contra,
-                    'quality_flags': ['corporate_action_zero_recovery'],
+                    'quality_flags': [
+                        'corporate_action_value_not_per_share',
+                        'delisting_terms_unavailable',
+                    ],
                 }
         return None
 
@@ -457,10 +849,10 @@ class PitWarehouse:
                field: str = 'closeadj') -> pd.Series:
         """Total-return-adjusted close series (default ``closeadj``), [start, end].
         Empty Series for an un-ingested warehouse / unknown ticker."""
+        col = self._price_field(field)
         s, e = self._date(start), self._date(end)
         if s is None or e is None:
             return pd.Series(dtype=float, name=ticker)
-        col = field if field in _PRICE_FIELDS else 'closeadj'
         res = self._query(
             'sep',
             f"SELECT CAST(date AS DATE), {col} FROM src WHERE ticker = ? "
@@ -471,6 +863,104 @@ class PitWarehouse:
             return pd.Series(dtype=float, name=ticker)
         idx = pd.DatetimeIndex([pd.Timestamp(r[0]) for r in rows])
         return pd.Series([r[1] for r in rows], index=idx, name=ticker)
+
+    def prices_strict(self, ticker: str, start, end, field: str) -> pd.Series:
+        """Read the exact requested SEP field under a fail-loud contract.
+
+        An unknown ticker or a range with no observations is a valid empty
+        result.  Missing/corrupt Parquet, missing columns, duplicate dates, and
+        non-finite prices are evidence failures and raise a typed
+        :class:`WarehouseReadError` subclass.  No as-of or nearest-session
+        substitution is performed: both range endpoints are exact and
+        inclusive.
+        """
+        col = self._price_field(field)
+        start_date, end_date = self._date(start), self._date(end)
+        if start_date is None or end_date is None:
+            raise WarehouseSchemaError(
+                f"invalid price range: {start!r} to {end!r}")
+        if start_date > end_date:
+            raise WarehouseSchemaError(
+                f"price range starts after it ends: "
+                f"{start_date} to {end_date}")
+
+        schema = self._strict_schema('sep', ('ticker', 'date', col))
+        numeric_prefixes = (
+            'TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT',
+            'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'FLOAT',
+            'REAL', 'DOUBLE', 'DECIMAL',
+        )
+        if not schema[col].startswith(numeric_prefixes):
+            raise WarehouseSchemaError(
+                f"sep.{col} must be numeric; found {schema[col]}")
+
+        result = self._query_strict(
+            'sep',
+            f"SELECT CAST(date AS DATE), {col} FROM src WHERE ticker = ? "
+            "AND CAST(date AS DATE) >= ? AND CAST(date AS DATE) <= ? "
+            "ORDER BY CAST(date AS DATE)",
+            [ticker, start_date, end_date],
+        )
+        rows = result.fetchall()
+        dates = [self._date(row[0]) for row in rows]
+        if any(date_value is None for date_value in dates):
+            raise WarehouseSchemaError(
+                f"sep contains an invalid date for {ticker!r}")
+        if dates != sorted(dates) or len(dates) != len(set(dates)):
+            raise WarehouseSchemaError(
+                f"sep dates must be sorted and unique for {ticker!r}")
+
+        values = []
+        for _, raw_value in rows:
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise WarehouseSchemaError(
+                    f"sep.{col} contains a non-numeric value for "
+                    f"{ticker!r}: {raw_value!r}") from exc
+            if not np.isfinite(value):
+                raise WarehouseSchemaError(
+                    f"sep.{col} contains a non-finite value for "
+                    f"{ticker!r}")
+            values.append(value)
+
+        index = pd.DatetimeIndex(
+            [pd.Timestamp(date_value) for date_value in dates])
+        return pd.Series(values, index=index, name=ticker, dtype=float)
+
+    def prices_bulk(self, tickers: Sequence[str], start, end, *,
+                    field: str = 'closeadj') -> Dict[str, pd.Series]:
+        """Batch twin of :meth:`prices` for a bounded group of tickers.
+
+        Full-universe research callers should invoke this in chunks. One
+        Parquet scan per chunk is materially faster than thousands of
+        per-ticker scans while keeping peak memory bounded.
+        """
+        col = self._price_field(field)
+        names = sorted({str(ticker) for ticker in tickers if str(ticker)})
+        s, e = self._date(start), self._date(end)
+        if not names or s is None or e is None:
+            return {}
+        result = self._query(
+            'sep',
+            f"SELECT ticker, CAST(date AS DATE), {col} FROM src "
+            f"WHERE ticker IN ({','.join('?' * len(names))}) "
+            "AND CAST(date AS DATE) >= ? AND CAST(date AS DATE) <= ? "
+            "ORDER BY ticker, CAST(date AS DATE)",
+            [*names, s, e],
+        )
+        rows = result.fetchall() if result else []
+        grouped: Dict[str, list[tuple]] = {}
+        for ticker, date_value, price in rows:
+            grouped.setdefault(ticker, []).append((date_value, price))
+        return {
+            ticker: pd.Series(
+                [row[1] for row in values],
+                index=pd.DatetimeIndex([pd.Timestamp(row[0]) for row in values]),
+                name=ticker,
+            )
+            for ticker, values in grouped.items()
+        }
 
     def ohlcv(self, ticker: str, start, end) -> pd.DataFrame:
         """Split/dividend-ADJUSTED OHLCV frame (DatetimeIndex, 'us' unit) over
@@ -707,6 +1197,31 @@ class PitWarehouse:
             return {}
         return {t: mc for t, mc in res.fetchall() if mc is not None}
 
+    def daily_marketcaps_for_dates(
+            self, tickers: Sequence[str], dates) -> Dict[tuple[str, object], float]:
+        """Batch dated market caps keyed by ``(ticker, datetime.date)``.
+
+        This is the bounded-panel twin of :meth:`daily_marketcaps`; callers
+        should pass a ticker chunk and all required formation dates.
+        """
+        names = sorted({str(ticker) for ticker in tickers if str(ticker)})
+        valid_dates = sorted({self._date(value) for value in dates
+                              if self._date(value) is not None})
+        if not names or not valid_dates:
+            return {}
+        result = self._query(
+            'daily',
+            "SELECT ticker, CAST(date AS DATE), marketcap FROM src "
+            "WHERE ticker IN (%s) AND CAST(date AS DATE) IN (%s)"
+            % (','.join('?' * len(names)),
+               ','.join('?' * len(valid_dates))),
+            [*names, *valid_dates],
+        )
+        rows = result.fetchall() if result else []
+        return {(ticker, date_value): float(marketcap)
+                for ticker, date_value, marketcap in rows
+                if marketcap is not None}
+
     # ------------------------------------------------------------------
     # Intraday minute bars (bars_1m and siblings; see _INTRADAY_TABLES).
     # Every helper takes an additive ``table`` param defaulting to
@@ -857,11 +1372,103 @@ class PitWarehouse:
     # ------------------------------------------------------------------
     # Ingest — OPERATOR-ONLY, network: bulk-export -> zip -> Parquet
     # ------------------------------------------------------------------
+    @staticmethod
+    def _candidate_datatable_metadata(
+            logical_name: str, table: str) -> Dict:  # pragma: no cover — network
+        """Fetch only credential-free metadata used by candidate receipts."""
+        from data.pit_provider import PitCache, _api_key
+
+        if logical_name not in CANDIDATE_TABLES:
+            raise ValueError(
+                f"candidate metadata is limited to {list(CANDIDATE_TABLES)}")
+        expected_table = _TABLES[logical_name][0]
+        if table != expected_table:
+            raise ValueError(
+                f"candidate metadata table differs for {logical_name!r}")
+        body = PitCache._get_json(
+            f"{table}/metadata", {'api_key': _api_key()})
+        raw = body.get('datatable') if isinstance(body, Mapping) else None
+        if not isinstance(raw, Mapping):
+            raise SharadarSourceEvidenceError(
+                f"{logical_name} datatable metadata response is malformed")
+        raw_columns = raw.get('columns')
+        if not isinstance(raw_columns, list):
+            raise SharadarSourceEvidenceError(
+                f"{logical_name} datatable metadata columns are malformed")
+        columns = []
+        for column in raw_columns:
+            if not isinstance(column, Mapping):
+                raise SharadarSourceEvidenceError(
+                    f"{logical_name} datatable metadata column is malformed")
+            columns.append({
+                'name': column.get('name'),
+                'type': column.get('type'),
+                'description': column.get('description'),
+            })
+        status = raw.get('status')
+        if not isinstance(status, Mapping):
+            raise SharadarSourceEvidenceError(
+                f"{logical_name} datatable metadata status is missing")
+        sanitized = {
+            'vendor_code': raw.get('vendor_code'),
+            'datatable_code': raw.get('datatable_code'),
+            'name': raw.get('name'),
+            'description': raw.get('description'),
+            'columns': columns,
+            'filters': raw.get('filters'),
+            'primary_key': raw.get('primary_key'),
+            'premium': raw.get('premium'),
+            'status': {
+                'expected_at': status.get('expected_at'),
+                'refreshed_at': status.get('refreshed_at'),
+                'status': status.get('status'),
+                'update_frequency': status.get('update_frequency'),
+            },
+        }
+        return normalize_datatable_metadata(logical_name, sanitized)
+
+    @staticmethod
+    def _actions_datatable_metadata(
+            table: str) -> Dict:  # pragma: no cover — network
+        """Fetch and sanitize the official ACTIONS metadata contract.
+
+        The API credential is request-only.  Only the schema/status fields
+        consumed by the evidence receipt are returned, so neither credentials,
+        request URLs, nor unrelated response fields can enter persisted
+        provenance.
+        """
+        from data.pit_provider import PitCache, _api_key
+
+        if table != 'SHARADAR/ACTIONS':
+            raise ValueError("datatable metadata evidence is ACTIONS-only")
+        body = PitCache._get_json(
+            f"{table}/metadata", {'api_key': _api_key()})
+        raw = body.get('datatable') if isinstance(body, Mapping) else None
+        if not isinstance(raw, Mapping):
+            raise ActionsEvidenceError(
+                "ACTIONS datatable metadata response is malformed")
+        expected = expected_datatable_metadata()
+        sanitized = {field: raw.get(field) for field in expected}
+        status = raw.get('status')
+        if not isinstance(status, Mapping):
+            raise ActionsEvidenceError(
+                "ACTIONS datatable metadata status is missing")
+        sanitized['status'] = dict(status)
+        return sanitized
+
     def _export_link(self, table: str, params: Dict, *,
-                     poll_attempts: int = 30, poll_wait: int = 10
-                     ) -> str:  # pragma: no cover — network
+                     poll_attempts: int = 30, poll_wait: int = 10,
+                     include_metadata: bool = False,
+                     ) -> str | tuple[str, Dict]:  # pragma: no cover — network
         """Request a bulk export and poll until the snapshot is 'fresh', then
-        return the signed S3 zip link. Reuses PitCache's retry/backoff."""
+        return the signed S3 zip link. Reuses PitCache's retry/backoff.
+
+        ``include_metadata`` is used by the ACTIONS and candidate-grade
+        SF1/SEP/TICKERS evidence paths.  The companion mapping intentionally
+        excludes the signed link and contains only provider timestamps and the
+        freshness status bound by the receipt.  The default remains the
+        historical string return value for compatibility callers.
+        """
         import time
 
         from data.pit_provider import PitCache, _api_key
@@ -870,12 +1477,252 @@ class PitWarehouse:
         p['api_key'] = _api_key()
         for _ in range(poll_attempts):
             body = PitCache._get_json(table, p)
-            f = body['datatable_bulk_download']['file']
+            download = body['datatable_bulk_download']
+            f = download['file']
             if f.get('status') == 'fresh':
+                if include_metadata:
+                    datatable = download.get('datatable') or {}
+                    return f['link'], {
+                        'last_refreshed_time': datatable.get(
+                            'last_refreshed_time'),
+                        'data_snapshot_time': f.get('data_snapshot_time'),
+                        'status': f.get('status'),
+                    }
                 return f['link']
             logger.info("export %s: status=%s, waiting…", table, f.get('status'))
             time.sleep(poll_wait)
         raise RuntimeError(f"bulk export for {table} never became 'fresh'")
+
+    @staticmethod
+    def _activate_candidate_parquet(source: Path, destination: Path) -> None:
+        """Atomically update the mutable cache after immutable publication."""
+        temporary: str | None = None
+        try:
+            with source.open('rb') as incoming, tempfile.NamedTemporaryFile(
+                    mode='wb', dir=destination.parent,
+                    prefix=f'.{destination.name}.', delete=False) as outgoing:
+                temporary = outgoing.name
+                shutil.copyfileobj(incoming, outgoing, 1 << 20)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    def _ingest_candidate_table(
+            self, logical_name: str, datatable: str, params: Dict) -> int:
+        """Acquire SF1/SEP/TICKERS through immutable candidate evidence.
+
+        Publication order is raw/converted archives, immutable receipt,
+        mutable cache Parquet, then mutable active receipt.  A failure before
+        the immutable receipt leaves at most unreferenced content-addressed
+        files; a failure after it leaves a valid immutable acquisition even if
+        the convenience cache has not advanced.
+        """
+        import requests
+
+        if logical_name not in CANDIDATE_TABLES:
+            raise ValueError(
+                f"candidate ingest is limited to {list(CANDIDATE_TABLES)}")
+        try:
+            metadata = self._candidate_datatable_metadata(logical_name, datatable)
+            export = self._export_link(
+                datatable, params, include_metadata=True)
+        except requests.exceptions.RequestException:
+            raise SharadarSourceEvidenceError(
+                f"{logical_name} candidate metadata/export request failed") from None
+        if (
+            not isinstance(export, tuple)
+            or len(export) != 2
+            or not isinstance(export[0], str)
+            or not isinstance(export[1], Mapping)
+        ):
+            raise SharadarSourceEvidenceError(
+                f"{logical_name} bulk export response is malformed")
+        link, bulk_metadata = export
+        expected_bulk_fields = {
+            'last_refreshed_time', 'data_snapshot_time', 'status'
+        }
+        if (
+            set(bulk_metadata) != expected_bulk_fields
+            or bulk_metadata.get('status') != 'fresh'
+        ):
+            raise SharadarSourceEvidenceError(
+                f"{logical_name} bulk export metadata is not fresh or complete")
+
+        root = Path(self.warehouse_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+                dir=root, prefix=f'.{logical_name}-candidate-ingest-') as temporary:
+            staging = Path(temporary)
+            raw_zip = staging / f'{logical_name}.zip'
+            try:
+                with requests.get(link, stream=True, timeout=600) as response:
+                    response.raise_for_status()
+                    with raw_zip.open('wb') as stream:
+                        for chunk in response.iter_content(chunk_size=1 << 20):
+                            if chunk:
+                                stream.write(chunk)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+            except requests.exceptions.RequestException:
+                raise SharadarSourceEvidenceError(
+                    f"{logical_name} candidate bulk download failed") from None
+            parquet = staging / f'{logical_name}.parquet'
+            convert_sharadar_zip_to_parquet(
+                raw_zip,
+                parquet,
+                logical_name=logical_name,
+                datatable_metadata=metadata,
+            )
+            document = build_sharadar_table_acquisition_document(
+                logical_name=logical_name,
+                raw_zip_path=raw_zip,
+                parquet_path=parquet,
+                acquired_at_utc=(
+                    datetime.now(timezone.utc).isoformat(timespec='seconds')
+                    .replace('+00:00', 'Z')),
+                last_refreshed_time=bulk_metadata['last_refreshed_time'],
+                data_snapshot_time=bulk_metadata['data_snapshot_time'],
+                datatable_metadata=metadata,
+            )
+            verified, _ = publish_sharadar_table_acquisition(
+                root,
+                raw_zip_path=raw_zip,
+                parquet_path=parquet,
+                document=document,
+            )
+            immutable_parquet = (
+                root / verified['payload']['parquet']['relative_path'])
+            self._activate_candidate_parquet(
+                immutable_parquet, root / f'{logical_name}.parquet')
+            atomic_write_json(
+                root / f'{logical_name}.acquisition.json', verified)
+            return int(
+                verified['payload']['parquet']['statistics']['rows'])
+
+    def candidate_source_snapshot(
+            self, candidate_id: str, *,
+            created_at_utc: str | None = None) -> Dict:
+        """Publish an aggregate receipt from the three active acquisitions."""
+        root = Path(self.warehouse_dir).resolve()
+        acquisitions = {
+            name: load_sharadar_table_acquisition(
+                root / f'{name}.acquisition.json', warehouse_dir=root)
+            for name in CANDIDATE_TABLES
+        }
+        created = created_at_utc or (
+            datetime.now(timezone.utc).isoformat(timespec='seconds')
+            .replace('+00:00', 'Z'))
+        document = build_pead_sharadar_source_snapshot(
+            warehouse_dir=root,
+            candidate_id=candidate_id,
+            created_at_utc=created,
+            acquisitions=acquisitions,
+        )
+        verified, _ = publish_pead_sharadar_source_snapshot(root, document)
+        atomic_write_json(root / 'sharadar_source_snapshot.json', verified)
+        return verified
+
+    def _ingest_actions(self, datatable: str, params: Dict) -> int:
+        """Acquire ACTIONS with immutable raw and validated receipt evidence.
+
+        All mutable active files remain untouched until the download,
+        conversion, exact schema/statistics checks, raw archive, and receipt
+        construction succeed.  Publication replaces the Parquet first and the
+        receipt second; an interruption between those two steps is detectable
+        and therefore fails closed at :meth:`corporate_action_evidence`.
+        """
+        import tempfile
+        import zipfile
+
+        import requests
+
+        datatable_metadata = self._actions_datatable_metadata(datatable)
+        export = self._export_link(
+            datatable, params, include_metadata=True)
+        if (
+            not isinstance(export, tuple)
+            or len(export) != 2
+            or not isinstance(export[0], str)
+            or not isinstance(export[1], Mapping)
+        ):
+            raise ActionsEvidenceError(
+                "ACTIONS bulk export response is malformed")
+        link, bulk_metadata = export
+        expected_bulk_fields = {
+            'last_refreshed_time', 'data_snapshot_time', 'status'
+        }
+        if (
+            set(bulk_metadata) != expected_bulk_fields
+            or bulk_metadata.get('status') != 'fresh'
+        ):
+            raise ActionsEvidenceError(
+                "ACTIONS bulk export metadata is not fresh or complete")
+
+        root = Path(self.warehouse_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+                dir=root, prefix='.actions-ingest-') as temporary:
+            staging = Path(temporary)
+            zip_path = staging / 'actions.zip'
+            with requests.get(link, stream=True, timeout=600) as response:
+                response.raise_for_status()
+                with zip_path.open('wb') as stream:
+                    for chunk in response.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            stream.write(chunk)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+            zip_stats = inspect_actions_zip(zip_path)
+            csv_path = staging / 'actions.csv'
+            with zipfile.ZipFile(zip_path) as archive:
+                with archive.open(zip_stats['member'], 'r') as incoming:
+                    with csv_path.open('wb') as outgoing:
+                        shutil.copyfileobj(incoming, outgoing, 1 << 20)
+                        outgoing.flush()
+                        os.fsync(outgoing.fileno())
+
+            parquet_path = staging / 'actions.parquet'
+            csv_sql = str(csv_path).replace("'", "''")
+            parquet_sql = str(parquet_path).replace("'", "''")
+            self._con().execute(
+                f"COPY (SELECT * FROM read_csv_auto('{csv_sql}', "
+                f"sample_size=-1)) TO '{parquet_sql}' (FORMAT PARQUET)",
+            )
+            # Validate before any active file is replaced.  The receipt builder
+            # repeats the check while binding these exact bytes.
+            statistics = inspect_actions_parquet(parquet_path)
+            with parquet_path.open('rb') as stream:
+                os.fsync(stream.fileno())
+
+            archived_zip = archive_raw_zip(zip_path, root)
+            document = build_actions_acquisition_document(
+                parquet_path=parquet_path,
+                raw_zip_path=archived_zip,
+                raw_zip_relative_path=(
+                    archived_zip.relative_to(root).as_posix()),
+                acquired_at_utc=(
+                    datetime.now(timezone.utc).isoformat(timespec='seconds')
+                    .replace('+00:00', 'Z')),
+                last_refreshed_time=bulk_metadata['last_refreshed_time'],
+                data_snapshot_time=bulk_metadata['data_snapshot_time'],
+                datatable_metadata=datatable_metadata,
+            )
+            receipt_rows = document['payload']['parquet']['statistics']['rows']
+            if int(receipt_rows) != statistics['rows']:
+                raise ActionsEvidenceError(
+                    "ACTIONS receipt row count changed during acquisition")
+
+            os.replace(parquet_path, root / 'actions.parquet')
+            atomic_write_json(root / ACTIONS_RECEIPT_FILE, document)
+            return int(receipt_rows)
 
     def ingest_table(self, name: str) -> int:  # pragma: no cover — network
         """Bulk-export one Sharadar table to ``<warehouse>/<name>.parquet`` and
@@ -889,6 +1736,10 @@ class PitWarehouse:
         if name not in _TABLES:
             raise ValueError(f"unknown table {name!r}; one of {list(_TABLES)}")
         datatable, params = _TABLES[name]
+        if name in CANDIDATE_TABLES:
+            return self._ingest_candidate_table(name, datatable, params)
+        if name == 'actions':
+            return self._ingest_actions(datatable, params)
         link = self._export_link(datatable, params)
 
         os.makedirs(self.warehouse_dir, exist_ok=True)
@@ -928,8 +1779,19 @@ if __name__ == '__main__':  # operator CLI (networked):
                     choices=list(_TABLES),
                     help='Sharadar tables to bulk-export to Parquet')
     ap.add_argument('--dir', default=None, help='warehouse dir (else PIT_WAREHOUSE_DIR)')
+    ap.add_argument(
+        '--candidate-id', default=None,
+        help=(
+            'after ingest, publish pead_sharadar_source_snapshot.v1 from the '
+            'active candidate-grade SF1/SEP/TICKERS receipts'))
     cli = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
     wh = PitWarehouse(cli.dir)
     for t in cli.tables:
         print(f"{t}: {wh.ingest_table(t)} rows -> {wh._pq(t)}")
+    if cli.candidate_id:
+        snapshot = wh.candidate_source_snapshot(cli.candidate_id)
+        print(
+            'source_snapshot: '
+            f"{snapshot['artifact_hash']} -> "
+            f"{Path(wh.warehouse_dir) / 'sharadar_source_snapshot.json'}")

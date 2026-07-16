@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Gate backtest for the Insider Net-Buy desk (see docs/insider_desk_spec.md).
+"""Legacy diagnostic for the Insider Net-Buy desk.
 
 Runs one PIT size sleeve (InsiderNetBuyDesk) through the event-driven engine on
 the survivorship-free warehouse feed, extracts the realized daily return series +
@@ -7,10 +7,13 @@ calendar-year labels, and applies the single research gate
 (analysis.research_stats.validate_strategy_oos): PSR(excess vs risk-free) >= 0.95
 AND >= 1 Benjamini-Hochberg-significant out-of-sample year.
 
-The desk's book prices come from WarehouseMarketData (delisted names priced), and
-size buckets from point-in-time daily_metric market cap — so the number is honest
-by construction. OPERATOR-run (reads the warehouse; requires tickers/sep/sf2/daily
-ingested):
+The book prices come from WarehouseMarketData (delisted names priced), and size
+buckets use point-in-time daily_metric market cap.  However, this legacy driver
+passes the *union* of dated listing membership to an engine whose universe is
+static for the run.  Its results are therefore diagnostics only and are forced
+to ``qualifying=False`` / ``passed=False`` even when the historical statistical
+gate would pass. OPERATOR-run (reads the warehouse; requires
+tickers/sep/sf2/daily ingested):
 
     python scripts/insider_desk_gate.py --band small --limit 300   # fast smoke
     python scripts/insider_desk_gate.py --band small               # full universe (slow)
@@ -33,9 +36,13 @@ from backtesting.backtest_engine import BacktestEngine  # noqa: E402
 from data.pit_warehouse import PitWarehouse  # noqa: E402
 from data.warehouse_feed import WarehouseMarketData  # noqa: E402
 from desks.insider_netbuy import InsiderNetBuyDesk  # noqa: E402
-from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
+from scripts.insider_screen import resolve_universe  # noqa: E402
 
 FULL_START, FULL_END = '2015-01-01', '2024-12-31'
+RETRIEVAL_UNION_NONQUALIFYING = (
+    'static engine universe uses the union of dated membership; exact '
+    'point-in-time eligibility is not enforced at every signal date'
+)
 
 
 def _datestr(ts) -> str:
@@ -54,21 +61,38 @@ def _daily_returns_with_years(history):
     return returns, years
 
 
+def _mark_retrieval_union_nonqualifying(gate):
+    """Fail closed when a legacy driver feeds a dated-universe union to the engine.
+
+    Keep the statistical result as ``diagnostic_passed`` for reproducibility,
+    but never expose it as promotion evidence through the conventional
+    ``passed`` field.
+    """
+    result = dict(gate)
+    result['diagnostic_passed'] = gate.get('passed')
+    result['qualifying'] = False
+    result['passed'] = False
+    result['universe_membership_model'] = 'static_retrieval_union'
+    result['nonqualifying_reasons'] = [RETRIEVAL_UNION_NONQUALIFYING]
+    return result
+
+
 def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
              long_only=False):
     wh = PitWarehouse()
     rb = pd.bdate_range(start, end, freq='BMS')
-    universe = resolve_universe(wh, rb, SCALE_SMALL_MID)
+    universe = resolve_universe(wh, rb)
     if limit and limit < len(universe):
         # seeded RANDOM sample (not the alphabetical head) so a subset is
-        # representative of the small/mid universe, not a-names only.
+        # representative of the full dated eligible universe, not a-names only.
         universe = sorted(random.Random(seed).sample(universe, limit))
     desk = InsiderNetBuyDesk(band, provider=wh, long_only=long_only)
     engine = BacktestEngine(desk=desk, initial_capital=capital, seed=seed,
                             market_data=WarehouseMarketData(wh))
     report = engine.run(universe, start, end)
     returns, years = _daily_returns_with_years(report['portfolio_history'])
-    gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
+    gate = _mark_retrieval_union_nonqualifying(
+        validate_strategy_oos(returns, years, psr_threshold=0.95))
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
@@ -80,6 +104,8 @@ def print_report(summary, gate, n_trades, n_names, band, start, end):
     print(f"  Total Return   : {summary['total_return_pct']:.2f}%")
     print(f"  Sharpe         : {summary['sharpe_ratio']:.2f}")
     print(f"  Max Drawdown   : {summary['max_drawdown']:.2f}%")
+    print("\n  NON-QUALIFYING DIAGNOSTIC: "
+          + '; '.join(gate['nonqualifying_reasons']))
     psr = gate['psr']
     print(f"\n  GATE: PSR(excess vs {gate.get('risk_free_rate', 0.02):.0%} rf) "
           ">= 0.95 AND >= 1 BH-significant OOS year")
@@ -88,7 +114,8 @@ def print_report(summary, gate, n_trades, n_names, band, start, end):
     print(f"    PSR pass (>=0.95)   : {gate['psr_pass']}")
     print(f"    OOS years tested    : {gate['n_periods_tested']}")
     print(f"    BH-significant years: {gate['bh']['n_significant_bh']}")
-    print(f"\n  VERDICT: {'PASS' if gate['passed'] else 'FAIL'}")
+    print("\n  VERDICT: NON-QUALIFYING (statistical diagnostic "
+          f"would {'PASS' if gate['diagnostic_passed'] else 'FAIL'})")
     print(f"\n  {'year':<8}{'p-value':>10}{'reject':>9}")
     for label, p, rej in zip(gate['fold_labels'], gate['fold_pvalues'],
                              gate['bh']['rejected_bh']):

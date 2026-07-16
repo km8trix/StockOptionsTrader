@@ -577,7 +577,7 @@ def test_run_gate_applies_variant_kwargs(monkeypatch):
 
     monkeypatch.setattr(pdg, 'PitWarehouse', lambda: 'WH')
     monkeypatch.setattr(pdg, 'resolve_universe',
-                        lambda wh, rb, scales: ['AAA', 'BBB'])
+                        lambda wh, rb, scales=None: ['AAA', 'BBB'])
     monkeypatch.setattr(pdg, 'WarehouseMarketData', lambda wh: 'FEED')
     monkeypatch.setattr(pdg, 'PEADDesk', FakeDesk)
     monkeypatch.setattr(pdg, 'BacktestEngine', FakeEngine)
@@ -586,12 +586,14 @@ def test_run_gate_applies_variant_kwargs(monkeypatch):
     monkeypatch.setattr(pdg, 'validate_strategy_oos',
                         lambda returns, years, psr_threshold: {'psr': 0.5})
 
-    pdg.run_gate('micro', '2015-01-01', '2024-12-31', long_only=True,
-                 dating='announce', variant='surge_confirm')
+    _, gate, _, _ = pdg.run_gate(
+        'micro', '2015-01-01', '2024-12-31', long_only=True,
+        dating='announce', variant='surge_confirm')
     assert captured['band'] == 'micro'
     assert captured['kwargs'] == {'provider': 'WH', 'long_only': True,
                                   'dating': 'announce',
                                   'surge_confirm': True}
+    assert gate['qualifying'] is False and gate['passed'] is False
     # Default: NO variant kwargs at all — byte-identical construction.
     pdg.run_gate('micro', '2015-01-01', '2024-12-31')
     assert captured['kwargs'] == {'provider': 'WH', 'long_only': False,

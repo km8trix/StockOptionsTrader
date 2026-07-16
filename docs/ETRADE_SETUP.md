@@ -23,7 +23,8 @@ operator action (enforced by `TestLauncherEnvHygiene`). So launching
 `python run_gui.py` directly will report **"E\*TRADE not configured"** because
 it sees none of your `.env` values.
 
-Use the wrapper, which sources `.env` in your shell and then launches:
+Use the wrapper, which parses `.env` as data with interpolation disabled and
+then launches:
 
 ```bash
 ./start.sh
@@ -32,13 +33,13 @@ Use the wrapper, which sources `.env` in your shell and then launches:
 Equivalent by hand:
 
 ```bash
-set -a && source .env && set +a
-.venv/bin/python run_gui.py
+.venv/bin/python -m scripts.launch_with_env \
+  --env-file "$PWD/.env" --script "$PWD/run_gui.py"
 ```
 
-`.env` is sourced as a shell script, so values must be **bare** `KEY=value`
-lines — no surrounding quotes, no trailing spaces (either would be baked into
-the OAuth signature and break it).
+`.env` is never evaluated as shell code. Values containing `$` therefore stay
+literal instead of being expanded as variable references. Standard dotenv
+quoting is supported; quote values containing spaces or `#`.
 
 > The auth manager is built once at startup and is a process-wide singleton.
 > After editing `.env`, **restart** (`Ctrl-C`, then `./start.sh`) — a running

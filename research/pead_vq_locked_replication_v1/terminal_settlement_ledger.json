@@ -1,0 +1,10 @@
+{
+  "artifact_hash": "fc497cfd1a354c87463edfa7348b9c9ddc6acb59b817812bb9204856d392cf77",
+  "payload": {
+    "ACTIONS": {
+      "value_allowed": false
+    },
+    "cash_only_records": [],
+    "schema_version": "pead_terminal_settlement_ledger.v1"
+  }
+}

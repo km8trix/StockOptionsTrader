@@ -16,10 +16,12 @@ RECORDED VERDICT (2026-07-01, survivorship-free small/mid universe, pb/ps focus)
 the headline is real but heavily QUALIFIED — the tradeable edge is MARGINAL and
 regime-dependent, very likely to fail a desk gate the way insider did.
 
-NOTE: the verdict numbers below were recorded UN-winsorized (before --winsor
-existed here; factor_screen's docstring calls such numbers contaminated/~40%
-inflated). The battery now defaults to --winsor 0.01, matching factor_screen /
-quality_screen; pass --winsor 0 to reproduce the recorded numbers.
+STATISTICAL STATUS (2026-07-13): the verdict numbers below were recorded before
+both winsorization and the net-array inference repair. Their displayed means
+were cost-net but their t/p values tested GROSS spreads. They are research
+provenance, not current significance claims. The battery now defaults to robust
+winsorized inference and ``factor_study`` deducts per-date costs before HAC;
+pass ``--winsor 0`` only to reproduce the contaminated raw-return sensitivity.
 
   1. OOS — entirely a back-half phenomenon (the real "value comeback"):
        IS  2015-2019  pb 63d net +0.32%  t=0.87  p=0.39   (nothing)
@@ -53,7 +55,10 @@ if ROOT not in sys.path:
 from data.pit_warehouse import PitWarehouse  # noqa: E402
 from data.size_buckets import size_buckets  # noqa: E402
 from scripts.factor_screen import collect_factor_events, factor_study  # noqa: E402
-from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
+from scripts.insider_screen import (  # noqa: E402
+    resolve_universe_membership,
+    universe_union,
+)
 
 FACTORS = ['pb', 'pe', 'ps', 'evebit', 'evebitda']
 HZ = [21, 63]
@@ -83,13 +88,16 @@ def _date_spreads(df, factor, h=63, q=0.2, winsor=None):
 
 def _rep(df, label, factors=FACTORS, winsor=None):
     print(f"\n=== {label}: {len(df)} events ===")
-    print(f"  {'factor':>9}{'h':>4}{'net%':>9}{'t':>7}{'p':>9}")
+    print(f"  {'factor':>9}{'h':>4}{'raw-n%':>9}{'rob-n%':>9}"
+          f"{'net-t':>7}{'p(+)':>9}")
     for f in factors:
         for s in factor_study(df, f, HZ, 30.0, winsor_returns=winsor):
             if s.get('insufficient'):
                 continue
-            print(f"  {s['factor']:>9}{s['h']:>4}{s['net_spread']*100:>+9.3f}"
-                  f"{s['t']:>+7.2f}{s['p']:>9.4f}")
+            raw_net = s.get('raw_net_spread', s['net_spread'])
+            print(f"  {s['factor']:>9}{s['h']:>4}{raw_net*100:>+9.3f}"
+                  f"{s['net_spread']*100:>+9.3f}{s['t']:>+7.2f}"
+                  f"{s['p']:>9.4f}")
 
 
 def load_events(cache):
@@ -99,13 +107,15 @@ def load_events(cache):
         return ev
     wh = PitWarehouse()
     rb = pd.bdate_range('2015-01-01', '2024-09-30', freq='BMS')
-    names = resolve_universe(wh, rb, SCALE_SMALL_MID)
+    membership = resolve_universe_membership(wh, rb)
+    names = universe_union(membership)
     pstart = (pd.Timestamp('2015-01-01') - pd.Timedelta(days=30)).date().isoformat()
     pend = (pd.Timestamp('2024-09-30')
             + pd.Timedelta(days=max(HZ) * 2 + 30)).date().isoformat()
     print(f"collecting {len(names)} names...", file=sys.stderr)
     ev, n = collect_factor_events(wh, names, rb, HZ, FACTORS + ['marketcap'],
-                                  pstart, pend)
+                                  pstart, pend,
+                                  membership_by_date=membership)
     print(f"collected {len(ev)} events from {n} names", file=sys.stderr)
     if cache:
         ev.to_pickle(cache)
@@ -147,8 +157,10 @@ def main(argv=None):
              if not x.get('insufficient')]
         if s:
             s = s[0]
-            print(f"  {lbl:>6}: n={len(sub):>6} net={s['net_spread']*100:+.3f}% "
-                  f"t={s['t']:+.2f} p={s['p']:.4f}")
+            raw_net = s.get('raw_net_spread', s['net_spread'])
+            print(f"  {lbl:>6}: n={len(sub):>6} raw-net={raw_net*100:+.3f}% "
+                  f"robust-net={s['net_spread']*100:+.3f}% "
+                  f"t={s['t']:+.2f} p(+)={s['p']:.4f}")
 
     print("\n=== factor correlation (63d per-date spread series) ===")
     sp = pd.DataFrame({f: _date_spreads(ev, f, winsor=w) for f in FACTORS}).dropna()

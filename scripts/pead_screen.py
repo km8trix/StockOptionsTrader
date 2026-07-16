@@ -1,5 +1,5 @@
 """PEAD screen — true SUE (SF1 diluted EPS) on the survivorship-free
-small/mid universe, through the honest apparatus.
+dated eligible universe, through the research apparatus.
 
 Post-earnings-announcement drift with a REAL standardized earnings surprise
 (data/earnings_surprise.sue_table over PitWarehouse.eps_quarterly), replacing
@@ -10,7 +10,8 @@ within --fresh-days of t). High SUE = long, low = short. The spread is tested
 with the exact machinery that validated/killed insider, value and quality:
 factor_screen.factor_study (per-date Fama-MacBeth spread, Newey-West/HAC t,
 per-date winsorized forward returns), Benjamini-Hochberg across the whole
-family (pooled + size terciles x horizons), 30bp/leg cost-netting.
+family (pooled + size terciles x horizons), using the historical 30bp/leg
+fixed-cost convention corrected below.
 
 PIT notes: datekey is the SEC FILING date (median ~41 days after quarter end),
 not the press-release date — entries are conservative/late by construction,
@@ -24,7 +25,17 @@ Deterministic; warehouse-only (tickers + sep + sf1 + daily ingested).
     python -m scripts.pead_screen --field revenue    # SURGE (revenue surprise)
     python -m scripts.pead_screen --selftest         # offline, no warehouse
 
-SURGE RESULT (2026-07-10, --field revenue --dating announce, 4291 names /
+STATISTICAL STATUS (2026-07-13): the recorded result below predates the net-array
+inference repair in ``factor_study``. Its displayed means were cost-net, but its
+t/p and BH decisions tested GROSS spreads. It is retained only as research
+provenance and is not evidence of a net tradeable edge until rerun. The current
+report separates raw economic P&L from winsorized robustness inference, deducts
+cost per formation date before HAC, and sends one-sided net p-values to BH. The
+legacy implementation deducted only two 30bp charges while the CLI described a
+one-way cost. The corrected fixed model charges four trades (120bp total at the
+default), making the historical net means stale as well.
+
+LEGACY SURGE RESULT (2026-07-10, --field revenue --dating announce, 4291 names /
 181,461 events): 2/8 BH survivors, micro only — 21d net +0.55% t=+3.23,
 63d net +2.96% t=+3.23. A real but weaker echo of EPS-SUE announce (4/8;
 micro 63d t=+5.09): comparable micro-63d magnitude, lower t, nothing
@@ -54,12 +65,17 @@ from data.earnings_surprise import (  # noqa: E402
     apply_announcement_dating, sue_table)
 from data.pit_warehouse import PitWarehouse  # noqa: E402
 from scripts.factor_screen import _print_report, factor_study  # noqa: E402
-from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
+from scripts.insider_screen import (  # noqa: E402
+    _eligible_on,
+    resolve_universe_membership,
+    universe_union,
+)
 
 
 def collect_sue_events(prov, names, rebal_dates, horizons, *,
                        fresh_days=63, price_start=None, price_end=None,
-                       announcements=None, field='epsdil'):
+                       announcements=None, field='epsdil',
+                       membership_by_date=None):
     """One row per (name, rebalance) with a fresh PIT SUE: columns
     ['date','name','sue','mcap'] + fwd_h. Cohort key = the rebalance date.
     announcements (optional, PitWarehouse.earnings_events shape): re-dates
@@ -79,7 +95,6 @@ def collect_sue_events(prov, names, rebal_dates, horizons, *,
         px = prov.prices(name, price_start, price_end)
         if len(px) < 100:
             continue
-        n_names += 1
         idx, vals = px.index, px.values
         g = g.sort_values('datekey')
         keys = g['datekey'].to_numpy(dtype='datetime64[ns]')
@@ -87,6 +102,8 @@ def collect_sue_events(prov, names, rebal_dates, horizons, *,
         live = []
         for t in rebal_dates:
             ts = pd.Timestamp(t)
+            if not _eligible_on(name, ts, membership_by_date):
+                continue
             # side='left': a filing with datekey == t is NOT usable at t —
             # its datekey covers after-close EDGAR acceptances, so the day-t
             # close printed before the filing was public (and the tradeable
@@ -106,6 +123,7 @@ def collect_sue_events(prov, names, rebal_dates, horizons, *,
             live.append((ts, pos, entry, svals[i - 1]))
         if not live:
             continue
+        n_names += 1
         caps = (batch(name, [t for t, _, _, _ in live]) if batch is not None
                 else [prov.daily_metric(name, t) for t, _, _, _ in live])
         for (ts, pos, entry, sue), metrics in zip(live, caps):
@@ -119,8 +137,12 @@ def collect_sue_events(prov, names, rebal_dates, horizons, *,
 
 
 def add_size_terciles(events: pd.DataFrame) -> pd.DataFrame:
-    """Per-date size tercile (0=micro..2=mid) over each event cross-section's
-    PIT marketcap; NaN where the cap is missing or the date has < 3 names."""
+    """Relative per-date size tercile over each eligible event cross-section.
+
+    Terciles use point-in-time market cap.  They are deliberately labelled
+    smallest/middle/largest rather than micro/small/mid: no absolute size-band
+    boundary is implied by a cross-sectional rank.
+    """
     events = events.copy()
 
     def _rank(g):
@@ -187,13 +209,16 @@ def main(argv=None):
     ap.add_argument('--start', default='2015-01-01')
     ap.add_argument('--end', default='2024-09-30')
     ap.add_argument('--horizons', nargs='+', type=int, default=[21, 63])
-    ap.add_argument('--cost-bps', type=float, default=30.0)
+    ap.add_argument('--cost-bps', type=float, default=30.0,
+                    help='one-way cost for one trade on one leg; charges entry '
+                         'and exit on both long and short legs (4x)')
     ap.add_argument('--fresh-days', type=int, default=63)
     ap.add_argument('--limit', type=int, default=None,
                     help='cap the universe for a faster smoke')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--winsor', type=float, default=0.01,
-                    help='per-date forward-return winsorization (0 = off)')
+                    help='per-date robust-inference winsorization; raw economic '
+                         'P&L is always retained (0 = off)')
     ap.add_argument('--dating', choices=['filing', 'announce'],
                     default='filing',
                     help="event timestamp: SF1 filing datekey (strict PIT) "
@@ -217,7 +242,8 @@ def main(argv=None):
     import random
     wh = PitWarehouse()
     rebal = pd.bdate_range(cli.start, cli.end, freq='BMS')
-    names = resolve_universe(wh, rebal, SCALE_SMALL_MID)
+    membership = resolve_universe_membership(wh, rebal)
+    names = universe_union(membership)
     if cli.limit and cli.limit < len(names):
         names = sorted(random.Random(cli.seed).sample(names, cli.limit))
     pstart = (pd.Timestamp(cli.start) - pd.Timedelta(days=30)).date().isoformat()
@@ -236,7 +262,7 @@ def main(argv=None):
     events, n_names = collect_sue_events(
         wh, names, rebal, cli.horizons, fresh_days=cli.fresh_days,
         price_start=pstart, price_end=pend, announcements=ann,
-        field=cli.field)
+        field=cli.field, membership_by_date=membership)
     events = add_size_terciles(events)
 
     slices = [('pooled', events)] + [
@@ -254,8 +280,8 @@ def main(argv=None):
     label = 'PEAD-SUE' if cli.field == 'epsdil' else 'SURGE-REV'
     _print_report(all_stats, bh, cli.cost_bps, n_names, len(events),
                   label=label)
-    print("\n(tercile0=micro, 1=small, 2=mid — per-date event cross-sections "
-          "on PIT marketcap; high SUE = long)")
+    print("\n(tercile0=smallest, 1=middle, 2=largest — relative per-date "
+          "event cross-sections on PIT marketcap; high SUE = long)")
     return 0
 
 

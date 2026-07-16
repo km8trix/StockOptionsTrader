@@ -29,6 +29,8 @@ from analysis.promotion import (  # noqa: E402
     PromotionNotApproved,
     PromotionRegistry,
 )
+from analysis.research_report_store import ResearchReportStore  # noqa: E402
+from analysis.research_integrity import ResearchIntegrityLedger  # noqa: E402
 from data.market_data import MarketDataHandler  # noqa: E402
 from data.pit_warehouse import PitWarehouse  # noqa: E402
 from data.warehouse_feed import WarehouseMarketData  # noqa: E402
@@ -67,8 +69,19 @@ def _config(args) -> FoundationDeploymentConfig:
 def command_research(args) -> None:
     registry = _registry(args)
     warehouse = PitWarehouse(args.warehouse_dir)
+    ledger_root = registry.root / "research-integrity"
+    if (args.integrity_root is not None
+            and Path(args.integrity_root).resolve() != ledger_root.resolve()):
+        raise ValueError(
+            "--integrity-root must equal <registry-root>/research-integrity")
+    ledger = ResearchIntegrityLedger(
+        ledger_root, program_id=args.program_id)
+    existing_opening = ledger.get_holdout_opening(
+        protocol_hash=args.protocol_hash, holdout_id=args.holdout_id)
+    trial_count = (int(existing_opening.payload["program_trial_count_at_open"])
+                   if existing_opening is not None else ledger.trial_count)
     spec = FoundationResearchSpec(
-        n_trials=args.trials,
+        n_trials=trial_count,
         start=args.start,
         end=args.end,
         universe_as_of=args.universe_as_of,
@@ -77,18 +90,28 @@ def command_research(args) -> None:
     )
     output = run_foundation_research(
         spec,
+        integrity_ledger=ledger,
+        protocol_hash=args.protocol_hash,
+        trial_hash=args.trial_hash,
+        holdout_id=args.holdout_id,
+        reviewer=args.reviewer,
         config=_config(args),
         warehouse=warehouse,
         market_data=WarehouseMarketData(warehouse),
     )
-    persist_foundation_research(output, registry.store)
+    persist_foundation_research(
+        output, registry.store,
+        integrity_ledger=ledger, reviewer=args.reviewer)
     _json({
         "artifact_hash": output.artifact.artifact_hash,
         "decision": output.artifact.decision.value,
         "artifact_path": str(registry.store.path_for(
             output.artifact.artifact_hash)),
+        "raw_report_path": str(ResearchReportStore(registry.store.root).path_for(
+            output.artifact.evidence["report_sha256"])),
         "universe_size": len(output.selected_universe),
         "data_version": output.artifact.payload["data_version"],
+        "research_integrity": output.artifact.evidence["research_integrity"],
         "paper_approval_created": False,
         "live_approval_created": False,
     })
@@ -235,11 +258,13 @@ def command_approve_live(args) -> None:
     registry = _registry(args)
     path = registry.promote(
         "foundation", args.artifact, PromotionLevel.LIVE_ELIGIBLE,
-        actor=args.actor, paper_artifact_hash=args.paper_artifact)
+        actor=args.actor, paper_artifact_hash=args.paper_artifact,
+        replication_artifact_hash=args.replication_artifact)
     _json({
         "approved": "live_eligible",
         "artifact_hash": args.artifact,
         "paper_artifact_hash": args.paper_artifact,
+        "replication_artifact_hash": args.replication_artifact,
         "actor": args.actor,
         "approval_path": str(path),
     })
@@ -327,9 +352,21 @@ def parser() -> argparse.ArgumentParser:
     research = commands.add_parser("research", help="run strict PIT research")
     _common(research)
     research.add_argument("--warehouse-dir", default=None)
-    research.add_argument("--trials", type=int, required=True)
-    research.add_argument("--start", default="2015-01-01")
-    research.add_argument("--end", default="2024-12-31")
+    research.add_argument(
+        "--integrity-root", default=None,
+        help=("optional explicit confirmation of "
+              "<registry-root>/research-integrity"))
+    research.add_argument("--program-id", default="stock-options-trader")
+    research.add_argument("--protocol-hash", required=True)
+    research.add_argument("--trial-hash", required=True)
+    research.add_argument("--holdout-id", required=True)
+    research.add_argument("--reviewer", required=True)
+    research.add_argument(
+        "--start", required=True,
+        help="explicit sealed research-window start (no contaminated default)")
+    research.add_argument(
+        "--end", required=True,
+        help="explicit sealed research-window end (no contaminated default)")
     research.add_argument("--universe-as-of", default=None)
     research.add_argument("--max-symbols", type=int, default=100)
     research.add_argument("--seed", type=int, default=7)
@@ -370,6 +407,7 @@ def parser() -> argparse.ArgumentParser:
     _common(approve_live)
     approve_live.add_argument("--artifact", required=True)
     approve_live.add_argument("--paper-artifact", required=True)
+    approve_live.add_argument("--replication-artifact", required=True)
     approve_live.add_argument("--actor", required=True)
     approve_live.set_defaults(func=command_approve_live)
 

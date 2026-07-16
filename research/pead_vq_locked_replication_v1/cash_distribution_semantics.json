@@ -1,0 +1,17 @@
+{
+  "artifact_hash": "d529a15fa99f61dcaba3c13dee1ef48c95a191d5cd6e8c521aeed9646c2b1d23",
+  "payload": {
+    "ACTIONS": {
+      "action": "dividend",
+      "date_role": "candidate_ex_date_unproven",
+      "value_role": "candidate_split_normalized_cash_per_share_unproven"
+    },
+    "adjustment_check_tolerance": {
+      "absolute": 0.005,
+      "relative": 0.001
+    },
+    "evidence_status": "empirically_reconciled_not_authoritatively_documented",
+    "qualification_allowed": false,
+    "schema_version": "pead_cash_distribution_semantics.v1"
+  }
+}

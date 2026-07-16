@@ -10,13 +10,19 @@ import pandas as pd
 import pytest
 
 from analysis.foundation_research import (
+    FoundationResearchOutput,
     FoundationResearchSpec,
     ResearchRegime,
+    FOUNDATION_UNIVERSE_METHOD,
+    _require_frozen_foundation_trial,
     _select_universe,
     _snapshot_version,
     build_foundation_artifact,
+    foundation_trial_inputs,
+    persist_foundation_research,
 )
 from analysis.promotion import (
+    ArtifactStore,
     PaperValidationArtifact,
     PaperValidationPolicy,
     PromotionArtifact,
@@ -25,6 +31,15 @@ from analysis.promotion import (
     PromotionPolicy,
     PromotionRegistry,
     PromotionResults,
+)
+from analysis.research_report_store import (
+    ResearchReportArtifact,
+    ResearchReportStore,
+)
+from analysis.research_integrity import (
+    ResearchIntegrityLedger,
+    ResearchProtocol,
+    TrialRegistration,
 )
 from deployment.live import (
     FoundationLiveController,
@@ -49,6 +64,15 @@ from core.models import AssetType
 from execution.live_context import LiveContextIdentity, LiveExecutionContext
 from scripts import foundation_pipeline
 from tests.paper_evidence_helpers import authoritative_paper_evidence
+from tests.replication_evidence_helpers import persist_passing_replication
+from tests.research_evidence_helpers import (
+    fixture_engine_parameters,
+    fixture_integrity_evidence,
+    fixture_regimes,
+    fixture_results,
+    persist_terminal_integrity,
+    positive_foundation_report,
+)
 from utils.audit import AuditLog
 
 
@@ -56,15 +80,72 @@ CODE_SHA = "a" * 40
 SNAPSHOT_SHA = "eb12241b17158c2ac21b6c18f8b23f12b3f1a0a3fde3c4e6ac94feed72a7f411"
 
 
-def _live_results() -> PromotionResults:
-    return PromotionResults(
-        psr=0.999, dsr=0.99,
-        oos_total_folds=4, oos_testable_folds=4,
-        oos_significant_bh=4,
-        cost_model_applied=True, estimated_cost_bps=20.0,
-        cost_adjusted_return=0.20, annual_turnover=2.0,
-        regime_results={"bull": 0.12, "bear": 0.01, "flat": 0.04},
+def _fixture_report():
+    return positive_foundation_report(2)
+
+
+def test_approve_live_cli_requires_and_forwards_replication_hash(
+        monkeypatch, tmp_path):
+    base = [
+        "approve-live",
+        "--artifact", "a" * 64,
+        "--paper-artifact", "b" * 64,
+        "--actor", "risk-reviewer",
+    ]
+    with pytest.raises(SystemExit):
+        foundation_pipeline.parser().parse_args(base)
+    args = foundation_pipeline.parser().parse_args([
+        *base,
+        "--replication-artifact", "c" * 64,
+    ])
+    captured = {}
+
+    class Registry:
+        def promote(self, *values, **kwargs):
+            captured["values"] = values
+            captured["kwargs"] = kwargs
+            return tmp_path / "approval.json"
+
+    monkeypatch.setattr(foundation_pipeline, "_registry", lambda _args: Registry())
+    monkeypatch.setattr(foundation_pipeline, "_json", captured.update)
+    args.func(args)
+
+    assert captured["kwargs"]["replication_artifact_hash"] == "c" * 64
+    assert captured["replication_artifact_hash"] == "c" * 64
+
+
+def test_research_cli_requires_explicit_window_boundaries():
+    base = [
+        "research",
+        "--protocol-hash", "a" * 64,
+        "--trial-hash", "b" * 64,
+        "--holdout-id", "oos-1",
+        "--reviewer", "independent-reviewer",
+    ]
+    with pytest.raises(SystemExit):
+        foundation_pipeline.parser().parse_args(base)
+
+    args = foundation_pipeline.parser().parse_args([
+        *base,
+        "--start", "2027-01-01",
+        "--end", "2027-12-31",
+    ])
+    assert args.start == "2027-01-01"
+    assert args.end == "2027-12-31"
+
+
+def _research_integrity(snapshot_sha=SNAPSHOT_SHA, n_trials=3):
+    return fixture_integrity_evidence(
+        snapshot_sha=snapshot_sha,
+        code_sha=CODE_SHA,
+        n_trials=n_trials,
+        identity="foundation-pipeline",
     )
+
+
+def _live_results() -> PromotionResults:
+    return fixture_results(
+        trade_count=2, regime_names=("bull", "bear", "flat"))
 
 
 def _config() -> FoundationDeploymentConfig:
@@ -95,7 +176,7 @@ def _research_artifact(universe=("TEST",)) -> PromotionArtifact:
         code_sha=CODE_SHA,
         results=_live_results(),
         evidence={
-            "runner": "foundation_research_v2",
+            "runner": "foundation_research_v4",
             "window": ["2022-01-01", "2024-12-31"],
             "universe_selection": {
                 "requested_as_of": "2022-01-01",
@@ -118,22 +199,12 @@ def _research_artifact(universe=("TEST",)) -> PromotionArtifact:
                 ],
                 "quality_flags": [],
             },
-            "engine_parameters": {
-                "initial_capital": 100_000.0,
-                "commission": 0.001,
-                "slippage_bps": 5.0,
-                "enable_realistic_fills": True,
-                "impact_coef": 0.01,
-                "participation_cap": 0.10,
-                "adv_window": 20,
-                "seed": 7,
-            },
+            "engine_parameters": fixture_engine_parameters(),
             "n_trials": 3,
-            "regimes": [
-                {"name": name, "start": "2022-01-01", "end": "2024-12-31"}
-                for name in ("bull", "bear", "flat")
-            ],
-            "report_sha256": "d" * 64,
+            "research_integrity": _research_integrity(),
+            "regimes": fixture_regimes(("bull", "bear", "flat")),
+            "report_sha256": ResearchReportArtifact.create(
+                _fixture_report()).report_hash,
             "trade_count": 2,
             "pending_signal_count": 0,
             "provenance": {
@@ -152,7 +223,10 @@ def _registry_with_paper_approval(
     registry = PromotionRegistry(
         tmp_path / "promotion", paper_validation_policy=paper_policy)
     research = _research_artifact(universe)
+    ResearchReportStore(registry.root).persist(
+        ResearchReportArtifact.create(_fixture_report()))
     registry.store.persist(research)
+    persist_terminal_integrity(registry.root, research)
     registry.promote(
         "foundation", research.artifact_hash,
         PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer",
@@ -178,7 +252,8 @@ def _positive_report() -> dict:
     }
 
 
-def test_research_artifact_binds_strict_inputs_and_can_reach_live_decision():
+def test_research_artifact_binds_strict_inputs_and_can_reach_live_decision(
+        tmp_path):
     spec = FoundationResearchSpec(
         n_trials=3,
         start="2022-01-01",
@@ -219,8 +294,12 @@ def test_research_artifact_binds_strict_inputs_and_can_reach_live_decision():
     assert artifact.parameters == _config().to_mapping()
     assert artifact.evidence["engine_parameters"]["enable_realistic_fills"] \
         is True
+    assert artifact.evidence["engine_parameters"][
+        "reject_fills_without_adv"] is True
+    assert artifact.evidence["engine_parameters"]["participation_cap"] \
+        == pytest.approx(0.01)
     assert artifact.evidence["n_trials"] == 3
-    assert artifact.evidence["runner"] == "foundation_research_v2"
+    assert artifact.evidence["runner"] == "foundation_research_v3"
     assert artifact.evidence["universe_selection"] == {
         "requested_as_of": "2022-01-01",
         "resolved_as_of": "2021-12-31",
@@ -234,8 +313,227 @@ def test_research_artifact_binds_strict_inputs_and_can_reach_live_decision():
         "market_cap_coverage_complete": True,
     }
     assert artifact.payload["data_version"] == "pit-sha256:" + SNAPSHOT_SHA
+    output = FoundationResearchOutput(
+        artifact=artifact,
+        report=_positive_report(),
+        selected_universe=("TEST",),
+        data_snapshot=snapshot,
+    )
+    store = ArtifactStore(tmp_path)
+    persist_foundation_research(output, store)
+    raw = ResearchReportStore(tmp_path).load(
+        artifact.evidence["report_sha256"])
+    assert len(raw.report["portfolio_history"]) == 90
+    assert len(raw.report["trades"]) == 2
 
 
+def test_qualified_research_uses_ledger_count_and_permanently_decides_holdout(
+        tmp_path):
+    registry = PromotionRegistry(tmp_path / "promotion")
+    ledger = ResearchIntegrityLedger(
+        registry.root / "research-integrity",
+        program_id="stock-options-trader")
+    protocol = ledger.freeze_protocol(ResearchProtocol.create(
+        program_id="stock-options-trader",
+        protocol_id="foundation-locked",
+        version="1",
+        objective="Evaluate the locked Foundation candidate net of costs.",
+        hypotheses=[{"hypothesis_id": "foundation-net", "direction": "+"}],
+        candidate_specifications=[{
+            "candidate_id": "foundation-target-v1", "locked": True}],
+        data_plan={"point_in_time": True},
+        evaluation_plan={"primary": "aggregate net OOS"},
+        decision_rules={"paper_policy": "promotion-v1"},
+        holdouts={"foundation-oos-v1": {
+            "data_artifact_hash": SNAPSHOT_SHA}},
+        code_version=CODE_SHA,
+    ))
+    trial = ledger.register_trial(TrialRegistration.create(
+        protocol_hash=protocol.protocol_hash,
+        trial_id="foundation-001",
+        candidate_id="foundation-target-v1",
+        family="foundation",
+        inputs={"configuration": "locked"},
+        data_version="pit-sha256:" + SNAPSHOT_SHA,
+        code_version=CODE_SHA,
+        seed=7,
+    ))
+    opening = ledger.open_holdout(
+        protocol_hash=protocol.protocol_hash,
+        holdout_id="foundation-oos-v1",
+        trial_hash=trial.trial_hash,
+        data_artifact_hash=SNAPSHOT_SHA,
+        actor="independent-reviewer",
+    )
+    spec = FoundationResearchSpec(
+        n_trials=1,
+        start="2022-01-01",
+        end="2024-12-31",
+        regimes=(
+            ResearchRegime("r2022", "2022-01-01", "2022-12-31"),
+            ResearchRegime("r2023", "2023-01-01", "2023-12-31"),
+            ResearchRegime("r2024", "2024-01-01", "2024-12-31"),
+        ),
+    )
+    snapshot = {
+        "version": SNAPSHOT_SHA,
+        "complete": True,
+        "tables": [{"table": name, "sha256": "c" * 64, "bytes": 10}
+                   for name in ("actions", "daily", "sep", "tickers")],
+        "quality_flags": [],
+    }
+    artifact = build_foundation_artifact(
+        report=_positive_report(),
+        selected_universe=["TEST"],
+        data_snapshot=snapshot,
+        provenance={
+            "git_sha": CODE_SHA,
+            "git_dirty": False,
+            "seed": 7,
+            "python_version": "3.13.3",
+            "dependency_versions": {"numpy": "2.4.6"},
+        },
+        spec=spec,
+        config=_config(),
+        universe_selection_date="2021-12-31",
+        eligible_symbol_count=1,
+        integrity_opening=opening,
+        integrity_program_id=ledger.program_id,
+        integrity_head_hash=ledger.head_hash,
+    )
+    assert artifact.evidence["runner"] == "foundation_research_v4"
+    assert artifact.evidence["n_trials"] == ledger.trial_count == 1
+
+    output = FoundationResearchOutput(
+        artifact=artifact,
+        report=_positive_report(),
+        selected_universe=("TEST",),
+        data_snapshot=snapshot,
+        integrity_opening=opening,
+    )
+    persist_foundation_research(
+        output, registry.store,
+        integrity_ledger=ledger, reviewer="independent-reviewer")
+    # A retry after durable writes verifies and reuses the exact terminal
+    # records instead of manufacturing a second outcome or decision.
+    persist_foundation_research(
+        output, registry.store,
+        integrity_ledger=ledger, reviewer="independent-reviewer")
+    decision = ledger.get_holdout_decision(
+        protocol_hash=protocol.protocol_hash,
+        holdout_id="foundation-oos-v1",
+    )
+    assert decision is not None
+    assert decision.payload["decision"] == "pass"
+    assert decision.payload["result_artifact_hash"] == artifact.artifact_hash
+    outcome = ledger.get_trial_outcome(trial.trial_hash)
+    assert outcome is not None
+    assert outcome.payload["status"] == "completed"
+    assert outcome.payload["evidence_hash"] == artifact.artifact_hash
+    verified = ledger.verify()
+    assert verified["trial_outcome_count"] == 1
+    assert verified["holdout_decision_count"] == 1
+    registry.promote(
+        "foundation", artifact.artifact_hash,
+        PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
+
+
+def test_qualifying_runner_requires_exact_frozen_trial_inputs(tmp_path):
+    registry = PromotionRegistry(tmp_path / "promotion")
+    ledger = ResearchIntegrityLedger(
+        registry.root / "research-integrity",
+        program_id="stock-options-trader")
+    spec = FoundationResearchSpec(
+        n_trials=1,
+        start="2022-01-01",
+        end="2024-12-31",
+        regimes=(
+            ResearchRegime("r2022", "2022-01-01", "2022-12-31"),
+            ResearchRegime("r2023", "2023-01-01", "2023-12-31"),
+            ResearchRegime("r2024", "2024-01-01", "2024-12-31"),
+        ),
+    )
+    config = _config()
+    policy = PromotionPolicy.default()
+    protocol = ledger.freeze_protocol(ResearchProtocol.create(
+        program_id="stock-options-trader",
+        protocol_id="foundation-exact-v1",
+        version="1",
+        objective="Evaluate one locked Foundation candidate net of costs.",
+        hypotheses=[{"hypothesis_id": "foundation-net", "direction": "+"}],
+        candidate_specifications=[{
+            "candidate_id": config.strategy_version, "locked": True}],
+        data_plan={
+            "point_in_time": True,
+            "snapshot_hash": SNAPSHOT_SHA,
+            "universe_selection_method": FOUNDATION_UNIVERSE_METHOD,
+        },
+        evaluation_plan={
+            "primary_test": "aggregate_net_oos",
+            "calendar_years": "diagnostic_only",
+            "costs": "realized_execution",
+            "independent_replication_required": True,
+        },
+        decision_rules={
+            "promotion_policy_id": policy.policy_id,
+            "one_shot_holdout": True,
+            "failure_is_terminal": True,
+        },
+        holdouts={"foundation-oos-v1": {
+            "start": "2022-01-01",
+            "end": "2024-12-31",
+            "data_artifact_hash": SNAPSHOT_SHA,
+            "sealed": True,
+        }},
+        code_version=CODE_SHA,
+    ))
+    trial = ledger.register_trial(TrialRegistration.create(
+        protocol_hash=protocol.protocol_hash,
+        trial_id="foundation-exact-001",
+        candidate_id=config.strategy_version,
+        family="foundation",
+        inputs=foundation_trial_inputs(spec, config, policy),
+        data_version="pit-sha256:" + SNAPSHOT_SHA,
+        code_version=CODE_SHA,
+        seed=7,
+    ))
+    provenance = {
+        "git_sha": CODE_SHA,
+        "git_dirty": False,
+        "seed": 7,
+        "python_version": "3.13.3",
+        "dependency_versions": {"numpy": "2.4.6"},
+    }
+    _require_frozen_foundation_trial(
+        ledger=ledger,
+        protocol_hash=protocol.protocol_hash,
+        trial_hash=trial.trial_hash,
+        holdout_id="foundation-oos-v1",
+        data_version=SNAPSHOT_SHA,
+        spec=spec,
+        config=config,
+        policy=policy,
+        provenance=provenance,
+    )
+    changed = FoundationResearchSpec(
+        n_trials=1,
+        start=spec.start,
+        end=spec.end,
+        max_symbols=99,
+        regimes=spec.regimes,
+    )
+    with pytest.raises(RuntimeError, match="registered trial"):
+        _require_frozen_foundation_trial(
+            ledger=ledger,
+            protocol_hash=protocol.protocol_hash,
+            trial_hash=trial.trial_hash,
+            holdout_id="foundation-oos-v1",
+            data_version=SNAPSHOT_SHA,
+            spec=changed,
+            config=config,
+            policy=policy,
+            provenance=provenance,
+        )
 def test_dirty_research_runtime_is_never_qualifying():
     spec = FoundationResearchSpec(
         n_trials=1, start="2022-01-01", end="2024-12-31",
@@ -299,6 +597,19 @@ def test_research_universe_date_cannot_look_past_backtest_start():
     with pytest.raises(ValueError, match="cannot be after the research start"):
         FoundationResearchSpec(
             n_trials=1, start="2015-01-01", universe_as_of="2024-01-01")
+
+
+def test_qualifying_research_requires_fail_closed_one_percent_liquidity():
+    spec = FoundationResearchSpec(n_trials=1)
+
+    assert spec.participation_cap == pytest.approx(0.01)
+    assert spec.reject_fills_without_adv is True
+    assert spec.engine_parameters()["reject_fills_without_adv"] is True
+
+    with pytest.raises(ValueError, match=r"\(0, 0\.01\]"):
+        FoundationResearchSpec(n_trials=1, participation_cap=0.02)
+    with pytest.raises(ValueError, match="must reject fills"):
+        FoundationResearchSpec(n_trials=1, reject_fills_without_adv=False)
 
 
 def test_research_snapshot_digest_must_match_table_manifest():
@@ -436,11 +747,13 @@ def test_paper_rehearsal_reconciles_two_fills_and_binds_live_approval(
     )
     assert resumed.finalize().artifact_hash == artifact.artifact_hash
 
+    replication = persist_passing_replication(registry, research)
     registry.promote(
         "foundation", research.artifact_hash,
         PromotionLevel.LIVE_ELIGIBLE,
         actor="live-risk-owner",
         paper_artifact_hash=artifact.artifact_hash,
+        replication_artifact_hash=replication.evidence_hash,
     )
     bound_research, bound_paper = registry.require_live_approved(
         "foundation", research.artifact_hash, artifact.artifact_hash)
@@ -660,10 +973,12 @@ def _passing_paper(
         evidence=evidence,
     )
     registry.paper_validation_store.persist(artifact)
+    replication = persist_passing_replication(registry, research)
     registry.promote(
         "foundation", research.artifact_hash,
         PromotionLevel.LIVE_ELIGIBLE,
         actor="live-approver", paper_artifact_hash=artifact.artifact_hash,
+        replication_artifact_hash=replication.evidence_hash,
     )
     return artifact
 

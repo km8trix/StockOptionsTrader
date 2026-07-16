@@ -36,6 +36,8 @@ Thumbs.db
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
@@ -55,3 +57,8 @@ analysis/signal_ic/
 # PIT warehouse (large Parquet — operator-ingested, never committed)
 pit_warehouse/
 *.parquet
+
+# Licensed, content-addressed PEAD source responses remain local.
+research/pead_vq_locked_replication_v1/earnings_announcements/
+research/pead_vq_locked_replication_v1/development_sample_report*.json
+research/pead_vq_locked_replication_v1/independent_reference_comparison*.json

@@ -1,0 +1,120 @@
+{
+  "candidate_family": "post-earnings-announcement-drift",
+  "candidate_id": "pead-vq-locked-replication-v1",
+  "disposition": "blocked_pending_complete_independent_source_acquisition",
+  "disposition_reason": "The signal and research family are fixed for source acquisition, but the available Zacks history is a 2018 sample and no qualifying prospective snapshot exists. This specification is not a ledger freeze, a holdout opening, or promotion evidence.",
+  "economic_hypothesis": "A positive point-in-time EPS forecast error predicts positive post-announcement drift because prices incorporate earnings information gradually; a negative forecast error predicts negative drift.",
+  "evidence_class": "development_protocol_no_qualifying_result",
+  "formation_and_execution": {
+    "entry_price": "exact SEP.closeunadj on the next observed session is retained as contemporaneous execution-price evidence; SEP.close is retained as the split-normalized accounting basis",
+    "entry_timing": "T+1: next observed SEP session close after the formation session",
+    "exit_price": "mechanically reconstructed SEP.close value at the exact global observed trading-session horizon plus explicit entry-exclusive/exit-inclusive cash distributions without reinvestment; the target may not slide along ticker-local rows, closeadj remains diagnostic only, and qualification stays blocked until distribution field semantics are authoritatively sourced",
+    "formation_cadence": "monthly",
+    "formation_session": "first observed SEP trading session of each calendar month",
+    "formation_visibility": "announcement timestamp must be strictly before the actual formation-session close from the content-addressed official NYSE calendar; published 13:00 ET early closes replace the regular 16:00 ET cutoff, the formation bar must exist, and dates may not slide",
+    "holding_period_trading_sessions": [
+      21,
+      63
+    ],
+    "session_close_calendar": "nyse_session_close_calendar.json plus nyse_session_close_sources/receipt.json and its content-addressed raw HTML; each calendar row must be independently re-extracted from exact official ICE/NYSE source bytes covering the signal lookback, frozen formation window, and maximum exit padding",
+    "signal_freshness_calendar_days": 63
+  },
+  "independent_source_binding": {
+    "acquisition_plan_file": "acquisition_plan.json",
+    "source_manifest_file": "source_manifest.json",
+    "source_id": "nasdaq-data-link-zacks",
+    "source_independence": "Zacks announcement actuals and analyst estimates are independent of the Sharadar SF1 filing values used by the legacy development screen.",
+    "required_tables": [
+      "ZACKS/ES",
+      "ZACKS/SS",
+      "ZACKS/EEH",
+      "ZACKS/SEH",
+      "ZACKS/MT",
+      "ZACKS/EA"
+    ],
+    "snapshot_artifact_file": null,
+    "snapshot_artifact_sha256": null,
+    "snapshot_status": "not_created"
+  },
+  "portfolio_rule": {
+    "direction": {
+      "long": "highest signal quintile",
+      "short": "lowest signal quintile"
+    },
+    "expression": "equal-weighted dollar-neutral long-short spread",
+    "minimum_names_per_formation": 10,
+    "selection_fraction_per_leg": 0.2,
+    "tie_break": "ascending stable m_ticker after signal sort",
+    "universe": "dated eligible US common-stock listings, including securities later delisted; identity is keyed by m_ticker rather than ticker alone"
+  },
+  "promotion_boundary": {
+    "pead_desk_promotion_allowed": false,
+    "required_before_reconsideration": [
+      "complete independent Zacks historical coverage and coverage report",
+      "actual-value and timestamp reconciliation to issuer releases or SEC Item 2.02 filings",
+      "authoritative ex-date, cash-per-share, currency, and split-basis evidence for every modeled distribution",
+      "separately sourced terminal settlement terms for every held delisting or successor chain",
+      "reconciliation of independently written vectorized and event-driven implementations",
+      "sealed prospective signal evidence accumulated after a ledger freeze",
+      "dated borrow and locate evidence for every short",
+      "calibrated spread, slippage, impact, commission, financing, and dividend costs",
+      "capacity curves and participation limits",
+      "independent reviewer reproduction and attestation"
+    ]
+  },
+  "protocol_freeze_status": "signal_and_analysis_family_locked_for_acquisition_not_ledger_frozen",
+  "schema_version": "candidate_specification.v1",
+  "signal_rule": {
+    "actual_eps_field": "ZACKS/ES.eps_act on the provider's split-restated per-share basis",
+    "announcement_timestamp": "ZACKS/ES.act_rpt_date plus act_rpt_time interpreted in America/New_York and reconciled to act_rpt_code",
+    "consensus_cross_check": "ZACKS/ES.eps_mean_est must be compared with the reconstructed EEH vintage; an absolute difference greater than USD 0.01 per share is retained as a discrepancy and blocks event eligibility pending resolution",
+    "consensus_cross_check_absolute_tolerance_usd_per_share": 0.01,
+    "consensus_field": "ZACKS/EEH.eps_mean_est",
+    "consensus_minimum_analyst_count": 2,
+    "consensus_vintage_rule": "latest EEH row with matching m_ticker, per_end_date, and per_type and obs_date strictly earlier than act_rpt_date; same-day vintages are excluded because EEH has no intraday vintage time",
+    "event_identity": [
+      "m_ticker",
+      "per_end_date",
+      "per_type"
+    ],
+    "formula": "(eps_act - point_in_time_eps_mean_est) / preannouncement_split_normalized_SEP.close",
+    "missing_or_ambiguous_data": "fail closed; do not impute actual EPS, consensus, analyst count, event timestamp, identifier, or price",
+    "per_share_basis": "Zacks historical actuals and estimates are split-restated (for example, the 2018 AAPL values reflect the later 4:1 split). SEP.close is therefore the matching split-normalized denominator; SEP.closeunadj is separately preserved as contemporaneous execution evidence and must never replace the denominator without reconstructing the EPS share basis.",
+    "preannouncement_price": "the most recent positive split-normalized SHARADAR/SEP close whose actual regular-session close timestamp from the bound official NYSE calendar is strictly before the announcement timestamp, with an exact same-session SEP.closeunadj execution-evidence value",
+    "revenue_role": "ZACKS/SS and ZACKS/SEH are required for source completeness and a separately reported revenue-surprise diagnostic; revenue may not alter the EPS primary signal or selection rule in this protocol",
+    "timing_conflicts": "act_rpt_time and act_rpt_code must agree; BTO means before open, DTM during market, and AMC after close. Missing or contradictory timing is ineligible."
+  },
+  "statistical_family": {
+    "alpha": 0.05,
+    "cells": [
+      "pooled_21",
+      "pooled_63",
+      "dated_size_tercile_0_21",
+      "dated_size_tercile_0_63",
+      "dated_size_tercile_1_21",
+      "dated_size_tercile_1_63",
+      "dated_size_tercile_2_21",
+      "dated_size_tercile_2_63"
+    ],
+    "correction": "Benjamini-Hochberg across the exact eight-cell family",
+    "cost_convention": {
+      "charged_trades_per_long_short_round_trip": 4,
+      "development_one_way_bps_per_trade_per_leg": 30,
+      "development_total_round_trip_bps": 120,
+      "qualification_status": "placeholder_until_calibrated"
+    },
+    "economic_returns": "mechanical candidates use exact SEP.close exit value plus explicit cash distributions without reinvestment; closeadj remains a separate diagnostic, the current ACTIONS dividend interpretation is nonqualifying pending authoritative semantics, and robust arrays may not replace executable economics",
+    "inference": "one-sided positive-spread HAC inference with dependence length covering the holding horizon",
+    "primary_cell": "pooled_63",
+    "robustness_diagnostic": "one-percent within-formation return winsorization reported separately from raw economics",
+    "size_slices": "dated market-cap terciles formed independently at each formation session"
+  },
+  "status": "acquisition_blocked",
+  "stop_rules": [
+    "stop if the independently reconstructed primary signal reverses sign",
+    "stop if no cost-net cell survives the frozen BH family",
+    "stop if the pooled 63-session cost-net spread is nonpositive",
+    "stop if timestamp, identifier, actual-value, consensus-vintage, corporate-action, or delisting discrepancies remain unresolved",
+    "stop if the executable borrowable portfolio materially differs from the researched book"
+  ]
+}

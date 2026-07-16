@@ -1,0 +1,122 @@
+{
+  "schema_version": "pead_source_qualification_status.v1",
+  "package_id": "pead-vq-source-qualification-v2",
+  "candidate_id": "pead-vq-source-qualification-v2",
+  "status": "blocked_contracts_implemented_evidence_absent",
+  "lineage": {
+    "inherited_candidate_id": "pead-vq-locked-replication-v1",
+    "inherited_package": "../pead_vq_locked_replication_v1",
+    "lineage_only": true,
+    "v1_artifacts_mutated": false,
+    "v1_development_evidence_reclassified": false
+  },
+  "architecture": {
+    "file": "source_architecture.json",
+    "schema_version": "pead_source_architecture.v1",
+    "status": "declared"
+  },
+  "implemented_contracts": {
+    "event_manifest": "../../data/pead_event_universe.py",
+    "consensus_evidence": "../../data/pead_consensus_evidence.py",
+    "announcement_evidence": "../../data/pead_announcement_evidence.py",
+    "source_reconciliation": "../../analysis/pead_source_reconciliation.py",
+    "source_reconciliation_cli": "../../scripts/pead_source_reconciliation.py"
+  },
+  "required_artifacts": {
+    "sharadar_source_snapshot": {
+      "schema_version": "pead_sharadar_source_snapshot.v1",
+      "file": null,
+      "sha256": null,
+      "status": "contract_not_implemented_or_bound"
+    },
+    "security_identity_snapshot": {
+      "schema_version": "pead_security_identity_snapshot.v1",
+      "file": null,
+      "sha256": null,
+      "status": "contract_not_implemented_or_bound"
+    },
+    "event_manifest": {
+      "schema_version": "pead_event_universe.v1",
+      "file": null,
+      "sha256": null,
+      "status": "absent"
+    },
+    "consensus_evidence": {
+      "schema_version": "pead_consensus_evidence.v1",
+      "file": null,
+      "sha256": null,
+      "provider_id": null,
+      "status": "absent"
+    },
+    "announcement_evidence": {
+      "schema_version": "pead_announcement_evidence.v1",
+      "file": null,
+      "sha256": null,
+      "status": "absent"
+    },
+    "sharadar_market_accounting_evidence": {
+      "schema_version": "pead_market_accounting_evidence.v1",
+      "file": null,
+      "sha256": null,
+      "status": "contract_not_implemented_or_bound"
+    },
+    "source_reconciliation": {
+      "schema_version": "pead_source_reconciliation.v1",
+      "file": null,
+      "sha256": null,
+      "status": "absent"
+    },
+    "signal_input_reconciliation": {
+      "schema_version": "pead_signal_input_reconciliation.v1",
+      "file": null,
+      "sha256": null,
+      "status": "contract_not_implemented_or_bound"
+    }
+  },
+  "source_qualification_blockers": [
+    {
+      "code": "Q00_SHARADAR_CENSUS_IDENTITY_SNAPSHOTS_ABSENT",
+      "detail": "No candidate-grade raw SF1/SEP/TICKERS snapshot or validated dated CIK-permaticker-ticker bridge exists to bind the event census. Existing warehouse Parquet files do not preserve the required acquisition receipts."
+    },
+    {
+      "code": "Q01_EVENT_UNIVERSE_ABSENT",
+      "detail": "No sealed exhaustive pead_event_universe.v1 manifest or universe-census proof exists."
+    },
+    {
+      "code": "Q02_CONSENSUS_EVIDENCE_ABSENT",
+      "detail": "No complete licensed point-in-time pead_consensus_evidence.v1 artifact and registered raw-response normalization replay adapter exist."
+    },
+    {
+      "code": "Q03_ANNOUNCEMENT_EVIDENCE_ABSENT",
+      "detail": "No independent SEC/issuer pead_announcement_evidence.v1 artifact establishes actuals and availability timestamps."
+    },
+    {
+      "code": "Q04_MARKET_ACCOUNTING_BINDING_ABSENT",
+      "detail": "No v2 candidate-grade SEP/TICKERS acquisition, dated CIK-security identity, official close-semantics, and per-event denominator artifact is bound."
+    },
+    {
+      "code": "Q05_SOURCE_RECONCILIATION_ABSENT",
+      "detail": "No pead_source_reconciliation.v1 artifact accounts for every manifest event and all cross-source discrepancies."
+    },
+    {
+      "code": "Q06_SIGNAL_INPUT_RECONCILIATION_ABSENT",
+      "detail": "No final pead_signal_input_reconciliation.v1 artifact has replayed the event-source and Sharadar market lanes into research-consumable inputs."
+    }
+  ],
+  "downstream_blockers": [
+    "independent signal implementation reconciliation has not been run on source-qualified inputs",
+    "no ledger-frozen prospective evidence exists",
+    "borrow, locate, execution, financing, impact, and capacity evidence is not qualified",
+    "independent reviewer attestation is absent"
+  ],
+  "qualification": {
+    "event_source_qualified": false,
+    "signal_input_qualified": false,
+    "historical_replication_allowed": false,
+    "prospective_accumulation_allowed": false,
+    "edge_claim_allowed": false,
+    "paper_execution_allowed": false,
+    "live_deployment_allowed": false
+  },
+  "next_credible_action": "Reacquire and seal candidate-grade Sharadar SF1/SEP/TICKERS source and dated identity snapshots, then derive and freeze the exhaustive pead_event_universe.v1 census before selecting consensus or announcement evidence."
+}

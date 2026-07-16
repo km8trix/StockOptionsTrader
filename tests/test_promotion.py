@@ -20,15 +20,64 @@ from analysis.promotion import (
     PromotionResults,
     canonical_json,
 )
+from analysis.research_report_store import (
+    ResearchReportArtifact,
+    ResearchReportStore,
+)
 from desks.foundation import FoundationDesk
 from desks.deployment_config import FoundationDeploymentConfig
 from desks.registry import create_deployed_desk
 from tests.paper_evidence_helpers import (
     authoritative_paper_evidence as _authoritative_paper_evidence,
 )
+from tests.research_evidence_helpers import (
+    fixture_engine_parameters,
+    fixture_integrity_evidence,
+    fixture_regimes,
+    fixture_results,
+    persist_terminal_integrity,
+    positive_foundation_report,
+)
+from tests.replication_evidence_helpers import (
+    persist_passing_replication,
+    persist_replication,
+    replication_evidence_for,
+)
 
 
 SNAPSHOT_SHA = "eb12241b17158c2ac21b6c18f8b23f12b3f1a0a3fde3c4e6ac94feed72a7f411"
+
+
+def _fixture_report(trade_count=4, pending_count=0):
+    report = positive_foundation_report(trade_count)
+    report["pending_signals"] = [
+        {"fixture_pending": index} for index in range(pending_count)]
+    return report
+
+
+def _persist_research(registry, artifact):
+    evidence = artifact.evidence or {}
+    report = _fixture_report(
+        evidence.get("trade_count", 4),
+        evidence.get("pending_signal_count", 0))
+    ResearchReportStore(registry.root).persist(
+        ResearchReportArtifact.create(report))
+    path = registry.store.persist(artifact)
+    if artifact.evidence and "research_integrity" in artifact.evidence:
+        persist_terminal_integrity(registry.root, artifact)
+    return path
+
+
+def _research_integrity(
+        snapshot_sha=SNAPSHOT_SHA, n_trials=3, *, code_sha="a" * 40,
+        seed=7, identity="default"):
+    return fixture_integrity_evidence(
+        snapshot_sha=snapshot_sha,
+        code_sha=code_sha,
+        seed=seed,
+        n_trials=n_trials,
+        identity=identity,
+    )
 
 
 def results_for(level: PromotionLevel) -> PromotionResults:
@@ -81,6 +130,9 @@ def artifact_for(level: PromotionLevel, **overrides) -> PromotionArtifact:
     }
     values.update(overrides)
     if "evidence" not in overrides:
+        if (level == PromotionLevel.LIVE_ELIGIBLE
+                and "results" not in overrides):
+            values["results"] = fixture_results(seed=values["seed"])
         symbols = sorted({
             str(symbol).strip().upper()
             for symbol in values["universe"] if str(symbol).strip()
@@ -89,7 +141,7 @@ def artifact_for(level: PromotionLevel, **overrides) -> PromotionArtifact:
         python_version = dependencies.pop("python")
         regime_names = list(values["results"].regime_results)
         values["evidence"] = {
-            "runner": "foundation_research_v2",
+            "runner": "foundation_research_v4",
             "window": ["2022-01-01", "2024-12-31"],
             "universe_selection": {
                 "requested_as_of": "2022-01-01",
@@ -112,22 +164,20 @@ def artifact_for(level: PromotionLevel, **overrides) -> PromotionArtifact:
                 ],
                 "quality_flags": [],
             },
-            "engine_parameters": {
-                "initial_capital": 100_000.0,
-                "commission": 0.001,
-                "slippage_bps": 5.0,
-                "enable_realistic_fills": True,
-                "impact_coef": 0.01,
-                "participation_cap": 0.10,
-                "adv_window": 20,
-                "seed": values["seed"],
-            },
+            "engine_parameters": fixture_engine_parameters(values["seed"]),
             "n_trials": 3,
-            "regimes": [
-                {"name": name, "start": "2022-01-01", "end": "2024-12-31"}
-                for name in regime_names
-            ],
-            "report_sha256": "d" * 64,
+            "research_integrity": _research_integrity(
+                code_sha=values["code_sha"],
+                seed=values["seed"],
+                identity=canonical_json({
+                    "parameters": values["parameters"],
+                    "universe": symbols,
+                    "strategy_version": values["strategy_version"],
+                }),
+            ),
+            "regimes": fixture_regimes(regime_names),
+            "report_sha256": ResearchReportArtifact.create(
+                _fixture_report()).report_hash,
             "trade_count": 4,
             "pending_signal_count": 0,
             "provenance": {
@@ -253,20 +303,26 @@ def test_missing_required_evidence_is_research_only(field, value):
         PromotionResults(**data)).level == PromotionLevel.RESEARCH_ONLY
 
 
-def test_cost_turnover_multiple_testing_and_regimes_are_real_gates():
+def test_cost_turnover_and_regimes_are_real_gates():
     base = results_for(PromotionLevel.LIVE_ELIGIBLE).__dict__.copy()
     mutations = [
         {"cost_model_applied": False},
         {"estimated_cost_bps": 101.0},
         {"cost_adjusted_return": -0.01},
         {"annual_turnover": 25.0},
-        {"oos_significant_bh": 0},
         {"regime_results": {"bull": 0.2, "crisis": -0.30}},
     ]
     for mutation in mutations:
         assert PromotionPolicy.default().evaluate(
             PromotionResults(**{**base, **mutation})
         ).level == PromotionLevel.RESEARCH_ONLY
+
+
+def test_calendar_year_significance_is_diagnostic_not_a_survivor_gate():
+    data = results_for(PromotionLevel.LIVE_ELIGIBLE).__dict__.copy()
+    data["oos_significant_bh"] = 0
+    assert PromotionPolicy.default().evaluate(
+        PromotionResults(**data)).level == PromotionLevel.LIVE_ELIGIBLE
 
 
 def test_results_factory_computes_psr_dsr_fold_bh_and_cost_return():
@@ -371,13 +427,15 @@ def test_registry_refuses_readable_legacy_research_for_execution(tmp_path):
     None,
     {"runner": "synthetic-contract-fixture"},
     {"runner": "foundation_research_v1"},
+    {"runner": "foundation_research_v2"},
+    {"runner": "foundation_research_v3"},
 ])
 def test_registry_refuses_fabricated_or_obsolete_research_evidence(
         tmp_path, evidence):
     artifact = artifact_for(
         PromotionLevel.LIVE_ELIGIBLE, evidence=evidence)
     registry = PromotionRegistry(tmp_path)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
 
     with pytest.raises(PromotionNotApproved, match="authoritative research"):
         registry.promote(
@@ -385,10 +443,10 @@ def test_registry_refuses_fabricated_or_obsolete_research_evidence(
             PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
 
 
-def test_registry_accepts_complete_v2_research_runner_attestation(tmp_path):
+def test_registry_accepts_complete_v4_research_runner_attestation(tmp_path):
     artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
     registry = PromotionRegistry(tmp_path)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
 
     approval = registry.promote(
         "foundation", artifact.artifact_hash,
@@ -398,6 +456,234 @@ def test_registry_accepts_complete_v2_research_runner_attestation(tmp_path):
     assert registry.require_approved(
         "foundation", artifact.artifact_hash,
         PromotionLevel.PAPER_ELIGIBLE) == artifact
+
+
+@pytest.mark.parametrize(
+    "strategy_id",
+    [
+        "pead",
+        "pead-vq-locked-replication-v1",
+        "pead-vq-source-qualification-v2",
+    ],
+)
+@pytest.mark.parametrize(
+    "level", [PromotionLevel.PAPER_ELIGIBLE, PromotionLevel.LIVE_ELIGIBLE])
+def test_registry_rejects_pead_until_authoritative_verifier_exists(
+        tmp_path, strategy_id, level):
+    artifact = artifact_for(
+        PromotionLevel.LIVE_ELIGIBLE,
+        strategy_id=strategy_id,
+        strategy_version="pead-v1",
+    )
+    registry = PromotionRegistry(tmp_path)
+    registry.store.persist(artifact)
+
+    with pytest.raises(
+            PromotionNotApproved,
+            match="no authoritative research verifier is registered"):
+        registry.promote(
+            strategy_id,
+            artifact.artifact_hash,
+            level,
+            actor="research-reviewer",
+        )
+    assert not registry.approval_dir.exists()
+
+
+def test_foundation_verifier_rejects_pead_version_masquerade(tmp_path):
+    strategy_version = "pead-vq-source-qualification-v2"
+    parameters = FoundationDeploymentConfig(
+        strategy_version=strategy_version,
+        capital_allocation=0.10,
+        gate_threshold=-0.05,
+    ).to_mapping()
+    artifact = artifact_for(
+        PromotionLevel.LIVE_ELIGIBLE,
+        strategy_id="foundation",
+        strategy_version=strategy_version,
+        parameters=parameters,
+    )
+    registry = PromotionRegistry(tmp_path)
+    _persist_research(registry, artifact)
+
+    with pytest.raises(
+            PromotionNotApproved,
+            match="strategy version must begin with 'foundation-'"):
+        registry.promote(
+            "foundation",
+            artifact.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE,
+            actor="research-reviewer",
+        )
+
+
+def test_authoritative_research_verifier_dispatch_has_no_mutable_map():
+    import analysis.promotion as promotion_module
+
+    assert not hasattr(
+        promotion_module, "_AUTHORITATIVE_RESEARCH_VERIFIERS")
+
+
+@pytest.mark.parametrize("strategy_id", [
+    "pead",
+    "pead-vq-source-qualification-v2",
+    "arbitrary-unregistered-strategy",
+])
+@pytest.mark.parametrize("schema_version", [1, 3])
+@pytest.mark.parametrize(
+    "level", [PromotionLevel.PAPER_ELIGIBLE, PromotionLevel.LIVE_ELIGIBLE])
+def test_unknown_strategy_direct_approval_files_remain_ineligible(
+        tmp_path, strategy_id, schema_version, level):
+    artifact = artifact_for(
+        PromotionLevel.LIVE_ELIGIBLE,
+        strategy_id=strategy_id,
+        strategy_version="pead-v1",
+    )
+    registry = PromotionRegistry(tmp_path)
+    registry.store.persist(artifact)
+    path = registry._approval_path(strategy_id, artifact.artifact_hash, level)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fixed = {
+        "schema_version": schema_version,
+        "strategy_id": strategy_id,
+        "artifact_hash": artifact.artifact_hash,
+        "approved_level": level.value,
+    }
+    if schema_version == 1:
+        document = fixed
+    else:
+        document = {
+            **fixed,
+            "actor": "planted-approval",
+            "paper_artifact_hash": (
+                "a" * 64 if level == PromotionLevel.LIVE_ELIGIBLE else None),
+            "replication_artifact_hash": (
+                "b" * 64 if level == PromotionLevel.LIVE_ELIGIBLE else None),
+            "promotion_policy_id": registry.policy.policy_id,
+            "paper_validation_policy_id": (
+                registry.paper_validation_policy.policy_id),
+        }
+    path.write_text(canonical_json(document) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+            PromotionNotApproved,
+            match="no authoritative research verifier is registered"):
+        registry.require_approved(strategy_id, artifact.artifact_hash, level)
+
+
+@pytest.mark.parametrize(
+    "level", [PromotionLevel.PAPER_ELIGIBLE, PromotionLevel.LIVE_ELIGIBLE])
+def test_legacy_schema_one_approval_is_inspect_only(tmp_path, level):
+    artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
+    registry = PromotionRegistry(tmp_path)
+    _persist_research(registry, artifact)
+    if level == PromotionLevel.LIVE_ELIGIBLE:
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
+    path = registry._approval_path(
+        "foundation", artifact.artifact_hash, level)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(canonical_json({
+        "schema_version": 1,
+        "strategy_id": "foundation",
+        "artifact_hash": artifact.artifact_hash,
+        "approved_level": level.value,
+    }) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+            PromotionNotApproved,
+            match="schema 1 is inspect-only"):
+        registry.require_approved(
+            "foundation", artifact.artifact_hash, level)
+
+
+def test_registry_recomputes_summary_from_complete_raw_report(tmp_path):
+    artifact = artifact_for(
+        PromotionLevel.LIVE_ELIGIBLE,
+        results=results_for(PromotionLevel.LIVE_ELIGIBLE),
+    )
+    registry = PromotionRegistry(tmp_path)
+    _persist_research(registry, artifact)
+
+    with pytest.raises(PromotionNotApproved, match="statistics differ"):
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
+
+
+def test_registry_requires_terminal_on_disk_research_ledger(tmp_path):
+    artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
+    registry = PromotionRegistry(tmp_path)
+    report = _fixture_report()
+    ResearchReportStore(registry.root).persist(
+        ResearchReportArtifact.create(report))
+    registry.store.persist(artifact)
+
+    with pytest.raises(PromotionNotApproved, match="verified research ledger"):
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
+
+
+def test_registry_rejects_summary_artifact_without_raw_report(tmp_path):
+    artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
+    registry = PromotionRegistry(tmp_path)
+    registry.store.persist(artifact)
+
+    with pytest.raises(PromotionNotApproved, match="complete verified raw"):
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
+
+
+def test_registry_rejects_fabricated_ledger_count_or_holdout_payload(tmp_path):
+    valid = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
+
+    count_evidence = json.loads(json.dumps(valid.evidence))
+    count_evidence["n_trials"] = 1
+    forged_count = artifact_for(
+        PromotionLevel.LIVE_ELIGIBLE, evidence=count_evidence)
+    registry = PromotionRegistry(tmp_path / "count")
+    _persist_research(registry, forged_count)
+    with pytest.raises(PromotionNotApproved, match="ledger-derived"):
+        registry.promote(
+            "foundation", forged_count.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
+
+    opening_evidence = json.loads(json.dumps(valid.evidence))
+    opening_evidence["research_integrity"]["opening"]["actor"] = "changed"
+    forged_opening = artifact_for(
+        PromotionLevel.LIVE_ELIGIBLE, evidence=opening_evidence)
+    registry = PromotionRegistry(tmp_path / "opening")
+    _persist_research(registry, forged_opening)
+    with pytest.raises(PromotionNotApproved, match="opening hash"):
+        registry.promote(
+            "foundation", forged_opening.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("reject_fills_without_adv", False, "without valid ADV"),
+        ("participation_cap", 0.02, "0.01"),
+    ],
+)
+def test_registry_rejects_relaxed_research_liquidity_attestation(
+        tmp_path, field, value, message):
+    valid = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
+    evidence = json.loads(json.dumps(valid.evidence))
+    evidence["engine_parameters"][field] = value
+    artifact = artifact_for(
+        PromotionLevel.LIVE_ELIGIBLE, evidence=evidence)
+    registry = PromotionRegistry(tmp_path)
+    _persist_research(registry, artifact)
+
+    with pytest.raises(PromotionNotApproved, match=message):
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.PAPER_ELIGIBLE, actor="research-reviewer")
 
 
 def test_registry_recomputes_research_snapshot_manifest_digest(tmp_path):
@@ -410,7 +696,7 @@ def test_registry_recomputes_research_snapshot_manifest_digest(tmp_path):
         evidence=evidence,
     )
     registry = PromotionRegistry(tmp_path)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
 
     with pytest.raises(PromotionNotApproved, match="table manifest"):
         registry.promote(
@@ -648,7 +934,7 @@ def test_paper_validation_store_detects_tampering(tmp_path):
 def test_registry_rejects_paper_validation_under_another_policy(tmp_path):
     registry = PromotionRegistry(tmp_path)
     research = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
-    registry.store.persist(research)
+    _persist_research(registry, research)
     other_policy = replace(PaperValidationPolicy.default(), version="other")
     validation = PaperValidationArtifact.create(
         research_artifact=research,
@@ -670,7 +956,7 @@ def test_promotion_requires_persisted_passing_artifact(tmp_path):
     with pytest.raises(PromotionNotApproved, match="does not exist"):
         registry.promote("foundation", artifact.artifact_hash,
                          PromotionLevel.PAPER_ELIGIBLE)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
     with pytest.raises(PromotionNotApproved, match="does not satisfy"):
         registry.promote("foundation", artifact.artifact_hash,
                          PromotionLevel.PAPER_ELIGIBLE)
@@ -679,7 +965,7 @@ def test_promotion_requires_persisted_passing_artifact(tmp_path):
 def test_live_promotion_requires_same_artifact_paper_approval(tmp_path):
     registry = PromotionRegistry(tmp_path)
     artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
     with pytest.raises(PromotionNotApproved, match="not explicitly approved"):
         registry.promote("foundation", artifact.artifact_hash,
                          PromotionLevel.LIVE_ELIGIBLE)
@@ -687,9 +973,11 @@ def test_live_promotion_requires_same_artifact_paper_approval(tmp_path):
                      PromotionLevel.PAPER_ELIGIBLE,
                      actor="research-approver")
     validation = persist_paper_validation(registry, artifact)
+    replication = persist_passing_replication(registry, artifact)
     registry.promote("foundation", artifact.artifact_hash,
                      PromotionLevel.LIVE_ELIGIBLE, actor="factory-test",
-                     paper_artifact_hash=validation.artifact_hash)
+                     paper_artifact_hash=validation.artifact_hash,
+                     replication_artifact_hash=replication.evidence_hash)
     assert registry.require_approved(
         "foundation", artifact.artifact_hash,
         PromotionLevel.LIVE_ELIGIBLE) == artifact
@@ -701,7 +989,7 @@ def test_live_promotion_requires_same_artifact_paper_approval(tmp_path):
 def test_live_promotion_requires_actor_and_passing_paper_evidence(tmp_path):
     registry = PromotionRegistry(tmp_path)
     artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
     with pytest.raises(PromotionNotApproved, match="approving actor"):
         registry.promote(
             "foundation", artifact.artifact_hash,
@@ -734,10 +1022,46 @@ def test_live_promotion_requires_actor_and_passing_paper_evidence(tmp_path):
             paper_artifact_hash=failing.artifact_hash)
 
 
+def test_live_promotion_requires_passing_matching_replication(tmp_path):
+    registry = PromotionRegistry(tmp_path)
+    artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
+    _persist_research(registry, artifact)
+    registry.promote(
+        "foundation", artifact.artifact_hash,
+        PromotionLevel.PAPER_ELIGIBLE, actor="research-approver")
+    validation = persist_paper_validation(registry, artifact)
+
+    with pytest.raises(PromotionNotApproved, match="independent replication"):
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.LIVE_ELIGIBLE, actor="risk-approver",
+            paper_artifact_hash=validation.artifact_hash)
+
+    failing = persist_replication(
+        registry,
+        replication_evidence_for(artifact, mismatch_field="signal"))
+    with pytest.raises(PromotionNotApproved, match="unresolved discrepancies"):
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.LIVE_ELIGIBLE, actor="risk-approver",
+            paper_artifact_hash=validation.artifact_hash,
+            replication_artifact_hash=failing.evidence_hash)
+
+    wrong_protocol = persist_replication(
+        registry,
+        replication_evidence_for(artifact, protocol_hash="a" * 64))
+    with pytest.raises(PromotionNotApproved, match="different research evidence"):
+        registry.promote(
+            "foundation", artifact.artifact_hash,
+            PromotionLevel.LIVE_ELIGIBLE, actor="risk-approver",
+            paper_artifact_hash=validation.artifact_hash,
+            replication_artifact_hash=wrong_protocol.evidence_hash)
+
+
 def test_live_approval_records_actor_and_exact_paper_hash_immutably(tmp_path):
     registry = PromotionRegistry(tmp_path)
     artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
     registry.promote(
         "foundation", artifact.artifact_hash,
         PromotionLevel.PAPER_ELIGIBLE, actor="research-approver")
@@ -745,14 +1069,18 @@ def test_live_approval_records_actor_and_exact_paper_hash_immutably(tmp_path):
     second = paper_validation_for(artifact, evidence={"run": "second"})
     registry.paper_validation_store.persist(first)
     registry.paper_validation_store.persist(second)
+    replication = persist_passing_replication(registry, artifact)
     approval_path = registry.promote(
         "foundation", artifact.artifact_hash,
         PromotionLevel.LIVE_ELIGIBLE, actor="risk-approver",
-        paper_artifact_hash=first.artifact_hash)
+        paper_artifact_hash=first.artifact_hash,
+        replication_artifact_hash=replication.evidence_hash)
 
     approval = json.loads(approval_path.read_text())
+    assert approval["schema_version"] == 3
     assert approval["actor"] == "risk-approver"
     assert approval["paper_artifact_hash"] == first.artifact_hash
+    assert approval["replication_artifact_hash"] == replication.evidence_hash
     assert approval["promotion_policy_id"] == registry.policy.policy_id
     assert (approval["paper_validation_policy_id"]
             == registry.paper_validation_policy.policy_id)
@@ -767,15 +1095,16 @@ def test_live_approval_records_actor_and_exact_paper_hash_immutably(tmp_path):
         registry.promote(
             "foundation", artifact.artifact_hash,
             PromotionLevel.LIVE_ELIGIBLE, actor="other-approver",
-            paper_artifact_hash=second.artifact_hash)
+            paper_artifact_hash=second.artifact_hash,
+            replication_artifact_hash=replication.evidence_hash)
 
 
 def test_live_promotion_rejects_paper_evidence_for_other_artifact(tmp_path):
     registry = PromotionRegistry(tmp_path)
     approved = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
     other = artifact_for(PromotionLevel.LIVE_ELIGIBLE, seed=8)
+    _persist_research(registry, other)
     registry.store.persist(approved)
-    registry.store.persist(other)
     registry.promote(
         "foundation", other.artifact_hash,
         PromotionLevel.PAPER_ELIGIBLE, actor="research-approver")
@@ -790,15 +1119,17 @@ def test_live_promotion_rejects_paper_evidence_for_other_artifact(tmp_path):
 def test_require_live_approved_reverifies_paper_evidence(tmp_path):
     registry = PromotionRegistry(tmp_path)
     artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
     registry.promote(
         "foundation", artifact.artifact_hash,
         PromotionLevel.PAPER_ELIGIBLE, actor="research-approver")
     validation = persist_paper_validation(registry, artifact)
+    replication = persist_passing_replication(registry, artifact)
     registry.promote(
         "foundation", artifact.artifact_hash,
         PromotionLevel.LIVE_ELIGIBLE, actor="risk-approver",
-        paper_artifact_hash=validation.artifact_hash)
+        paper_artifact_hash=validation.artifact_hash,
+        replication_artifact_hash=replication.evidence_hash)
     path = registry.paper_validation_store.path_for(validation.artifact_hash)
     document = json.loads(path.read_text())
     document["payload"]["audit_verified"] = False
@@ -809,11 +1140,35 @@ def test_require_live_approved_reverifies_paper_evidence(tmp_path):
             PromotionLevel.LIVE_ELIGIBLE)
 
 
+def test_require_live_approved_reverifies_replication_evidence(tmp_path):
+    registry = PromotionRegistry(tmp_path)
+    artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
+    _persist_research(registry, artifact)
+    registry.promote(
+        "foundation", artifact.artifact_hash,
+        PromotionLevel.PAPER_ELIGIBLE, actor="research-approver")
+    validation = persist_paper_validation(registry, artifact)
+    replication = persist_passing_replication(registry, artifact)
+    registry.promote(
+        "foundation", artifact.artifact_hash,
+        PromotionLevel.LIVE_ELIGIBLE, actor="risk-approver",
+        paper_artifact_hash=validation.artifact_hash,
+        replication_artifact_hash=replication.evidence_hash)
+
+    replication_path = (registry.root / "independent-replications"
+                        / f"{replication.evidence_hash}.json")
+    replication_path.write_text("{}")
+    with pytest.raises(PromotionNotApproved, match="verified independent"):
+        registry.require_live_approved(
+            "foundation", artifact.artifact_hash,
+            validation.artifact_hash)
+
+
 def test_approval_is_exact_hash_and_strategy(tmp_path):
     registry = PromotionRegistry(tmp_path)
     approved = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
     other = artifact_for(PromotionLevel.LIVE_ELIGIBLE, seed=8)
-    registry.store.persist(approved)
+    _persist_research(registry, approved)
     registry.store.persist(other)
     registry.promote("foundation", approved.artifact_hash,
                      PromotionLevel.PAPER_ELIGIBLE,
@@ -829,7 +1184,7 @@ def test_approval_is_exact_hash_and_strategy(tmp_path):
 def test_corrupt_approval_reference_fails_closed(tmp_path):
     registry = PromotionRegistry(tmp_path)
     artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
     path = registry.promote("foundation", artifact.artifact_hash,
                             PromotionLevel.PAPER_ELIGIBLE,
                             actor="research-approver")
@@ -848,14 +1203,16 @@ def test_runtime_factory_requires_exact_approval_code_and_parameters(
     registry = PromotionRegistry(tmp_path)
     artifact = artifact_for(PromotionLevel.LIVE_ELIGIBLE,
                             parameters=parameters)
-    registry.store.persist(artifact)
+    _persist_research(registry, artifact)
     registry.promote("foundation", artifact.artifact_hash,
                      PromotionLevel.PAPER_ELIGIBLE,
                      actor="research-approver")
     validation = persist_paper_validation(registry, artifact)
+    replication = persist_passing_replication(registry, artifact)
     registry.promote("foundation", artifact.artifact_hash,
                      PromotionLevel.LIVE_ELIGIBLE, actor="factory-test",
-                     paper_artifact_hash=validation.artifact_hash)
+                     paper_artifact_hash=validation.artifact_hash,
+                     replication_artifact_hash=replication.evidence_hash)
     monkeypatch.setattr(
         "desks.registry._current_clean_code_sha",
         lambda error_type: artifact.code_sha,

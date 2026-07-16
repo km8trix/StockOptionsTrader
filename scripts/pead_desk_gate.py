@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Gate backtest for the PEAD desk (see docs/vix_pead_desks_spec.md).
+"""Legacy diagnostic backtest for the PEAD desk.
 
 Runs PEADDesk (true-SUE post-earnings drift, optionally one PIT size sleeve)
 through the event-driven engine on the survivorship-free warehouse feed,
@@ -9,8 +9,11 @@ PSR(excess vs risk-free) >= 0.95 AND >= 1 Benjamini-Hochberg-significant
 out-of-sample year.
 
 Book prices come from WarehouseMarketData (delisted names priced) and the SUE
-signal from PIT SF1 filings — honest by construction. OPERATOR-run (requires
-tickers/sep/sf1/daily ingested):
+signal from PIT SF1 filings.  This legacy driver nevertheless gives the engine
+a static union of dated listing membership, so it cannot enforce exact
+eligibility at each signal date. Results are forced non-qualifying regardless
+of the diagnostic statistics. OPERATOR-run (requires tickers/sep/sf1/daily
+ingested):
 
     python scripts/pead_desk_gate.py --limit 300                # fast smoke
     python scripts/pead_desk_gate.py --limit 600 --long-only    # long book only
@@ -59,8 +62,10 @@ from data.pit_warehouse import PitWarehouse  # noqa: E402
 from data.warehouse_feed import WarehouseMarketData  # noqa: E402
 from desks.pead import PEADDesk  # noqa: E402
 from scripts.insider_desk_gate import (  # noqa: E402
-    _daily_returns_with_years)
-from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
+    _daily_returns_with_years,
+    _mark_retrieval_union_nonqualifying,
+)
+from scripts.insider_screen import resolve_universe  # noqa: E402
 
 FULL_START, FULL_END = '2015-01-01', '2024-12-31'
 
@@ -85,10 +90,10 @@ def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
              dating='filing', variant='base'):
     wh = PitWarehouse()
     rb = pd.bdate_range(start, end, freq='BMS')
-    universe = resolve_universe(wh, rb, SCALE_SMALL_MID)
+    universe = resolve_universe(wh, rb)
     if limit and limit < len(universe):
         # seeded RANDOM sample (not the alphabetical head) so a subset is
-        # representative of the small/mid universe, not a-names only.
+        # representative of the full dated eligible universe, not a-names only.
         universe = sorted(random.Random(seed).sample(universe, limit))
     desk = PEADDesk(band, provider=wh, long_only=long_only, dating=dating,
                     **PEAD_VARIANT_KWARGS[variant])
@@ -98,7 +103,8 @@ def run_gate(band, start, end, *, limit=None, capital=100_000.0, seed=42,
                             market_data=WarehouseMarketData(wh))
     report = engine.run(universe, start, end)
     returns, years = _daily_returns_with_years(report['portfolio_history'])
-    gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
+    gate = _mark_retrieval_union_nonqualifying(
+        validate_strategy_oos(returns, years, psr_threshold=0.95))
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
@@ -113,6 +119,8 @@ def print_report(summary, gate, n_trades, n_names, band, start, end,
     print(f"  Total Return   : {summary['total_return_pct']:.2f}%")
     print(f"  Sharpe         : {summary['sharpe_ratio']:.2f}")
     print(f"  Max Drawdown   : {summary['max_drawdown']:.2f}%")
+    print("\n  NON-QUALIFYING DIAGNOSTIC: "
+          + '; '.join(gate['nonqualifying_reasons']))
     psr = gate['psr']
     print(f"\n  GATE: PSR(excess vs {gate.get('risk_free_rate', 0.02):.0%} rf) "
           ">= 0.95 AND >= 1 BH-significant OOS year")
@@ -121,7 +129,8 @@ def print_report(summary, gate, n_trades, n_names, band, start, end,
     print(f"    PSR pass (>=0.95)   : {gate['psr_pass']}")
     print(f"    OOS years tested    : {gate['n_periods_tested']}")
     print(f"    BH-significant years: {gate['bh']['n_significant_bh']}")
-    print(f"\n  VERDICT: {'PASS' if gate['passed'] else 'FAIL'}")
+    print("\n  VERDICT: NON-QUALIFYING (statistical diagnostic "
+          f"would {'PASS' if gate['diagnostic_passed'] else 'FAIL'})")
     print(f"\n  {'year':<8}{'p-value':>10}{'reject':>9}")
     for label_, p, rej in zip(gate['fold_labels'], gate['fold_pvalues'],
                               gate['bh']['rejected_bh']):

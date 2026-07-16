@@ -4203,9 +4203,7 @@ class TestLauncherEnvHygiene:
 
 
 class TestStartScript:
-    """start.sh is the explicit-operator-action launcher: it sources .env in
-    the operator's shell, then runs run_gui.py — WITHOUT weakening run_gui.py's
-    no-silent-load control (TestLauncherEnvHygiene)."""
+    """start.sh is the explicit-operator-action dotenv launcher."""
 
     def test_start_script_exists_and_is_executable(self):
         import os
@@ -4213,11 +4211,10 @@ class TestStartScript:
         assert script.is_file(), 'start.sh is missing'
         assert os.access(str(script), os.X_OK), 'start.sh is not executable'
 
-    def test_start_script_sources_env_then_runs_launcher(self):
+    def test_start_script_parses_env_as_data_then_runs_launcher(self):
         text = (REPO_ROOT / 'start.sh').read_text()
-        # set -a / set +a bracket the source so .env vars are EXPORTED.
-        assert 'set -a' in text and 'set +a' in text
-        assert 'source .env' in text
+        assert 'scripts.launch_with_env' in text
+        assert 'source .env' not in text
         assert 'run_gui.py' in text
 
     def test_start_script_is_valid_bash(self):

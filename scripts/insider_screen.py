@@ -3,9 +3,9 @@
 Promoted from the data session's scratchpad screen (the most encouraging result:
 on a 250-name small/mid subset, insider buyers beat sellers +1.19% @63d, t=1.77,
 p=0.077 — right sign, grows with horizon, cost-positive, but UNDERPOWERED). This
-exists to rerun that screen on the FULL small/mid universe via the DuckDB+Parquet
-warehouse (~10x events) and resolve whether the edge survives a multiple-testing
-+ transaction-cost bar, or dies.
+exists to rerun that screen on the full dated eligible universe via the
+DuckDB+Parquet warehouse and resolve whether the edge survives a
+multiple-testing + transaction-cost bar, or dies.
 
 Method (unchanged from the scratchpad, which was debugged in PR #67):
   * At each monthly rebalance t, score every name by ``insider_net_buys`` over the
@@ -47,10 +47,11 @@ if ROOT not in sys.path:
 
 from analysis.research_stats import benjamini_hochberg  # noqa: E402
 
-# Sharadar scalemarketcap buckets that make up "small/mid" — where insider
-# signals are strongest and least arbitraged. NOTE: scalemarketcap is the
-# CURRENT bucket, not point-in-time, so this scopes the universe approximately
-# (a name's size band can have drifted); it is not used as a PIT signal.
+# Legacy reproduction only.  Sharadar ``scalemarketcap`` is the CURRENT bucket,
+# not a point-in-time attribute.  It therefore must never be supplied by a
+# qualifying research run: even when it is not used as the factor itself, using
+# it to choose historical names conditions the sample on future information.
+# Keep the constant so old exploratory commands can be reproduced explicitly.
 SCALE_SMALL_MID = ['2 - Micro', '3 - Small', '4 - Mid']
 
 
@@ -65,18 +66,56 @@ def make_provider(kind: str, path: str = None):
     raise ValueError(f"unknown provider {kind!r}")
 
 
-def resolve_universe(prov, rebal_dates, scale) -> list:
-    """Survivorship-free union of the names live across the rebalance window —
-    every name that was tradeable on ANY rebalance date (delisted names kept for
-    their live span). This is the whole point of universe_asof."""
-    names = set()
+def resolve_universe_membership(prov, rebal_dates, scale=None) -> dict:
+    """Return the exact eligible-name set at every rebalance date.
+
+    The qualifying default deliberately applies *no* ``scalemarketcap`` filter:
+    that vendor field describes the current size band and would leak future
+    information into historical membership.  Callers may pass ``scale`` only to
+    reproduce a legacy exploratory result; such a result is not PIT universe
+    evidence and must not be used for promotion.  Point-in-time size slices are
+    formed later from dated market capitalisation.
+    """
+    membership = {}
     for t in rebal_dates:
-        names.update(prov.universe_asof(t, scalemarketcap=scale))
-    return sorted(names)
+        kwargs = ({"scalemarketcap": scale} if scale else {})
+        timestamp = pd.Timestamp(t)
+        membership[timestamp] = frozenset(
+            str(name).strip().upper()
+            for name in prov.universe_asof(t, **kwargs)
+            if str(name).strip()
+        )
+    return membership
+
+
+def universe_union(membership) -> list:
+    """Return the deterministic union used only to batch data retrieval."""
+    return sorted(set().union(*membership.values()) if membership else set())
+
+
+def resolve_universe(prov, rebal_dates, scale=None) -> list:
+    """Compatibility wrapper returning the dated universe's name union.
+
+    A union is safe only as a retrieval list. Qualifying event collectors must
+    also receive ``membership_by_date`` so a name is never evaluated outside
+    the dates on which it was actually eligible.
+    """
+    return universe_union(resolve_universe_membership(
+        prov, rebal_dates, scale))
+
+
+def _eligible_on(name, date, membership_by_date) -> bool:
+    if membership_by_date is None:
+        return True
+    timestamp = pd.Timestamp(date)
+    if timestamp not in membership_by_date:
+        raise ValueError(
+            f"missing point-in-time universe membership for {timestamp.date()}")
+    return str(name).strip().upper() in membership_by_date[timestamp]
 
 
 def collect_events(prov, names, rebal_dates, horizons, lookback,
-                   price_start, price_end):
+                   price_start, price_end, *, membership_by_date=None):
     """One row per (name, rebalance) with non-zero insider activity: date, name,
     signed net_value, direction, and a forward total-return per horizon."""
     maxh = max(horizons)
@@ -87,13 +126,14 @@ def collect_events(prov, names, rebal_dates, horizons, lookback,
         px = prov.prices(name, price_start, price_end)
         if len(px) < 100:
             continue
-        n_names += 1
         idx, vals = px.index, px.values
         # Cheap bounds/entry checks FIRST so out-of-range dates (delisted
         # names, tail rebalances) never pay an SF2 query; then ONE batched
         # fetch per name instead of one query per rebalance date.
         live = []
         for t in rebal_dates:
+            if not _eligible_on(name, t, membership_by_date):
+                continue
             pos = int(idx.searchsorted(pd.Timestamp(t)))
             if pos + maxh >= len(px) or pos >= len(px):
                 continue
@@ -103,6 +143,7 @@ def collect_events(prov, names, rebal_dates, horizons, lookback,
             live.append((t, pos, entry))
         if not live:
             continue
+        n_names += 1
         if batch is not None:
             nbs = batch(name, [t for t, _, _ in live], lookback_days=lookback)
         else:
@@ -173,11 +214,21 @@ def event_study(events: pd.DataFrame, horizons, cost_bps: float, *,
                         'insufficient': True})
             continue
         gross = float(spreads.mean())
-        net = gross - 2.0 * cost_bps / 1e4
+        round_trip_cost = 2.0 * cost_bps / 1e4
+        net_spreads = spreads - round_trip_cost
+        net = float(net_spreads.mean())
         lag = max(1, int(np.ceil(h / 21)))          # window overlap in ~months
-        fit = sm.OLS(spreads, np.ones(n_dates)).fit(
+        # Promotion inference is on executable NET cohort returns.  Fitting the
+        # gross series and merely displaying a shifted mean would overstate the
+        # t-statistic whenever costs are non-zero.
+        fit = sm.OLS(net_spreads, np.ones(n_dates)).fit(
             cov_type='HAC', cov_kwds={'maxlags': lag})
-        t, p = float(fit.tvalues[0]), float(fit.pvalues[0])
+        t = float(fit.tvalues[0])
+        p_two_sided = float(fit.pvalues[0])
+        # Declared alternative: the net spread is positive.  A large negative
+        # t-statistic is evidence of harm, not a BH-significant trading edge.
+        p = (p_two_sided / 2.0 if t >= 0
+             else 1.0 - p_two_sided / 2.0)
         pvals.append(p)
         # descriptive pooled rank-IC: signed net_value vs date-demeaned return
         abn = (df[col] - df.groupby('date')[col].transform('mean')).to_numpy()
@@ -186,7 +237,8 @@ def event_study(events: pd.DataFrame, horizons, cost_bps: float, *,
         out.append({'h': h, 'events': int(len(df)), 'n_dates': n_dates,
                     'buys': int(vc.get('buy', 0)), 'sells': int(vc.get('sell', 0)),
                     'ic': ic, 'gross_spread': gross, 'net_spread': net,
-                    't': t, 'p': p})
+                    'inference_basis': 'net', 'cost_per_cohort': round_trip_cost,
+                    't': t, 'p': p, 'p_two_sided': p_two_sided})
     bh = benjamini_hochberg(pvals) if pvals else None
     return out, bh
 
@@ -233,9 +285,12 @@ def main(argv=None):
     src = ap.add_mutually_exclusive_group()
     src.add_argument('--symbols-file', help='one ticker per line (reproduce a subset)')
     src.add_argument('--universe-asof', action='store_true',
-                     help='derive the survivorship-free small/mid universe from the provider')
-    ap.add_argument('--scale', nargs='+', default=SCALE_SMALL_MID,
-                    help='scalemarketcap buckets for --universe-asof')
+                     help='derive the full survivorship-free PIT universe')
+    ap.add_argument(
+        '--legacy-current-scale', nargs='+', default=None,
+        help=('NON-QUALIFYING reproduction only: filter on Sharadar current '
+              'scalemarketcap buckets (future-informed historical sample)'),
+    )
     ap.add_argument('--start', default='2015-01-01')
     ap.add_argument('--end', default='2024-09-30')
     ap.add_argument('--horizons', nargs='+', type=int, default=[21, 63])
@@ -252,15 +307,22 @@ def main(argv=None):
 
     if cli.symbols_file:
         names = [s.strip() for s in open(cli.symbols_file) if s.strip()]
+        membership = None
     elif cli.universe_asof:
-        names = resolve_universe(prov, rebal, cli.scale)
+        membership = resolve_universe_membership(
+            prov, rebal, cli.legacy_current_scale)
+        names = universe_union(membership)
+        if cli.legacy_current_scale:
+            print('WARNING: current scalemarketcap filter is legacy, '
+                  'future-informed, and non-qualifying', file=sys.stderr)
     else:
         ap.error('choose --symbols-file or --universe-asof')
     print(f"provider={cli.provider} names={len(names)} rebalances={len(rebal)}",
           file=sys.stderr)
 
     events, n_names = collect_events(prov, names, rebal, cli.horizons,
-                                     cli.lookback, pstart, pend)
+                                     cli.lookback, pstart, pend,
+                                     membership_by_date=membership)
     stats, bh = event_study(events, cli.horizons, cli.cost_bps)
     _print_report(stats, bh, cli.cost_bps, n_names, len(events))
     return 0

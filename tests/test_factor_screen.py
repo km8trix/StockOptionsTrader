@@ -2,7 +2,9 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 
+from analysis.research_stats import benjamini_hochberg
 from scripts.factor_screen import _print_report, factor_study
 from scripts.value_validate import _date_spreads
 
@@ -46,9 +48,73 @@ def test_nonpositive_factor_values_dropped():
     assert not s.get('insufficient')
 
 
-def test_cost_nets_both_legs():
+def test_one_way_cost_charges_entry_and_exit_on_both_legs():
     s = factor_study(_events(), 'pb', [21], cost_bps=25.0)[0]
-    assert abs(s['net_spread'] - (s['gross_spread'] - 0.0050)) < 1e-12
+    # Long entry + long exit + short entry + short exit = four 25bp trades.
+    assert abs(s['net_spread'] - (s['gross_spread'] - 0.0100)) < 1e-12
+    assert s['mean_total_cost_bps'] == 100.0
+    assert s['cost_model'] == 'fixed_one_way_four_trade_round_trip'
+
+
+def test_inference_and_bh_use_net_period_spreads_not_gross():
+    # The planted gross edge is highly significant, but 200bp/leg makes the
+    # per-date net series significantly NEGATIVE. The directional p-value must
+    # be near one so BH cannot promote a losing-after-cost signal.
+    s = factor_study(_events(), 'pb', [21], cost_bps=200.0)[0]
+    assert s['raw_gross_spread'] > 0
+    assert s['raw_gross_t'] > 3
+    assert s['raw_net_spread'] < 0
+    assert s['t'] < -3
+    assert s['p'] > 0.5
+    assert s['p_two_sided'] < 0.05       # retained diagnostic, not BH input
+    assert benjamini_hochberg([s['p']])['rejected_bh'] == [False]
+
+
+def test_dated_total_spread_costs_are_deducted_per_period():
+    ev = _events()
+    dates = sorted(ev['date'].unique())
+    # Total long+short strategy-return drag; deliberately time-varying so the
+    # HAC test sees the actual net array, not merely a shifted headline mean.
+    costs = {d: (10.0 if i % 2 == 0 else 90.0)
+             for i, d in enumerate(dates)}
+    s = factor_study(ev, 'pb', [21], cost_bps=999.0,
+                     spread_cost_bps_by_date=costs)[0]
+    assert s['cost_model'] == 'dated_total_spread_cost'
+    assert s['mean_total_cost_bps'] == pytest.approx(50.0)
+    assert s['raw_net_spread'] == pytest.approx(
+        s['raw_gross_spread'] - 50.0 / 1e4)
+    # Variation in dated costs changes the uncertainty, proving t is fit on
+    # the per-date net values rather than copied from the gross fit.
+    assert s['raw_net_t'] != pytest.approx(s['raw_gross_t'])
+
+
+def test_persisted_inference_series_recomputes_reported_economics():
+    s = factor_study(
+        _events(), 'pb', [21], cost_bps=25.0,
+        winsor_returns=0.1, include_series=True,
+    )[0]
+    series = s['inference_series']
+
+    assert len(series['formation_dates']) == s['n_dates']
+    assert np.mean(series['raw_gross_spreads']) == pytest.approx(
+        s['raw_gross_spread'])
+    assert np.mean(series['raw_net_spreads']) == pytest.approx(
+        s['raw_net_spread'])
+    assert np.mean(series['total_cost_drags']) * 1e4 == pytest.approx(
+        s['mean_total_cost_bps'])
+    assert np.asarray(series['raw_gross_spreads']) - np.asarray(
+        series['total_cost_drags']) == pytest.approx(
+            series['raw_net_spreads'])
+    assert np.mean(series['robust_net_spreads']) == pytest.approx(
+        s['robust_net_spread'])
+
+
+def test_dated_costs_fail_closed_when_a_formation_date_is_missing():
+    ev = _events()
+    dates = sorted(ev['date'].unique())
+    with pytest.raises(ValueError, match='missing spread cost'):
+        factor_study(ev, 'pb', [21], 0.0,
+                     spread_cost_bps_by_date={d: 20.0 for d in dates[:-1]})
 
 
 def test_too_few_dates_flagged():
@@ -61,26 +127,48 @@ def test_winsor_returns_tames_outlier_leg():
     # winsorization clips it back to the leg's bulk, shrinking the spread.
     ev = _events()
     ev.loc[ev['name'] == 'N0', 'fwd_21'] = 100.0          # N0 = cheapest -> long
-    raw = factor_study(ev, 'pb', [21], 0.0)[0]['gross_spread']
-    wins = factor_study(ev, 'pb', [21], 0.0,
-                        winsor_returns=0.1)[0]['gross_spread']
-    assert raw > 5 * wins
+    raw = factor_study(ev, 'pb', [21], 0.0)[0]
+    wins = factor_study(ev, 'pb', [21], 0.0, winsor_returns=0.1)[0]
+    assert wins['raw_gross_spread'] == raw['raw_gross_spread']
+    assert wins['raw_gross_spread'] > 5 * wins['robust_gross_spread']
+    # Compatibility aliases and BH stay on the raw executable series;
+    # winsorized values are diagnostics and cannot create a promotion result.
+    assert wins['gross_spread'] == wins['raw_gross_spread']
+    assert wins['net_spread'] == wins['raw_net_spread']
+    assert wins['inference_basis'] == 'raw_net'
+    assert wins['inference_is_executable'] is True
+    assert wins['robust_inference_basis'] == 'winsorized_net_diagnostic'
+    assert wins['p'] == wins['raw_net_p']
+    assert wins['t'] == wins['raw_net_t']
 
 
-def test_print_report_default_width_byte_identical(capsys):
-    # the width param is opt-in: default output must keep the original
-    # fixed-9 factor column, byte for byte.
-    stats = [{'factor': 'pb', 'h': 21, 'n_dates': 24, 'gross_spread': 0.0123,
-              'net_spread': 0.0063, 't': 2.5, 'p': 0.0124}]
+def test_print_report_separates_raw_economics_from_robust_inference(capsys):
+    stats = [{'factor': 'pb', 'h': 21, 'n_dates': 24,
+              'raw_gross_spread': 0.0123, 'raw_net_spread': 0.0063,
+              'robust_net_spread': 0.0051, 'gross_spread': 0.0111,
+              'net_spread': 0.0051, 't': 2.5, 'p': 0.0062}]
     _print_report(stats, None, 30.0, 10, 240)
     out = capsys.readouterr().out
-    assert ("  {:>9}{:>4}{:>7}{:>9}{:>9}{:>7}{:>9}{:>5}"
-            .format('factor', 'h', 'dates', 'gross%', 'net%', 't', 'p', 'BH*')
-            in out)
-    assert "         pb  21     24   +1.230   +0.630  +2.50   0.0124" in out
+    assert 'raw-g%' in out and 'raw-n%' in out and 'rob-n%' in out
+    assert "         pb  21     24   +1.230   +0.630   +0.510   +2.50   0.0062" in out
+    assert 'winsorized robustness diagnostic only' in out
+    assert 'never drives BH or promotion' in out
+    assert 'one-sided H1 net-mean>0 p-values' in out
     _print_report(stats, None, 30.0, 10, 240, width=15)
     wide = capsys.readouterr().out
     assert "             pb  21" in wide          # factor column widened
+
+
+def test_print_report_verdict_requires_positive_raw_net_economics(capsys):
+    stats = [{'factor': 'pb', 'h': 21, 'n_dates': 24,
+              'raw_gross_spread': 0.002, 'raw_net_spread': -0.004,
+              'robust_net_spread': 0.005, 'gross_spread': 0.011,
+              'net_spread': 0.005, 't': 3.0, 'p': 0.001}]
+    bh = {'m': 1, 'alpha': 0.05, 'n_significant_bh': 1,
+          'rejected_bh': [True]}
+    _print_report(stats, bh, 30.0, 10, 240)
+    out = capsys.readouterr().out
+    assert 'no value factor clears net-inference BH + positive raw-net' in out
 
 
 def test_date_spreads_series_matches_factor_study_mean():

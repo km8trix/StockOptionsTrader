@@ -97,6 +97,13 @@ from backtesting.reporting import (
     compute_oos_folds,
     generate_report,
 )
+from backtesting.liquidity import (
+    capped_fill_quantity,
+    has_executable_share_capacity,
+    requeue_remainder,
+    require_credible_delisting_terms,
+    trailing_average_daily_volume,
+)
 
 if TYPE_CHECKING:  # annotation only — avoids any import-order coupling
     from desks.orchestrator import FundOrchestrator
@@ -146,7 +153,8 @@ class BacktestEngine:
                  portfolio_mechanics: Optional[PortfolioMechanics] = None,
                  option_lifecycle_policy: Optional[
                      OptionLifecyclePolicy] = None,
-                 dividend_fn=None):
+                 dividend_fn=None,
+                 reject_fills_without_adv: bool = False):
         if sum(driver is not None
                for driver in (strategy, desk, orchestrator)) != 1:
             raise ValueError(
@@ -185,15 +193,19 @@ class BacktestEngine:
         # Realistic execution (Phase 3 Step 6) — OPT-IN, default OFF so every
         # existing backtest and the greeks golden stay BYTE-IDENTICAL. When on:
         # square-root ADV market impact (impact_coef*sqrt(filled/ADV)) is added
-        # to slippage on STOCK fills, and an order is capped at
+        # to slippage on STOCK fills, and an opening order is capped at
         # participation_cap*ADV per day with the remainder re-queued to fill
         # over subsequent days (accumulating into the position). ADV is the
         # trailing adv_window-day mean of volume STRICTLY BEFORE the fill date
-        # (no lookahead). Options are unaffected (synthetic, no contract volume).
+        # (no lookahead). When reject_fills_without_adv is true, exits are also
+        # capped, and an intent waits (then expires under MAX_PENDING_DAYS) when
+        # valid whole-share capacity cannot be computed. Options are unaffected
+        # (synthetic, no contract volume).
         self.enable_realistic_fills = enable_realistic_fills
         self.impact_coef = impact_coef
         self.participation_cap = participation_cap
         self.adv_window = adv_window
+        self.reject_fills_without_adv = reject_fills_without_adv
         # Idle-cash yield (OPT-IN, default None = byte-identical: cash earns
         # zero, exactly as before the param existed). Pass a date->annual-rate
         # callable OR a pd.Series (datetime index -> annualized decimal rate,
@@ -509,6 +521,8 @@ class BacktestEngine:
                 exit_price = modeled_price
                 payout_source = str(payout.get('source') or 'unknown')
                 quality_flags = list(payout.get('quality_flags') or [])
+            require_credible_delisting_terms(
+                self.reject_fills_without_adv, payout_source, quality_flags, asset.symbol)
 
             quantity = position.quantity
             commission = abs(quantity) * exit_price * self.commission
@@ -537,7 +551,8 @@ class BacktestEngine:
                 'price': exit_price,
                 'commission': commission,
                 flow_key: cash_flow,
-                'reason': 'delisting liquidation',
+                'reason': ('delisting settlement' if self.reject_fills_without_adv
+                           else 'delisting liquidation'),
                 'payout_source': payout_source,
                 'data_quality_flags': quality_flags,
             })
@@ -966,25 +981,6 @@ class BacktestEngine:
     # ------------------------------------------------------------------
     # Realistic execution (Step 6, opt-in) — STOCK fills only
     # ------------------------------------------------------------------
-    def _average_daily_volume(self, data: Optional[pd.DataFrame],
-                              date) -> Optional[float]:
-        """Trailing adv_window-day mean of volume STRICTLY BEFORE `date`.
-
-        No lookahead: the fill is at today's open, before today's volume is
-        known, so today's bar is excluded. Returns None when volume is
-        unavailable or non-positive (the caller then applies no impact/cap).
-        """
-        if data is None or 'volume' not in getattr(data, 'columns', []):
-            return None
-        prior = data[data.index < pd.Timestamp(date)].sort_index()
-        if prior.empty:
-            return None
-        vols = prior['volume'].tail(self.adv_window).dropna()
-        if vols.empty:
-            return None
-        adv = float(vols.mean())
-        return adv if adv > 0 else None
-
     def _impact_fraction(self, quantity: int,
                          adv: Optional[float]) -> float:
         """Square-root market impact (Almgren) as an adverse price fraction:
@@ -995,34 +991,10 @@ class BacktestEngine:
         return min(_MAX_IMPACT_FRACTION,
                    self.impact_coef * math.sqrt(quantity / adv))
 
-    def _capped_fill_quantity(self, desired: int,
-                              adv: Optional[float]):
-        """Participation cap: at most ``participation_cap * ADV`` units fill
-        today. Returns ``(filled, remainder)``; no cap (remainder 0) when ADV
-        is unknown or the cap is not binding."""
-        if not adv or adv <= 0:
-            return desired, 0
-        # Floor the cap at 1 share: int(participation_cap*ADV) rounds to 0 for
-        # very thin names — exactly where the cap matters MOST — so without the
-        # floor the whole order would dump uncapped. Thin names trickle instead.
-        cap = max(1, int(self.participation_cap * adv))
-        if desired <= cap:
-            return desired, 0
-        return cap, desired - cap
-
-    def _requeue_remainder(self, intent: Dict, remainder: int) -> Optional[Dict]:
-        """Build a follow-on intent for the un-filled remainder (cap-and-requeue),
-        or None when nothing remains. The remainder is an ABSOLUTE share count
-        and carries 'accumulate' so its next-day fill adds to the position
-        opened today rather than opening a fresh one. Returns None unless
-        realistic fills are enabled."""
-        if remainder <= 0 or not self.enable_realistic_fills:
-            return None
-        follow = dict(intent)
-        follow['quantity'] = remainder
-        follow['accumulate'] = True
-        follow['days_waiting'] = 0
-        return follow
+    def _capped_fill_quantity(self, desired: int, adv: Optional[float]):
+        return capped_fill_quantity(
+            desired, adv, self.participation_cap,
+            strict=self.reject_fills_without_adv)
 
     def _queue_pending_intent(self, asset, intent: Dict) -> None:
         """Queue a new pending intent for ``asset``, replacing any older one.
@@ -1033,7 +1005,9 @@ class BacktestEngine:
         carries 'accumulate', so this is a plain assignment (byte-identical).
         """
         prior = self.pending_intents.get(asset)
-        if prior is not None and prior.get('accumulate'):
+        if (prior is not None
+                and (prior.get('liquidity_remainder')
+                     or prior.get('accumulate'))):
             logger.warning(
                 "Abandoning %s unfilled shares of %s: a new %s signal "
                 "supersedes the in-flight partial fill",
@@ -1309,8 +1283,28 @@ class BacktestEngine:
                 self._fill_option_intent(asset, intent, float(fill_base), date)
                 del self.pending_intents[asset]
             else:
-                adv = (self._average_daily_volume(data, date)
+                adv = (trailing_average_daily_volume(
+                    data, date, self.adv_window)
                        if self.enable_realistic_fills else None)
+                if (self.enable_realistic_fills
+                        and self.reject_fills_without_adv
+                        and not has_executable_share_capacity(
+                            adv, self.participation_cap)):
+                    intent['days_waiting'] += 1
+                    if intent['days_waiting'] >= MAX_PENDING_DAYS:
+                        logger.warning(
+                            "Dropping %s intent for %s (signal %s): no valid "
+                            "trailing ADV capacity for %d trading days",
+                            intent['signal'], str(asset), intent['signal_date'],
+                            intent['days_waiting'])
+                        del self.pending_intents[asset]
+                    else:
+                        logger.warning(
+                            "Deferring %s intent for %s (signal %s): no valid "
+                            "trailing ADV capacity on %s",
+                            intent['signal'], str(asset), intent['signal_date'],
+                            date)
+                    continue
                 remainder = self._fill_intent(asset, intent, float(fill_base),
                                               date, position_size, adv=adv)
                 # Cap-and-requeue: a partial stock fill returns a follow-on
@@ -1753,16 +1747,16 @@ class BacktestEngine:
 
         SHORT/COVER (desk OR fund mode, contract C4): SHORT opens a NEGATIVE
         position of -qty shares with proceeds credited to cash (margin is
-        not modeled — cash-account approximation); COVER closes the full
-        short, debiting cash, and records the Trade with the negative
+        not modeled — cash-account approximation); COVER closes the requested
+        short quantity, debiting cash, and records the Trade with the negative
         quantity (Trade.pnl = qty * (exit - entry) is sign-correct). Gated on
         self._desk_mode, so a fund's netted-SHORT residual and account-level
         COVER fill the same way a single desk's do.
 
         REALISTIC FILLS (Step 6, opt-in via enable_realistic_fills; ``adv`` is
         the trailing volume passed by the caller): adds square-root ADV market
-        impact to slippage and caps the filled size at participation_cap*ADV,
-        re-queuing the remainder. Returns a follow-on intent dict for that
+        impact to slippage and caps openings at participation_cap*ADV; strict
+        fail-closed mode caps exits too. Returns a follow-on intent dict for the
         remainder (to fill on later days, accumulating into the position) or
         None when the intent is fully consumed. With realistic fills OFF this
         always returns None and every fill is byte-identical to before.
@@ -1879,14 +1873,19 @@ class BacktestEngine:
             logger.info("BUY %d %s @ %.4f on %s (signal %s)",
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
-            return self._requeue_remainder(intent, remainder)
+            return requeue_remainder(intent, remainder, realistic)
 
         elif signal == 'SELL' and existing_pos and existing_pos.quantity > 0:
-            if intent.get('target_native') and intent.get('quantity') is not None:
-                quantity = min(int(intent['quantity']), existing_pos.quantity)
+            exact = intent.get('target_native') or intent.get(
+                'liquidity_remainder')
+            if exact and intent.get('quantity') is not None:
+                desired = min(int(intent['quantity']), existing_pos.quantity)
             else:
-                quantity = existing_pos.quantity
-            # Closes are not size-capped (a full exit), but pay market impact.
+                desired = existing_pos.quantity
+            if realistic and self.reject_fills_without_adv:
+                quantity, remainder = self._capped_fill_quantity(desired, adv)
+            else:
+                quantity, remainder = desired, 0
             if realistic:
                 fill_price = base_price * (
                     1 - slippage - self._impact_fraction(quantity, adv))
@@ -1898,7 +1897,7 @@ class BacktestEngine:
                 asset, fill_price, quantity,
                 existing_pos.timestamp, fill_date
             )
-            if not intent.get('target_native'):
+            if not intent.get('target_native') and remainder == 0:
                 # Legacy behavior explicitly removed after close_position.
                 self.portfolio.remove_position(asset)
             self.trades_log.append({
@@ -1909,6 +1908,7 @@ class BacktestEngine:
             logger.info("SELL %d %s @ %.4f on %s (signal %s)",
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
+            return requeue_remainder(intent, remainder, realistic)
 
         elif signal == 'SHORT' and self._desk_mode and (
                 (not existing_pos or existing_pos.quantity == 0)
@@ -1980,16 +1980,22 @@ class BacktestEngine:
             logger.info("SHORT %d %s @ %.4f on %s (signal %s)",
                         quantity, asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
-            return self._requeue_remainder(intent, remainder)
+            return requeue_remainder(intent, remainder, realistic)
 
         elif signal == 'COVER' and self._desk_mode \
                 and existing_pos and existing_pos.quantity < 0:
             # A cover is a BUY: adverse slippage means a HIGHER fill.
-            if intent.get('target_native') and intent.get('quantity') is not None:
-                quantity = -min(int(intent['quantity']), abs(existing_pos.quantity))
+            exact = intent.get('target_native') or intent.get(
+                'liquidity_remainder')
+            if exact and intent.get('quantity') is not None:
+                desired = min(int(intent['quantity']), abs(existing_pos.quantity))
             else:
-                quantity = existing_pos.quantity  # negative
-            # Closes are not size-capped (a full exit), but pay market impact.
+                desired = abs(existing_pos.quantity)
+            if realistic and self.reject_fills_without_adv:
+                filled, remainder = self._capped_fill_quantity(desired, adv)
+            else:
+                filled, remainder = desired, 0
+            quantity = -filled
             if realistic:
                 fill_price = base_price * (
                     1 + slippage + self._impact_fraction(abs(quantity), adv))
@@ -2003,7 +2009,7 @@ class BacktestEngine:
                 asset, fill_price, quantity,
                 existing_pos.timestamp, fill_date
             )
-            if not intent.get('target_native'):
+            if not intent.get('target_native') and remainder == 0:
                 # Legacy behavior explicitly removed after close_position.
                 self.portfolio.remove_position(asset)
             self.trades_log.append({
@@ -2014,6 +2020,7 @@ class BacktestEngine:
             logger.info("COVER %d %s @ %.4f on %s (signal %s)",
                         abs(quantity), asset.symbol, fill_price, fill_date,
                         intent['signal_date'])
+            return requeue_remainder(intent, remainder, realistic)
 
         # No matching branch (e.g. a BUY when already long without accumulate,
         # or a close with no position) -> consume the intent. Realistic-fill

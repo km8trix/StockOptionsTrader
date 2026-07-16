@@ -1,0 +1,342 @@
+{
+  "schema_version": "historical_trial_inventory.v1",
+  "inventory_id": "stockoptionstrader-legacy-development-backfill-2026-07-13",
+  "program_id": "stock-options-trader",
+  "candidate_context": "issuance-midcap-ls-v1",
+  "as_of_date": "2026-07-13",
+  "evidence_class": "legacy_development_backfill",
+  "complete": false,
+  "qualifying_evidence": false,
+  "attestation": null,
+  "raw_evidence_complete": false,
+  "ledger_import_ready": false,
+  "count_reconciliation": {
+    "operator": ">=",
+    "reconstructed_floor": 316,
+    "group_floor_sum": 316,
+    "unit": "selection_bearing_trial_cell",
+    "meaning": "At least 316 executed or result-bearing development cells are evidenced. This is not an exact historical trial count and may only increase after row-level review.",
+    "use_for_interim_deflation": "Use 316 only as a conservative minimum program breadth when an interim calculation cannot wait for an attested row-level ledger. Do not encode 316 as a claim of exactness."
+  },
+  "trial_unit_definition": {
+    "material_dimensions": [
+      "signal_definition",
+      "formation_or_holding_horizon",
+      "universe_or_reported_universe_slice",
+      "research_window_or_data_feed",
+      "portfolio_expression",
+      "strategy_parameters",
+      "cost_or_execution_economics",
+      "inference_target_or_weighting_rule"
+    ],
+    "deduplication": [
+      "Collapse an exact deterministic rerun only when the material dimensions and implementation/data identity are the same.",
+      "Retain multiple evidence runs under one cell after an exact-rerun determination.",
+      "Treat a bug fix, code change affecting behavior, different data feed/window, cost model, universe slice, portfolio form, or weighting rule as a distinct cell.",
+      "When identity cannot be established, do not silently collapse the records; mark the ambiguity for independent review."
+    ],
+    "excluded": [
+      "proposed-only configurations with no evidence of execution",
+      "unit tests and synthetic fixtures",
+      "pure performance benchmarks that did not produce a strategy result",
+      "broker preview/place/cancel smoke checks with no alpha evaluation"
+    ]
+  },
+  "evidence_artifacts": [
+    {
+      "artifact_id": "persisted-backtest-database",
+      "path": "trading_data.db",
+      "sha256_at_inventory": "7f722042fe5f665c304ffc85fe5907a204cde4890f408a57ee89ce81dca98f94",
+      "tracked_by_git": false,
+      "mutable": true,
+      "notes": "The backtests table contains 35 rows. The file is ignored and is not a sealed research artifact."
+    },
+    {
+      "artifact_id": "signal-ic-report",
+      "path": "analysis/signal_ic/signal_ic.json",
+      "sha256_at_inventory": "e6e3eb56eaae1dc78073b0c599d2bba8ec16e8a3efae58ba806a07cfeb9b7f09",
+      "tracked_by_git": false,
+      "mutable": true
+    },
+    {
+      "artifact_id": "saved-desk-backtests",
+      "path_glob": "analysis/backtests/*.json",
+      "tracked_by_git": false,
+      "mutable": true,
+      "members": [
+        {"path": "analysis/backtests/aqr.json", "sha256_at_inventory": "3482699a80d50f28f65034dbe36e329afe92887d199c10c4264d14583dd5673e"},
+        {"path": "analysis/backtests/citadel.json", "sha256_at_inventory": "5b2f83b08ee9383fbb77c70dda7afc183c1e6dad62f9476f04b17c2335d9a277"},
+        {"path": "analysis/backtests/foundation.json", "sha256_at_inventory": "2ddd166cc94d33f4b30295fce35c01db13b5ac4a72e46aac5fd4ca613788f424"},
+        {"path": "analysis/backtests/foundation_lightgbm.json", "sha256_at_inventory": "0ff341bec98f649838d2f46ab79198d7b417cd3c372f2e0ca45d6322c9326f05"},
+        {"path": "analysis/backtests/foundation_lstm.json", "sha256_at_inventory": "432711acd35410b80bd8c7c0363e925a2575f96aed9d33ced393e2f3ae44b4b7"},
+        {"path": "analysis/backtests/foundation_mlp.json", "sha256_at_inventory": "fea51f634fabce7ece9516ff32363de92589e7372b6f4ac1da68e415f8df6151"},
+        {"path": "analysis/backtests/hybrid.json", "sha256_at_inventory": "902fd2f6f79af71b68f784c1782efee1cf28fc31c3604fc82fe0d204236f427e"},
+        {"path": "analysis/backtests/janestreet.json", "sha256_at_inventory": "16fe3dc092f043e4181d1eff0e51532554d19dcb97d4f9afec179a0d7ed55b58"},
+        {"path": "analysis/backtests/momentum.json", "sha256_at_inventory": "9150006139cba025f8c7f1e1aedcb0988f6c56453345470d76b46ba8192fdd34"},
+        {"path": "analysis/backtests/pead.json", "sha256_at_inventory": "566bbb5d6c25f33383106df864f36f88794133979070f7a954e402d697f21114"},
+        {"path": "analysis/backtests/renaissance.json", "sha256_at_inventory": "c11dd2412a6cfe0a40b854d723553eeba2ff7b2d37e0f77fc5af460afefc27f2"},
+        {"path": "analysis/backtests/twosigma.json", "sha256_at_inventory": "2e5ccfbff11e32d7d514ec424aaec85ca3439e0a25feb2918be35b161edd208d"},
+        {"path": "analysis/backtests/vixrevert.json", "sha256_at_inventory": "6650c0259bb0f9da26a044885e823e69006838985f07793033159aa92a5c00b6"}
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "group_id": "persisted_gui_and_cli_backtests",
+      "family_id": "legacy_backtest_database",
+      "selection_unit_count_floor": 30,
+      "reconstruction_confidence": "high_for_rows_low_for_full_configuration",
+      "cell_spec": {
+        "source_rows": 35,
+        "source_table": "trading_data.db:backtests",
+        "exact_rerun_aliases": [[1, 5], [15, 16, 21], [17, 22], [18, 19]],
+        "distinct_after_exact_output_key_dedup": 30,
+        "strategies": ["momentum", "machine_learning", "foundation", "citadel", "renaissance", "twosigma", "janestreet", "aqr", "foundation+renaissance_fund"],
+        "candidate_id_pattern": "legacy-db.{strategy}.{start_date}.{end_date}.{symbols}.{position_size}"
+      },
+      "result_digest": "Mixed negative, positive, and zero-trade outputs; none has a qualifying protocol/result chain. Rows 11-35 carry provenance, but many report a dirty worktree. Rows 1-10 have no run provenance.",
+      "evidence_refs": [
+        {"artifact_id": "persisted-backtest-database", "table": "backtests", "row_ids": "1-35"}
+      ],
+      "uncertainties": ["Database parameters retain little beyond position_size.", "Code and data identity are missing for rows 1-10.", "Near-reruns with shifted windows are retained as distinct cells."]
+    },
+    {
+      "group_id": "saved_legacy_desk_harness_and_tuning",
+      "family_id": "legacy_desks",
+      "selection_unit_count_floor": 15,
+      "reconstruction_confidence": "medium",
+      "cell_spec": {
+        "saved_desk_cells": ["aqr", "citadel", "foundation.default", "foundation.lightgbm", "foundation.lstm", "foundation.mlp", "janestreet", "renaissance", "twosigma"],
+        "material_tuning_cells": ["foundation.threshold_minus_0_05", "twosigma.exit_q_0_4_minhold_21", "janestreet.rv_cap_0_02", "renaissance.mr_prob_0_75", "citadel.cut_recovery_on", "aqr.ridge_alpha_5"],
+        "formula": "9 saved harness cells + 6 documented material tuning cells"
+      },
+      "result_digest": "All failed the historical promotion gate. The saved Foundation default lost about 2.38% with Sharpe about -3.10; no saved desk had a BH-significant OOS fold.",
+      "evidence_refs": [
+        {"artifact_id": "saved-desk-backtests"},
+        {"git_commit": "aec0beb", "description": "six-desk tuning pass and retained/reverted variants"}
+      ],
+      "uncertainties": ["Saved JSON does not contain the full strategy configuration, code hash, data hash, or cost specification."]
+    },
+    {
+      "group_id": "price_signal_information_coefficients",
+      "family_id": "price_signal_ic",
+      "selection_unit_count_floor": 12,
+      "reconstruction_confidence": "high_for_grid_low_for_provenance",
+      "cell_spec": {
+        "signals": ["mom_12_1", "mom_21", "reversal_5", "low_vol_21"],
+        "forward_horizons_days": [1, 5, 21],
+        "formula": "4 signals * 3 horizons",
+        "candidate_id_pattern": "price-ic.{signal}.h{forward_horizon_days}"
+      },
+      "result_digest": "Descriptive IC cells included mom_12_1 t=2.66 at 1d and reversal_5 t=2.86 at 5d. These were development observations, not sealed confirmation evidence.",
+      "evidence_refs": [
+        {"artifact_id": "signal-ic-report"},
+        {"git_commit": "b0f916d"}
+      ],
+      "uncertainties": ["The ignored report is mutable and does not bind a data snapshot or clean code version."]
+    },
+    {
+      "group_id": "trend_parameter_sweep",
+      "family_id": "trend_following",
+      "selection_unit_count_floor": 18,
+      "reconstruction_confidence": "high",
+      "cell_spec": {
+        "universes": ["indices", "sectors", "multiasset"],
+        "breakout_days": [20, 50, 100],
+        "atr_multipliers": [2.5, 3.5],
+        "formula": "3 universes * 3 breakout windows * 2 ATR multipliers",
+        "candidate_id_pattern": "trend.{universe}.breakout_{breakout_days}.atr_{atr_multiplier}"
+      },
+      "result_digest": "The best reported cell, multiasset/50/3.5, had PSR about 0.76 and DSR about 0.13; no cell passed.",
+      "evidence_refs": [{"git_commit": "9a98412"}, {"git_commit": "d8d5b9a", "description": "default cell, deduplicated into the sweep"}],
+      "uncertainties": []
+    },
+    {
+      "group_id": "momentum_and_reversal_portfolio_variants",
+      "family_id": "momentum_reversal",
+      "selection_unit_count_floor": 7,
+      "reconstruction_confidence": "medium",
+      "cell_spec": {
+        "recovered_variants": ["momentum_base", "own_vol_crash_filter", "market_vol_target", "residual_momentum", "breadth_filter", "hybrid_reversal_weight_0_5", "hybrid_reversal_weight_1_0"],
+        "deduplicated_alias": "hybrid reversal_weight_0.0 duplicates momentum-only",
+        "candidate_id_pattern": "mom-reversal.{variant}"
+      },
+      "result_digest": "Momentum-only returned about +46% with Sharpe about 0.20; residual momentum returned about +24.26% with Sharpe about 0.07; reversal mixtures were sharply negative. No promotion.",
+      "evidence_refs": [{"git_commit": "018abfc"}, {"git_commit": "0c324f9"}, {"path": ".claude/plans/evidence-first-desk-overhaul.plan.md"}],
+      "uncertainties": ["Some overlay inputs are recoverable only from plan comments and code history, not complete raw reports."]
+    },
+    {
+      "group_id": "insider_screen_and_desk_history",
+      "family_id": "insider_net_buy",
+      "selection_unit_count_floor": 16,
+      "reconstruction_confidence": "medium_low",
+      "cell_spec": {
+        "reported_dimensions": {"horizons_days": [21, 63], "size_slices": ["pooled", "micro", "small", "mid"], "desk_forms": ["magnitude", "sign_long_short", "sign_long_only"]},
+        "known_run_classes": ["scratch_250_legacy", "scratch_250_hac_corrected", "full_universe_broken_cohort", "full_universe_fixed_cohort", "size_slice_reports", "implemented_desk_forms"],
+        "enumeration_status": "partial; sixteen is a conservative documented-cell floor, not a completed Cartesian product"
+      },
+      "result_digest": "The realized sign desk lost about 34% long/short and 18% long-only. Historical positive screen claims are non-qualifying because inference used gross spreads and current size labels.",
+      "evidence_refs": [{"git_commit": "39712f4"}, {"git_commit": "825c0af"}, {"git_commit": "1079205"}, {"path": "docs/insider_desk_spec.md"}],
+      "uncertainties": ["Not every historical output row survived as a raw artifact.", "The exact relationship between scratch, broken, fixed, and size-slice outputs needs independent row-level reconstruction."]
+    },
+    {
+      "group_id": "value_factor_screens",
+      "family_id": "value",
+      "selection_unit_count_floor": 35,
+      "reconstruction_confidence": "medium_high",
+      "cell_spec": {
+        "raw_grid": {"factors": ["pb", "pe", "ps", "evebit", "evebitda"], "horizons_days": [21, 63], "count": 10},
+        "winsor_corrected_grid": {"same_dimensions": true, "count": 10},
+        "validation_subperiod_grid": {"factors": ["pb", "ps"], "horizons_days": [21, 63], "windows": ["in_sample_2015_2019", "oos_2020_2024", "exclude_2020"], "count": 12},
+        "pb_63_size_slices": {"slices": ["micro", "small", "mid"], "count": 3},
+        "formula": "10 + 10 + 12 + 3"
+      },
+      "result_digest": "The correction moved pb/63d from about +2.52%, t=3.01 to +1.60%, t=2.17. All historical significance claims are non-qualifying under the later net-inference and PIT-universe correction.",
+      "evidence_refs": [{"git_commit": "c2d3871"}, {"git_commit": "9107297"}, {"path": "scripts/value_validate.py"}, {"path": "docs/factor_research_findings.md"}],
+      "uncertainties": ["No content-addressed raw row report binds every cell to code/data versions."]
+    },
+    {
+      "group_id": "quality_factor_screens",
+      "family_id": "quality",
+      "selection_unit_count_floor": 84,
+      "reconstruction_confidence": "low_medium",
+      "cell_spec": {
+        "components": [
+          {"name": "raw_native_factors", "factors": ["netmargin", "grossmargin"], "horizons_days": [21, 63], "count": 4},
+          {"name": "winsor_corrected_native_factors", "same_dimensions": true, "count": 4},
+          {"name": "netmargin_63_subperiod_or_slice_checks", "count": 4},
+          {"name": "expanded_300_name_smoke", "factors": ["netmargin", "grossmargin", "gp_assets", "roa"], "slices": ["pooled", "micro", "small", "mid"], "horizons_days": [21, 63], "count": 32},
+          {"name": "full_universe_unguarded_new_cells_after_native_pooled_dedup", "count": 28},
+          {"name": "assets_floor_guard_computed_factor_cells_included_in_floor", "count": 12}
+        ],
+        "formula": "4 + 4 + 4 + 32 + 28 + 12",
+        "enumeration_status": "grouped reconstruction; row-level independent review required before ledger import"
+      },
+      "result_digest": "The 300-name smoke reported 0/32 survivors; the guarded full run later reported 19/32 under legacy inference. Those survivor claims are non-qualifying after the net-inference/current-universe corrections.",
+      "evidence_refs": [{"git_commit": "9107297"}, {"git_commit": "fc93582"}, {"git_commit": "8166f1c"}, {"path": "docs/factor_research_findings.md"}],
+      "uncertainties": ["This is the largest reconstruction uncertainty.", "Native pooled cells may alias earlier runs; the floor removes the most evident duplicates but is not an attested row manifest.", "Four additional assets-floor-guard computed-factor cells may be distinct, but are withheld from the floor until row-level evidence and deduplication are independently reviewed."]
+    },
+    {
+      "group_id": "pead_and_surge_signal_screens",
+      "family_id": "earnings_surprise",
+      "selection_unit_count_floor": 25,
+      "reconstruction_confidence": "medium_high",
+      "cell_spec": {
+        "filing_dated_sue": {"slices": ["pooled", "micro", "small", "mid"], "horizons_days": [21, 63], "count": 8},
+        "aggressive_winsor_check": {"cell": "filing_sue.micro.h63.winsor_0_05", "count": 1},
+        "announcement_dated_sue": {"same_8_cell_grid": true, "count": 8},
+        "announcement_dated_surge": {"same_8_cell_grid": true, "count": 8},
+        "formula": "8 + 1 + 8 + 8"
+      },
+      "result_digest": "Legacy filing SUE, announcement SUE, and SURGE screens produced selected positive cells, but the inference and current-size-universe defects make every claim non-qualifying.",
+      "evidence_refs": [{"git_commit": "d0f5c6c"}, {"git_commit": "4456a84"}, {"git_commit": "49c3833"}, {"path": "docs/vix_pead_desks_spec.md"}],
+      "uncertainties": []
+    },
+    {
+      "group_id": "pead_desk_portfolio_variants",
+      "family_id": "pead_desk",
+      "selection_unit_count_floor": 10,
+      "reconstruction_confidence": "medium_low",
+      "cell_spec": {
+        "recovered_variant_classes": ["filing_long_short", "filing_long_only", "pre_and_post_universe_fix_runs", "commission_sensitivity", "announcement_long_only", "surge_confirm_solo", "rank_combine_solo", "surge_confirm_fund", "rank_combine_fund"],
+        "enumeration_status": "At least ten materially distinct desk/configuration contexts are evidenced; additional saved or pre-fix runs are excluded from this floor pending deduplication."
+      },
+      "result_digest": "The strongest historical base was announcement-dated long-only at about +147.7%, Sharpe 0.42, PSR 0.926; SURGE variants hurt. All failed and are non-qualifying.",
+      "evidence_refs": [{"git_commit": "d0f5c6c"}, {"git_commit": "4456a84"}, {"git_commit": "16b3607"}, {"path": "docs/vix_pead_desks_spec.md"}],
+      "uncertainties": ["The ignored five-name PEAD artifact and some pre-fix reruns may be distinct additional cells; neither is used to raise this floor."]
+    },
+    {
+      "group_id": "vix_mean_reversion_windows",
+      "family_id": "vix_mean_reversion",
+      "selection_unit_count_floor": 2,
+      "reconstruction_confidence": "high",
+      "cell_spec": {"windows": ["2015-2024", "2005-2024"], "candidate_id_pattern": "vix-mr.{window}"},
+      "result_digest": "The 2015-2024 result was about -0.1% with Sharpe -0.70 and PSR 0.01; the 2005-2024 robustness window returned about +5% over twenty years but failed risk-adjusted criteria.",
+      "evidence_refs": [{"git_commit": "d0f5c6c"}, {"path": "docs/vix_pead_desks_spec.md"}],
+      "uncertainties": []
+    },
+    {
+      "group_id": "net_share_issuance_screen",
+      "family_id": "net_share_issuance",
+      "selection_unit_count_floor": 16,
+      "reconstruction_confidence": "high_for_grid_low_for_inference",
+      "cell_spec": {
+        "signal": "split_adjusted_yoy_share_growth",
+        "slices": ["pooled", "micro", "small", "mid"],
+        "horizons_days": [21, 63],
+        "run_classes": ["legacy_gross_inference_current_size_grid", "corrected_pit_session_t_plus_1_raw_net_grid"],
+        "formula": "2 materially distinct runs * 4 slices * 2 horizons",
+        "candidate_id_pattern": "issuance.{slice}.h{horizon_days}"
+      },
+      "result_digest": "The historical run reported 8/8 BH survivors and motivated an issuance desk, but used gross inference, a current-size-conditioned universe, same-close timing, and only 60bp total cost. The 2026-07-13 corrected run used observed SEP sessions, dated relative size terciles, T+1 entry, raw net HAC inference, and 120bp total fixed cost; 0/8 survived BH. The middle tercile was net -0.458% at 21d (p=0.8344) and +0.699% at 63d (p=0.2904). The candidate was stopped at development.",
+      "evidence_refs": [{"git_commit": "997f7b2"}, {"path": "scripts/issuance_screen.py"}, {"path": "docs/factor_research_findings.md"}, {"path": "research/issuance_midcap_ls_v1/development_falsification.json", "sha256": "de0c785d0558d091706b976bbfa0019f3a3f11d375231d457db03f02fec43ac1"}],
+      "uncertainties": ["Neither run can qualify issuance-midcap-ls-v1 and the inspected period cannot be treated as a fresh holdout.", "The corrected report retains complete dated inference arrays but not all raw event rows, ranks, or executable order evidence."]
+    },
+    {
+      "group_id": "value_quality_and_fund_combinations",
+      "family_id": "multi_signal_fund",
+      "selection_unit_count_floor": 21,
+      "reconstruction_confidence": "medium_low",
+      "cell_spec": {
+        "recovered_classes": ["vq_solo_all_bands", "vq_solo_ex_micro", "paper_static_50_50", "paper_inverse_vol", "engine_preownership_overlapping", "engine_preownership_disjoint", "engine_ownership_fixed", "engine_true_risk_parity", "legacy_fund_unscoped", "legacy_fund_scoped", "issuance_solo", "issuance_three_leg_fund", "vq_gp_assets_solo", "vq_issuance_filter_solo", "vq_both_solo", "vq_gp_assets_fund", "vq_issuance_filter_fund", "vq_both_fund", "dtb3_cash_yield", "pead_surge_confirm_fund", "pead_rank_combine_fund"],
+        "formula": "21 recovered materially distinct portfolio/configuration contexts after removing the known duplicate static-weight rerun"
+      },
+      "result_digest": "The strongest historical fund result used the VQ-both variant plus dated cash yield, PSR about 0.9435, still below the bar. No combination was promoted.",
+      "evidence_refs": [{"git_commit": "4456a84"}, {"git_commit": "b192372"}, {"git_commit": "5f1c788"}, {"git_commit": "248f6a2"}, {"git_commit": "bab2b1c"}, {"git_commit": "7ac27fb"}, {"git_commit": "6874dbd"}, {"git_commit": "16b3607"}, {"path": "docs/vix_pead_desks_spec.md"}],
+      "uncertainties": ["Several comparisons were reported in docs rather than preserved as immutable raw artifacts.", "The line between an allocator diagnostic and a selected portfolio variant requires independent review."]
+    },
+    {
+      "group_id": "opening_range_breakout_reported_cuts",
+      "family_id": "opening_range_breakout",
+      "selection_unit_count_floor": 20,
+      "reconstruction_confidence": "high_for_reported_cuts",
+      "cell_spec": {
+        "feeds_or_trials": ["iex_pilot_2016_2024", "sip_confirmation_2025_2026"],
+        "directions": ["long_short", "long_only"],
+        "scopes": ["SPY", "QQQ", "IWM", "TQQQ", "equal_weight_portfolio"],
+        "formula": "2 feeds * 2 directions * 5 reported scopes",
+        "primary_registered_trials": 2,
+        "candidate_id_pattern": "orb.{feed}.{direction}.{scope}"
+      },
+      "result_digest": "IEX long-only appeared promising, but the sealed SIP confirmation refuted it with portfolio PSR about 0.3519. The confirmation holdout is consumed permanently.",
+      "evidence_refs": [{"git_commit": "571e8a7"}, {"git_commit": "034bd03"}, {"path": "scripts/orb_gate.py"}],
+      "uncertainties": ["Only two top-level trials were registered; twenty is the strict selection-bearing count because symbol, direction, and portfolio cuts were reported and available for selection."]
+    },
+    {
+      "group_id": "variance_risk_premium_slices",
+      "family_id": "variance_risk_premium",
+      "selection_unit_count_floor": 4,
+      "reconstruction_confidence": "high",
+      "cell_spec": {"scopes": ["SPY", "QQQ", "IWM", "pooled"], "formula": "one registered configuration * four reported universe scopes", "candidate_id_pattern": "vrp.{scope}"},
+      "result_digest": "Pooled monthly P&L had Newey-West t about 0.13; the measured premium was too small to harvest at modeled retail costs.",
+      "evidence_refs": [{"git_commit": "4ec63a1"}, {"path": "scripts/vrp_screen.py"}],
+      "uncertainties": []
+    },
+    {
+      "group_id": "rl_execution_throttle_safety_backtest",
+      "family_id": "execution_throttle",
+      "selection_unit_count_floor": 1,
+      "reconstruction_confidence": "medium",
+      "cell_spec": {"comparison": "baseline versus subtractive contextual-bandit throttle", "candidate_id": "execution-throttle.safety-only.v1"},
+      "result_digest": "An end-to-end safety comparison was executed, but no complete alpha gate result was preserved. Treat as an incomplete, non-qualifying sizing/execution attempt.",
+      "evidence_refs": [{"git_commit": "0edd049"}, {"path": "README.md"}],
+      "uncertainties": ["It is unclear whether this should remain in the alpha trial denominator or a separately reported execution-policy denominator; retaining one cell is statistically conservative."]
+    }
+  ],
+  "global_uncertainties": [
+    "This is a grouped reconstruction, not a row-complete, independently reviewed ledger.",
+    "Ignored JSON and SQLite files are mutable and were not externally timestamped when created.",
+    "Many historical reports omit exact data snapshots, code identity, dependency lock, seed, complete configuration, costs, and raw return series.",
+    "Historical factor screens used gross-return inference while displaying net means and used current size labels; their significance claims are invalid.",
+    "The quality and multi-signal-fund group counts have the greatest deduplication uncertainty.",
+    "Additional attempts may exist in deleted files, local shells, notebooks, unmerged branches, or unpreserved CLI output.",
+    "All data inspected before a future sealed protocol is development data; none can be relabeled as a fresh holdout."
+  ],
+  "required_next_actions": [
+    "Generate one row per recovered trial cell with a canonical deduplication key and evidence-run aliases.",
+    "Have an independent reviewer resolve every medium/low-confidence group and sign a content hash; attestation remains null until then.",
+    "Import the reviewed rows under one frozen legacy-development-backfill protocol, never as preregistered or qualifying evidence.",
+    "Increase, never decrease, the program trial breadth when additional documented attempts are recovered unless an exact duplicate is proven.",
+    "Keep issuance_midcap_ls_v1's future protocol, holdout, outcome, replication, paper, and deployment evidence separate from this inventory."
+  ]
+}

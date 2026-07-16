@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Gate backtests for the Value+Quality desk and the PEAD+VQ combined fund
+"""Legacy diagnostic backtests for Value+Quality and the PEAD+VQ fund
 (docs/vix_pead_desks_spec.md, unlock c: combine decorrelated survivors).
 
 Modes:
@@ -25,9 +25,11 @@ passes. The gate benchmark stays flat-2% rf — self-consistent (the fund
 EARNS real dated yield, is JUDGED vs 2%), but comparators must be rerun
 under the same setting; labels carry ' [+DTB3]' so numbers are never mixed.
 
-Both run on the survivorship-free warehouse feed with a seeded random
-small/mid universe subset, and apply the single research gate
-(analysis.research_stats.validate_strategy_oos). OPERATOR-run (requires
+Both run on the survivorship-free warehouse feed with a seeded random subset,
+but pass a static union of dated listing membership to the engine. Exact
+point-in-time eligibility is not enforced at every signal date, so every result
+is forced non-qualifying even if the legacy statistical diagnostic passes.
+OPERATOR-run (requires
 tickers/sep/sf1/daily ingested; events too when --dating announce):
 
     python scripts/vq_fund_gate.py --mode vq --limit 600
@@ -132,8 +134,10 @@ from desks.trend_follower import TrendFollowerDesk  # noqa: E402
 from desks.value_quality import ValueQualityDesk  # noqa: E402
 from portfolio.risk_manager import RiskManager  # noqa: E402
 from scripts.insider_desk_gate import (  # noqa: E402
-    _daily_returns_with_years)
-from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
+    _daily_returns_with_years,
+    _mark_retrieval_union_nonqualifying,
+)
+from scripts.insider_screen import resolve_universe  # noqa: E402
 from scripts.pead_desk_gate import PEAD_VARIANT_KWARGS  # noqa: E402
 
 FULL_START, FULL_END = '2015-01-01', '2024-12-31'
@@ -213,7 +217,7 @@ def _make_desk(key, wh, *, capital_allocation=1.0, dating='filing',
 
 def _universe(wh, start, end, limit, seed):
     rb = pd.bdate_range(start, end, freq='BMS')
-    universe = resolve_universe(wh, rb, SCALE_SMALL_MID)
+    universe = resolve_universe(wh, rb)
     if limit and limit < len(universe):
         universe = sorted(random.Random(seed).sample(universe, limit))
     return universe
@@ -230,7 +234,8 @@ def run_vq(start, end, *, limit=None, capital=100_000.0, seed=42,
                             cash_yield=cash_yield)
     report = engine.run(universe, start, end)
     returns, years = _daily_returns_with_years(report['portfolio_history'])
-    gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
+    gate = _mark_retrieval_union_nonqualifying(
+        validate_strategy_oos(returns, years, psr_threshold=0.95))
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
@@ -246,7 +251,8 @@ def run_issuance(start, end, *, limit=None, capital=100_000.0, seed=42,
                             cash_yield=cash_yield)
     report = engine.run(universe, start, end)
     returns, years = _daily_returns_with_years(report['portfolio_history'])
-    gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
+    gate = _mark_retrieval_union_nonqualifying(
+        validate_strategy_oos(returns, years, psr_threshold=0.95))
     return report['summary'], gate, len(report['closed_trades']), len(universe)
 
 
@@ -328,7 +334,8 @@ def run_fund(start, end, *, limit=None, capital=100_000.0, seed=42,
     if 'error' in report:
         raise SystemExit(f"fund backtest failed: {report['error']}")
     returns, years = _daily_returns_with_years(report['portfolio_history'])
-    gate = validate_strategy_oos(returns, years, psr_threshold=0.95)
+    gate = _mark_retrieval_union_nonqualifying(
+        validate_strategy_oos(returns, years, psr_threshold=0.95))
     n_trades = len(report.get('closed_trades', []))
     deploy = _deployment_stats(report.get('portfolio_history', []))
     return report['summary'], gate, n_trades, len(universe), deploy
@@ -342,6 +349,8 @@ def print_report(summary, gate, n_trades, n_names, label, start, end):
     print(f"  Total Return   : {summary['total_return_pct']:.2f}%")
     print(f"  Sharpe         : {summary['sharpe_ratio']:.2f}")
     print(f"  Max Drawdown   : {summary['max_drawdown']:.2f}%")
+    print("\n  NON-QUALIFYING DIAGNOSTIC: "
+          + '; '.join(gate['nonqualifying_reasons']))
     psr = gate['psr']
     print(f"\n  GATE: PSR(excess vs {gate.get('risk_free_rate', 0.02):.0%} rf) "
           ">= 0.95 AND >= 1 BH-significant OOS year")
@@ -350,7 +359,8 @@ def print_report(summary, gate, n_trades, n_names, label, start, end):
     print(f"    PSR pass (>=0.95)   : {gate['psr_pass']}")
     print(f"    OOS years tested    : {gate['n_periods_tested']}")
     print(f"    BH-significant years: {gate['bh']['n_significant_bh']}")
-    print(f"\n  VERDICT: {'PASS' if gate['passed'] else 'FAIL'}")
+    print("\n  VERDICT: NON-QUALIFYING (statistical diagnostic "
+          f"would {'PASS' if gate['diagnostic_passed'] else 'FAIL'})")
     print(f"\n  {'year':<8}{'p-value':>10}{'reject':>9}")
     for lab, p, rej in zip(gate['fold_labels'], gate['fold_pvalues'],
                            gate['bh']['rejected_bh']):

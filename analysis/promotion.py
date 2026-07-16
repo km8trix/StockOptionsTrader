@@ -199,8 +199,9 @@ class TierCriteria:
             raise ValueError("min_dsr must be in [0, 1]")
         if self.min_testable_oos_folds < 1:
             raise ValueError("min_testable_oos_folds must be positive")
-        if self.min_significant_oos_folds < 1:
-            raise ValueError("min_significant_oos_folds must be positive")
+        if self.min_significant_oos_folds < 0:
+            raise ValueError(
+                "min_significant_oos_folds cannot be negative")
         if self.min_significant_oos_folds > self.min_testable_oos_folds:
             raise ValueError("significant OOS folds cannot exceed testable folds")
         if self.max_estimated_cost_bps < 0 or self.max_annual_turnover < 0:
@@ -331,17 +332,17 @@ class PromotionPolicy:
     def default(cls) -> PromotionPolicy:
         return cls(
             name="authoritative-promotion",
-            version="1",
+            version="2",
             paper=TierCriteria(
                 min_psr=0.90, min_dsr=0.80,
-                min_testable_oos_folds=2, min_significant_oos_folds=1,
+                min_testable_oos_folds=2, min_significant_oos_folds=0,
                 require_cost_model=True, max_estimated_cost_bps=100.0,
                 min_cost_adjusted_return=0.0, max_annual_turnover=24.0,
                 min_regime_count=2, min_regime_return=-0.25,
             ),
             live=TierCriteria(
                 min_psr=0.95, min_dsr=0.95,
-                min_testable_oos_folds=3, min_significant_oos_folds=2,
+                min_testable_oos_folds=3, min_significant_oos_folds=0,
                 require_cost_model=True, max_estimated_cost_bps=50.0,
                 min_cost_adjusted_return=0.0, max_annual_turnover=12.0,
                 min_regime_count=3, min_regime_return=-0.10,
@@ -511,7 +512,7 @@ class PromotionArtifact:
         return cls(actual_hash, payload_json)
 
 
-_FOUNDATION_RESEARCH_RUNNER = "foundation_research_v2"
+_FOUNDATION_RESEARCH_RUNNER = "foundation_research_v4"
 _FOUNDATION_RESEARCH_TABLES = frozenset({
     "actions", "daily", "sep", "tickers",
 })
@@ -521,7 +522,8 @@ _FOUNDATION_UNIVERSE_METHOD = (
 )
 _FOUNDATION_ENGINE_FIELDS = frozenset({
     "adv_window", "commission", "enable_realistic_fills", "impact_coef",
-    "initial_capital", "participation_cap", "seed", "slippage_bps",
+    "initial_capital", "participation_cap", "reject_fills_without_adv",
+    "seed", "slippage_bps",
 })
 
 
@@ -563,6 +565,11 @@ def _require_authoritative_foundation_research(
         payload = artifact.payload
         if payload.get("schema_version") != 2:
             raise ValueError("research artifact schema 2 is required")
+        strategy_version = payload.get("strategy_version")
+        if (not isinstance(strategy_version, str)
+                or not strategy_version.startswith("foundation-")):
+            raise ValueError(
+                "Foundation strategy version must begin with 'foundation-'")
         evidence = payload.get("evidence")
         if not isinstance(evidence, Mapping):
             raise ValueError("research runner evidence is required")
@@ -660,6 +667,9 @@ def _require_authoritative_foundation_research(
             raise ValueError("research engine parameters are incomplete")
         if engine.get("enable_realistic_fills") is not True:
             raise ValueError("research must enable realistic fills")
+        if engine.get("reject_fills_without_adv") is not True:
+            raise ValueError(
+                "research must reject stock fills without valid ADV")
         seed = payload.get("seed")
         if type(seed) is not int or engine.get("seed") != seed:
             raise ValueError("engine seed differs from artifact seed")
@@ -680,12 +690,71 @@ def _require_authoritative_foundation_research(
         if not _finite(impact_coef) or not 0 <= float(impact_coef) <= 1:
             raise ValueError("impact_coef must be in [0, 1]")
         if not _finite(participation_cap) \
-                or not 0 < float(participation_cap) <= 1:
-            raise ValueError("participation_cap must be in (0, 1]")
+                or not 0 < float(participation_cap) <= 0.01:
+            raise ValueError(
+                "participation_cap must be in (0, 0.01] for qualifying "
+                "research")
 
         n_trials = _positive_integer(
             evidence.get("n_trials"), field="n_trials")
-        del n_trials
+        integrity = evidence.get("research_integrity")
+        if not isinstance(integrity, Mapping) or set(integrity) != {
+                "ledger_head_hash", "opening", "opening_hash", "program_id"}:
+            raise ValueError("research integrity evidence is incomplete")
+        program_id = integrity.get("program_id")
+        if not isinstance(program_id, str) or not program_id.strip():
+            raise ValueError("research integrity program_id is required")
+        opening_hash = integrity.get("opening_hash")
+        ledger_head_hash = integrity.get("ledger_head_hash")
+        if not isinstance(opening_hash, str) \
+                or not isinstance(ledger_head_hash, str):
+            raise ValueError("research integrity hashes must be SHA-256 digests")
+        opening_hash = _validate_sha256(
+            opening_hash, field="holdout opening hash")
+        _validate_sha256(
+            ledger_head_hash, field="research ledger head hash")
+        opening = integrity.get("opening")
+        if not isinstance(opening, Mapping) or set(opening) != {
+                "actor", "data_artifact_hash", "holdout_id",
+                "holdout_spec_hash", "opened_at", "program_trial_count_at_open",
+                "protocol_hash", "protocol_trial_count_at_open", "record_type",
+                "schema_version", "trial_hash"}:
+            raise ValueError("holdout opening evidence is incomplete")
+        if opening.get("schema_version") != 1 \
+                or opening.get("record_type") != "holdout_opening":
+            raise ValueError("holdout opening schema is invalid")
+        actual_opening_hash = hashlib.sha256(
+            canonical_json(opening).encode("utf-8")).hexdigest()
+        if actual_opening_hash != opening_hash:
+            raise ValueError("holdout opening hash does not match its payload")
+        for field in ("protocol_hash", "trial_hash", "holdout_spec_hash",
+                      "data_artifact_hash"):
+            value = opening.get(field)
+            if not isinstance(value, str):
+                raise ValueError(f"holdout {field} must be a SHA-256 digest")
+            _validate_sha256(value, field=f"holdout {field}")
+        if opening.get("data_artifact_hash") != snapshot_version:
+            raise ValueError("holdout data differs from the warehouse snapshot")
+        protocol_trials = _positive_integer(
+            opening.get("protocol_trial_count_at_open"),
+            field="protocol_trial_count_at_open")
+        if (opening.get("program_trial_count_at_open") != n_trials
+                or protocol_trials > n_trials):
+            raise ValueError("research trial count is not ledger-derived")
+        for field in ("actor", "holdout_id"):
+            if not isinstance(opening.get(field), str) \
+                    or not str(opening[field]).strip():
+                raise ValueError(f"holdout {field} is required")
+        opened_at = opening.get("opened_at")
+        if not isinstance(opened_at, str) or not opened_at.endswith("Z"):
+            raise ValueError("holdout opened_at must be canonical UTC")
+        try:
+            parsed_opened_at = datetime.fromisoformat(
+                opened_at[:-1] + "+00:00")
+        except ValueError as exc:
+            raise ValueError("holdout opened_at is invalid") from exc
+        if parsed_opened_at.utcoffset() != timedelta(0):
+            raise ValueError("holdout opened_at must be UTC")
         regimes = evidence.get("regimes")
         if not isinstance(regimes, list) or not regimes:
             raise ValueError("research regime evidence is required")
@@ -757,6 +826,25 @@ def _require_authoritative_foundation_research(
         raise
     except (KeyError, TypeError, ValueError) as exc:
         raise _authoritative_foundation_research_error(str(exc)) from exc
+
+
+def _require_authoritative_research(artifact: PromotionArtifact) -> None:
+    """Apply the registered strategy-specific research verifier.
+
+    Passing scalar promotion metrics is never sufficient to authorize an
+    execution tier.  Every deployable strategy must have an explicit branch for
+    its complete evidence contract.  Adding one therefore requires a reviewed
+    code change; there is no mutable runtime verifier registry.  Until that
+    branch exists the strategy remains research-only, even if its artifact
+    carries evidence that resembles another strategy's accepted schema.
+    """
+    if artifact.strategy_id == "foundation":
+        _require_authoritative_foundation_research(artifact)
+        return
+    raise PromotionNotApproved(
+        "no authoritative research verifier is registered for strategy "
+        f"{artifact.strategy_id!r}"
+    )
 
 
 @dataclass(frozen=True)
@@ -1721,14 +1809,16 @@ class PromotionRegistry:
     def _approval_document(
             self, strategy_id: str, artifact_hash: str,
             level: PromotionLevel, *, actor: str | None,
-            paper_artifact_hash: str | None) -> str:
+            paper_artifact_hash: str | None,
+            replication_artifact_hash: str | None) -> str:
         return canonical_json({
-            "schema_version": 2,
+            "schema_version": 3,
             "strategy_id": strategy_id,
             "artifact_hash": artifact_hash,
             "approved_level": level.value,
             "actor": actor,
             "paper_artifact_hash": paper_artifact_hash,
+            "replication_artifact_hash": replication_artifact_hash,
             "promotion_policy_id": self.policy.policy_id,
             "paper_validation_policy_id": self.paper_validation_policy.policy_id,
         }) + "\n"
@@ -1782,11 +1872,10 @@ class PromotionRegistry:
             if document != expected:
                 raise ArtifactIntegrityError(
                     "promotion approval reference is invalid")
-            if level == PromotionLevel.LIVE_ELIGIBLE:
-                raise PromotionNotApproved(
-                    "legacy live approval has no paper validation evidence")
-            return document
-        if schema_version != 2:
+            raise PromotionNotApproved(
+                "legacy promotion approval schema 1 is inspect-only and cannot "
+                "authorize execution")
+        if schema_version not in (2, 3):
             raise ArtifactIntegrityError(
                 "unsupported promotion approval schema")
         expected_keys = {
@@ -1794,6 +1883,8 @@ class PromotionRegistry:
             "paper_artifact_hash", "promotion_policy_id",
             "paper_validation_policy_id",
         }
+        if schema_version == 3:
+            expected_keys.add("replication_artifact_hash")
         if set(document) != expected_keys:
             raise ArtifactIntegrityError(
                 "promotion approval reference is invalid")
@@ -1811,6 +1902,7 @@ class PromotionRegistry:
         if actor is not None and (not isinstance(actor, str) or not actor.strip()):
             raise ArtifactIntegrityError("promotion approval actor is invalid")
         paper_hash = document.get("paper_artifact_hash")
+        replication_hash = document.get("replication_artifact_hash")
         if actor is None:
             raise ArtifactIntegrityError("approval actor is missing")
         if level == PromotionLevel.LIVE_ELIGIBLE:
@@ -1819,10 +1911,155 @@ class PromotionRegistry:
             except ValueError as exc:
                 raise ArtifactIntegrityError(
                     "live approval paper evidence reference is invalid") from exc
+            if schema_version == 2:
+                raise PromotionNotApproved(
+                    "legacy live approval has no independent replication")
+            try:
+                _validate_sha256(
+                    replication_hash, field="replication_artifact_hash")
+            except ValueError as exc:
+                raise ArtifactIntegrityError(
+                    "live approval replication evidence reference is invalid") \
+                    from exc
         elif paper_hash is not None:
             raise ArtifactIntegrityError(
                 "paper approval cannot contain live validation evidence")
+        elif replication_hash is not None:
+            raise ArtifactIntegrityError(
+                "paper approval cannot contain replication evidence")
         return document
+
+    def _require_passing_replication(
+            self, artifact: PromotionArtifact,
+            replication_artifact_hash: str):
+        from analysis.independent_replication import (
+            ReplicationEvidenceStore,
+            ReplicationIntegrityError,
+        )
+        try:
+            digest = _validate_sha256(
+                replication_artifact_hash,
+                field="replication_artifact_hash")
+            replication = ReplicationEvidenceStore(self.root).load(digest)
+        except (FileNotFoundError, ReplicationIntegrityError, ValueError) as exc:
+            raise PromotionNotApproved(
+                "live promotion requires verified independent replication") \
+                from exc
+        if not replication.passed:
+            raise PromotionNotApproved(
+                "independent replication contains unresolved discrepancies")
+        research = artifact.evidence or {}
+        expected_protocol = research["research_integrity"]["opening"][
+            "protocol_hash"]
+        expected_data = research["warehouse_snapshot"]["version"]
+        if (replication.payload["protocol_hash"] != expected_protocol
+                or replication.payload["data_snapshot_hash"] != expected_data):
+            raise PromotionNotApproved(
+                "independent replication targets different research evidence")
+        return replication
+
+    def _require_terminal_research_integrity(
+            self, artifact: PromotionArtifact) -> None:
+        """Re-verify the on-disk chain through the permanent result decision."""
+        from analysis.research_integrity import (
+            ResearchIntegrityError,
+            ResearchIntegrityLedger,
+        )
+        evidence = artifact.evidence or {}
+        integrity = evidence["research_integrity"]
+        opening_payload = integrity["opening"]
+        ledger_root = self.root / "research-integrity"
+        if not (ledger_root / "program.json").is_file():
+            raise PromotionNotApproved(
+                "Foundation promotion requires its verified research ledger")
+        try:
+            ledger = ResearchIntegrityLedger(
+                ledger_root, program_id=integrity["program_id"])
+            ledger.verify()
+            protocol = ledger.get_protocol(opening_payload["protocol_hash"])
+            trial = ledger.get_trial(opening_payload["trial_hash"])
+            opening = ledger.get_holdout_opening(
+                protocol_hash=protocol.protocol_hash,
+                holdout_id=opening_payload["holdout_id"],
+            )
+            if opening is None or opening.opening_hash != integrity["opening_hash"]:
+                raise PromotionNotApproved(
+                    "research ledger opening differs from artifact evidence")
+            opening_event = ledger.event_hash_for(
+                event_kind="holdout_opened",
+                target_hash=opening.opening_hash,
+            )
+            if opening_event != integrity["ledger_head_hash"]:
+                raise PromotionNotApproved(
+                    "research opening checkpoint differs from the ledger")
+            outcome = ledger.get_trial_outcome(trial.trial_hash)
+            decision = ledger.get_holdout_decision(
+                protocol_hash=protocol.protocol_hash,
+                holdout_id=opening_payload["holdout_id"],
+            )
+            if (outcome is None
+                    or outcome.payload["status"] != "completed"
+                    or outcome.payload["evidence_hash"] != artifact.artifact_hash):
+                raise PromotionNotApproved(
+                    "research ledger has no matching terminal trial outcome")
+            if (decision is None
+                    or decision.payload["decision"] != "pass"
+                    or decision.payload["opening_hash"] != opening.opening_hash
+                    or decision.payload["result_artifact_hash"]
+                    != artifact.artifact_hash):
+                raise PromotionNotApproved(
+                    "research ledger has no matching permanent holdout decision")
+            terminal_event = ledger.event_hash_for(
+                event_kind="holdout_decided",
+                target_hash=decision.record_hash,
+            )
+            receipt_path = (
+                self.root / "research-integrity-receipts"
+                / f"{artifact.artifact_hash}.json")
+            raw_receipt = receipt_path.read_text(encoding="utf-8")
+            receipt = json.loads(raw_receipt)
+            if raw_receipt != canonical_json(receipt) + "\n" \
+                    or not isinstance(receipt, Mapping) \
+                    or set(receipt) != {"payload", "receipt_hash"}:
+                raise PromotionNotApproved(
+                    "research terminal receipt is not canonical")
+            receipt_payload = receipt["payload"]
+            if not isinstance(receipt_payload, Mapping) or set(
+                    receipt_payload) != {
+                        "artifact_hash", "decision_hash", "opening_event_hash",
+                        "opening_hash", "outcome_hash", "program_id",
+                        "protocol_hash", "record_type", "schema_version",
+                        "terminal_event_hash", "trial_hash",
+                    }:
+                raise PromotionNotApproved(
+                    "research terminal receipt is incomplete")
+            receipt_hash = hashlib.sha256(
+                canonical_json(receipt_payload).encode("utf-8")).hexdigest()
+            if receipt.get("receipt_hash") != receipt_hash:
+                raise PromotionNotApproved(
+                    "research terminal receipt hash is invalid")
+            expected_receipt = {
+                "schema_version": 1,
+                "record_type": "research_integrity_receipt",
+                "program_id": ledger.program_id,
+                "artifact_hash": artifact.artifact_hash,
+                "protocol_hash": protocol.protocol_hash,
+                "trial_hash": trial.trial_hash,
+                "opening_hash": opening.opening_hash,
+                "outcome_hash": outcome.record_hash,
+                "decision_hash": decision.record_hash,
+                "opening_event_hash": opening_event,
+                "terminal_event_hash": terminal_event,
+            }
+            if dict(receipt_payload) != expected_receipt:
+                raise PromotionNotApproved(
+                    "research terminal receipt differs from the verified ledger")
+        except PromotionNotApproved:
+            raise
+        except (FileNotFoundError, json.JSONDecodeError, KeyError,
+                ResearchIntegrityError, TypeError, ValueError) as exc:
+            raise PromotionNotApproved(
+                "Foundation research ledger failed verification") from exc
 
     def _eligible_artifact(
             self, strategy_id: str, artifact_hash: str,
@@ -1833,14 +2070,51 @@ class PromotionRegistry:
         if _LEVEL_RANK[artifact.decision] < _LEVEL_RANK[level]:
             raise PromotionNotApproved(
                 f"artifact decision {artifact.decision.value} does not satisfy {level.value}")
+        _require_authoritative_research(artifact)
         if artifact.strategy_id == "foundation":
-            _require_authoritative_foundation_research(artifact)
+            from analysis.research_report_store import (
+                ResearchReportStore,
+                recompute_foundation_results,
+            )
+            evidence = artifact.evidence or {}
+            report_hash = evidence["report_sha256"]
+            try:
+                report = ResearchReportStore(self.root).load(report_hash).report
+            except (ArtifactIntegrityError, FileNotFoundError, ValueError) as exc:
+                raise PromotionNotApproved(
+                    "Foundation promotion requires the complete verified raw "
+                    "research report") from exc
+            trades = report.get("trades")
+            pending = report.get("pending_signals")
+            history = report.get("portfolio_history")
+            if (not isinstance(trades, list)
+                    or len(trades) != evidence["trade_count"]
+                    or not isinstance(pending, list)
+                    or len(pending) != evidence["pending_signal_count"]
+                    or not isinstance(history, list)):
+                raise PromotionNotApproved(
+                    "raw research report contents differ from its summary")
+            try:
+                recomputed = recompute_foundation_results(
+                    report,
+                    n_trials=evidence["n_trials"],
+                    engine_parameters=evidence["engine_parameters"],
+                    regimes=evidence["regimes"],
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PromotionNotApproved(
+                    "raw research report cannot reproduce its summary") from exc
+            if recomputed.to_dict() != artifact.payload["results"]:
+                raise PromotionNotApproved(
+                    "raw research report statistics differ from its summary")
+            self._require_terminal_research_integrity(artifact)
         return artifact
 
     def promote(
             self, strategy_id: str, artifact_hash: str,
             required_level: PromotionLevel, *, actor: str | None = None,
-            paper_artifact_hash: str | None = None) -> Path:
+            paper_artifact_hash: str | None = None,
+            replication_artifact_hash: str | None = None) -> Path:
         level = PromotionLevel(required_level)
         if level == PromotionLevel.RESEARCH_ONLY:
             raise ValueError("research-only artifacts are not deployment approvals")
@@ -1870,17 +2144,28 @@ class PromotionRegistry:
                 raise PromotionNotApproved(
                     "paper validation evidence does not satisfy live policy")
             approved_paper_hash = evidence.artifact_hash
+            if replication_artifact_hash is None:
+                raise PromotionNotApproved(
+                    "live promotion requires independent replication evidence")
+            replication = self._require_passing_replication(
+                artifact, replication_artifact_hash)
+            approved_replication_hash = replication.evidence_hash
         else:
             approving_actor = self._normalize_actor(actor, required=True)
             if paper_artifact_hash is not None:
                 raise ValueError(
                     "paper validation evidence is only valid for live approval")
+            if replication_artifact_hash is not None:
+                raise ValueError(
+                    "replication evidence is only valid for live approval")
             approved_paper_hash = None
+            approved_replication_hash = None
         path = self._approval_path(strategy_id, artifact_hash, level)
         _atomic_create(path, self._approval_document(
             strategy_id, artifact.artifact_hash, level,
             actor=approving_actor,
-            paper_artifact_hash=approved_paper_hash))
+            paper_artifact_hash=approved_paper_hash,
+            replication_artifact_hash=approved_replication_hash))
         return path
 
     def require_approved(self, strategy_id: str, artifact_hash: str,
@@ -1914,6 +2199,8 @@ class PromotionRegistry:
             strategy_id, artifact.artifact_hash,
             PromotionLevel.LIVE_ELIGIBLE)
         approved_paper_hash = str(approval["paper_artifact_hash"])
+        approved_replication_hash = str(
+            approval["replication_artifact_hash"])
         if paper_artifact_hash is not None:
             expected_hash = _validate_sha256(
                 paper_artifact_hash, field="paper_artifact_hash")
@@ -1928,4 +2215,6 @@ class PromotionRegistry:
         if not evidence.passed:
             raise PromotionNotApproved(
                 "paper validation evidence does not satisfy live policy")
+        self._require_passing_replication(
+            artifact, approved_replication_hash)
         return artifact, evidence

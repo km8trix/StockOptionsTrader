@@ -14,6 +14,10 @@ from analysis.promotion import (
     PromotionRegistry,
     PromotionResults,
 )
+from analysis.research_report_store import (
+    ResearchReportArtifact,
+    ResearchReportStore,
+)
 from desks.deployment_config import (
     FoundationDeploymentConfig,
     FoundationDeploymentIdentity,
@@ -22,10 +26,32 @@ from desks.foundation import FoundationDesk
 from desks.ml_model import GradientBoostingModel
 from desks.registry import create_deployed_desk
 from tests.paper_evidence_helpers import authoritative_paper_evidence
+from tests.replication_evidence_helpers import persist_passing_replication
+from tests.research_evidence_helpers import (
+    fixture_engine_parameters,
+    fixture_integrity_evidence,
+    fixture_regimes,
+    fixture_results,
+    persist_terminal_integrity,
+    positive_foundation_report,
+)
 
 
 CODE_SHA = "a" * 40
 DATA_SHA = "eb12241b17158c2ac21b6c18f8b23f12b3f1a0a3fde3c4e6ac94feed72a7f411"
+
+
+def _fixture_report():
+    return positive_foundation_report(2)
+
+
+def _research_integrity(n_trials=3):
+    return fixture_integrity_evidence(
+        snapshot_sha=DATA_SHA,
+        code_sha=CODE_SHA,
+        n_trials=n_trials,
+        identity="deployment-config",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -38,18 +64,7 @@ def _clean_approved_runtime(monkeypatch):
 
 
 def _live_results() -> PromotionResults:
-    return PromotionResults(
-        psr=0.99,
-        dsr=0.98,
-        oos_total_folds=4,
-        oos_testable_folds=4,
-        oos_significant_bh=3,
-        cost_model_applied=True,
-        estimated_cost_bps=12.0,
-        cost_adjusted_return=0.20,
-        annual_turnover=3.0,
-        regime_results={"bull": 0.20, "bear": 0.02, "sideways": 0.08},
-    )
+    return fixture_results(trade_count=2)
 
 
 def _config(**overrides) -> FoundationDeploymentConfig:
@@ -71,7 +86,7 @@ def _config(**overrides) -> FoundationDeploymentConfig:
 def _research_evidence(universe, results: PromotionResults) -> dict:
     symbols = sorted({str(symbol).strip().upper() for symbol in universe})
     return {
-        "runner": "foundation_research_v2",
+        "runner": "foundation_research_v4",
         "window": ["2022-01-01", "2024-12-31"],
         "universe_selection": {
             "requested_as_of": "2022-01-01",
@@ -94,22 +109,12 @@ def _research_evidence(universe, results: PromotionResults) -> dict:
             ],
             "quality_flags": [],
         },
-        "engine_parameters": {
-            "initial_capital": 100_000.0,
-            "commission": 0.001,
-            "slippage_bps": 5.0,
-            "enable_realistic_fills": True,
-            "impact_coef": 0.01,
-            "participation_cap": 0.10,
-            "adv_window": 20,
-            "seed": 7,
-        },
+        "engine_parameters": fixture_engine_parameters(),
         "n_trials": 3,
-        "regimes": [
-            {"name": name, "start": "2022-01-01", "end": "2024-12-31"}
-            for name in results.regime_results
-        ],
-        "report_sha256": "d" * 64,
+        "research_integrity": _research_integrity(),
+        "regimes": fixture_regimes(tuple(results.regime_results)),
+        "report_sha256": ResearchReportArtifact.create(
+            _fixture_report()).report_hash,
         "trade_count": 2,
         "pending_signal_count": 0,
         "provenance": {
@@ -138,7 +143,10 @@ def _approved(tmp_path, config: FoundationDeploymentConfig):
         results=results,
         evidence=_research_evidence(universe, results),
     )
+    ResearchReportStore(registry.root).persist(
+        ResearchReportArtifact.create(_fixture_report()))
     registry.store.persist(artifact)
+    persist_terminal_integrity(registry.root, artifact)
     _approve_live(registry, artifact)
     return registry, artifact
 
@@ -163,10 +171,12 @@ def _approve_live(registry: PromotionRegistry,
         evidence=authoritative_paper_evidence(artifact, fills=4),
     )
     registry.paper_validation_store.persist(validation)
+    replication = persist_passing_replication(registry, artifact)
     registry.promote(
         "foundation", artifact.artifact_hash,
         PromotionLevel.LIVE_ELIGIBLE, actor="deployment-test",
         paper_artifact_hash=validation.artifact_hash,
+        replication_artifact_hash=replication.evidence_hash,
     )
 
 

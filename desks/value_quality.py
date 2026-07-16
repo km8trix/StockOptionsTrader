@@ -1,11 +1,12 @@
 """Value+Quality composite desk — the screened two-factor rank blend.
 
-Graduates the validated screen composite (scripts/factor_screen.py value pb +
+Implements the legacy screen composite (scripts/factor_screen.py value pb +
 scripts/quality_screen.py netmargin, combined per the 2026-07-02 rank-average
 study: composite beat each leg on both t and magnitude) to a desk. Score =
 mean of the cross-sectional percentile ranks of CHEAPNESS (low DAILY pb,
 non-positive pb dropped — value traps are not "cheap") and PROFITABILITY
 (latest PIT SF1 netmargin; negative margins are legitimate short-leg members).
+Those historical comparisons are development evidence, not a qualifying edge.
 
 PIT discipline: pb comes from the DAILY table (point-in-time by nature) on
 the simulated date; netmargin from the latest ARQ filing with datekey <= date,
@@ -14,7 +15,8 @@ carrying a years-old margin. Monthly score cache (the base calls
 _alpha_scores daily), monthly effective cadence — the cadence the screens
 validated.
 
-FIXED factor: committee=[] => walk_forward_fits=[] => n_trials=1 validation.
+FIXED factor: committee=[] => walk_forward_fits=[]. Historical validation used
+n_trials=1; qualifying DSR uses the ledger-derived program-wide trial count.
 Wide RiskManager (monthly signal; a 2% stop would churn it). Run under
 ``BacktestEngine(desk=..., market_data=WarehouseMarketData())``.
 

@@ -1,11 +1,13 @@
 """Net-issuance desk — YoY split-adjusted share growth, buybacks long.
 
-Graduates the validated issuance screen (scripts/issuance_screen.py,
+Implements the strongest legacy issuance screen (scripts/issuance_screen.py,
 2026-07-10: 8/8 BH survivors, pooled 63d net +4.83% t=+3.42, and uniquely a
 LIVE MID-CAP slice — 63d net +1.89% t=+2.79 — where value/quality/PEAD all
 died; measured long-leg turnover 7.3%/rebalance) to a desk. The signal math
 is the shared data/share_issuance.issuance_table — one definition for screen
-and desk.
+and desk. Those survivor counts used future-informed current size filtering
+and gross-return inference, so they are hypothesis provenance, not qualifying
+evidence of a tradeable edge.
 
 SIGN CONVENTION (explicit, academic — Pontiff-Woodgate / Daniel-Titman):
 HIGH issuance predicts LOW returns. The base machinery longs the HIGHEST
@@ -32,7 +34,9 @@ screen uniquely survived, and stays disjoint from the micro PEAD leg
 equal desk.key (the vq_fund_gate key contract) or risk-parity silently
 degenerates to the equal-weight fallback.
 
-FIXED factor: committee=[] => walk_forward_fits=[] => n_trials=1 validation.
+FIXED factor: committee=[] => walk_forward_fits=[]. The historical gate treated
+this as n_trials=1; qualifying work instead uses the program-wide count from
+the append-only research ledger.
 Wide RiskManager (0.50 stop — monthly signal; a 2% stop would churn it).
 Monthly score cache (the base calls _alpha_scores daily), monthly effective
 cadence — the BMS cadence the screen validated. Run under

@@ -1,0 +1,37 @@
+{
+  "EA": {
+    "exp_rpt_date_qr1.gte": "2015-01-01",
+    "exp_rpt_date_qr1.lte": "2024-09-30",
+    "m_ticker": "AAPL,AXP,BA,BEL,CHL,CSCO,CTR,DIS,DOW,GE,GS&,HOMD,IBM,ITL,J,JNJ,KO,MCD,MMM,MRK,MSFT,NIKE,PFE,PG,SD,SPM,UNIH,VISA,WMS"
+  },
+  "EEH": {
+    "obs_date.gte": "2014-01-01",
+    "obs_date.lte": "2024-09-30",
+    "per_end_date.gte": "2014-01-01",
+    "per_end_date.lte": "2024-09-30",
+    "per_type": "Q",
+    "ticker": "AAPL,AXP,BA,CAT,CSCO,CVX,DD,DIS,GE,GS,HD,IBM,INTC,JNJ,JPM,KO,MCD,MMM,MRK,MSFT,NKE,PFE,PG,TRV,UNH,V,VZ,WMT,XOM"
+  },
+  "ES": {
+    "per_end_date.gte": "2014-01-01",
+    "per_end_date.lte": "2024-09-30",
+    "ticker": "AAPL,AXP,BA,CAT,CSCO,CVX,DD,DIS,GE,GS,HD,IBM,INTC,JNJ,JPM,KO,MCD,MMM,MRK,MSFT,NKE,PFE,PG,TRV,UNH,V,VZ,WMT,XOM"
+  },
+  "MT": {
+    "m_ticker": "AAPL,AXP,BA,BEL,CHL,CSCO,CTR,DIS,DOW,GE,GS&,HOMD,IBM,ITL,J,JNJ,KO,MCD,MMM,MRK,MSFT,NIKE,PFE,PG,SD,SPM,UNIH,VISA,WMS"
+  },
+  "SEH": {
+    "obs_date.gte": "2014-01-01",
+    "obs_date.lte": "2024-09-30",
+    "per_end_date.gte": "2014-01-01",
+    "per_end_date.lte": "2024-09-30",
+    "per_type": "Q",
+    "ticker": "AAPL,AXP,BA,CAT,CSCO,CVX,DD,DIS,GE,GS,HD,IBM,INTC,JNJ,JPM,KO,MCD,MMM,MRK,MSFT,NKE,PFE,PG,TRV,UNH,V,VZ,WMT,XOM"
+  },
+  "SS": {
+    "per_end_date.gte": "2014-01-01",
+    "per_end_date.lte": "2024-09-30",
+    "per_type": "Q",
+    "ticker": "AAPL,AXP,BA,CAT,CSCO,CVX,DD,DIS,GE,GS,HD,IBM,INTC,JNJ,JPM,KO,MCD,MMM,MRK,MSFT,NKE,PFE,PG,TRV,UNH,V,VZ,WMT,XOM"
+  }
+}

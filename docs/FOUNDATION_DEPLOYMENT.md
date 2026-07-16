@@ -21,11 +21,11 @@ trading evidence and not entries in an operator's promotion registry.
 
 | Stage | Required evidence/control | Implementation |
 |---|---|---|
-| Research | PIT fixed-start universe, dated market-cap ranking, hashed source files before/after, clean Git SHA, exact dependencies/config, seed, explicit trial count, realistic fills/cost stress, OOS/DSR/PSR/BH/regime/turnover gates | `analysis.foundation_research` |
+| Research | Exact frozen protocol/trial binding, PIT fixed-start universe, dated market-cap ranking, hashed source files before/after, clean Git SHA, exact dependencies/config/seed/window/costs/regimes/policy, ledger-derived trial count, strict ADV fills, aggregate OOS PSR/DSR/economic gates, and diagnostic calendar/regime results | `analysis.foundation_research` |
 | Paper approval | Immutable human approval of one exact research hash | `analysis.promotion.PromotionRegistry` |
 | Paper execution | Exact artifact-built target-native desk; signals use only the prior completed NYSE session (D close), while pricing and orders use a provider-timestamped quote observed within five minutes in the current session (D+1); durable independent broker ledger and LocalBook; safe model checkpoints; idempotent target orders; explicit costs; pre/post one-cent reconciliation each cycle | `deployment.rehearsal`, `brokers.paper_trader` |
 | Paper qualification | Independently recomputed, content-addressed cycle/quote/order/reconciliation evidence tied to the research/config/code hash; at least 20 cycles across 15 real NYSE sessions, a completed flat buy/sell round trip and 41 reconciliation checks; zero derived errors, unknown/open orders, or reconciliation failures; valid audit chain and a fitted, restorable final model checkpoint | `PaperValidationArtifact` |
-| Live approval | A second named actor, distinct from the paper approver, explicitly binds the exact research hash to the exact passing paper hash | `PromotionRegistry.promote(... live_eligible ...)` |
+| Live approval | A second named actor, distinct from the paper approver, explicitly binds the exact research, passing paper, and independent-replication hashes | `PromotionRegistry.promote(... live_eligible ...)` |
 | Live staging | Expiring account/environment/universe manifest, absolute order/day limits, generic gross/per-name limits, distinct risk and operations approvers | `deployment.state` |
 | Activation | Production account match, connected auth, clean exact build, verified audit, engaged kill switch, initialized/flat book, no working orders/reservations, strict reconciliation, exact desk/config, and exact restoration of a current-or-prior-session paper checkpoint | `deployment.live.FoundationLiveController.prepare` |
 | Running/rollback | Manifest authorization immediately below strategy code, persistent daily limits, audited state, engage-kill-first pause/revoke and final reconciliation | `FoundationExecutionGuard`, `FoundationLiveController` |
@@ -50,6 +50,8 @@ desk factories remain available for research only.
 - The exact research universe is used in paper and live. Removing names would
   change position sizing and model input, so a manifest cannot deploy a subset.
 - Research artifacts never promote themselves.
+- Paper promotion recomputes the complete raw report statistics and replays the
+  on-disk integrity chain through its terminal result receipt.
 - Live approval cannot skip paper approval or paper qualification.
 - A different paper run cannot reuse an existing live approval.
 - The complete fitted paper checkpoint is inside the paper artifact. Live
@@ -95,22 +97,60 @@ and risk reservations intentionally share that transaction boundary.
 
 First ingest the required PIT warehouse tables (`tickers`, `sep`, `daily`, and
 `actions`). Commit all code changes: qualifying research refuses an unknown or
-dirty Git checkout. Count every strategy/model/parameter variant tried, not
-only the winning run.
+dirty Git checkout. Before touching the holdout, freeze the complete protocol
+and register every attempted strategy/model/parameter variant—including failed
+and abandoned historical attempts—in the append-only integrity ledger. The
+ledger CLI accepts strict JSON matching `ResearchProtocol.create` and
+`TrialRegistration.create`; it exposes no trial-count override. Protocol,
+trial, and outcome JSON must include explicit `frozen_at`, `registered_at`, and
+`recorded_at` timestamps respectively. Holdout commands likewise require
+`--opened-at` / `--decided-at`, keeping exact retries content-identical.
+
+```bash
+INTEGRITY="$REGISTRY/research-integrity"
+PROGRAM="stock-options-trader"
+
+$PY -m scripts.research_integrity \
+  --ledger-root "$INTEGRITY" --program-id "$PROGRAM" \
+  freeze-protocol --json research-protocol.json
+
+$PY -m scripts.research_integrity \
+  --ledger-root "$INTEGRITY" --program-id "$PROGRAM" \
+  register-trial --json foundation-trial.json
+```
+
+Keep the returned `protocol_hash`, `trial_hash`, and ledger `head_hash` in the
+review record. Anchor the head outside this mutable checkout (for example an
+object-locked record or signed release) so deleting a valid ledger tail is
+detectable.
 
 ```bash
 $PY $PIPELINE research \
   --registry-root "$REGISTRY" \
   --warehouse-dir pit_warehouse \
-  --trials 7 \
-  --start 2015-01-01 \
-  --end 2024-12-31 \
+  --integrity-root "$INTEGRITY" \
+  --program-id "$PROGRAM" \
+  --protocol-hash PROTOCOL_HASH \
+  --trial-hash TRIAL_HASH \
+  --holdout-id foundation-oos-v1 \
+  --reviewer independent-reviewer@example.com \
+  --start HOLDOUT_START \
+  --end HOLDOUT_END \
   --max-symbols 100
 ```
 
-The command always persists the immutable artifact but creates no approval. If
-its printed decision is `research_only`, stop. Improve the hypothesis or data;
-do not weaken the policy around it.
+The command opens the named holdout before universe selection or strategy
+execution, derives DSR trial breadth from the count captured by that opening,
+persists the complete raw report and immutable summary, and writes one
+permanent pass/fail decision back to the ledger plus an immutable terminal
+receipt under the same registry. Promotion recomputes PSR, DSR, net return,
+turnover, costs, and regime results from that raw report and re-verifies the
+protocol/trial/opening/outcome/decision chain. It creates no deployment
+approval. If its printed decision is `research_only`, that protocol/holdout has
+failed permanently. Improve the next protocol using development data; do not
+reuse the holdout. `--start` and `--end` are intentionally mandatory: all
+locally inspected 2015–2024 data is development evidence and must not be used
+as the example or default holdout window.
 
 If `--start`/`--universe-as-of` is not an exchange session (for example,
 2015-01-01), membership is still frozen at that requested date but ranking uses
@@ -118,6 +158,15 @@ the most recent DAILY market-cap observation on or before it. The artifact
 records both dates and exact coverage counts. Every eligible name must have a
 finite positive market cap; missing coverage fails instead of falling back to
 alphabetical ticker order. `--universe-as-of` cannot be later than `--start`.
+
+The Foundation protocol is not an opaque note. Its data plan exactly binds the
+snapshot and PIT-universe method; its evaluation plan declares aggregate net
+OOS as primary, calendar years as diagnostics, realized execution costs, and
+independent replication; and its decision rules bind the promotion-policy hash
+and terminal one-shot failure. The registered trial must exactly equal
+`foundation_trial_inputs(...)`, including the full strategy configuration,
+window, universe rule, engine economics, regimes, and policy hash. Code, data,
+candidate, and seed identities must also match the run.
 
 Inspect an artifact:
 
@@ -196,13 +245,23 @@ checks. These are minimums, not a replay shortcut. Result/report failures are
 derived from the sealed facts rather than trusted from a summary counter, and
 the run must have zero errors, unknown/open orders, or reconciliation failures.
 
-### 4. Bind live approval to passing paper evidence
+### 4. Bind live approval to paper and replication evidence
+
+Before approval, an independent implementation must be run against the exact
+frozen protocol and warehouse snapshot. Reconcile its complete checkpoints
+with `analysis.independent_replication`, then persist the passing evidence with
+`ReplicationEvidenceStore(REGISTRY)`. Record the returned content hash as
+`REPLICATION_HASH`. A missing artifact, any unresolved discrepancy, or a
+protocol/data hash mismatch fails live approval. The replication contract must
+freeze a nonempty expected checkpoint-key manifest; agreeing empty or partial
+outputs fail even when both implementations omit the same checkpoints.
 
 ```bash
 $PY $PIPELINE approve-live \
   --registry-root "$REGISTRY" \
   --artifact RESEARCH_HASH \
   --paper-artifact PAPER_HASH \
+  --replication-artifact REPLICATION_HASH \
   --actor live-risk-owner@example.com
 ```
 
@@ -316,8 +375,8 @@ research_only
     └─ passing immutable research artifact
        └─ PAPER_ELIGIBLE + named paper approval
           └─ durable paper cycles + reconciliation evidence
-             └─ passing PAPER_HASH
-                └─ LIVE_ELIGIBLE approval bound to RESEARCH_HASH + PAPER_HASH
+             └─ passing PAPER_HASH + independently reconciled REPLICATION_HASH
+                └─ LIVE_ELIGIBLE approval bound to all three hashes
                    └─ STAGED
                       └─ RISK_APPROVED (actor A)
                          └─ OPS_APPROVED (actor B)

@@ -1,0 +1,133 @@
+{
+  "artifact_contract": {
+    "payload_schema_version": "zacks_pead_snapshot.v1",
+    "required_payload_fields": [
+      "candidate_id",
+      "source_id",
+      "evidence_class",
+      "captured_at",
+      "requested_window",
+      "coverage",
+      "tables"
+    ],
+    "required_table_fields": [
+      "columns",
+      "rows",
+      "canonical_request",
+      "response_sha256",
+      "provider_metadata"
+    ],
+    "wrapper_fields": [
+      "artifact_hash",
+      "payload"
+    ]
+  },
+  "candidate_id": "pead-vq-locked-replication-v1",
+  "current_blocker": "The accepted Nasdaq Data Link credential exposes a 2018 Zacks sample rather than complete historical coverage. No qualifying snapshot or prospective commitment exists.",
+  "evidence_lanes": {
+    "full_historical_reconstruction": {
+      "allowed_claim": "independent-source reconstruction and falsification after complete coverage and implementation reconciliation",
+      "minimum_requested_window": {
+        "end": "2024-09-30",
+        "start": "2015-01-01"
+      },
+      "qualification_limit": "The period was previously inspected through other data and is not fresh prospective evidence. It cannot alone support promotion."
+    },
+    "prospective_signal": {
+      "allowed_claim": "qualifying prospective signal evidence only after the protocol, source manifest, query identity, acquisition plan, and append-only dates are committed before the first observation",
+      "end": null,
+      "start": null,
+      "status": "not_committed"
+    },
+    "sample_2018": {
+      "allowed_claim": "development-only parser, join, timing, coverage, and reconciliation validation",
+      "qualifying_evidence": false,
+      "status": "available_but_not_sealed"
+    }
+  },
+  "historical_acquisition": {
+    "canonicalization": {
+      "credentials_in_requests": "forbidden",
+      "duplicate_policy": "reject duplicate natural keys unless raw revisions are separately identified and preserved",
+      "raw_response_preservation": "required before parsing",
+      "row_representation": "mapping from exact provider column to raw provider value",
+      "row_sort": {
+        "ZACKS/EA": [
+          "m_ticker"
+        ],
+        "ZACKS/EEH": [
+          "m_ticker",
+          "per_end_date",
+          "per_type",
+          "obs_date"
+        ],
+        "ZACKS/ES": [
+          "m_ticker",
+          "per_end_date",
+          "per_type",
+          "act_rpt_date"
+        ],
+        "ZACKS/MT": [
+          "m_ticker"
+        ],
+        "ZACKS/SEH": [
+          "m_ticker",
+          "per_end_date",
+          "per_type",
+          "obs_date"
+        ],
+        "ZACKS/SS": [
+          "m_ticker",
+          "per_end_date",
+          "per_type",
+          "act_rpt_date"
+        ]
+      }
+    },
+    "method": "Use a complete provider bulk export when licensed. If filtering or pagination is required, preserve every canonical request, cursor receipt, response hash, and provider refresh/snapshot timestamp and prove contiguous coverage before assembly.",
+    "required_tables": [
+      "ZACKS/ES",
+      "ZACKS/SS",
+      "ZACKS/EEH",
+      "ZACKS/SEH",
+      "ZACKS/MT",
+      "ZACKS/EA"
+    ]
+  },
+  "manual_reconciliation": {
+    "actual_and_timestamp_source": "issuer earnings release attached to SEC Item 2.02 8-K, with EDGAR acceptance time retained separately from the vendor announcement time",
+    "consensus_reconciliation": "reconstruct the last strictly prior-date EEH/SEH vintage and compare it with ES/SS pre-release estimate fields without overwriting either value",
+    "discrepancy_policy": "retain every discrepancy; unresolved event identity, direction-changing actual/estimate differences, or timestamp conflicts block qualification",
+    "sample_rule": "50 distinct events selected by a deterministic PRNG seeded with the UTF-8 string pead-vq-locked-replication-v1-source-audit-v1"
+  },
+  "prospective_acquisition": {
+    "actual_capture": "After each announcement, append every observed ES/SS version with its trusted acquisition time; never overwrite an earlier version.",
+    "append_only": true,
+    "commitment_required_before_first_observation": true,
+    "consensus_capture": "Seal an event-specific EEH/SEH snapshot no later than the close of the prior observed market session. Eligibility requires its trusted acquisition time to precede the announcement timestamp.",
+    "event_schedule": "Use EA only to schedule acquisition. Projected or revised EA dates are retained as revisions and never treated as actual announcement timestamps.",
+    "query_hash_required": true,
+    "realized_snapshot_hash_supplied_only_at_decision": true,
+    "sealed": true,
+    "source_manifest_hash_required": true
+  },
+  "quality_gates": [
+    "exact provider schema matches source_manifest.json",
+    "all raw responses and normalized payloads have verified SHA-256 hashes",
+    "requested-window coverage is contiguous and includes delisted identities",
+    "m_ticker maps uniquely through MT and ticker reuse is not collapsed",
+    "ES and EEH event keys reconcile without same-day consensus leakage",
+    "SS and SEH event keys reconcile without same-day consensus leakage",
+    "act_rpt_date, act_rpt_time, and act_rpt_code are present and mutually consistent",
+    "actual EPS, consensus, analyst count, and preannouncement split-normalized close are finite and nonmissing, with exact same-session closeunadj execution evidence",
+    "every announcement visibility decision independently re-extracts the content-addressed official ICE/NYSE raw session-close source bytes and receipt, including published 13:00 ET early closes, and fails closed on any source/calendar mismatch or outside its covered window",
+    "every holding horizon maps to the exact global observed session without ticker-local sliding or cross-horizon survivor selection",
+    "the ACTIONS raw ZIP and Parquet conversion have identical typed row-multiset commitments, and their schema, provider snapshot time, statistics, and hashes verify against one content-addressed acquisition receipt",
+    "corporate actions and separately sourced delisting economics are complete for every held security; ACTIONS.value is never treated as terminal proceeds per share",
+    "coverage, missingness, anomaly, revision, and identifier reports are sealed",
+    "independent reviewer reproduces the snapshot and signs an attestation"
+  ],
+  "schema_version": "pead_acquisition_plan.v1",
+  "source_id": "nasdaq-data-link-zacks",
+  "status": "blocked_pending_full_history_license_and_prospective_commitment"
+}

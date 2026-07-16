@@ -1,0 +1,208 @@
+{
+  "artifact_hash": "5e68b8f6a4ea6960dafcc43fa30ebafed94dff3b5310b3bc4364316703f9254f",
+  "payload": {
+    "coverage": {
+      "end": "2025-12-31",
+      "start": "2014-01-01"
+    },
+    "early_close_local_time": "13:00:00",
+    "early_close_sessions": [
+      {
+        "date": "2014-07-03",
+        "source_id": "ice-2014-2015"
+      },
+      {
+        "date": "2014-11-28",
+        "source_id": "ice-2014-2015"
+      },
+      {
+        "date": "2014-12-24",
+        "source_id": "ice-2014-2015"
+      },
+      {
+        "date": "2015-11-27",
+        "source_id": "ice-2015-2016"
+      },
+      {
+        "date": "2015-12-24",
+        "source_id": "ice-2015-2016"
+      },
+      {
+        "date": "2016-11-25",
+        "source_id": "ice-2015-2016"
+      },
+      {
+        "date": "2017-07-03",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2017-11-24",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2018-07-03",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2018-11-23",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2018-12-24",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2019-07-03",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2019-11-29",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2019-12-24",
+        "source_id": "ice-2017-2019"
+      },
+      {
+        "date": "2020-11-27",
+        "source_id": "ice-2018-2020"
+      },
+      {
+        "date": "2020-12-24",
+        "source_id": "ice-2018-2020"
+      },
+      {
+        "date": "2021-11-26",
+        "source_id": "ice-2021-2023"
+      },
+      {
+        "date": "2022-11-25",
+        "source_id": "ice-2022-2024"
+      },
+      {
+        "date": "2023-07-03",
+        "source_id": "ice-2022-2024"
+      },
+      {
+        "date": "2023-11-24",
+        "source_id": "ice-2022-2024"
+      },
+      {
+        "date": "2024-07-03",
+        "source_id": "ice-2022-2024"
+      },
+      {
+        "date": "2024-11-29",
+        "source_id": "ice-2022-2024"
+      },
+      {
+        "date": "2024-12-24",
+        "source_id": "ice-2022-2024"
+      },
+      {
+        "date": "2025-07-03",
+        "source_id": "ice-2025-2027"
+      },
+      {
+        "date": "2025-11-28",
+        "source_id": "ice-2025-2027"
+      },
+      {
+        "date": "2025-12-24",
+        "source_id": "ice-2025-2027"
+      }
+    ],
+    "observed_session_rule": "SEP-observed sessions use the listed 13:00 early close when present and otherwise the NYSE 16:00 core-session close; dates absent from SEP receive no inferred session.",
+    "regular_close_local_time": "16:00:00",
+    "schema_version": "nyse_session_close_calendar.v1",
+    "sources": [
+      {
+        "covered_years": [
+          2014,
+          2015
+        ],
+        "publisher": "Intercontinental Exchange / NYSE Euronext",
+        "source_id": "ice-2014-2015",
+        "url": "https://ir.theice.com/press/news-details/2013/NYSE-Euronext-Announces-2015-Holiday-Calendar-and-Early-Closings/default.aspx"
+      },
+      {
+        "covered_years": [
+          2015,
+          2016
+        ],
+        "publisher": "Intercontinental Exchange / NYSE Group",
+        "source_id": "ice-2015-2016",
+        "url": "https://ir.theice.com/press/news-details/2014/NYSE-Group-2016-Holiday-Calendar-and-Early-Closings/default.aspx"
+      },
+      {
+        "covered_years": [
+          2017,
+          2018,
+          2019
+        ],
+        "publisher": "Intercontinental Exchange / NYSE Group",
+        "source_id": "ice-2017-2019",
+        "url": "https://ir.theice.com/press/news-details/2016/NYSE-Group-announces-2018-and-2019-holiday-and-early-closings-calendar/default.aspx"
+      },
+      {
+        "covered_years": [
+          2018,
+          2019,
+          2020
+        ],
+        "publisher": "Intercontinental Exchange / NYSE Group",
+        "source_id": "ice-2018-2020",
+        "url": "https://ir.theice.com/press/news-details/2017/NYSE-Group-Announces-2018-2019-and-2020-Holiday-and-Early-Closings-Calendar/default.aspx"
+      },
+      {
+        "covered_years": [
+          2021,
+          2022,
+          2023
+        ],
+        "publisher": "Intercontinental Exchange / NYSE Group",
+        "source_id": "ice-2021-2023",
+        "url": "https://ir.theice.com/press/news-details/2020/NYSE-Group-Announces-2021-2022-and-2023-Holiday-and-Early-Closings-Calendar/default.aspx"
+      },
+      {
+        "covered_years": [
+          2022,
+          2023,
+          2024
+        ],
+        "publisher": "Intercontinental Exchange / NYSE Group",
+        "source_id": "ice-2022-2024",
+        "url": "https://ir.theice.com/press/news-details/2021/NYSE-Group-Announces-2022-2023-and-2024-Holiday-and-Early-Closings-Calendar/default.aspx"
+      },
+      {
+        "covered_years": [
+          2025
+        ],
+        "publisher": "Intercontinental Exchange / NYSE Group",
+        "source_id": "ice-2025-2027",
+        "url": "https://ir.theice.com/press/news-details/2024/NYSE-Group-Announces-2025-2026-and-2027-Holiday-and-Early-Closings-Calendar/default.aspx"
+      },
+      {
+        "covered_years": [
+          2014,
+          2015,
+          2016,
+          2017,
+          2018,
+          2019,
+          2020,
+          2021,
+          2022,
+          2023,
+          2024,
+          2025
+        ],
+        "publisher": "New York Stock Exchange",
+        "source_id": "nyse-core-hours",
+        "url": "https://www.nyse.com/trade/hours-calendars"
+      }
+    ],
+    "timezone": "America/New_York",
+    "venue": "NYSE cash equities"
+  }
+}

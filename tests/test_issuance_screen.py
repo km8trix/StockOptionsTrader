@@ -10,7 +10,13 @@ import pytest
 
 from data.share_issuance import _share_rows, issuance_table
 from scripts.factor_screen import factor_study
-from scripts.issuance_screen import collect_issuance_events, long_leg_turnover
+from scripts.issuance_screen import (
+    _canonical_utc_timestamp,
+    _write_development_report,
+    collect_issuance_events,
+    long_leg_turnover,
+    monthly_formation_dates,
+)
 
 
 def test_screen_reexports_the_data_seam():
@@ -21,6 +27,49 @@ def test_screen_reexports_the_data_seam():
     import scripts.issuance_screen as screen
     assert screen.issuance_table is issuance_table
     assert screen._share_rows is _share_rows
+
+
+def test_monthly_formations_use_first_observed_session_not_business_weekday():
+    sessions = pd.DatetimeIndex([
+        '2023-12-29',
+        '2024-01-02',  # Jan 1 was a Monday but the exchange was closed.
+        '2024-01-03',
+        '2024-02-01',
+        '2024-02-02',
+    ])
+
+    got = monthly_formation_dates(sessions, '2024-01-01', '2024-02-29')
+
+    assert got.equals(pd.DatetimeIndex(
+        ['2024-01-02', '2024-02-01'], name='date'))
+
+
+def test_monthly_formations_reject_reversed_window_and_preserve_missing_month():
+    with pytest.raises(ValueError, match='start must be on or before end'):
+        monthly_formation_dates([], '2024-02-01', '2024-01-01')
+    got = monthly_formation_dates(
+        ['2024-01-02', '2024-03-01'], '2024-01-01', '2024-03-31')
+    assert list(got) == [pd.Timestamp('2024-01-02'), pd.Timestamp('2024-03-01')]
+
+
+def test_development_report_is_canonical_create_only_and_idempotent(tmp_path):
+    path = tmp_path / 'report.json'
+    report = {'z': [2, 1], 'a': {'value': 1.0}}
+
+    first = _write_development_report(path, report)
+    second = _write_development_report(path, report)
+
+    assert first == second
+    assert path.read_text(encoding='utf-8') == '{"a":{"value":1.0},"z":[2,1]}\n'
+    with pytest.raises(FileExistsError, match='different bytes'):
+        _write_development_report(path, {'changed': True})
+
+
+def test_development_report_timestamp_is_explicit_canonical_utc():
+    assert _canonical_utc_timestamp(
+        '2026-07-13T18:00:00Z') == '2026-07-13T18:00:00Z'
+    with pytest.raises(ValueError, match='canonical UTC'):
+        _canonical_utc_timestamp('2026-07-13T14:00:00-04:00')
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +173,28 @@ class _FakeProv:
         return {'marketcap': 5e8}
 
 
+class _BulkFakeProv(_FakeProv):
+    def prices(self, name, start, end):
+        raise AssertionError('per-name price path should not run')
+
+    def prices_bulk(self, names, start, end):
+        return {
+            name: pd.Series(
+                np.linspace(10, 20, len(self._idx)),
+                index=self._idx,
+                name=name,
+            )
+            for name in names
+        }
+
+    def daily_marketcaps_for_dates(self, names, dates):
+        return {(name, pd.Timestamp(date).date()): 5e8
+                for name in names for date in dates}
+
+    def daily_metrics(self, name, dates):
+        raise AssertionError('per-name market-cap path should not run')
+
+
 def test_collect_is_pit_and_respects_staleness():
     prov = _FakeProv(_share_rows('AAA', [100] * 8 + [110]))
     rebal = pd.bdate_range('2020-06-01', '2024-06-01', freq='BMS')
@@ -136,7 +207,52 @@ def test_collect_is_pit_and_respects_staleness():
     # Last filing q8 datekey 2022-05-10 + 400 stale days ~ 2023-06-14: the
     # 2023-07+ rebalances carry no stale signal.
     assert ev['date'].max() <= pd.Timestamp('2023-06-14')
-    assert {'issuance', 'mcap', 'fwd_21'} <= set(ev.columns)
+    assert {'entry_date', 'issuance', 'mcap', 'fwd_21'} <= set(ev.columns)
+    assert (ev['entry_date'] > ev['date']).all()
+
+
+def test_collect_uses_bounded_bulk_warehouse_paths_when_available():
+    rows = (_share_rows('AAA', [100] * 8 + [110])
+            + _share_rows('BBB', [100] * 8 + [90]))
+    prov = _BulkFakeProv(rows)
+    formations = pd.DatetimeIndex(['2022-06-01', '2022-07-01'])
+
+    ev, n_names = collect_issuance_events(
+        prov, ['AAA', 'BBB'], formations, [21], price_batch_size=1)
+
+    assert n_names == 2
+    assert set(ev['name']) == {'AAA', 'BBB'}
+    assert ev['mcap'].eq(5e8).all()
+
+
+def test_collect_enters_next_observed_session_after_formation_close():
+    rows = _share_rows('AAA', [100] * 8 + [110])
+    prov = _FakeProv(rows)
+    formation = pd.Timestamp(rows[8]['datekey']) + pd.offsets.BDay(1)
+    pos = prov._idx.get_indexer([formation])[0]
+    assert pos >= 0
+
+    ev, _ = collect_issuance_events(
+        prov, ['AAA'], [formation], [21], stale_days=400)
+
+    assert len(ev) == 1
+    assert ev.iloc[0]['entry_date'] == prov._idx[pos + 1]
+    prices = prov.prices('AAA', None, None)
+    expected = prices.iloc[pos + 1 + 21] / prices.iloc[pos + 1] - 1.0
+    assert ev.iloc[0]['fwd_21'] == pytest.approx(expected)
+
+
+def test_collect_does_not_slide_missing_formation_bar_forward():
+    rows = _share_rows('AAA', [100] * 8 + [110])
+    prov = _FakeProv(rows)
+    formation = pd.Timestamp(rows[8]['datekey']) + pd.offsets.BDay(1)
+    missing = prov._idx.get_loc(formation)
+    prov._idx = prov._idx.delete(missing)
+
+    ev, _ = collect_issuance_events(
+        prov, ['AAA'], [formation], [21], stale_days=400)
+
+    assert ev.empty
 
 
 def test_collect_datekey_equal_to_rebalance_not_usable():

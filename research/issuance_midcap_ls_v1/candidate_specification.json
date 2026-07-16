@@ -1,0 +1,108 @@
+{
+  "schema_version": "candidate_specification.v1",
+  "candidate_id": "issuance-midcap-ls-v1",
+  "candidate_family": "net-share-issuance",
+  "status": "draft",
+  "disposition": "stopped_development",
+  "evidence_class": "development_hypothesis_only",
+  "disposition_reason": "The corrected development family produced zero positive cost-net Benjamini-Hochberg survivors across eight declared tests. This draft preserves the tested rule and unresolved requirements; it is not approved for preregistration, holdout evaluation, paper trading, or live deployment.",
+  "development_evidence": {
+    "artifact_file": "development_falsification.json",
+    "artifact_sha256": "de0c785d0558d091706b976bbfa0019f3a3f11d375231d457db03f02fec43ac1",
+    "window_start": "2015-01-01",
+    "window_end": "2024-09-30",
+    "declared_family_tests": 8,
+    "positive_cost_net_bh_survivors": 0
+  },
+  "economic_hypothesis": "Firms with high year-over-year net share issuance subsequently underperform firms retiring shares, so the intended spread is long low or negative issuance and short high issuance.",
+  "signal_rule": {
+    "source": "point-in-time SF1 ARQ filings",
+    "inputs": [
+      "datekey",
+      "reportperiod",
+      "sharefactor",
+      "sharesbas",
+      "ticker"
+    ],
+    "adjusted_shares": "sharesbas * sharefactor",
+    "net_share_issuance": "adjusted_shares_current / adjusted_shares_year_ago - 1",
+    "seasonal_match": "latest reportperiod 330 to 410 calendar days before the current reportperiod",
+    "minimum_prior_quarters": 4,
+    "filing_deduplication": "earliest datekey per ticker and reportperiod",
+    "out_of_order_guard": "datekey must equal the running maximum datekey in reportperiod order",
+    "formation_visibility": "only signals with datekey strictly before the formation session are eligible",
+    "maximum_signal_age_calendar_days": 400,
+    "direction": {
+      "long": "lowest net-share-issuance quintile, including negative issuance",
+      "short": "highest net-share-issuance quintile"
+    }
+  },
+  "formation_and_execution": {
+    "formation_cadence": "monthly",
+    "formation_session": "first observed SEP trading session of each calendar month",
+    "formation_price_use": "formation-session close supplies dated market capitalization only",
+    "entry_timing": "next observed session close after formation (T+1)",
+    "development_holding_period_trading_days": [
+      21,
+      63
+    ],
+    "final_holding_period_trading_days": null
+  },
+  "portfolio_intent": {
+    "expression": "dollar-neutral long-short spread",
+    "selection_fraction_per_leg": 0.2,
+    "development_size_slices": "pooled and relative dated-market-cap terciles",
+    "final_size_slice": null,
+    "weighting": null,
+    "sector_beta_factor_constraints": null
+  },
+  "cost_intent": {
+    "status": "development_placeholder_not_calibrated",
+    "one_way_bps_per_trade_per_leg": 30,
+    "charged_trades_per_round_trip": 4,
+    "fixed_total_round_trip_bps": 120,
+    "components": [
+      "long entry",
+      "long exit",
+      "short entry",
+      "short exit"
+    ]
+  },
+  "unresolved_fields": {
+    "fixed_midcap_definition": {
+      "status": "unresolved",
+      "value": null,
+      "reason": "The development screen used relative dated-market-cap terciles; no ex ante fixed mid-cap bounds were selected."
+    },
+    "dated_liquidity_eligibility": {
+      "status": "unresolved",
+      "value": null,
+      "reason": "No final point-in-time price, ADV, spread, or participation-rate thresholds are specified."
+    },
+    "historical_borrow_locates_and_fees": {
+      "status": "unresolved",
+      "value": null,
+      "reason": "No dated locate availability, borrow-fee, recall, or short-financing inventory is available."
+    },
+    "spread_slippage_impact_and_capacity": {
+      "status": "unresolved",
+      "value": null,
+      "reason": "The 120 bp development cost is a fixed convention, not a calibrated execution or capacity model."
+    },
+    "statistical_power_and_independent_cohorts": {
+      "status": "unresolved",
+      "value": null,
+      "reason": "No minimum detectable effect, required number of independent cohorts, or prospective stopping rule is specified."
+    },
+    "holdout_source_and_acquisition_window": {
+      "status": "unresolved",
+      "value": null,
+      "reason": "No uncontaminated source, future acquisition dates, access controls, or immutable seal location have been selected."
+    },
+    "corporate_action_economics": {
+      "status": "unresolved",
+      "value": null,
+      "reason": "The required corporate-actions table is absent from the local warehouse and action-sensitive return economics are not attested complete."
+    }
+  }
+}

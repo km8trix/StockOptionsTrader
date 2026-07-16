@@ -1,9 +1,18 @@
 # Spec — Insider Net-Buy Desk (size-bucketed cross-sectional long/short)
 
-> Graduate the validated insider-buying signal into a proper `Desk`, score it through
-> the honest OOS gate, and combine the size sleeves with the existing capital allocator.
+> Historical plan to graduate the insider-buying hypothesis into a proper `Desk`,
+> score it through an implementation gate, and combine the size sleeves with the
+> existing capital allocator.
 > Every reuse claim below is grounded against the code (file:line). Engineering plan,
 > not investment advice.
+
+> **Evidence correction (2026-07-13):** The historical screen inferred t/p and
+> BH decisions from gross spreads while displaying net means, and scoped names
+> with today's `scalemarketcap` label. Its positive screen claims below are
+> non-qualifying provenance. A qualifying rerun must use the full PIT-eligible
+> universe, dated market cap for contemporaneous buckets, and inference on net
+> returns. The negative realized desk results remain a reason not to deploy this
+> implementation; they do not validate the original screen.
 
 ## STATUS: tested — DOCUMENTED NEGATIVE (2026-07-01)
 
@@ -26,11 +35,12 @@ the (correct) record of how it was done.
 
 ## 0. Why this desk
 
-The full-universe insider screen (`scripts/insider_screen.py`, PR #68/#69) found the
-first signal in the program to clear the honest bar: a 63d insider **buy-vs-sell**
-long/short, BH-significant and cost-positive **within each size bucket** and
+The historical insider screen (`scripts/insider_screen.py`, PR #68/#69) reported a
+63d insider **buy-vs-sell** long/short as BH-significant and cost-positive
+**within each size bucket** and
 2020-independent — Small-cap strongest (t=4.33 ex-2020, net +1.39% @30bp/leg), Mid-cap
-tradeable (t=2.38, net +0.56%), Micro (t=2.50). Two load-bearing facts from that work:
+positive (t=2.38, net +0.56%), Micro (t=2.50). Those statistics are legacy gross
+inference. Two hypotheses from that work were:
 
 - **Signal = SIGN, not magnitude.** Direction (net buyers vs net sellers) predicts;
   dollar size (`net_value`) does not (pooled rank-IC ≈ −0.02). Don't size by dollars.
@@ -56,7 +66,7 @@ tradeable (t=2.38, net +0.56%), Micro (t=2.50). Two load-bearing facts from that
 
 ## 2. The one design decision that matters — size-neutral, point-in-time
 
-The validated edge is **within-bucket**. Two ways to express that in a desk:
+The historical pattern was **within-bucket**. Two ways it was expressed in a desk:
 
 - **Chosen: one desk per PIT size band, combined by the allocator.** `InsiderNetBuyDesk`
   takes a `band` param; its `_alpha_scores` scores **only** names whose *point-in-time*
@@ -74,13 +84,13 @@ The validated edge is **within-bucket**. Two ways to express that in a desk:
 the **current** band as of data download, *not* point-in-time (`data/pit_warehouse.py:118,132-134`;
 `scripts/insider_screen.py:50-54`). Using it to decide which bucket a name trades in
 leaks the future. **Use `daily_metric(..., 'marketcap')` (PIT) to form buckets;**
-`scalemarketcap` is fine only to coarsely scope the candidate universe.
+`scalemarketcap` is not acceptable even to scope a qualifying candidate universe.
 
 ## 3. Build order (each step gates the next)
 
 | # | Step | Reuse | Net-new | Done when |
 |---|------|-------|---------|-----------|
-| 1 | **MVP: single Small-cap desk** (strongest sleeve, t≈4.3) | subclass `CrossSectionalLongShortDesk`; clone `cross_sectional_momentum.py`; `insider_net_buys` sign | `desks/insider_netbuy.py`: `_alpha_scores` = ±1 sign for names with PIT marketcap in the Small band (`daily_metric`) & non-zero activity; inject a `PitWarehouse`; wide `RiskManager` | runs under `BacktestEngine(desk=...)`; a no-lookahead check passes (`daily_metric`/`insider_net_buys` both keyed on `date`); book is non-empty on a small/mid universe |
+| 1 | **MVP: single Small-cap desk** (legacy strongest sleeve, t≈4.3) | subclass `CrossSectionalLongShortDesk`; clone `cross_sectional_momentum.py`; `insider_net_buys` sign | `desks/insider_netbuy.py`: `_alpha_scores` = ±1 sign for names with PIT marketcap in the Small band (`daily_metric`) & non-zero activity; inject a `PitWarehouse`; wide `RiskManager` | runs under `BacktestEngine(desk=...)`; a no-lookahead check passes (`daily_metric`/`insider_net_buys` both keyed on `date`); book is non-empty on the PIT-eligible universe |
 | 2 | **Honest gate** | `validate_strategy_oos`; `trend_follower_gate.py` driver | `scripts/insider_desk_gate.py` (mirror trend-follower): run desk → daily returns + calendar-year labels → `validate_strategy_oos(psr_threshold=0.95)` | single PASS/FAIL verdict; deterministic with `seed=`; the desk P&L (T+1, slippage, caps) is the real bar, expected weaker than the event-study spread |
 | 3 | **Three size sleeves** | same class | `band` param → 3 registry entries (`insider_micro/small/mid`) in `desks/registry.py` `_DESK_SPECS` + provider injection branch (copy `:240-242`) | all 3 register, run, and gate independently |
 | 4 | **Combine** | `ReweightingFundBacktest`, `CrossDeskCapitalAllocator`, `FundOrchestrator` | wire the 3 sleeves into `reweighting_fund.py` with `weighting='risk_parity_cov'` | one insider book; report inter-sleeve correlation + reweight_log; gate the combined book |
@@ -100,10 +110,10 @@ Step-2 gate number is only honest with this feed.
 
 ## 5. Open decisions (recommended defaults in **bold**)
 
-1. Score value — **±1 sign** (validated) vs signed `net_shares`. Magnitude dilutes; use sign.
+1. Score value — **±1 sign** (historical choice) vs signed `net_shares`. The legacy magnitude result was weaker; a qualifying rerun must re-establish this choice.
 2. Bucketing — **PIT `daily_metric` marketcap terciles/bands** vs `scalemarketcap` (lookahead — no).
-3. Committee — **empty (`committee=[]`, n_trials=1, no deflation)**; it's a pre-specified rule, validate via `validate_strategy_oos`, not the lenient `_profitable` harness bar (`desk_backtest.py:120`).
-4. Universe — **provider-derived small/mid** (`universe_asof`, survivorship-free) vs `LARGE_CAP_100` (the harness default — wrong universe for this edge).
+3. Committee — **empty (`committee=[]`)** for the fixed implementation. Trial breadth is ledger-derived in qualifying research; the historical `n_trials=1` setting is not evidence that only one hypothesis was tried.
+4. Universe — **full provider-derived PIT-eligible universe** (`universe_asof`, survivorship-free); dated market cap creates diagnostic/trading bands, never a current-label prefilter.
 5. Rebalance/holding — **monthly rebalance** (matches the screen); tune `min_holding_days`/`exit_quantile` for turnover.
 
 ## 6. Risks / gotchas (grounded)
@@ -115,8 +125,9 @@ Step-2 gate number is only honest with this feed.
   the book reintroduces the churn/orphan bug it fixed (`desks/cross_sectional.py:6-8`).
 - **Sign convention** was double-negated once (commit `3faacdb`/PR #67) — score on
   `net_shares`/`net_value` as returned; higher = more buying = stronger long.
-- **`committee=[]` → n_trials=1 → deflated_sharpe==psr** (no deflation) — honest for a
-  fixed rule, but claim no OOS-fold deflation credit from it (`backtest_engine.py:1136-1139`).
+- **`committee=[]` does not prove `n_trials=1`.** A qualifying DSR uses the full
+  ledger-derived research breadth; the historical engine shortcut made
+  `deflated_sharpe==psr` (`backtest_engine.py:1136-1139`).
 - **The allocator down-weights but does not prune** correlated desks; with only 3 size
   sleeves that's fine, no pruning layer needed (`desks/capital_allocator.py` net-new gap).
 - **`_PROMOTED_DESKS` stays empty** — a passing gate makes this a *research* candidate, not

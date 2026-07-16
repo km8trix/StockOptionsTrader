@@ -1,5 +1,5 @@
 """Net share issuance screen — YoY split-adjusted share growth on the
-survivorship-free small/mid universe, through the honest apparatus.
+survivorship-free dated eligible universe, through the research apparatus.
 
 The Pontiff-Woodgate / Daniel-Titman issuance anomaly: firms that ISSUE shares
 (SEOs, stock comp, stock-financed M&A) subsequently UNDERPERFORM; firms that
@@ -28,14 +28,18 @@ both fields non-null at both quarters, relative-epsilon on zero/near-zero
 adjusted share counts (sharefactor==0 garbage), >=4 prior quarters of filing
 history, and the sue_table running-max-datekey rule so a delinquent old
 filing cannot leak into an earlier-dated signal. The signal of a filing is
-KNOWN at its datekey; at each business-month-start rebalance a name carries
-its latest visible filing, dropped when staler than --stale-days.
+KNOWN at its datekey; at each first-observed-session monthly formation a name
+carries its latest visible filing, dropped when staler than --stale-days. The
+formation-session close supplies the dated size bucket, so execution is delayed
+to the next observed session (T+1); a name without a formation-session bar is
+dropped instead of silently entering later.
 
 Tested with the exact machinery that validated/killed insider, value, quality
 and PEAD: factor_screen.factor_study (per-date Fama-MacBeth spread,
 Newey-West/HAC t, per-date winsorized forward returns), Benjamini-Hochberg
-across the whole family (pooled + size terciles x horizons), 30bp/leg
-cost-netting. Also reports the month-over-month name turnover of the LONG
+across the whole family (pooled + size terciles x horizons), using the
+historical 30bp/leg fixed-cost convention corrected below. Also reports the
+month-over-month name turnover of the LONG
 (buyback) leg — the thesis is that a slow annual signal dodges the cost drag
 that killed the monthly signals, so the turnover is measured, not assumed.
 
@@ -45,23 +49,38 @@ Deterministic; warehouse-only (tickers + sep + sf1 + daily ingested).
     python -m scripts.issuance_screen --limit 250    # seeded smoke subset
     python -m scripts.issuance_screen --selftest     # offline, no warehouse
 
-RESULT (2026-07-10, full universe 4608 names / 306,453 events, winsor 0.01):
+STATISTICAL STATUS (2026-07-13): the recorded result below predates the net-array
+inference repair in ``factor_study``. Its displayed means were cost-net, but its
+t/p and BH decisions tested GROSS spreads. It is retained only as research
+provenance and is not evidence of a net tradeable edge until rerun. The current
+report separates raw economic P&L from winsorized robustness inference, deducts
+cost per formation date before HAC, and sends one-sided net p-values to BH. The
+legacy implementation deducted only two 30bp charges while the CLI described a
+one-way cost. The corrected fixed model charges four trades (120bp total at the
+default), making the historical net means stale as well.
+
+LEGACY RESULT (2026-07-10, full universe 4608 names / 306,453 events, winsor 0.01):
 8/8 BH survivors at alpha=0.05 — the program's first clean sweep. Pooled 21d
 net +1.55% t=+3.76, 63d net +4.83% t=+3.42; micro 63d net +8.21% t=+4.02;
 and uniquely, MID-CAP survives (21d net +0.44% t=+2.67, 63d net +1.89%
 t=+2.79) — the tradeable slice where value/quality/PEAD all died. Median
 issuance +1.0%/yr, 21.9% of events negative (buybacks). Measured long-leg
 turnover: 7.3%/rebalance (~87%/yr one-sided, mean leg 523 names) — slower
-than monthly signals but NOT annual; note the net figures above deduct the
-full 2x30bp per rebalance while actual membership turnover is 7.3%, so
-realized cost drag is ~1/14th of what the netting assumes and true net sits
-near gross. Screen-level only; no desk, no promotion claim.
+than monthly signals but NOT annual. The net figures above used the erroneous
+2x30bp fixed convention. A corrected fixed run charges 4x30bp; a lower
+turnover-based claim requires complete dated long/short turnover and execution
+cost inputs and cannot be inferred from long-leg membership turnover alone.
+Screen-level only; no desk, no promotion claim.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
 import os
+from pathlib import Path
 import sys
 
 import numpy as np
@@ -75,16 +94,78 @@ from analysis.research_stats import benjamini_hochberg  # noqa: E402
 from data.pit_warehouse import PitWarehouse  # noqa: E402
 from data.share_issuance import _share_rows, issuance_table  # noqa: E402
 from scripts.factor_screen import _print_report, factor_study  # noqa: E402
-from scripts.insider_screen import SCALE_SMALL_MID, resolve_universe  # noqa: E402
+from scripts.insider_screen import (  # noqa: E402
+    _eligible_on,
+    resolve_universe_membership,
+    universe_union,
+)
 from scripts.pead_screen import add_size_terciles  # noqa: E402
+from utils.provenance import capture_run_provenance  # noqa: E402
+
+
+def monthly_formation_dates(sessions, start, end) -> pd.DatetimeIndex:
+    """First observed trading session of every calendar month in range.
+
+    Missing months fail closed instead of being replaced with a weekday that
+    has no market data.  The caller can compare the result with the expected
+    month count before running a qualifying study.
+    """
+    lo, hi = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    if lo > hi:
+        raise ValueError("start must be on or before end")
+    idx = pd.DatetimeIndex(sessions).dropna().normalize().unique().sort_values()
+    idx = idx[(idx >= lo) & (idx <= hi)]
+    if idx.empty:
+        return pd.DatetimeIndex([], name='date')
+    frame = pd.DataFrame({'session': idx})
+    first = frame.groupby(frame['session'].dt.to_period('M'), sort=True)[
+        'session'].min()
+    return pd.DatetimeIndex(first.to_numpy(), name='date')
+
+
+def _canonical_utc_timestamp(value: str) -> str:
+    if not isinstance(value, str) or not value.endswith('Z'):
+        raise ValueError('recorded_at must be canonical UTC ending in Z')
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + '+00:00')
+    except ValueError as exc:
+        raise ValueError('recorded_at must be a valid UTC timestamp') from exc
+    parsed = parsed.astimezone(timezone.utc)
+    timespec = 'microseconds' if parsed.microsecond else 'seconds'
+    canonical = parsed.isoformat(timespec=timespec).replace('+00:00', 'Z')
+    if canonical != value:
+        raise ValueError(f'recorded_at must be canonical: {canonical}')
+    return canonical
+
+
+def _write_development_report(path_value, report) -> str:
+    """Create one canonical report, allowing only byte-identical retries."""
+    encoded = (json.dumps(
+        report, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+        allow_nan=False) + '\n').encode('utf-8')
+    digest = hashlib.sha256(encoded).hexdigest()
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != encoded:
+            raise FileExistsError(
+                f'development report already exists with different bytes: {path}')
+        return digest
+    with path.open('xb') as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return digest
 
 
 def collect_issuance_events(prov, names, rebal_dates, horizons, *,
-                            stale_days=400, price_start=None, price_end=None):
-    """One row per (name, rebalance) with a live PIT issuance: columns
-    ['date','name','issuance','mcap'] + fwd_h. Cohort key = the rebalance
-    date. stale_days: drop names whose latest filing is older than this at
-    the rebalance (default 400 ~ the seasonal-match upper bound: a live
+                            stale_days=400, price_start=None, price_end=None,
+                            membership_by_date=None, price_batch_size=250):
+    """One row per (name, formation) with a live PIT issuance: columns
+    ['date','entry_date','name','issuance','mcap'] + fwd_h. Cohort key is the
+    formation date and returns enter on the next observed session. stale_days:
+    drop names whose latest filing is older than this at the formation
+    (default 400 ~ the seasonal-match upper bound: a live
     quarterly filer is always fresh; only names that stopped filing over a
     year ago fall out, where a "YoY" count describes ancient history)."""
     maxh = max(horizons)
@@ -94,45 +175,82 @@ def collect_issuance_events(prov, names, rebal_dates, horizons, *,
     n_names = 0
     recs = []
     batch = getattr(prov, 'daily_metrics', None)
-    for name, g in rows.groupby('ticker', sort=False):
-        px = prov.prices(name, price_start, price_end)
-        if len(px) < 100:
-            continue
-        n_names += 1
-        idx, vals = px.index, px.values
-        g = g.sort_values('datekey')
-        keys = g['datekey'].to_numpy(dtype='datetime64[ns]')
-        ivals = g['issuance'].to_numpy(dtype=float)
-        live = []
-        for t in rebal_dates:
-            ts = pd.Timestamp(t)
-            # side='left': a filing with datekey == t is NOT usable at t —
-            # its datekey covers after-close EDGAR acceptances, so the day-t
-            # close printed before the filing was public.
-            i = int(np.searchsorted(keys, np.datetime64(ts), side='left'))
-            if i == 0:
-                continue                       # nothing filed yet (PIT)
-            dk = pd.Timestamp(keys[i - 1])
-            if (ts - dk).days > stale_days:
-                continue                       # stopped filing — stale count
-            pos = int(idx.searchsorted(ts))
-            if pos + maxh >= len(px) or pos >= len(px):
+    price_bulk = getattr(prov, 'prices_bulk', None)
+    cap_bulk = getattr(prov, 'daily_marketcaps_for_dates', None)
+    groups = [(name, group) for name, group in rows.groupby(
+        'ticker', sort=False)]
+    if type(price_batch_size) is not int or price_batch_size < 1:
+        raise ValueError('price_batch_size must be a positive integer')
+    for offset in range(0, len(groups), price_batch_size):
+        group_batch = groups[offset:offset + price_batch_size]
+        batch_names = [name for name, _ in group_batch]
+        prices = (price_bulk(batch_names, price_start, price_end)
+                  if price_bulk is not None else {})
+        marketcaps = (cap_bulk(batch_names, rebal_dates)
+                      if cap_bulk is not None else {})
+        for name, g in group_batch:
+            px = (prices.get(name, pd.Series(dtype=float, name=name))
+                  if price_bulk is not None
+                  else prov.prices(name, price_start, price_end))
+            if len(px) < 100:
                 continue
-            entry = vals[pos]
-            if not entry or entry <= 0:
+            idx, vals = px.index, px.values
+            g = g.sort_values('datekey')
+            keys = g['datekey'].to_numpy(dtype='datetime64[ns]')
+            ivals = g['issuance'].to_numpy(dtype=float)
+            live = []
+            for t in rebal_dates:
+                ts = pd.Timestamp(t)
+                if not _eligible_on(name, ts, membership_by_date):
+                    continue
+                # side='left': a filing with datekey == t is NOT usable at t —
+                # its datekey covers after-close EDGAR acceptances, so the day-t
+                # close printed before the filing was public.
+                i = int(np.searchsorted(keys, np.datetime64(ts), side='left'))
+                if i == 0:
+                    continue                       # nothing filed yet (PIT)
+                dk = pd.Timestamp(keys[i - 1])
+                if (ts - dk).days > stale_days:
+                    continue                       # stopped filing — stale count
+                formation_pos = int(idx.searchsorted(ts))
+                if formation_pos >= len(px):
+                    continue
+                # The dated market cap used for the size rank is known only at
+                # this session's close. Require that exact formation bar, then
+                # enter at the following observed close (T+1). A halted/missing
+                # formation bar may not slide the signal into a later session.
+                if pd.Timestamp(idx[formation_pos]).normalize() != ts.normalize():
+                    continue
+                entry_pos = formation_pos + 1
+                if entry_pos + maxh >= len(px):
+                    continue
+                entry = vals[entry_pos]
+                if not entry or entry <= 0:
+                    continue
+                live.append((ts, entry_pos, entry, ivals[i - 1]))
+            if not live:
                 continue
-            live.append((ts, pos, entry, ivals[i - 1]))
-        if not live:
-            continue
-        caps = (batch(name, [t for t, _, _, _ in live]) if batch is not None
-                else [prov.daily_metric(name, t) for t, _, _, _ in live])
-        for (ts, pos, entry, iss), metrics in zip(live, caps):
-            rec = {'date': ts, 'name': name, 'issuance': iss,
-                   'mcap': (metrics or {}).get('marketcap')}
-            for h in horizons:
-                rec[f'fwd_{h}'] = vals[pos + h] / entry - 1.0
-            recs.append(rec)
-    cols = ['date', 'name', 'issuance', 'mcap'] + [f'fwd_{h}' for h in horizons]
+            n_names += 1
+            if cap_bulk is not None:
+                caps = [
+                    ({'marketcap': marketcaps.get((name, ts.date()))}
+                     if (name, ts.date()) in marketcaps else None)
+                    for ts, _, _, _ in live
+                ]
+            else:
+                caps = (batch(name, [t for t, _, _, _ in live])
+                        if batch is not None else [
+                            prov.daily_metric(name, t)
+                            for t, _, _, _ in live])
+            for (ts, pos, entry, iss), metrics in zip(live, caps):
+                rec = {'date': ts, 'entry_date': pd.Timestamp(idx[pos]),
+                       'name': name, 'issuance': iss,
+                       'mcap': (metrics or {}).get('marketcap')}
+                for h in horizons:
+                    rec[f'fwd_{h}'] = vals[pos + h] / entry - 1.0
+                recs.append(rec)
+    cols = ['date', 'entry_date', 'name', 'issuance', 'mcap'] + [
+        f'fwd_{h}' for h in horizons]
     return pd.DataFrame(recs, columns=cols), n_names
 
 
@@ -230,23 +348,48 @@ def main(argv=None):
     ap.add_argument('--start', default='2015-01-01')
     ap.add_argument('--end', default='2024-09-30')
     ap.add_argument('--horizons', nargs='+', type=int, default=[21, 63])
-    ap.add_argument('--cost-bps', type=float, default=30.0)
+    ap.add_argument('--cost-bps', type=float, default=30.0,
+                    help='one-way cost for one trade on one leg; charges entry '
+                         'and exit on both long and short legs (4x)')
     ap.add_argument('--stale-days', type=int, default=400)
     ap.add_argument('--limit', type=int, default=None,
                     help='cap the universe for a faster smoke')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--winsor', type=float, default=0.01,
-                    help='per-date forward-return winsorization (0 = off)')
+                    help='per-date robust-inference winsorization; raw economic '
+                         'P&L is always retained (0 = off)')
+    ap.add_argument(
+        '--output-json', default=None,
+        help='create a canonical development evidence report with dated arrays')
+    ap.add_argument(
+        '--recorded-at', default=None,
+        help='explicit canonical UTC timestamp required with --output-json')
     ap.add_argument('--selftest', action='store_true')
     cli = ap.parse_args(argv)
+    if (cli.output_json is None) != (cli.recorded_at is None):
+        ap.error('--output-json and --recorded-at must be supplied together')
+    recorded_at = (_canonical_utc_timestamp(cli.recorded_at)
+                   if cli.recorded_at is not None else None)
     if cli.selftest:
         _selftest()
         return 0
 
     import random
     wh = PitWarehouse()
-    rebal = pd.bdate_range(cli.start, cli.end, freq='BMS')
-    names = resolve_universe(wh, rebal, SCALE_SMALL_MID)
+    sessions = wh.market_sessions(cli.start, cli.end)
+    rebal = monthly_formation_dates(sessions, cli.start, cli.end)
+    expected_months = len(pd.period_range(cli.start, cli.end, freq='M'))
+    if len(rebal) != expected_months:
+        print(
+            f"incomplete SEP session calendar: expected {expected_months} "
+            f"months, found {len(rebal)} — refusing to screen",
+            file=sys.stderr,
+        )
+        return 1
+    # Full live PIT universe.  Size slices are formed from dated market cap;
+    # Sharadar's current ``scalemarketcap`` field is never a qualifying filter.
+    membership = resolve_universe_membership(wh, rebal)
+    names = universe_union(membership)
     if cli.limit and cli.limit < len(names):
         names = sorted(random.Random(cli.seed).sample(names, cli.limit))
     pstart = (pd.Timestamp(cli.start) - pd.Timedelta(days=30)).date().isoformat()
@@ -257,7 +400,8 @@ def main(argv=None):
 
     events, n_names = collect_issuance_events(
         wh, names, rebal, cli.horizons, stale_days=cli.stale_days,
-        price_start=pstart, price_end=pend)
+        price_start=pstart, price_end=pend,
+        membership_by_date=membership)
     if not len(events):
         # Honest empty report instead of add_size_terciles' opaque pandas
         # ValueError (empty warehouse, or filters that exclude everything).
@@ -278,7 +422,8 @@ def main(argv=None):
         # negatives KEPT — they ARE the long leg (drop_nonpositive=False).
         stats = factor_study(ev, 'issuance', cli.horizons, cli.cost_bps,
                              cheap_is_long=True, drop_nonpositive=False,
-                             winsor_returns=cli.winsor or None)
+                             winsor_returns=cli.winsor or None,
+                             include_series=cli.output_json is not None)
         for s in stats:
             s['factor'] = label                    # reuse the report printer
         all_stats.extend(stats)
@@ -287,14 +432,86 @@ def main(argv=None):
     _print_report(all_stats, bh, cli.cost_bps, n_names, len(events),
                   label='net-issuance')
     print("\n(sign: HIGH issuance predicts LOW returns — long = LOW/NEGATIVE "
-          "YoY issuance i.e. buybacks, short = heavy issuers; tercile0=micro, "
-          "1=small, 2=mid on PIT marketcap)")
+          "YoY issuance i.e. buybacks, short = heavy issuers; "
+          "tercile0=smallest, 1=middle, 2=largest relative to each dated "
+          "eligible cross-section on PIT marketcap)")
     to = long_leg_turnover(events)
     if to:
         print(f"long-leg (buyback quintile) turnover: "
               f"{to['per_rebalance']:.1%}/rebalance over {to['n_pairs']} "
               f"monthly pairs (mean leg {to['mean_leg_size']:.0f} names) "
               f"= {to['annualized']:.0%}/yr one-sided")
+    if cli.output_json is not None:
+        valid = [item for item in all_stats if not item.get('insufficient')]
+        rejected = bh['rejected_bh'] if bh else [False] * len(valid)
+        survivors = [
+            {'slice': item['factor'], 'horizon_days': item['h']}
+            for item, reject in zip(valid, rejected)
+            if reject and item['raw_net_spread'] > 0
+        ]
+        report = {
+            'schema_version': 1,
+            'report_type': 'development_factor_screen',
+            'evidence_class': 'development',
+            'candidate_id': 'issuance-midcap-ls-v1',
+            'recorded_at': recorded_at,
+            'disposition': (
+                'development_screen_survived' if survivors
+                else 'stop_candidate_no_corrected_net_edge'),
+            'disposition_reason': (
+                'No member of the declared eight-test screen family survived '
+                'Benjamini-Hochberg on raw cost-net cohort returns.'
+                if not survivors else
+                'At least one development slice survived; this is hypothesis '
+                'generation only and is not holdout evidence.'),
+            'configuration': {
+                'start': pd.Timestamp(cli.start).date().isoformat(),
+                'end': pd.Timestamp(cli.end).date().isoformat(),
+                'horizons_days': list(cli.horizons),
+                'one_way_cost_bps_per_trade_per_leg': float(cli.cost_bps),
+                'fixed_total_round_trip_bps': float(4 * cli.cost_bps),
+                'stale_days': int(cli.stale_days),
+                'quantile': 0.2,
+                'winsor_fraction_diagnostic_only': float(cli.winsor),
+                'formation_calendar': 'first_observed_sep_session_of_month',
+                'entry_timing': 'next_observed_session_close_t_plus_1',
+                'size_slices': 'relative_dated_market_cap_terciles',
+                'long_leg': 'lowest_net_share_issuance_quintile',
+                'short_leg': 'highest_net_share_issuance_quintile',
+            },
+            'counts': {
+                'eligible_name_union': len(names),
+                'names_with_events': int(n_names),
+                'events': len(events),
+                'formation_dates': len(rebal),
+                'family_tests': len(valid),
+            },
+            'descriptives': {
+                'median_issuance': float(events['issuance'].median()),
+                'fraction_negative_issuance': neg,
+                'long_leg_turnover': to,
+            },
+            'tests': all_stats,
+            'multiple_testing': bh,
+            'positive_net_bh_survivors': survivors,
+            'warehouse_snapshot': wh.snapshot_version(
+                ('daily', 'sep', 'sf1', 'tickers')),
+            'provenance': capture_run_provenance(seed=cli.seed),
+            'qualification': {
+                'qualifying_evidence': False,
+                'raw_event_rows_preserved': False,
+                'blockers': [
+                    'development window was previously inspected',
+                    'historical borrow/locate/fee evidence is absent',
+                    'independent filing-derived share reconstruction is absent',
+                    'corporate-actions table is absent from the local warehouse',
+                    'spread/impact costs are fixed rather than calibrated',
+                    'working tree is not a sealed clean revision',
+                ],
+            },
+        }
+        digest = _write_development_report(cli.output_json, report)
+        print(f"development report: {cli.output_json} sha256={digest}")
     return 0
 
 

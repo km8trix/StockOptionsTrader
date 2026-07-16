@@ -1,0 +1,122 @@
+{
+  "schema_version": "pead_candidate_specification.v3",
+  "candidate_id": "pead-vq-source-qualification-v3",
+  "candidate_family": "post-earnings-announcement-drift",
+  "status": "source_qualification_protocol_frozen_no_qualifying_result",
+  "lineage": {
+    "analysis_parent": "../pead_vq_locked_replication_v1/candidate_specification.json",
+    "architecture_parent": "../pead_vq_source_qualification_v2/source_architecture.json",
+    "parents_are_read_only": true,
+    "qualification_transfer_allowed": false,
+    "reason_for_new_version": "Replace unprovable exact-first-public and vendor-actual assumptions with independent actual evidence and a conservative known-public-by activation contract."
+  },
+  "objective": "Test whether a source-qualified point-in-time quarterly EPS forecast error predicts post-announcement drift after frozen multiple-testing and economic-cost rules.",
+  "historical_target": {
+    "fiscal_period_end_start": "2015-01-01",
+    "fiscal_period_end_end": "2024-09-30",
+    "minimum_consensus_observation_start": "2014-01-01",
+    "evidence_class": "historical_reconstruction",
+    "previously_inspected": true,
+    "promotion_evidence_by_itself": false
+  },
+  "event_universe": {
+    "source": "candidate-grade SHARADAR/SF1 ARQ and SHARADAR/TICKERS snapshots",
+    "event_identity": [
+      "10_digit_cik",
+      "fiscal_period_end",
+      "fiscal_period_type_Q"
+    ],
+    "security_lineage_rule": "Join each distinct SF1 ticker and reportperiod to exactly one dated TICKERS row and positive permaticker. Group the joined rows by CIK and fiscal period. An issuer-period mapping to more than one permaticker is excluded as ambiguous; no primary share class is guessed.",
+    "revision_rule": "Multiple SF1 ARQ rows for one ticker and reportperiod are one event-census lineage with every source row retained; no SF1 EPS value or datekey supplies the signal actual or announcement time.",
+    "missing_identity_rule": "Missing CIK, ticker, permaticker, lifecycle, or contradictory interval evidence is an explicit identity-gap disposition.",
+    "delisted_securities_included": true,
+    "empty_universe_qualifies": false,
+    "evidence_availability_may_change_universe": false
+  },
+  "source_independence": {
+    "market_accounting_lane": "Sharadar supplies event census lineage, security identity and lifecycle, SEP prices, dated size inputs, and separately qualified economic-return evidence only.",
+    "consensus_lane": "A licensed point-in-time estimates source supplies raw consensus vintages and analyst counts through a registered byte-replay adapter.",
+    "announcement_lane": "Issuer releases and/or SEC-filed issuer exhibits supply the reported actual; a separately trusted distribution or prospective observation receipt supplies only a known-public-by upper bound.",
+    "forbidden_cross_fill": [
+      "Sharadar SF1 values or datekey may not supply actual EPS, consensus, analyst count, or announcement activation.",
+      "Consensus-provider actuals or report times may not satisfy the independent announcement lane.",
+      "SEC acceptance, PDS build time, HTTP Date, or later retrieval may not be relabeled as exact global first-public time."
+    ]
+  },
+  "signal_rule": {
+    "formula": "(independent_canonical_actual_eps - selected_point_in_time_consensus_eps) / strictly_prior_split_normalized_SEP_close",
+    "consensus_selection": "Select the latest unambiguous provider vintage with provider_as_of_date strictly before the known-public-by America/New_York calendar date.",
+    "same_day_consensus_allowed": false,
+    "minimum_analyst_count": 2,
+    "announcement_activation_claim": "known_public_by",
+    "activation_semantics": "conservative upper bound; never exact first-public",
+    "historical_activation_source": "licensed release-distribution archive with provider-attested distribution time and trusted provider-manifest hash",
+    "prospective_activation_source": "precommitted live SEC/PDS or licensed-release observer with raw response replay and an externally trusted append-only checkpoint",
+    "historical_sec_https_observation_allowed": false,
+    "preannouncement_price": "The unique latest positive SHARADAR/SEP close on an observed NYSE session whose session date is strictly before the activation's America/New_York date.",
+    "same_day_market_close_allowed": false,
+    "execution_price_evidence": "Retain closeunadj from the exact selected SEP row separately from split-normalized close; it is not the signal denominator.",
+    "metric_reconciliation": "Actual and consensus must match metric, accounting basis, per-share basis, scope, canonical share basis, currency, unit, and metric-definition digest exactly; no implicit GAAP/non-GAAP or share-basis conversion is allowed.",
+    "missing_or_ambiguous_data": "Exclude the event without imputation or fallback and preserve the blocker code."
+  },
+  "prospective_commitment": {
+    "universe_frozen_before_first_observation": true,
+    "consensus_snapshot_deadline": "no later than the selected prior NYSE session close",
+    "append_only_external_checkpoint_required": true,
+    "observer_code_and_configuration_digest_required": true,
+    "retroactive_activation_allowed": false,
+    "start": null,
+    "status": "not_started"
+  },
+  "portfolio_rule": {
+    "formation_cadence": "monthly",
+    "formation_session": "first observed SEP session of each calendar month",
+    "formation_freshness_calendar_days": 63,
+    "selection_fraction_per_leg": 0.2,
+    "minimum_names_per_formation": 10,
+    "long_leg": "highest signal quintile",
+    "short_leg": "lowest signal quintile",
+    "weighting": "equal-weighted dollar-neutral",
+    "tie_break": "ascending positive permaticker after signal sort",
+    "holding_period_trading_sessions": [
+      21,
+      63
+    ]
+  },
+  "statistical_family": {
+    "primary_cell": "pooled_63",
+    "cells": [
+      "pooled_21",
+      "pooled_63",
+      "dated_size_tercile_0_21",
+      "dated_size_tercile_0_63",
+      "dated_size_tercile_1_21",
+      "dated_size_tercile_1_63",
+      "dated_size_tercile_2_21",
+      "dated_size_tercile_2_63"
+    ],
+    "alpha": 0.05,
+    "correction": "Benjamini-Hochberg across the exact eight-cell family",
+    "inference": "one-sided positive-spread HAC inference with dependence length covering the holding horizon",
+    "robustness_diagnostic": "one-percent within-formation return winsorization reported separately from raw economics",
+    "additional_signal_variants_allowed": false
+  },
+  "economic_and_execution_boundary": {
+    "historical_signal_reconstruction_requires": "source-qualified final signal-input reconciliation",
+    "edge_claim_requires": "independent implementation reconciliation and a cost-net result surviving the frozen statistical family",
+    "prospective_edge_claim_requires": "separately committed prospective accumulation after this protocol and its exact source adapters are frozen",
+    "paper_execution_requires": "qualified edge evidence plus borrow, locate, calibrated costs, capacity, kill switches, immutable paper ledger, and explicit approval",
+    "live_execution_requires": "successful controlled paper evidence, independent review, separate live approval, minimal capital limits, and automatic rollback",
+    "current_edge_claim_allowed": false,
+    "current_paper_execution_allowed": false,
+    "current_live_execution_allowed": false
+  },
+  "stop_rules": [
+    "Stop if raw-byte replay cannot reproduce every selected consensus value, analyst count, source membership, and disposition.",
+    "Stop if independent actual and consensus metric semantics do not match exactly.",
+    "Stop if announcement activation or strictly prior denominator evidence is missing or ambiguous.",
+    "Stop if security identity, lifecycle, corporate-action, delisting, borrow, or cost evidence remains unresolved for an executable claim.",
+    "Stop if the independently reconstructed primary signal reverses sign.",
+    "Stop if no cost-net cell survives the frozen BH family or pooled_63 is nonpositive."
+  ]
+}

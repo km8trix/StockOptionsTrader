@@ -1,0 +1,229 @@
+{
+  "schema_version": "pead_source_architecture.v1",
+  "package_id": "pead-vq-source-qualification-v2",
+  "candidate_id": "pead-vq-source-qualification-v2",
+  "status": "architecture_frozen_evidence_absent",
+  "lineage": {
+    "inherited_candidate_id": "pead-vq-locked-replication-v1",
+    "inherited_package": "../pead_vq_locked_replication_v1",
+    "role": "read_only_signal_and_analysis_lineage",
+    "mutation_allowed": false,
+    "qualification_transfer_allowed": false
+  },
+  "objective": "Produce source-qualified PEAD event inputs without allowing one source family to supply market evidence, consensus expectations, and announcement truth.",
+  "source_lanes": {
+    "market_accounting": {
+      "source_family": "Sharadar",
+      "permitted_roles": [
+        "dated issuer and security identity",
+        "listing lifecycle and delisting coverage",
+        "frozen universe membership",
+        "split-normalized signal-denominator prices",
+        "contemporaneous execution-price evidence",
+        "dated market capitalization and size slices",
+        "corporate-action and terminal-return accounting only after field semantics and completeness are independently proved"
+      ],
+      "forbidden_roles": [
+        "PEAD actual EPS",
+        "analyst consensus value",
+        "analyst count",
+        "consensus vintage timestamp",
+        "earnings-announcement availability timestamp"
+      ],
+      "fail_closed_rules": [
+        "SF1 datekey is filing visibility and may not be relabeled as earnings-announcement time",
+        "unproved cash-distribution or terminal-settlement semantics block executable return qualification",
+        "missing lifecycle or delisting evidence excludes the affected path"
+      ]
+    },
+    "consensus": {
+      "normalized_schema": "pead_consensus_evidence.v1",
+      "provider_binding": "provider_neutral_licensed_adapter",
+      "allowed_provider_examples": [
+        "Zacks",
+        "I/B/E/S",
+        "equivalent licensed point-in-time source"
+      ],
+      "minimum_evidence": [
+        "stable provider observation identity",
+        "issuer/security and fiscal-period identity",
+        "consensus metric and per-share basis",
+        "consensus value and currency",
+        "analyst count",
+        "provider observation/effective timestamp with precision",
+        "trusted acquisition timestamp",
+        "preserved raw receipt and provider-specific row reference"
+      ],
+      "selection_rule": "Select only a source vintage proved strictly earlier than independently established announcement availability; same-date observations without sufficient intraday precision are ineligible.",
+      "independence_rule": "Provider actuals and announcement times are cross-checks only and cannot satisfy pead_announcement_evidence.v1.",
+      "missing_value_policy": "exclude_event"
+    },
+    "announcement": {
+      "normalized_schema": "pead_announcement_evidence.v1",
+      "source_family": "issuer_release_or_SEC_filed_issuer_document",
+      "minimum_evidence": [
+        "issuer identity including CIK when available",
+        "fiscal period identity",
+        "reported actual value, metric, basis, unit, and currency",
+        "preserved source document bytes and content digest",
+        "source URL or SEC accession identity",
+        "retrieval timestamp",
+        "issuer publication/distribution timestamp and precision when available",
+        "SEC acceptance timestamp retained as a distinct field when applicable",
+        "deterministic extraction method and reviewer disposition"
+      ],
+      "time_rule": "SEC acceptance is filing provenance and is not silently equated with exact first-public issuer-release availability.",
+      "ambiguity_policy": "Missing, conflicting, or insufficiently precise actual/timing evidence excludes the event unless the inherited protocol has a precommitted conservative visibility rule.",
+      "independence_rule": "Consensus-provider values may be compared but cannot populate required issuer/SEC actual or timing fields."
+    }
+  },
+  "artifact_contracts": {
+    "sharadar_source_snapshot": {
+      "schema_version": "pead_sharadar_source_snapshot.v1",
+      "role": "candidate_grade_sf1_sep_tickers_census_identity_and_market_source",
+      "minimum_evidence": [
+        "canonical credential-free SF1, SEP, and TICKERS export requests",
+        "provider data snapshot and last-refreshed timestamps",
+        "preserved content-addressed raw ZIP and CSV members",
+        "exact provider and converted schemas, row counts, and byte digests",
+        "independently replayed CSV-to-Parquet row-multiset equivalence"
+      ]
+    },
+    "security_identity_snapshot": {
+      "schema_version": "pead_security_identity_snapshot.v1",
+      "role": "dated_cik_permaticker_ticker_bridge",
+      "required_fields": [
+        "CIK",
+        "positive stable permaticker",
+        "ticker",
+        "ticker-valid interval",
+        "exact TICKERS source-row digest"
+      ],
+      "ambiguity_policy": "Missing, duplicate, overlapping, or contradictory identity intervals block the affected census row."
+    },
+    "event_manifest": {
+      "schema_version": "pead_event_universe.v1",
+      "role": "exhaustive_event_manifest",
+      "prerequisite_artifacts": [
+        "pead_sharadar_source_snapshot.v1",
+        "pead_security_identity_snapshot.v1"
+      ],
+      "required_scope_proof": [
+        "frozen date window",
+        "frozen issuer/security universe rule",
+        "content-addressed universe census/query receipts",
+        "coverage of inactive and delisted securities",
+        "source-census, enumerated-event, and identity-gap counts with an exact reconciliation"
+      ],
+      "required_event_identity": [
+        "event_id",
+        "10-digit CIK",
+        "fiscal_period_end",
+        "fiscal_period_type"
+      ],
+      "required_event_fields": [
+        "canonical event key and event digest",
+        "source census row commitment",
+        "ex-ante scope disposition and reason"
+      ],
+      "identity_binding_rule": "Security, permaticker, and dated ticker identity are supplied by the separately content-addressed identity snapshot bound in the manifest; they are not copied into or inferred from the event key.",
+      "cardinality_rule": "Every ex-ante expected event appears exactly once; evidence availability and signal outcome may not alter this set.",
+      "empty_manifest_qualifies": false
+    },
+    "consensus_evidence": {
+      "schema_version": "pead_consensus_evidence.v1",
+      "content_addressed": true,
+      "append_only_raw_receipts": true
+    },
+    "announcement_evidence": {
+      "schema_version": "pead_announcement_evidence.v1",
+      "content_addressed": true,
+      "append_only_raw_documents": true
+    },
+    "source_reconciliation": {
+      "schema_version": "pead_source_reconciliation.v1",
+      "role": "upstream_announcement_consensus_event_boundary",
+      "required_inputs": [
+        "pead_event_universe.v1",
+        "pead_consensus_evidence.v1",
+        "pead_announcement_evidence.v1"
+      ],
+      "required_outputs": [
+        "one disposition for every event-manifest row",
+        "both source values for every compared field",
+        "period, basis, currency, share-basis, and timestamp reconciliation decisions",
+        "accepted normalized event-source inputs",
+        "excluded events with blocker codes",
+        "input artifact identities and digests"
+      ],
+      "overwrite_discrepancies_allowed": false,
+      "research_consumable": false
+    },
+    "market_accounting_evidence": {
+      "schema_version": "pead_market_accounting_evidence.v1",
+      "role": "per_event_sharadar_identity_and_signal_denominator_evidence",
+      "required_inputs": [
+        "pead_sharadar_source_snapshot.v1",
+        "validated CIK-permaticker-dated-ticker identity snapshot",
+        "byte-verified NYSE session-close evidence",
+        "official SEP close and closeunadj field-semantics evidence",
+        "pead_source_reconciliation.v1"
+      ],
+      "required_outputs": [
+        "one disposition for every event-manifest row including upstream exclusions",
+        "exact dated identity and lifecycle record",
+        "latest positive observed session close strictly before independent first-public time",
+        "split-normalized close, contemporaneous closeunadj, normalization factor, and source-row digest",
+        "source snapshot, identity, calendar, semantics, and upstream reconciliation digests"
+      ],
+      "return_accounting_allowed": false
+    },
+    "signal_input_reconciliation": {
+      "schema_version": "pead_signal_input_reconciliation.v1",
+      "role": "only_source_qualified_research_input_boundary",
+      "required_inputs": [
+        "pead_source_reconciliation.v1",
+        "provider-adapter replay of every selected consensus value, count, metric, timestamp, and raw-response membership",
+        "exact candidate specification, consensus source manifest, and construction-code bytes matching their bound digests",
+        "pead_market_accounting_evidence.v1"
+      ],
+      "required_outputs": [
+        "one final accepted or excluded disposition for every frozen event",
+        "exact cross-artifact identity and share-basis reconciliation",
+        "actual, consensus, analyst count, first-public time, and strictly prior denominator",
+        "all upstream artifact identities and replay-verifier code identities",
+        "explicit partial-coverage and all-events-qualified status"
+      ],
+      "edge_claim_allowed": false,
+      "paper_execution_allowed": false,
+      "live_deployment_allowed": false
+    }
+  },
+  "cross_lane_gates": [
+    "all artifact schemas and content digests verify before semantic validation",
+    "event identities and fiscal periods match without ticker-only joins",
+    "consensus vintage precedes announcement availability at the available timestamp precision",
+    "actual and consensus metric, unit, per-share basis, currency, and split treatment reconcile",
+    "announcement actual and availability have independent SEC/issuer evidence",
+    "the final signal-input receipt proves that the signal denominator market close is strictly before announcement availability",
+    "every event-manifest row receives exactly one accepted or excluded disposition",
+    "enumerated event counts exactly reconcile to the frozen universe census"
+  ],
+  "immutability": {
+    "canonical_serialization": "UTF-8 canonical JSON with sorted object keys and no insignificant whitespace",
+    "artifact_identity": "SHA-256 of canonical payload or preserved raw bytes as declared by the producing schema",
+    "placeholder_digests_allowed": false,
+    "overwrite_allowed": false,
+    "rule_change_policy": "Any source, universe, timing, signal, or statistical-family rule change requires a new versioned package."
+  },
+  "claim_boundary": {
+    "currently_allowed": "architecture and blocker reporting only",
+    "currently_forbidden": [
+      "source-qualified event claim",
+      "replicated edge claim",
+      "prospective edge claim",
+      "paper-trading readiness",
+      "live-deployment authorization"
+    ]
+  }
+}
